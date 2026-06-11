@@ -376,8 +376,18 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
         c->set_error("model not found: %s", onnx_path.c_str());
         return false;
     }
+    // Persistent per-model timing cache: tactic timings get reused across
+    // builds (other resolutions, rebuilds), which speeds builds up and is
+    // NVIDIA's mitigation for timing noise when the GPU isn't idle - our
+    // background builds run alongside playback. Appended to the command
+    // line only: the settings string feeds the engine filename CRC and
+    // must stay Python-compatible.
+    const std::string tcache =
+        (fs::path(dir ? *dir : c->model_dir) / (onnx_name + ".timing.cache"))
+            .string();
     spec->cmdline = "\"" + c->trtexec + "\" --onnx=\"" + onnx_path +
-                    "\" --saveEngine=\"" + engine_path + "\" " + settings;
+                    "\" --saveEngine=\"" + engine_path + "\" " + settings +
+                    " --timingCacheFile=\"" + tcache + "\"";
     spec->env_prefix = c->trtexec_env;
     spec->engine_path = engine_path;
     spec->log_path = engine_path + ".build.log";
