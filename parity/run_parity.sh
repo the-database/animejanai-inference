@@ -5,7 +5,9 @@ set -e
 
 WROOT='C:\Users\<user>\aji-win\parity'
 LROOT=/mnt/c/Users/<user>/aji-win/parity
-VSPIPE=/mnt/c/Users/<user>/aji-win/fullpkg/mpv-upscale-2x_animejanai-v3.2.0/VSPipe.exe
+# the current shipped reference (VS R73 / vsmlrt 3.22.38 / TRT 10.16.0);
+# override with AJI_VSPIPE to golden against another package version
+VSPIPE=${AJI_VSPIPE:-/mnt/c/mpv-upscale-2x_animejanai-v3.3.0/VSPipe.exe}
 KT=~/src/animejanai-inference/build/aji_kernel_test
 PY=~/src/vsenv/bin/python
 CMP=~/src/animejanai-inference/parity/compare.py
