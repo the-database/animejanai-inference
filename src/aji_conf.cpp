@@ -167,7 +167,15 @@ AjiChainConf parse_chain(const Section &sec, int chain)
         c.models.push_back(std::move(mc));
     }
 
+    // RIFE keys mirror animejanai_config.py: ints go through float parsing,
+    // model code 414 = rife_v4.14 (trailing 1 on 4-digit codes = lite).
     c.rife = parse_yes(get("rife", "no"));
+    c.rife_factor_num = (int)to_double(get("rife_factor_numerator", "1"), 1);
+    c.rife_factor_den = (int)to_double(get("rife_factor_denominator", "1"), 1);
+    c.rife_model = (int)to_double(get("rife_model", "414"), 414);
+    c.rife_ensemble = parse_yes(get("rife_ensemble", "no"));
+    c.rife_scd_threshold =
+        to_double(get("rife_scene_detect_threshold", "0.150"), 0.150);
     return c;
 }
 

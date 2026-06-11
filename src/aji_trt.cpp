@@ -124,7 +124,7 @@ struct aji_ctx {
 
     // conf mode
     bool conf_mode = false;
-    std::string conf_path, model_dir, trtexec, trtexec_env;
+    std::string conf_path, model_dir, trtexec, trtexec_env, rife_model_dir;
     AjiConf conf;
     int slot = 1;
     bool engines_cleaned = false;
@@ -147,6 +147,28 @@ struct aji_ctx {
     // (re)built lazily per frame key since siting arrives with frames
     aji_plan *pre_plan = nullptr, *post_plan = nullptr;
     int pre_key[4] = {0}, post_key[4] = {0};
+
+    // RIFE (phase 1.5): interpolation between already-upscaled frames,
+    // replicating animejanai_core's pad/crop + rife_cuda.py's bilinear 709
+    // conversions + the vsmlrt v1 11-channel model input. Geometry state
+    // is set at configure; format-dependent staging/plans build lazily on
+    // the first aji_infer_rife (frames carry the format).
+    struct {
+        bool enabled = false;
+        int num = 1, den = 1;
+        double scd_threshold = 0.150;
+        ModelEngine engine;
+        int w = 0, h = 0;            // unpadded = chain output dims
+        int pw = 0, ph = 0;          // padded to mod-64
+        int pad_l = 0, pad_t = 0;    // centered, rounded down to even
+        int format = 0;              // staging/plans built for this format
+        aji_plan *pre = nullptr;     // padded YUV -> RGB, bilinear, 709
+        aji_plan *post = nullptr;    // RGB -> padded YUV, bilinear, 709
+        void *pad_a = nullptr, *pad_b = nullptr, *pad_o = nullptr;
+        void *in_tensor = nullptr;   // 11 * pw*ph fp16
+        void *out_tensor = nullptr;  // 3 * pw*ph fp16
+        float *scd = nullptr;        // device diff accumulator
+    } rife;
 
     // CUDA graph replay of the whole chain (pre -> steps -> post). The
     // captured graph bakes device pointers, so frames are staged through
@@ -244,10 +266,11 @@ void clean_stale_engines(aji_ctx *c)
 }
 
 bool build_engine(aji_ctx *c, const std::string &onnx_name,
-                  const std::string &settings, const std::string &engine_path)
+                  const std::string &settings, const std::string &engine_path,
+                  const std::string *dir = nullptr)
 {
     const std::string onnx_path =
-        (fs::path(c->model_dir) / (onnx_name + ".onnx")).string();
+        (fs::path(dir ? *dir : c->model_dir) / (onnx_name + ".onnx")).string();
     if (!fs::exists(onnx_path)) {
         c->set_error("model not found: %s", onnx_path.c_str());
         return false;
@@ -278,7 +301,7 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
 }
 
 bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
-                 int in_w, int in_h)
+                 int in_w, int in_h, int in_ch = 3)
 {
     std::ifstream f(engine_path, std::ios::binary);
     if (!f) {
@@ -308,7 +331,8 @@ bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
         c->set_error("createExecutionContext failed");
         return false;
     }
-    if (!me->exec->setInputShape(me->in_name, nvinfer1::Dims4{1, 3, in_h, in_w})) {
+    if (!me->exec->setInputShape(me->in_name,
+                                 nvinfer1::Dims4{1, in_ch, in_h, in_w})) {
         c->set_error("engine rejects input %dx%d (%s)", in_w, in_h,
                      engine_path.c_str());
         return false;
@@ -358,6 +382,108 @@ bool ensure_buffers(aji_ctx *c, size_t bytes)
         return false;
     }
     c->buf_bytes = bytes;
+    return true;
+}
+
+// rife model code -> file basename: 414 -> rife_v4.14, 4141 -> _lite,
+// ensemble appends _ensemble (rife_cuda.py's mapping).
+std::string rife_model_name(int code, bool ensemble)
+{
+    std::string s = std::to_string(code);
+    if (s.size() < 2)
+        return "";
+    std::string dec = s.size() == 2 ? s.substr(1, 1) : s.substr(1, 2);
+    std::string name = "rife_v" + s.substr(0, 1) + "." + dec;
+    if (s.size() == 4 && s.back() == '1')
+        name += "_lite";
+    if (ensemble)
+        name += "_ensemble";
+    return name;
+}
+
+void rife_teardown(aji_ctx *c)
+{
+    auto &R = c->rife;
+    aji_plan_destroy(R.pre);
+    aji_plan_destroy(R.post);
+    cudaFree(R.pad_a);
+    cudaFree(R.pad_b);
+    cudaFree(R.pad_o);
+    cudaFree(R.in_tensor);
+    cudaFree(R.out_tensor);
+    cudaFree(R.scd);
+    R.engine.exec.reset();
+    R.engine.engine.reset();
+    R = {};
+}
+
+// Configure-time RIFE setup: geometry, engine (build on first play), the
+// constant input planes. Format-dependent staging builds lazily in
+// aji_infer_rife. Requires the CUDA context to be current.
+bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
+                double fps)
+{
+    auto &R = c->rife;
+    R.w = w;
+    R.h = h;
+    R.pw = (w + 63) / 64 * 64;
+    R.ph = (h + 63) / 64 * 64;
+    // centered like animejanai_core's AddBorders split, but rounded down
+    // to even so 4:2:0 chroma stays aligned (odd borders are an error in
+    // the reference pipeline)
+    R.pad_l = ((R.pw - w) / 2) & ~1;
+    R.pad_t = ((R.ph - h) / 2) & ~1;
+    R.num = chain->rife_factor_num;
+    R.den = chain->rife_factor_den;
+    R.scd_threshold = chain->rife_scd_threshold;
+
+    const std::string model =
+        rife_model_name(chain->rife_model, chain->rife_ensemble);
+    char dims[64];
+    snprintf(dims, sizeof(dims), "1x11x%dx%d", R.ph, R.pw);
+    // vsmlrt's RIFE TRT backend: fp16 build with fp16 I/O, no cuDNN/cuBLAS
+    const std::string settings = std::string("--fp16 --optShapes=input:") +
+        dims + " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
+        " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
+    const std::string epath =
+        engine_path_for(c->rife_model_dir, model, settings);
+    if (!fs::exists(epath)) {
+        if (!build_engine(c, model, settings, epath, &c->rife_model_dir))
+            return false;
+    }
+    if (!load_engine(c, epath, &R.engine, R.pw, R.ph, 11))
+        return false;
+
+    const size_t plane = (size_t)R.pw * R.ph;
+    if (cudaMalloc(&R.in_tensor, plane * 11 * 2) != cudaSuccess ||
+        cudaMalloc(&R.out_tensor, plane * 3 * 2) != cudaSuccess ||
+        cudaMalloc(&R.scd, sizeof(float)) != cudaSuccess) {
+        c->set_error("rife buffer allocation failed");
+        return false;
+    }
+    // constant channels 7..10 (mesh + multipliers); one-time fill, default
+    // stream + device sync so non-blocking infer streams see it
+    char *t = (char *)R.in_tensor;
+    aji_rife_fill_consts(t + plane * 7 * 2, t + plane * 8 * 2,
+                         t + plane * 9 * 2, t + plane * 10 * 2,
+                         R.pw, R.ph, nullptr);
+    cudaDeviceSynchronize();
+
+    char buf[200];
+    const double factor = (double)R.num / R.den;
+    if (R.pw != w || R.ph != h) {
+        snprintf(buf, sizeof(buf),
+                 "Padded to %dx%d, applied RIFE v%d Interpolation %.3fx, "
+                 "cropped back to %dx%d;    New Video FPS: %.3f",
+                 R.pw, R.ph, chain->rife_model, factor, w, h, fps * factor);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "Applied RIFE v%d Interpolation %.3fx;    "
+                 "New Video FPS: %.3f",
+                 chain->rife_model, factor, fps * factor);
+    }
+    c->log_steps.push_back(buf);
+    R.enabled = true;
     return true;
 }
 
@@ -438,7 +564,9 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         c->model_dir = params->model_dir ? params->model_dir : ".";
         c->trtexec = params->trtexec ? params->trtexec : "trtexec";
         c->trtexec_env = params->trtexec_env ? params->trtexec_env : "";
-        c->slot = params->slot > 0 ? params->slot : 1;
+        c->slot = params->slot >= 0 ? params->slot : 1;
+        c->rife_model_dir =
+            params->rife_model_dir ? params->rife_model_dir : "";
         return c.release();
     }
 
@@ -524,6 +652,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     for (Step &st : c->steps)
         aji_plan_destroy(st.plan);
     c->steps.clear();
+    rife_teardown(c);
     if (c->graph_exec) {
         cudaGraphExecDestroy(c->graph_exec);
         c->graph_exec = nullptr;
@@ -663,12 +792,27 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         max_bytes = std::max(max_bytes, (size_t)3 * cw * ch * 2);
     }
 
+    if (chain->rife) {
+        if (!c->rife_model_dir.empty()) {
+            if (!setup_rife(c, chain, cw, ch, fps)) {
+                finalize_log(c);
+                return AJI_ERR_ENGINE;
+            }
+        } else {
+            c->log_steps.push_back(
+                "RIFE requested by the chain but no rife model dir is "
+                "configured; interpolation disabled");
+        }
+    }
+
     finalize_log(c);
 
     if (!any_model && c->steps.empty()) {
         if (out_w) *out_w = w;
         if (out_h) *out_h = h;
-        return 0;  // chain matched but does nothing -> passthrough
+        // chain selected no scaling work; rife (if enabled above) still
+        // interpolates between the passthrough frames
+        return 0;
     }
 
     if (!ensure_buffers(c, max_bytes))
@@ -852,7 +996,7 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
     if (!c->pre_plan || memcmp(pkey, c->pre_key, sizeof(pkey)) != 0) {
         aji_plan_destroy(c->pre_plan);
         c->pre_plan = aji_pre_plan_create(in->format, in->width, in->height,
-                                          in->siting);
+                                          in->siting, AJI_FILTER_SPLINE36);
         if (!c->pre_plan) {
             c->set_error("pre plan allocation failed");
             return AJI_ERR_CUDA;
@@ -920,7 +1064,8 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
     if (!c->post_plan || memcmp(qkey, c->post_key, sizeof(qkey)) != 0) {
         aji_plan_destroy(c->post_plan);
         c->post_plan = aji_post_plan_create(out->format, cw, ch,
-                                            AJI_SITING_LEFT);
+                                            AJI_SITING_LEFT,
+                                            AJI_FILTER_SPLINE36);
         if (!c->post_plan) {
             c->set_error("post plan allocation failed");
             return AJI_ERR_CUDA;
@@ -948,6 +1093,174 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
     return c ? c->scale : 0;
 }
 
+extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
+{
+    if (!c || !c->rife.enabled)
+        return 0;
+    if (num)
+        *num = c->rife.num;
+    if (den)
+        *den = c->rife.den;
+    return 1;
+}
+
+extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b, double t,
+                                         const aji_frame *out, void *cu_stream)
+{
+    if (!c || !a || !b || !out)
+        return AJI_ERR;
+    auto &R = c->rife;
+    if (!R.enabled) {
+        c->set_error("aji_infer_rife without an active RIFE configuration");
+        return AJI_ERR;
+    }
+    if (a->format != b->format || a->format != out->format ||
+        (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010)) {
+        c->set_error("rife frame formats must match (nv12/p010)");
+        return AJI_ERR_FORMAT;
+    }
+    if (a->width != R.w || a->height != R.h || b->width != R.w ||
+        b->height != R.h || out->width != R.w || out->height != R.h) {
+        c->set_error("rife frame dims do not match configured %dx%d",
+                     R.w, R.h);
+        return AJI_ERR_SHAPE;
+    }
+
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return AJI_ERR_CUDA;
+    }
+    cudaStream_t stream = (cudaStream_t)cu_stream;
+    const int fmt = a->format;
+    const int bpp = fmt == AJI_FMT_P010 ? 2 : 1;
+    const size_t prow = (size_t)R.pw * bpp;
+    const size_t py = prow * R.ph;
+    const size_t plane = (size_t)R.pw * R.ph;          // fp16 elements
+
+    // format-dependent staging + plans, built on first use
+    if (R.format != fmt) {
+        aji_plan_destroy(R.pre);
+        aji_plan_destroy(R.post);
+        R.pre = aji_pre_plan_create(fmt, R.pw, R.ph, AJI_SITING_LEFT,
+                                    AJI_FILTER_BILINEAR);
+        R.post = aji_post_plan_create(fmt, R.pw, R.ph, AJI_SITING_LEFT,
+                                      AJI_FILTER_BILINEAR);
+        cudaFree(R.pad_a);
+        cudaFree(R.pad_b);
+        cudaFree(R.pad_o);
+        R.pad_a = R.pad_b = R.pad_o = nullptr;
+        const size_t pad_bytes = py + py / 2;
+        if (!R.pre || !R.post ||
+            cudaMalloc(&R.pad_a, pad_bytes) != cudaSuccess ||
+            cudaMalloc(&R.pad_b, pad_bytes) != cudaSuccess ||
+            cudaMalloc(&R.pad_o, pad_bytes) != cudaSuccess) {
+            c->set_error("rife staging allocation failed");
+            R.format = 0;
+            return AJI_ERR_CUDA;
+        }
+        // pad borders are studio black like std.AddBorders; interiors get
+        // overwritten per frame, so fill whole planes once
+        const unsigned yblack = fmt == AJI_FMT_P010 ? 16 * 256 : 16;
+        const unsigned cblack = fmt == AJI_FMT_P010 ? 128 * 256 : 128;
+        for (void *p : {R.pad_a, R.pad_b}) {
+            aji_fill_plane(fmt, p, prow, R.pw, R.ph, yblack, stream);
+            aji_fill_plane(fmt, (char *)p + py, prow, R.pw, R.ph / 2, cblack,
+                           stream);
+        }
+        R.format = fmt;
+    }
+
+    // scene detection on the unpadded luma (misc.SCDetect's metric)
+    cudaMemsetAsync(R.scd, 0, sizeof(float), stream);
+    int err = aji_scd_diff(fmt, a->plane[0], a->stride[0], b->plane[0],
+                           b->stride[0], R.w, R.h, R.scd, stream);
+    if (err) {
+        c->set_error("scd kernel failed: %s",
+                     cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+    float sum = 0.0f;
+    cudaMemcpyAsync(&sum, R.scd, sizeof(float), cudaMemcpyDeviceToHost,
+                    stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        c->set_error("scd sync failed");
+        return AJI_ERR_CUDA;
+    }
+    // The reference runs SCDetect on the padded clip; the constant borders
+    // contribute zero difference, so its mean divides by the padded area.
+    if (sum / ((double)R.pw * R.ph) > R.scd_threshold)
+        return AJI_SCENE;
+
+    // stage both frames into the padded buffers (interior only)
+    const size_t doff_y = (size_t)R.pad_t * prow + (size_t)R.pad_l * bpp;
+    const size_t doff_uv = py + (size_t)(R.pad_t / 2) * prow +
+                           (size_t)R.pad_l * bpp;
+    const aji_frame *src[2] = {a, b};
+    void *pad[2] = {R.pad_a, R.pad_b};
+    for (int i = 0; i < 2; i++) {
+        if (!copy_plane((char *)pad[i] + doff_y, prow, src[i]->plane[0],
+                        src[i]->stride[0], (size_t)R.w * bpp, R.h, stream) ||
+            !copy_plane((char *)pad[i] + doff_uv, prow, src[i]->plane[1],
+                        src[i]->stride[1], (size_t)R.w * bpp, R.h / 2,
+                        stream)) {
+            c->set_error("rife staging copy failed");
+            return AJI_ERR_CUDA;
+        }
+    }
+
+    // padded YUV -> RGB into input channels 0-2 (frame a) and 3-5 (b),
+    // bilinear chroma, hardcoded BT.709 like rife_cuda.py
+    const aji_csp csp = aji_make_csp(fmt, AJI_MATRIX_BT709, a->range);
+    char *tin = (char *)R.in_tensor;
+    for (int i = 0; i < 2; i++) {
+        err = aji_run_pre(R.pre, pad[i], prow, (char *)pad[i] + py, prow,
+                          &csp, tin + plane * 2 * (i * 3), stream);
+        if (err) {
+            c->set_error("rife pre kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+    }
+    // channel 6: the timestep plane
+    err = aji_fill_f16(tin + plane * 2 * 6, plane, (float)t, stream);
+    if (err) {
+        c->set_error("timestep fill failed");
+        return AJI_ERR_CUDA;
+    }
+
+    ModelEngine &me = R.engine;
+    if (!me.exec->setTensorAddress(me.in_name, R.in_tensor) ||
+        !me.exec->setTensorAddress(me.out_name, R.out_tensor)) {
+        c->set_error("rife setTensorAddress failed");
+        return AJI_ERR_ENGINE;
+    }
+    if (!me.exec->enqueueV3(stream)) {
+        c->set_error("rife enqueueV3 failed");
+        return AJI_ERR_ENGINE;
+    }
+
+    // RGB -> padded YUV (bilinear, 709), then crop the window out
+    err = aji_run_post(R.post, R.out_tensor, &csp, R.pad_o, prow,
+                       (char *)R.pad_o + py, prow, stream);
+    if (err) {
+        c->set_error("rife post kernel failed: %s",
+                     cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+    if (!copy_plane(out->plane[0], out->stride[0],
+                    (char *)R.pad_o + doff_y, prow, (size_t)R.w * bpp, R.h,
+                    stream) ||
+        !copy_plane(out->plane[1], out->stride[1],
+                    (char *)R.pad_o + doff_uv, prow, (size_t)R.w * bpp,
+                    R.h / 2, stream)) {
+        c->set_error("rife crop copy failed");
+        return AJI_ERR_CUDA;
+    }
+    return AJI_OK;
+}
+
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)
 {
     return c ? c->errbuf : "no context";
@@ -967,6 +1280,7 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->steps.clear();
         aji_plan_destroy(c->pre_plan);
         aji_plan_destroy(c->post_plan);
+        rife_teardown(c);
         if (c->graph_exec)
             cudaGraphExecDestroy(c->graph_exec);
         cudaFree(c->stage_in);

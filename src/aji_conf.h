@@ -18,7 +18,12 @@ struct AjiChainConf {
     std::string min_resolution = "0x0";
     std::string max_resolution = "infxinf";
     std::vector<AjiModelConf> models;
-    bool rife = false;                         // parsed; phase 1.5
+    bool rife = false;
+    int rife_factor_num = 1;                   // output fps multiplier
+    int rife_factor_den = 1;
+    int rife_model = 414;                      // e.g. 414 = rife_v4.14
+    bool rife_ensemble = false;
+    double rife_scd_threshold = 0.150;         // misc.SCDetect threshold
 };
 
 struct AjiSlotConf {

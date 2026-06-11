@@ -74,11 +74,19 @@ double spline36(double x)
     return 0.0;
 }
 
-bool build_pass(pass *p, int src, int dst, double shift)
+double bilinear(double x)
+{
+    x = fabs(x);
+    return x < 1.0 ? 1.0 - x : 0.0;
+}
+
+bool build_pass(pass *p, int src, int dst, double shift, int filter)
 {
     const double scale = (double)dst / src;
     const double step = scale < 1.0 ? scale : 1.0;
-    int taps = (int)ceil(3.0 / step) * 2;
+    double (*f)(double) = filter == AJI_FILTER_BILINEAR ? bilinear : spline36;
+    const double support = filter == AJI_FILTER_BILINEAR ? 1.0 : 3.0;
+    int taps = (int)ceil(support / step) * 2;
     if (taps < 1)
         taps = 1;
 
@@ -91,7 +99,7 @@ bool build_pass(pass *p, int src, int dst, double shift)
         const double begin = floor(pos - taps / 2.0 + 0.5) + 0.5;
         double sum = 0.0;
         for (int j = 0; j < taps; j++) {
-            row[j] = spline36((begin + j - pos) * step);
+            row[j] = f((begin + j - pos) * step);
             sum += row[j];
         }
         start[i] = (int)(begin - 0.5);
@@ -351,7 +359,8 @@ extern "C" void aji_plan_destroy(aji_plan *p)
     delete p;
 }
 
-extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting)
+extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting,
+                                         int filter)
 {
     aji_plan *p = new aji_plan();
     p->kind = aji_plan::PRE;
@@ -361,7 +370,8 @@ extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting)
     const int cw = w >> 1, ch = h >> 1;
     double sx, sy;
     chroma_shifts(siting, true, &sx, &sy);
-    if (!build_pass(&p->ph, cw, w, sx) || !build_pass(&p->pv, ch, h, sy) ||
+    if (!build_pass(&p->ph, cw, w, sx, filter) ||
+        !build_pass(&p->pv, ch, h, sy, filter) ||
         cudaMalloc(&p->tmp0, (size_t)2 * w * ch * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&p->tmp1, (size_t)2 * w * h * sizeof(float)) != cudaSuccess) {
         aji_plan_destroy(p);
@@ -370,7 +380,8 @@ extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting)
     return p;
 }
 
-extern "C" aji_plan *aji_post_plan_create(int format, int w, int h, int siting)
+extern "C" aji_plan *aji_post_plan_create(int format, int w, int h, int siting,
+                                          int filter)
 {
     aji_plan *p = new aji_plan();
     p->kind = aji_plan::POST;
@@ -380,7 +391,8 @@ extern "C" aji_plan *aji_post_plan_create(int format, int w, int h, int siting)
     const int cw = w >> 1, ch = h >> 1;
     double sx, sy;
     chroma_shifts(siting, false, &sx, &sy);
-    if (!build_pass(&p->ph, w, cw, sx) || !build_pass(&p->pv, h, ch, sy) ||
+    if (!build_pass(&p->ph, w, cw, sx, filter) ||
+        !build_pass(&p->pv, h, ch, sy, filter) ||
         cudaMalloc(&p->tmp0, (size_t)2 * w * h * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&p->tmp1, (size_t)2 * cw * h * sizeof(float)) != cudaSuccess) {
         aji_plan_destroy(p);
@@ -397,7 +409,8 @@ extern "C" aji_plan *aji_resize_plan_create(int sw, int sh, int dw, int dh)
     p->h = sh;
     p->dw = dw;
     p->dh = dh;
-    if (!build_pass(&p->ph, sw, dw, 0.0) || !build_pass(&p->pv, sh, dh, 0.0) ||
+    if (!build_pass(&p->ph, sw, dw, 0.0, AJI_FILTER_SPLINE36) ||
+        !build_pass(&p->pv, sh, dh, 0.0, AJI_FILTER_SPLINE36) ||
         cudaMalloc(&p->tmp0, (size_t)3 * dw * sh * sizeof(float)) != cudaSuccess) {
         aji_plan_destroy(p);
         return nullptr;
@@ -480,5 +493,122 @@ extern "C" int aji_run_resize(aji_plan *p, const void *src_f16, void *dst_f16,
         (const __half *)src_f16, p->h, p->ph, p->tmp0);
     k_rs_v<<<GRID(p->dw, p->dh, 3), 0, s>>>(
         p->tmp0, p->dw, p->pv, (__half *)dst_f16);
+    return (int)cudaGetLastError();
+}
+
+/* ---------------- RIFE helpers ---------------- */
+
+// The four constant planes of the RIFE v1 input layout (vsmlrt
+// get_rife_input): mesh X = 2x/(w-1)-1, mesh Y = 2y/(h-1)-1, then the
+// constant multipliers 2/(w-1) and 2/(h-1).
+__global__ void k_rife_consts(__half *meshx, __half *meshy, __half *mulw,
+                              __half *mulh, int w, int h)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+    const size_t idx = (size_t)y * w + x;
+    meshx[idx] = __float2half(2.0f * x / (w - 1) - 1.0f);
+    meshy[idx] = __float2half(2.0f * y / (h - 1) - 1.0f);
+    mulw[idx] = __float2half(2.0f / (w - 1));
+    mulh[idx] = __float2half(2.0f / (h - 1));
+}
+
+extern "C" int aji_rife_fill_consts(void *meshx_f16, void *meshy_f16,
+                                    void *mulw_f16, void *mulh_f16,
+                                    int w, int h, void *stream)
+{
+    k_rife_consts<<<GRID(w, h, 1), 0, (cudaStream_t)stream>>>(
+        (__half *)meshx_f16, (__half *)meshy_f16, (__half *)mulw_f16,
+        (__half *)mulh_f16, w, h);
+    return (int)cudaGetLastError();
+}
+
+__global__ void k_fill_f16(__half *dst, size_t count, float value)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        dst[i] = __float2half(value);
+}
+
+extern "C" int aji_fill_f16(void *dst_f16, size_t count, float value,
+                            void *stream)
+{
+    const int block = 256;
+    const size_t grid = (count + block - 1) / block;
+    k_fill_f16<<<(unsigned)grid, block, 0, (cudaStream_t)stream>>>(
+        (__half *)dst_f16, count, value);
+    return (int)cudaGetLastError();
+}
+
+template <typename T>
+__global__ void k_fill_plane(uint8_t *plane, ptrdiff_t stride, int w, int h,
+                             unsigned value)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+    ((T *)(plane + (size_t)y * stride))[x] = (T)value;
+}
+
+extern "C" int aji_fill_plane(int format, void *plane, ptrdiff_t stride,
+                              int w, int h, unsigned value, void *stream)
+{
+    cudaStream_t s = (cudaStream_t)stream;
+    if (format == AJI_FMT_NV12) {
+        k_fill_plane<uint8_t><<<GRID(w, h, 1), 0, s>>>(
+            (uint8_t *)plane, stride, w, h, value);
+    } else {
+        k_fill_plane<uint16_t><<<GRID(w, h, 1), 0, s>>>(
+            (uint8_t *)plane, stride, w, h, value);
+    }
+    return (int)cudaGetLastError();
+}
+
+// Block-reduced sum of |Ya - Yb| / peak; one atomicAdd per block.
+template <typename T>
+__global__ void k_scd_diff(const uint8_t *ya, ptrdiff_t sa,
+                           const uint8_t *yb, ptrdiff_t sb, int w, int h,
+                           float norm, float *accum)
+{
+    __shared__ float partial[BLOCK_X * BLOCK_Y];
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    float d = 0.0f;
+    if (x < w && y < h) {
+        const float a = ((const T *)(ya + (size_t)y * sa))[x];
+        const float b = ((const T *)(yb + (size_t)y * sb))[x];
+        d = fabsf(a - b) * norm;
+    }
+    partial[tid] = d;
+    __syncthreads();
+    for (int n = BLOCK_X * BLOCK_Y / 2; n > 0; n >>= 1) {
+        if (tid < n)
+            partial[tid] += partial[tid + n];
+        __syncthreads();
+    }
+    if (tid == 0)
+        atomicAdd(accum, partial[0]);
+}
+
+extern "C" int aji_scd_diff(int format, const void *ya, ptrdiff_t stride_a,
+                            const void *yb, ptrdiff_t stride_b, int w, int h,
+                            float *accum_dev, void *stream)
+{
+    cudaStream_t s = (cudaStream_t)stream;
+    if (format == AJI_FMT_NV12) {
+        k_scd_diff<uint8_t><<<GRID(w, h, 1), 0, s>>>(
+            (const uint8_t *)ya, stride_a, (const uint8_t *)yb, stride_b,
+            w, h, 1.0f / 255.0f, accum_dev);
+    } else {
+        // P010 raw values are MSB-aligned 10-bit
+        k_scd_diff<uint16_t><<<GRID(w, h, 1), 0, s>>>(
+            (const uint8_t *)ya, stride_a, (const uint8_t *)yb, stride_b,
+            w, h, 1.0f / 65472.0f, accum_dev);
+    }
     return (int)cudaGetLastError();
 }

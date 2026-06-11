@@ -103,9 +103,9 @@ int main(int argc, char **argv)
 
     aji_plan *plan;
     if (!strcmp(mode, "pre"))
-        plan = aji_pre_plan_create(fmt, w, h, sit);
+        plan = aji_pre_plan_create(fmt, w, h, sit, AJI_FILTER_SPLINE36);
     else if (!strcmp(mode, "post"))
-        plan = aji_post_plan_create(fmt, w, h, sit);
+        plan = aji_post_plan_create(fmt, w, h, sit, AJI_FILTER_SPLINE36);
     else
         plan = aji_resize_plan_create(w, h, dw, dh);
     if (!plan) {

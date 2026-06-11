@@ -43,14 +43,19 @@ int main(int argc, char **argv)
 {
     const char *engine = NULL, *input = NULL, *output = NULL;
     const char *conf = NULL, *model_dir = NULL, *trtexec = NULL, *trtexec_env = NULL;
+    const char *rife_model_dir = NULL;
     const char *format = "nv12", *matrix = "709", *range = "limited", *siting = "left";
-    int w = 0, h = 0, max_frames = 1 << 30, slot = 1;
+    int w = 0, h = 0, max_frames = 1 << 30, slot = 1, rife = 0;
+
     double fps = 23.976;
 
-    for (int i = 1; i < argc - 1; i++) {
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--rife")) { rife = 1; continue; }
+        if (i >= argc - 1) break;
         if (!strcmp(argv[i], "--engine")) engine = argv[++i];
         else if (!strcmp(argv[i], "--conf")) conf = argv[++i];
         else if (!strcmp(argv[i], "--model-dir")) model_dir = argv[++i];
+        else if (!strcmp(argv[i], "--rife-model-dir")) rife_model_dir = argv[++i];
         else if (!strcmp(argv[i], "--trtexec")) trtexec = argv[++i];
         else if (!strcmp(argv[i], "--trtexec-env")) trtexec_env = argv[++i];
         else if (!strcmp(argv[i], "--slot")) slot = atoi(argv[++i]);
@@ -84,6 +89,7 @@ int main(int argc, char **argv)
         .trtexec = trtexec,
         .trtexec_env = trtexec_env,
         .slot = slot,
+        .rife_model_dir = rife_model_dir,
         .engine_path = engine,
         .max_width = w,
         .max_height = h,
@@ -102,6 +108,100 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("%s\n", aji_current_log(aji));
+
+    if (rife) {
+        // Interpolation-only test loop, replicating the reference's 2x
+        // video_player ordering: f0, i01, f1, i12, f2 ... with the left
+        // source frame substituted on scene changes.
+        int rn = 0, rd = 0;
+        if (!aji_rife_factor(aji, &rn, &rd) || rn != 2 * rd) {
+            fprintf(stderr, "rife test needs an active 2/1 rife chain\n");
+            return 1;
+        }
+        const int fmt2 = strcmp(format, "p010") ? AJI_FMT_NV12 : AJI_FMT_P010;
+        const int mat2 = !strcmp(matrix, "601") ? AJI_MATRIX_BT601 :
+                         !strcmp(matrix, "2020") ? AJI_MATRIX_BT2020
+                                                 : AJI_MATRIX_BT709;
+        const int rng2 = !strcmp(range, "full") ? AJI_RANGE_FULL
+                                                : AJI_RANGE_LIMITED;
+        const int sit2 = !strcmp(siting, "center") ? AJI_SITING_CENTER :
+                         !strcmp(siting, "topleft") ? AJI_SITING_TOPLEFT
+                                                    : AJI_SITING_LEFT;
+        FILE *fin = fopen(input, "rb");
+        if (!fin) { perror(input); return 1; }
+        FILE *fout = output ? fopen(output, "wb") : NULL;
+        if (output && !fout) { perror(output); return 1; }
+
+        void *h_in, *h_out;
+        CK(cudaMallocHost(&h_in, frame_sz));
+        CK(cudaMallocHost(&h_out, frame_sz));
+        aji_frame fr[3];  // two source slots + interp output
+        for (int i = 0; i < 3; i++) {
+            fr[i] = (aji_frame){.width = w, .height = h, .format = fmt2,
+                                .matrix = mat2, .range = rng2, .siting = sit2,
+                                .stride = {(ptrdiff_t)(w * bpp),
+                                           (ptrdiff_t)(w * bpp)}};
+            CK(cudaMalloc(&fr[i].plane[0], y_sz));
+            CK(cudaMalloc(&fr[i].plane[1], uv_sz));
+        }
+        cudaStream_t stream;
+        CK(cudaStreamCreate(&stream));
+
+        int prev = -1, cur = 0, n = 0, interp = 0, scenes = 0;
+        while (n < max_frames && fread(h_in, 1, frame_sz, fin) == frame_sz) {
+            CK(cudaMemcpyAsync(fr[cur].plane[0], h_in, y_sz,
+                               cudaMemcpyHostToDevice, stream));
+            CK(cudaMemcpyAsync(fr[cur].plane[1], (char *)h_in + y_sz, uv_sz,
+                               cudaMemcpyHostToDevice, stream));
+            if (prev >= 0 && fout) {
+                int ret = aji_infer_rife(aji, &fr[prev], &fr[cur], 0.5,
+                                         &fr[2], stream);
+                const aji_frame *emit;
+                if (ret == AJI_OK) {
+                    emit = &fr[2];
+                    interp++;
+                } else if (ret == AJI_SCENE) {
+                    emit = &fr[prev];
+                    scenes++;
+                } else {
+                    fprintf(stderr, "aji_infer_rife: %d: %s\n", ret,
+                            aji_last_error(aji));
+                    return 1;
+                }
+                CK(cudaMemcpyAsync(h_out, emit->plane[0], y_sz,
+                                   cudaMemcpyDeviceToHost, stream));
+                CK(cudaMemcpyAsync((char *)h_out + y_sz, emit->plane[1],
+                                   uv_sz, cudaMemcpyDeviceToHost, stream));
+                CK(cudaStreamSynchronize(stream));
+                if (fwrite(h_out, 1, frame_sz, fout) != frame_sz) {
+                    perror("fwrite");
+                    return 1;
+                }
+            } else {
+                CK(cudaStreamSynchronize(stream));
+            }
+            if (fout && fwrite(h_in, 1, frame_sz, fout) != frame_sz) {
+                perror("fwrite");
+                return 1;
+            }
+            if (prev < 0) {
+                prev = cur;
+                cur = 1;
+            } else {
+                int tmp = prev;
+                prev = cur;
+                cur = tmp;
+            }
+            n++;
+        }
+        printf("rife: %d source frames, %d interpolated, %d scene skips\n",
+               n, interp, scenes);
+        if (fout) fclose(fout);
+        fclose(fin);
+        aji_destroy(&aji);
+        return 0;
+    }
+
     if (act == 0) {
         printf("no chain active (passthrough); nothing to do\n");
         return 0;
