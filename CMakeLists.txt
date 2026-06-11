@@ -43,3 +43,9 @@ add_executable(aji_harness src/harness.c)
 target_link_libraries(aji_harness PRIVATE aji CUDA::cudart)
 set_target_properties(aji_harness PROPERTIES
     BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
+
+# Parity test tool: compiles the kernels directly (the shared lib hides
+# the launcher symbols), no TensorRT dependency.
+add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
+target_include_directories(aji_kernel_test PRIVATE include src)
+target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)

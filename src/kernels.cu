@@ -1,232 +1,484 @@
 /*
  * Pre/post-processing and resize CUDA kernels for the aji shim.
  *
- * pre:    NV12/P010 -> fp16 NCHW RGB [0,1], parametrized matrix/range/siting
- * post:   fp16 NCHW RGB [0,1] -> NV12/P010
- * resize: Catmull-Rom on fp16 NCHW RGB (chain resize steps)
+ * pre:    NV12/P010 -> fp16 NCHW RGB, Spline36 chroma upsample + matrix
+ * post:   fp16 NCHW RGB -> NV12/P010, matrix + Spline36 chroma downsample
+ * resize: Spline36 on fp16 NCHW RGB (chain resize steps)
  *
- * Remaining quality deltas vs the zimg path (quantified by the parity
- * harness): chroma upsampling is bilinear (zimg: spline36 via VS resize),
- * chroma downsampling is a 2x2 box, resize is Catmull-Rom not Spline36.
+ * Resampling replicates zimg's compute_filter (what VapourSynth resize —
+ * the reference pipeline — uses): per-output-pixel weight tables built
+ * host-side in double precision, kernel stretched by 1/scale on downscale,
+ * taps = max(ceil(2*support/step), 1), positions mirrored then clamped at
+ * the borders, weights normalized to 1. Intermediates are fp32; values are
+ * only clamped at final integer quantization (P010 at true 10-bit depth).
  */
 
 #include <cuda_fp16.h>
+#include <math.h>
 #include <stdint.h>
 
+#include <vector>
+
+#include "aji.h"
 #include "kernels.h"
 
-__device__ __forceinline__ float3 ycbcr_to_rgb(float y, float u, float v,
-                                               float kr, float kb)
+extern "C" aji_csp aji_make_csp(int format, int matrix, int range)
 {
-    const float kg = 1.0f - kr - kb;
-    float r = y + 2.0f * (1.0f - kr) * v;
-    float b = y + 2.0f * (1.0f - kb) * u;
-    float g = y - (2.0f * kb * (1.0f - kb) * u + 2.0f * kr * (1.0f - kr) * v) / kg;
-    return make_float3(__saturatef(r), __saturatef(g), __saturatef(b));
+    aji_csp c = {};
+    switch (matrix) {
+    case AJI_MATRIX_BT601:  c.kr = 0.299f;  c.kb = 0.114f;  break;
+    case AJI_MATRIX_BT2020: c.kr = 0.2627f; c.kb = 0.0593f; break;
+    case AJI_MATRIX_BT709:
+    default:                c.kr = 0.2126f; c.kb = 0.0722f; break;
+    }
+    const bool p010 = format == AJI_FMT_P010;
+    const float m = p010 ? 256.0f : 1.0f;          // 8-bit-reference scale
+    const float maxraw = p010 ? 65472.0f : 255.0f; // (2^bd - 1) << (16 - bd)
+    if (range == AJI_RANGE_FULL) {
+        c.yoff = 0.0f;
+        c.yscale = maxraw;
+        c.coff = p010 ? 32768.0f : 128.0f;
+        c.cscale = maxraw;
+    } else {
+        c.yoff = 16.0f * m;
+        c.yscale = 219.0f * m;
+        c.coff = 128.0f * m;
+        c.cscale = 224.0f * m;
+    }
+    return c;
+}
+
+/* ---------------- weight tables (zimg compute_filter) ---------------- */
+
+namespace {
+
+struct pass {
+    int taps = 0, src = 0, dst = 0;
+    const int *start = nullptr;   // [dst] first source index per output
+    const float *wt = nullptr;    // [dst * taps], normalized
+};
+
+double spline36(double x)
+{
+    x = fabs(x);
+    if (x < 1.0)
+        return ((13.0 / 11.0 * x - 453.0 / 209.0) * x - 3.0 / 209.0) * x + 1.0;
+    if (x < 2.0) {
+        x -= 1.0;
+        return ((-6.0 / 11.0 * x + 270.0 / 209.0) * x - 156.0 / 209.0) * x;
+    }
+    if (x < 3.0) {
+        x -= 2.0;
+        return ((1.0 / 11.0 * x - 45.0 / 209.0) * x + 26.0 / 209.0) * x;
+    }
+    return 0.0;
+}
+
+bool build_pass(pass *p, int src, int dst, double shift)
+{
+    const double scale = (double)dst / src;
+    const double step = scale < 1.0 ? scale : 1.0;
+    int taps = (int)ceil(3.0 / step) * 2;
+    if (taps < 1)
+        taps = 1;
+
+    std::vector<int> start(dst);
+    std::vector<float> wt((size_t)dst * taps);
+    std::vector<double> row(taps);
+    for (int i = 0; i < dst; i++) {
+        const double pos = (i + 0.5) / scale + shift;
+        // round_halfup(pos - taps/2) + 0.5 = first tap center
+        const double begin = floor(pos - taps / 2.0 + 0.5) + 0.5;
+        double sum = 0.0;
+        for (int j = 0; j < taps; j++) {
+            row[j] = spline36((begin + j - pos) * step);
+            sum += row[j];
+        }
+        start[i] = (int)(begin - 0.5);
+        for (int j = 0; j < taps; j++)
+            wt[(size_t)i * taps + j] = (float)(row[j] / sum);
+    }
+
+    int *d_start = nullptr;
+    float *d_wt = nullptr;
+    if (cudaMalloc(&d_start, dst * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&d_wt, wt.size() * sizeof(float)) != cudaSuccess) {
+        cudaFree(d_start);
+        return false;
+    }
+    cudaMemcpy(d_start, start.data(), dst * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_wt, wt.data(), wt.size() * sizeof(float), cudaMemcpyHostToDevice);
+    p->taps = taps;
+    p->src = src;
+    p->dst = dst;
+    p->start = d_start;
+    p->wt = d_wt;
+    return true;
+}
+
+void free_pass(pass *p)
+{
+    cudaFree((void *)p->start);
+    cudaFree((void *)p->wt);
+    *p = {};
+}
+
+/* Chroma plane shifts in zimg convention (source-plane units): where an
+ * output sample's center lands in the source grid, beyond the plain
+ * (i + 0.5) / scale mapping. Derived from the siting offsets. */
+void chroma_shifts(int siting, bool up, double *sx, double *sy)
+{
+    if (up) {  // 420 chroma -> luma grid
+        *sx = siting == AJI_SITING_CENTER ? 0.0 : 0.25;
+        *sy = siting == AJI_SITING_TOPLEFT ? 0.25 : 0.0;
+    } else {   // luma grid -> 420 chroma
+        *sx = siting == AJI_SITING_CENTER ? 0.0 : -0.5;
+        *sy = siting == AJI_SITING_TOPLEFT ? -0.5 : 0.0;
+    }
+}
+
+} // namespace
+
+struct aji_plan {
+    enum Kind { PRE, POST, RESIZE } kind;
+    int format = 0;
+    int w = 0, h = 0;          // pre/post luma dims; resize: src dims
+    int dw = 0, dh = 0;        // resize: dst dims
+    pass ph, pv;
+    float *tmp0 = nullptr;     // after the first pass
+    float *tmp1 = nullptr;     // after the second pass (pre only)
+};
+
+/* ---------------- device helpers ---------------- */
+
+__device__ __forceinline__ int mirr(int i, int n)
+{
+    i = i < 0 ? -i - 1 : i;
+    i = i >= n ? 2 * n - 1 - i : i;
+    return min(max(i, 0), n - 1);
+}
+
+__device__ __forceinline__ float quant(float v, float qdiv, float qmax)
+{
+    return fminf(fmaxf(rintf(v / qdiv), 0.0f), qmax) * qdiv;
+}
+
+/* ---------------- pre: NV12/P010 -> RGB fp16 ---------------- */
+
+// horizontal resample of interleaved raw chroma -> 2 planar fp32 (raw units)
+template <typename T>
+__global__ void k_uv_h(const uint8_t *uv, ptrdiff_t stride, int ch, pass px,
+                       float *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= px.dst || y >= ch)
+        return;
+    const T *row = (const T *)(uv + (size_t)y * stride);
+    const float *w = px.wt + (size_t)x * px.taps;
+    const int s0 = px.start[x];
+    float u = 0.0f, v = 0.0f;
+    for (int j = 0; j < px.taps; j++) {
+        const int sx = mirr(s0 + j, px.src);
+        u += w[j] * row[2 * sx];
+        v += w[j] * row[2 * sx + 1];
+    }
+    const size_t plane = (size_t)px.dst * ch, idx = (size_t)y * px.dst + x;
+    dst[idx] = u;
+    dst[plane + idx] = v;
+}
+
+// vertical resample of N planar fp32 planes (gridDim.z = N)
+__global__ void k_v_f32(const float *src, int w, pass py, float *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= py.dst)
+        return;
+    const float *sp = src + (size_t)blockIdx.z * w * py.src;
+    const float *wt = py.wt + (size_t)y * py.taps;
+    const int s0 = py.start[y];
+    float a = 0.0f;
+    for (int j = 0; j < py.taps; j++)
+        a += wt[j] * sp[(size_t)mirr(s0 + j, py.src) * w + x];
+    dst[(size_t)blockIdx.z * w * py.dst + (size_t)y * w + x] = a;
 }
 
 template <typename T>
-__global__ void k_pre(const uint8_t *y_plane, ptrdiff_t y_stride,
-                      const uint8_t *uv_plane, ptrdiff_t uv_stride,
-                      int w, int h, aji_csp csp, __half *dst)
+__global__ void k_pre_combine(const uint8_t *y_plane, ptrdiff_t y_stride,
+                              const float *uvf, int w, int h, aji_csp csp,
+                              __half *dst)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
         return;
+    const size_t plane = (size_t)w * h, idx = (size_t)y * w + x;
 
     const T *yrow = (const T *)(y_plane + (size_t)y * y_stride);
     const float Y = ((float)yrow[x] - csp.yoff) / csp.yscale;
+    const float U = (uvf[idx] - csp.coff) / csp.cscale;
+    const float V = (uvf[plane + idx] - csp.coff) / csp.cscale;
 
-    // bilinear chroma upsample at the configured siting
-    const int cw = w >> 1, ch = h >> 1;
-    float cxf = x * 0.5f + csp.cox;
-    float cyf = y * 0.5f + csp.coy;
-    int cx0 = (int)floorf(cxf), cy0 = (int)floorf(cyf);
-    const float fx = cxf - cx0, fy = cyf - cy0;
-    int cx1 = min(cx0 + 1, cw - 1), cy1 = min(cy0 + 1, ch - 1);
-    cx0 = max(cx0, 0); cy0 = max(cy0, 0);
+    const float kg = 1.0f - csp.kr - csp.kb;
+    const float r = Y + 2.0f * (1.0f - csp.kr) * V;
+    const float b = Y + 2.0f * (1.0f - csp.kb) * U;
+    const float g = Y - (2.0f * csp.kb * (1.0f - csp.kb) * U +
+                         2.0f * csp.kr * (1.0f - csp.kr) * V) / kg;
 
-    const T *uv0 = (const T *)(uv_plane + (size_t)cy0 * uv_stride);
-    const T *uv1 = (const T *)(uv_plane + (size_t)cy1 * uv_stride);
-    const float w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy);
-    const float w01 = (1 - fx) * fy,       w11 = fx * fy;
-
-    float U = w00 * uv0[2 * cx0] + w10 * uv0[2 * cx1] +
-              w01 * uv1[2 * cx0] + w11 * uv1[2 * cx1];
-    float V = w00 * uv0[2 * cx0 + 1] + w10 * uv0[2 * cx1 + 1] +
-              w01 * uv1[2 * cx0 + 1] + w11 * uv1[2 * cx1 + 1];
-    U = (U - csp.coff) / csp.cscale;
-    V = (V - csp.coff) / csp.cscale;
-
-    const float3 rgb = ycbcr_to_rgb(Y, U, V, csp.kr, csp.kb);
-
-    const size_t plane = (size_t)w * h, idx = (size_t)y * w + x;
-    dst[idx]             = __float2half(rgb.x);
-    dst[plane + idx]     = __float2half(rgb.y);
-    dst[2 * plane + idx] = __float2half(rgb.z);
+    dst[idx]             = __float2half(r);
+    dst[plane + idx]     = __float2half(g);
+    dst[2 * plane + idx] = __float2half(b);
 }
 
+/* ---------------- post: RGB fp16 -> NV12/P010 ---------------- */
+
+// matrix + luma quantize; chroma (normalized units) to 2 planar fp32
 template <typename T>
-__global__ void k_post_luma(const __half *src, int w, int h, aji_csp csp,
-                            uint8_t *y_plane, ptrdiff_t y_stride)
+__global__ void k_post_matrix(const __half *src, int w, int h, aji_csp csp,
+                              float qdiv, float qmax,
+                              uint8_t *y_plane, ptrdiff_t y_stride, float *uvf)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
         return;
-
     const size_t plane = (size_t)w * h, idx = (size_t)y * w + x;
+
     const float r = __half2float(src[idx]);
     const float g = __half2float(src[plane + idx]);
     const float b = __half2float(src[2 * plane + idx]);
 
     const float Y = csp.kr * r + (1.0f - csp.kr - csp.kb) * g + csp.kb * b;
-    const float maxv = (float)(T)~(T)0;
-    float val = fminf(fmaxf(rintf(__saturatef(Y) * csp.yscale + csp.yoff), 0.0f), maxv);
-
     T *yrow = (T *)(y_plane + (size_t)y * y_stride);
-    yrow[x] = (T)val;
+    yrow[x] = (T)quant(Y * csp.yscale + csp.yoff, qdiv, qmax);
+
+    uvf[idx]         = (b - Y) / (2.0f * (1.0f - csp.kb));
+    uvf[plane + idx] = (r - Y) / (2.0f * (1.0f - csp.kr));
 }
 
-template <typename T>
-__global__ void k_post_chroma(const __half *src, int w, int h, aji_csp csp,
-                              uint8_t *uv_plane, ptrdiff_t uv_stride)
-{
-    const int cx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int cy = blockIdx.y * blockDim.y + threadIdx.y;
-    const int cw = w >> 1, ch = h >> 1;
-    if (cx >= cw || cy >= ch)
-        return;
-
-    // 2x2 box average of RGB, then derive CbCr from the averaged color.
-    const size_t plane = (size_t)w * h;
-    float r = 0, g = 0, b = 0;
-    #pragma unroll
-    for (int dy = 0; dy < 2; dy++) {
-        #pragma unroll
-        for (int dx = 0; dx < 2; dx++) {
-            const size_t idx = (size_t)(2 * cy + dy) * w + (2 * cx + dx);
-            r += __half2float(src[idx]);
-            g += __half2float(src[plane + idx]);
-            b += __half2float(src[2 * plane + idx]);
-        }
-    }
-    r *= 0.25f; g *= 0.25f; b *= 0.25f;
-
-    const float Y = csp.kr * r + (1.0f - csp.kr - csp.kb) * g + csp.kb * b;
-    const float U = (b - Y) / (2.0f * (1.0f - csp.kb));
-    const float V = (r - Y) / (2.0f * (1.0f - csp.kr));
-
-    const float maxv = (float)(T)~(T)0;
-    float uval = fminf(fmaxf(rintf(U * csp.cscale + csp.coff), 0.0f), maxv);
-    float vval = fminf(fmaxf(rintf(V * csp.cscale + csp.coff), 0.0f), maxv);
-
-    T *uvrow = (T *)(uv_plane + (size_t)cy * uv_stride);
-    uvrow[2 * cx]     = (T)uval;
-    uvrow[2 * cx + 1] = (T)vval;
-}
-
-__device__ __forceinline__ float catmull_rom(float t)
-{
-    t = fabsf(t);
-    if (t <= 1.0f)
-        return (1.5f * t - 2.5f) * t * t + 1.0f;
-    if (t < 2.0f)
-        return ((-0.5f * t + 2.5f) * t - 4.0f) * t + 2.0f;
-    return 0.0f;
-}
-
-__global__ void k_resize(const __half *src, int sw, int sh,
-                         __half *dst, int dw, int dh)
+// horizontal resample of N planar fp32 planes (gridDim.z = N)
+__global__ void k_h_f32(const float *src, int h, pass px, float *dst)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    const int p = blockIdx.z;  // plane 0..2
-    if (x >= dw || y >= dh)
+    if (x >= px.dst || y >= h)
         return;
-
-    const float sx = (x + 0.5f) * sw / dw - 0.5f;
-    const float sy = (y + 0.5f) * sh / dh - 0.5f;
-    const int ix = (int)floorf(sx), iy = (int)floorf(sy);
-    const float fx = sx - ix, fy = sy - iy;
-
-    float wx[4], wy[4];
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        wx[i] = catmull_rom(fx - (i - 1));
-        wy[i] = catmull_rom(fy - (i - 1));
-    }
-
-    const __half *plane = src + (size_t)p * sw * sh;
-    float acc = 0.0f, wsum = 0.0f;
-    #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        const int yy = min(max(iy + j - 1, 0), sh - 1);
-        const __half *row = plane + (size_t)yy * sw;
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const int xx = min(max(ix + i - 1, 0), sw - 1);
-            const float wgt = wx[i] * wy[j];
-            acc += wgt * __half2float(row[xx]);
-            wsum += wgt;
-        }
-    }
-    dst[(size_t)p * dw * dh + (size_t)y * dw + x] =
-        __float2half(__saturatef(acc / wsum));
+    const float *sp = src + (size_t)blockIdx.z * px.src * h +
+                      (size_t)y * px.src;
+    const float *wt = px.wt + (size_t)x * px.taps;
+    const int s0 = px.start[x];
+    float a = 0.0f;
+    for (int j = 0; j < px.taps; j++)
+        a += wt[j] * sp[mirr(s0 + j, px.src)];
+    dst[(size_t)blockIdx.z * px.dst * h + (size_t)y * px.dst + x] = a;
 }
 
-#define BLOCK 16
-#define GRID2(w, h) dim3(((w) + BLOCK - 1) / BLOCK, ((h) + BLOCK - 1) / BLOCK)
-
-extern "C" int aji_launch_pre(int format,
-                              const void *y_plane, ptrdiff_t y_stride,
-                              const void *uv_plane, ptrdiff_t uv_stride,
-                              int w, int h, const aji_csp *csp,
-                              void *dst_f16, void *stream)
+// vertical chroma resample + quantize + interleave
+template <typename T>
+__global__ void k_uv_v_store(const float *src, int cw, pass py, aji_csp csp,
+                             float qdiv, float qmax,
+                             uint8_t *uv, ptrdiff_t uv_stride)
 {
-    dim3 block(BLOCK, BLOCK);
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= cw || y >= py.dst)
+        return;
+    const size_t plane = (size_t)cw * py.src;
+    const float *wt = py.wt + (size_t)y * py.taps;
+    const int s0 = py.start[y];
+    float u = 0.0f, v = 0.0f;
+    for (int j = 0; j < py.taps; j++) {
+        const size_t row = (size_t)mirr(s0 + j, py.src) * cw + x;
+        u += wt[j] * src[row];
+        v += wt[j] * src[plane + row];
+    }
+    T *uvrow = (T *)(uv + (size_t)y * uv_stride);
+    uvrow[2 * x]     = (T)quant(u * csp.cscale + csp.coff, qdiv, qmax);
+    uvrow[2 * x + 1] = (T)quant(v * csp.cscale + csp.coff, qdiv, qmax);
+}
+
+/* ---------------- resize: RGB fp16 -> RGB fp16 ---------------- */
+
+__global__ void k_rs_h(const __half *src, int h, pass px, float *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= px.dst || y >= h)
+        return;
+    const __half *sp = src + (size_t)blockIdx.z * px.src * h +
+                       (size_t)y * px.src;
+    const float *wt = px.wt + (size_t)x * px.taps;
+    const int s0 = px.start[x];
+    float a = 0.0f;
+    for (int j = 0; j < px.taps; j++)
+        a += wt[j] * __half2float(sp[mirr(s0 + j, px.src)]);
+    dst[(size_t)blockIdx.z * px.dst * h + (size_t)y * px.dst + x] = a;
+}
+
+__global__ void k_rs_v(const float *src, int w, pass py, __half *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= py.dst)
+        return;
+    const float *sp = src + (size_t)blockIdx.z * w * py.src;
+    const float *wt = py.wt + (size_t)y * py.taps;
+    const int s0 = py.start[y];
+    float a = 0.0f;
+    for (int j = 0; j < py.taps; j++)
+        a += wt[j] * sp[(size_t)mirr(s0 + j, py.src) * w + x];
+    dst[(size_t)blockIdx.z * w * py.dst + (size_t)y * w + x] =
+        __float2half(a);
+}
+
+/* ---------------- plans ---------------- */
+
+static void plan_destroy_inner(aji_plan *p)
+{
+    free_pass(&p->ph);
+    free_pass(&p->pv);
+    cudaFree(p->tmp0);
+    cudaFree(p->tmp1);
+    p->tmp0 = p->tmp1 = nullptr;
+}
+
+extern "C" void aji_plan_destroy(aji_plan *p)
+{
+    if (!p)
+        return;
+    plan_destroy_inner(p);
+    delete p;
+}
+
+extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting)
+{
+    aji_plan *p = new aji_plan();
+    p->kind = aji_plan::PRE;
+    p->format = format;
+    p->w = w;
+    p->h = h;
+    const int cw = w >> 1, ch = h >> 1;
+    double sx, sy;
+    chroma_shifts(siting, true, &sx, &sy);
+    if (!build_pass(&p->ph, cw, w, sx) || !build_pass(&p->pv, ch, h, sy) ||
+        cudaMalloc(&p->tmp0, (size_t)2 * w * ch * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&p->tmp1, (size_t)2 * w * h * sizeof(float)) != cudaSuccess) {
+        aji_plan_destroy(p);
+        return nullptr;
+    }
+    return p;
+}
+
+extern "C" aji_plan *aji_post_plan_create(int format, int w, int h, int siting)
+{
+    aji_plan *p = new aji_plan();
+    p->kind = aji_plan::POST;
+    p->format = format;
+    p->w = w;
+    p->h = h;
+    const int cw = w >> 1, ch = h >> 1;
+    double sx, sy;
+    chroma_shifts(siting, false, &sx, &sy);
+    if (!build_pass(&p->ph, w, cw, sx) || !build_pass(&p->pv, h, ch, sy) ||
+        cudaMalloc(&p->tmp0, (size_t)2 * w * h * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&p->tmp1, (size_t)2 * cw * h * sizeof(float)) != cudaSuccess) {
+        aji_plan_destroy(p);
+        return nullptr;
+    }
+    return p;
+}
+
+extern "C" aji_plan *aji_resize_plan_create(int sw, int sh, int dw, int dh)
+{
+    aji_plan *p = new aji_plan();
+    p->kind = aji_plan::RESIZE;
+    p->w = sw;
+    p->h = sh;
+    p->dw = dw;
+    p->dh = dh;
+    if (!build_pass(&p->ph, sw, dw, 0.0) || !build_pass(&p->pv, sh, dh, 0.0) ||
+        cudaMalloc(&p->tmp0, (size_t)3 * dw * sh * sizeof(float)) != cudaSuccess) {
+        aji_plan_destroy(p);
+        return nullptr;
+    }
+    return p;
+}
+
+/* ---------------- runs ---------------- */
+
+#define BLOCK_X 32
+#define BLOCK_Y 8
+#define GRID(w, h, d) dim3(((w) + BLOCK_X - 1) / BLOCK_X, \
+                           ((h) + BLOCK_Y - 1) / BLOCK_Y, (d)), \
+                      dim3(BLOCK_X, BLOCK_Y)
+
+extern "C" int aji_run_pre(aji_plan *p,
+                           const void *y_plane, ptrdiff_t y_stride,
+                           const void *uv_plane, ptrdiff_t uv_stride,
+                           const aji_csp *csp, void *dst_f16, void *stream)
+{
     cudaStream_t s = (cudaStream_t)stream;
-    if (format == 1) {
-        k_pre<uint8_t><<<GRID2(w, h), block, 0, s>>>(
-            (const uint8_t *)y_plane, y_stride, (const uint8_t *)uv_plane,
-            uv_stride, w, h, *csp, (__half *)dst_f16);
+    const int w = p->w, h = p->h, ch = h >> 1;
+    if (p->format == AJI_FMT_NV12) {
+        k_uv_h<uint8_t><<<GRID(w, ch, 1), 0, s>>>(
+            (const uint8_t *)uv_plane, uv_stride, ch, p->ph, p->tmp0);
     } else {
-        k_pre<uint16_t><<<GRID2(w, h), block, 0, s>>>(
-            (const uint8_t *)y_plane, y_stride, (const uint8_t *)uv_plane,
-            uv_stride, w, h, *csp, (__half *)dst_f16);
+        k_uv_h<uint16_t><<<GRID(w, ch, 1), 0, s>>>(
+            (const uint8_t *)uv_plane, uv_stride, ch, p->ph, p->tmp0);
+    }
+    k_v_f32<<<GRID(w, h, 2), 0, s>>>(p->tmp0, w, p->pv, p->tmp1);
+    if (p->format == AJI_FMT_NV12) {
+        k_pre_combine<uint8_t><<<GRID(w, h, 1), 0, s>>>(
+            (const uint8_t *)y_plane, y_stride, p->tmp1, w, h, *csp,
+            (__half *)dst_f16);
+    } else {
+        k_pre_combine<uint16_t><<<GRID(w, h, 1), 0, s>>>(
+            (const uint8_t *)y_plane, y_stride, p->tmp1, w, h, *csp,
+            (__half *)dst_f16);
     }
     return (int)cudaGetLastError();
 }
 
-extern "C" int aji_launch_post(int format, const void *src_f16, int w, int h,
-                               const aji_csp *csp,
-                               void *y_plane, ptrdiff_t y_stride,
-                               void *uv_plane, ptrdiff_t uv_stride,
-                               void *stream)
+extern "C" int aji_run_post(aji_plan *p, const void *src_f16,
+                            const aji_csp *csp,
+                            void *y_plane, ptrdiff_t y_stride,
+                            void *uv_plane, ptrdiff_t uv_stride, void *stream)
 {
-    dim3 block(BLOCK, BLOCK);
     cudaStream_t s = (cudaStream_t)stream;
-    if (format == 1) {
-        k_post_luma<uint8_t><<<GRID2(w, h), block, 0, s>>>(
-            (const __half *)src_f16, w, h, *csp, (uint8_t *)y_plane, y_stride);
-        k_post_chroma<uint8_t><<<GRID2(w / 2, h / 2), block, 0, s>>>(
-            (const __half *)src_f16, w, h, *csp, (uint8_t *)uv_plane, uv_stride);
+    const int w = p->w, h = p->h, cw = w >> 1, ch = h >> 1;
+    const bool p010 = p->format == AJI_FMT_P010;
+    const float qdiv = p010 ? 64.0f : 1.0f;
+    const float qmax = p010 ? 1023.0f : 255.0f;
+    if (p010) {
+        k_post_matrix<uint16_t><<<GRID(w, h, 1), 0, s>>>(
+            (const __half *)src_f16, w, h, *csp, qdiv, qmax,
+            (uint8_t *)y_plane, y_stride, p->tmp0);
     } else {
-        k_post_luma<uint16_t><<<GRID2(w, h), block, 0, s>>>(
-            (const __half *)src_f16, w, h, *csp, (uint8_t *)y_plane, y_stride);
-        k_post_chroma<uint16_t><<<GRID2(w / 2, h / 2), block, 0, s>>>(
-            (const __half *)src_f16, w, h, *csp, (uint8_t *)uv_plane, uv_stride);
+        k_post_matrix<uint8_t><<<GRID(w, h, 1), 0, s>>>(
+            (const __half *)src_f16, w, h, *csp, qdiv, qmax,
+            (uint8_t *)y_plane, y_stride, p->tmp0);
+    }
+    k_h_f32<<<GRID(cw, h, 2), 0, s>>>(p->tmp0, h, p->ph, p->tmp1);
+    if (p010) {
+        k_uv_v_store<uint16_t><<<GRID(cw, ch, 1), 0, s>>>(
+            p->tmp1, cw, p->pv, *csp, qdiv, qmax,
+            (uint8_t *)uv_plane, uv_stride);
+    } else {
+        k_uv_v_store<uint8_t><<<GRID(cw, ch, 1), 0, s>>>(
+            p->tmp1, cw, p->pv, *csp, qdiv, qmax,
+            (uint8_t *)uv_plane, uv_stride);
     }
     return (int)cudaGetLastError();
 }
 
-extern "C" int aji_launch_resize(const void *src_f16, int sw, int sh,
-                                 void *dst_f16, int dw, int dh, void *stream)
+extern "C" int aji_run_resize(aji_plan *p, const void *src_f16, void *dst_f16,
+                              void *stream)
 {
-    dim3 block(BLOCK, BLOCK);
-    dim3 grid(((dw) + BLOCK - 1) / BLOCK, ((dh) + BLOCK - 1) / BLOCK, 3);
-    k_resize<<<grid, block, 0, (cudaStream_t)stream>>>(
-        (const __half *)src_f16, sw, sh, (__half *)dst_f16, dw, dh);
+    cudaStream_t s = (cudaStream_t)stream;
+    k_rs_h<<<GRID(p->dw, p->h, 3), 0, s>>>(
+        (const __half *)src_f16, p->h, p->ph, p->tmp0);
+    k_rs_v<<<GRID(p->dw, p->dh, 3), 0, s>>>(
+        p->tmp0, p->dw, p->pv, (__half *)dst_f16);
     return (int)cudaGetLastError();
 }

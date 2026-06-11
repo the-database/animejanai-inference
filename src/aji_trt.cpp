@@ -109,7 +109,8 @@ struct ModelEngine {
 struct Step {
     enum Kind { RESIZE, MODEL } kind;
     int out_w, out_h;
-    int engine_idx;       // MODEL
+    int engine_idx;             // MODEL
+    aji_plan *plan = nullptr;   // RESIZE
 };
 
 } // namespace
@@ -142,6 +143,11 @@ struct aji_ctx {
     void *buf[2] = {nullptr, nullptr};
     size_t buf_bytes = 0;
 
+    // resampling plans: per-step resize plans live in steps[]; pre/post are
+    // (re)built lazily per frame key since siting arrives with frames
+    aji_plan *pre_plan = nullptr, *post_plan = nullptr;
+    int pre_key[4] = {0}, post_key[4] = {0};
+
     char errbuf[512] = {0};
 
     void set_error(const char *fmt, ...) {
@@ -167,34 +173,7 @@ namespace {
 
 aji_csp make_csp(const aji_frame *f)
 {
-    aji_csp c = {};
-    switch (f->matrix) {
-    case AJI_MATRIX_BT601:  c.kr = 0.299f;  c.kb = 0.114f;  break;
-    case AJI_MATRIX_BT2020: c.kr = 0.2627f; c.kb = 0.0593f; break;
-    case AJI_MATRIX_BT709:
-    default:                c.kr = 0.2126f; c.kb = 0.0722f; break;
-    }
-    const bool p010 = f->format == AJI_FMT_P010;
-    const float m = p010 ? 256.0f : 1.0f;        // 8-bit-reference scale
-    const float maxraw = p010 ? 65472.0f : 255.0f; // (2^bd - 1) << (16 - bd)
-    if (f->range == AJI_RANGE_FULL) {
-        c.yoff = 0.0f;
-        c.yscale = maxraw;
-        c.coff = p010 ? 32768.0f : 128.0f;
-        c.cscale = maxraw;
-    } else {
-        c.yoff = 16.0f * m;
-        c.yscale = 219.0f * m;
-        c.coff = 128.0f * m;
-        c.cscale = 224.0f * m;
-    }
-    switch (f->siting) {
-    case AJI_SITING_CENTER:  c.cox = -0.25f; c.coy = -0.25f; break;
-    case AJI_SITING_TOPLEFT: c.cox = 0.0f;   c.coy = 0.0f;   break;
-    case AJI_SITING_LEFT:
-    default:                 c.cox = 0.0f;   c.coy = -0.25f; break;
-    }
-    return c;
+    return aji_make_csp(f->format, f->matrix, f->range);
 }
 
 std::string trt_version_token()
@@ -372,6 +351,23 @@ bool ensure_buffers(aji_ctx *c, size_t bytes)
     return true;
 }
 
+// Append a RESIZE step with its Spline36 plan; advances *cw/*ch to nw x nh.
+// Requires the CUDA context to be current (plan creation allocates).
+bool push_resize_step(aji_ctx *c, int *cw, int *ch, int nw, int nh)
+{
+    Step st{Step::RESIZE, nw, nh, -1};
+    st.plan = aji_resize_plan_create(*cw, *ch, nw, nh);
+    if (!st.plan) {
+        c->set_error("resize plan %dx%d -> %dx%d allocation failed",
+                     *cw, *ch, nw, nh);
+        return false;
+    }
+    c->steps.push_back(st);
+    *cw = nw;
+    *ch = nh;
+    return true;
+}
+
 void finalize_log(aji_ctx *c)
 {
     std::string out;
@@ -498,7 +494,17 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     std::string err;
     aji_conf_load(c->conf_path.c_str(), &c->conf, &err);
 
+    // Held from here: clearing steps frees their resize plans (cudaFree),
+    // and plan creation below allocates.
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return AJI_ERR_CUDA;
+    }
+
     c->engines.clear();
+    for (Step &st : c->steps)
+        aji_plan_destroy(st.plan);
     c->steps.clear();
     c->log_info.clear();
     c->log_steps.clear();
@@ -545,12 +551,6 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         chain->max_resolution + ";    FPS Range: " + fmt_num(chain->min_fps) +
         " - " + fmt_num(chain->max_fps));
 
-    CtxGuard guard(c->cu_ctx);
-    if (!guard.ok) {
-        c->set_error("cuCtxPushCurrent failed");
-        return AJI_ERR_CUDA;
-    }
-
     if (!c->engines_cleaned) {
         clean_stale_engines(c);
         c->engines_cleaned = true;
@@ -574,8 +574,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             int nw = round_even(cw * factor / 100.0);
             int nh = round_even(ch * factor / 100.0);
             if (nw >= 2 && nh >= 2 && (nw != cw || nh != ch)) {
-                cw = nw; ch = nh;
-                c->steps.push_back({Step::RESIZE, cw, ch, -1});
+                if (!push_resize_step(c, &cw, &ch, nw, nh))
+                    return AJI_ERR_CUDA;
                 snprintf(buf, sizeof(buf),
                          "Applied Resize Factor Before Upscale: %g%%;    "
                          "New Video Resolution: %dx%d", factor, cw, ch);
@@ -587,8 +587,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             int nw, nh;
             fit_box(cw, ch, m.resize_height_before_upscale * 16.0 / 9.0,
                     m.resize_height_before_upscale, &nw, &nh);
-            cw = nw; ch = nh;
-            c->steps.push_back({Step::RESIZE, cw, ch, -1});
+            if (!push_resize_step(c, &cw, &ch, nw, nh))
+                return AJI_ERR_CUDA;
             snprintf(buf, sizeof(buf),
                      "Applied Resize Height Before Upscale: %gpx;    "
                      "New Video Resolution: %dx%d",
@@ -597,8 +597,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         } else if (ch > 1080) {
             int nw, nh;
             fit_box(cw, ch, 1920, 1080, &nw, &nh);
-            cw = nw; ch = nh;
-            c->steps.push_back({Step::RESIZE, cw, ch, -1});
+            if (!push_resize_step(c, &cw, &ch, nw, nh))
+                return AJI_ERR_CUDA;
             snprintf(buf, sizeof(buf),
                      "Applied Resize to Video Larger than 1080p;    "
                      "New Video Resolution: %dx%d", cw, ch);
@@ -691,10 +691,22 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     cudaStream_t stream = (cudaStream_t)cu_stream;
     const aji_csp csp = make_csp(in);
 
+    const int pkey[4] = {in->format, in->width, in->height, in->siting};
+    if (!c->pre_plan || memcmp(pkey, c->pre_key, sizeof(pkey)) != 0) {
+        aji_plan_destroy(c->pre_plan);
+        c->pre_plan = aji_pre_plan_create(in->format, in->width, in->height,
+                                          in->siting);
+        if (!c->pre_plan) {
+            c->set_error("pre plan allocation failed");
+            return AJI_ERR_CUDA;
+        }
+        memcpy(c->pre_key, pkey, sizeof(pkey));
+    }
+
     int cur = 0;
-    int err = aji_launch_pre(in->format, in->plane[0], in->stride[0],
-                             in->plane[1], in->stride[1], in->width,
-                             in->height, &csp, c->buf[cur], stream);
+    int err = aji_run_pre(c->pre_plan, in->plane[0], in->stride[0],
+                          in->plane[1], in->stride[1], &csp, c->buf[cur],
+                          stream);
     if (err) {
         c->set_error("pre-kernel failed: %s", cudaGetErrorString((cudaError_t)err));
         return AJI_ERR_CUDA;
@@ -718,8 +730,8 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     } else {
         for (const Step &st : c->steps) {
             if (st.kind == Step::RESIZE) {
-                err = aji_launch_resize(c->buf[cur], cw, ch, c->buf[cur ^ 1],
-                                        st.out_w, st.out_h, stream);
+                err = aji_run_resize(st.plan, c->buf[cur], c->buf[cur ^ 1],
+                                     stream);
                 if (err) {
                     c->set_error("resize kernel failed: %s",
                                  cudaGetErrorString((cudaError_t)err));
@@ -742,9 +754,26 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         }
     }
 
-    err = aji_launch_post(out->format, c->buf[cur], cw, ch, &csp,
-                          out->plane[0], out->stride[0], out->plane[1],
-                          out->stride[1], stream);
+    // The reference pipeline's final resize.Spline36(format=YUV420...) call
+    // always subsamples with LEFT placement: VS/zimg only propagates chroma
+    // location between subsampled formats, and RGB sources have none, so the
+    // frame prop is ignored and no chromaloc argument is passed. Match it
+    // regardless of the frame's tagged siting.
+    const int qkey[4] = {out->format, cw, ch, AJI_SITING_LEFT};
+    if (!c->post_plan || memcmp(qkey, c->post_key, sizeof(qkey)) != 0) {
+        aji_plan_destroy(c->post_plan);
+        c->post_plan = aji_post_plan_create(out->format, cw, ch,
+                                            AJI_SITING_LEFT);
+        if (!c->post_plan) {
+            c->set_error("post plan allocation failed");
+            return AJI_ERR_CUDA;
+        }
+        memcpy(c->post_key, qkey, sizeof(qkey));
+    }
+
+    err = aji_run_post(c->post_plan, c->buf[cur], &csp,
+                       out->plane[0], out->stride[0], out->plane[1],
+                       out->stride[1], stream);
     if (err) {
         c->set_error("post-kernel failed: %s", cudaGetErrorString((cudaError_t)err));
         return AJI_ERR_CUDA;
@@ -776,6 +805,11 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         CtxGuard guard(c->cu_ctx);
         for (auto &b : c->buf)
             cudaFree(b);
+        for (Step &st : c->steps)
+            aji_plan_destroy(st.plan);
+        c->steps.clear();
+        aji_plan_destroy(c->pre_plan);
+        aji_plan_destroy(c->post_plan);
         c->engines.clear();
         c->direct.exec.reset();
         c->direct.engine.reset();
