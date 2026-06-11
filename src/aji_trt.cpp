@@ -444,9 +444,14 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
             c->set_error("cuCtxPushCurrent failed");
             return nullptr;
         }
-        if (!load_engine(c.get(), params->engine_path, &c->direct, 64, 64))
+        // Probe at max dims, not a fixed small shape: static engines
+        // (the default trt_engine_settings build) accept only their one
+        // resolution.
+        const int pw = c->max_w >= 2 ? c->max_w : 64;
+        const int ph = c->max_h >= 2 ? c->max_h : 64;
+        if (!load_engine(c.get(), params->engine_path, &c->direct, pw, ph))
             return nullptr;
-        c->scale = c->direct.out_w / 64;
+        c->scale = c->direct.out_w / pw;
         const size_t bytes =
             (size_t)3 * c->max_w * c->max_h * 2 * c->scale * c->scale;
         if (!ensure_buffers(c.get(), bytes))

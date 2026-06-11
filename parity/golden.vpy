@@ -11,13 +11,16 @@
 # vapoursynth filter); matrix is passed explicitly like the reference code.
 #
 # vspipe --arg parameters (all strings):
-#   mode=pre|post|resize|roundtrip
+#   mode=pre|post|resize|roundtrip|e2e
 #   input=<raw file>  w= h=           input dims
 #   fmt=yuv8|yuv10|rgbh                input layout (planar yuv / fp16 rgb)
 #   matrix=709|170m   vrange=limited|full   siting=left|center|topleft
 #   (the range key is named vrange so it can't shadow the builtin)
 #   outfmt=yuv8|yuv10                  post/roundtrip output depth
 #   dw= dh=                            resize target
+#   engine= vstrt= dlldir=             e2e: TRT engine, vstrt.dll, vsmlrt-cuda
+#                                      (e2e = pre + core.trt.Model + post,
+#                                      the real upscale2x_trt path)
 #
 # Raw layouts: yuv8/yuv10 are planar Y,U,V (u8 / u16 LSB-aligned 10-bit);
 # rgbh is planar R,G,B fp16. Frames are read until EOF.
@@ -98,6 +101,16 @@ elif mode == "roundtrip":
     rgb = core.resize.Spline36(clip, format=vs.RGBH, matrix_in_s=matrix)
     tgt = vs.YUV420P10 if outfmt == "yuv10" else vs.YUV420P8
     out = core.resize.Spline36(rgb, format=tgt, matrix_s=matrix,
+                               range=1 if CR == 0 else None)
+elif mode == "e2e":
+    # the portable package auto-loads vs-plugins; load explicitly only if not
+    if not hasattr(core, "trt"):
+        os.add_dll_directory(globals()["dlldir"])
+        core.std.LoadPlugin(path=globals()["vstrt"])
+    rgb = core.resize.Spline36(clip, format=vs.RGBH, matrix_in_s=matrix)
+    up = core.trt.Model(rgb, engine_path=globals()["engine"], num_streams=1)
+    tgt = vs.YUV420P10 if outfmt == "yuv10" else vs.YUV420P8
+    out = core.resize.Spline36(up, format=tgt, matrix_s=matrix,
                                range=1 if CR == 0 else None)
 else:
     raise ValueError(f"unknown mode {mode}")
