@@ -462,7 +462,9 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
 
 extern "C" AJI_EXPORT int aji_set_slot(aji_ctx *c, int slot)
 {
-    if (!c || slot <= 0)
+    // slot 0 = bypass: configure() finds no such slot and reports
+    // passthrough, which is exactly the wanted "off" behavior.
+    if (!c || slot < 0)
         return AJI_ERR;
     c->slot = slot;
     return AJI_OK;
@@ -520,7 +522,9 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     auto sit = c->conf.slots.find(c->slot);
     std::string profile = sit != c->conf.slots.end()
                               ? sit->second.profile_name : "(missing slot)";
-    if (c->slot < 10)
+    if (c->slot == 0)
+        profile = "Off";  // slot 0 = bypass, deliberately matches nothing
+    else if (c->slot < 10)
         profile = std::to_string(c->slot) + ". " + profile;
     c->log_info.push_back("Upscale Profile: " + profile);
     {
