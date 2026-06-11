@@ -42,7 +42,7 @@ int main(int argc, char **argv)
     const char *mode = argv[1];
     const char *input = NULL, *output = NULL;
     const char *format = "nv12", *matrix = "709", *range = "limited", *siting = "left";
-    int w = 0, h = 0, dw = 0, dh = 0;
+    int w = 0, h = 0, dw = 0, dh = 0, bench = 0;
 
     for (int i = 2; i < argc - 1; i++) {
         if (!strcmp(argv[i], "--input")) input = argv[++i];
@@ -55,6 +55,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--height")) h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out-width")) dw = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out-height")) dh = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bench")) bench = atoi(argv[++i]);
     }
     if (!input || !output || w < 2 || h < 2) {
         fprintf(stderr, "missing required args\n");
@@ -110,6 +111,49 @@ int main(int argc, char **argv)
     if (!plan) {
         fprintf(stderr, "plan creation failed\n");
         return 1;
+    }
+
+    if (bench > 0) {
+        // device-time microbenchmark on the first frame, no host I/O
+        if (fread(h_in, 1, in_sz, fin) != in_sz) {
+            fprintf(stderr, "bench: no full frame in input\n");
+            return 1;
+        }
+        CK(cudaMemcpy(d_in, h_in, in_sz, cudaMemcpyHostToDevice));
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0));
+        CK(cudaEventCreate(&e1));
+        for (int i = 0; i < 10; i++) {  // warmup
+            if (!strcmp(mode, "pre"))
+                aji_run_pre(plan, d_in, (ptrdiff_t)w * bpp,
+                            (char *)d_in + y_sz, (ptrdiff_t)w * bpp,
+                            &csp, d_out, NULL);
+            else if (!strcmp(mode, "post"))
+                aji_run_post(plan, d_in, &csp, d_out, (ptrdiff_t)w * bpp,
+                             (char *)d_out + y_sz, (ptrdiff_t)w * bpp, NULL);
+            else
+                aji_run_resize(plan, d_in, d_out, NULL);
+        }
+        CK(cudaDeviceSynchronize());
+        CK(cudaEventRecord(e0, 0));
+        for (int i = 0; i < bench; i++) {
+            if (!strcmp(mode, "pre"))
+                aji_run_pre(plan, d_in, (ptrdiff_t)w * bpp,
+                            (char *)d_in + y_sz, (ptrdiff_t)w * bpp,
+                            &csp, d_out, NULL);
+            else if (!strcmp(mode, "post"))
+                aji_run_post(plan, d_in, &csp, d_out, (ptrdiff_t)w * bpp,
+                             (char *)d_out + y_sz, (ptrdiff_t)w * bpp, NULL);
+            else
+                aji_run_resize(plan, d_in, d_out, NULL);
+        }
+        CK(cudaEventRecord(e1, 0));
+        CK(cudaEventSynchronize(e1));
+        float ms = 0;
+        CK(cudaEventElapsedTime(&ms, e0, e1));
+        printf("%s %dx%d: %.1f us/frame (%d iters)\n", mode, w, h,
+               1000.0 * ms / bench, bench);
+        return 0;
     }
 
     int n = 0;

@@ -148,6 +148,16 @@ struct aji_ctx {
     aji_plan *pre_plan = nullptr, *post_plan = nullptr;
     int pre_key[4] = {0}, post_key[4] = {0};
 
+    // CUDA graph replay of the whole chain (pre -> steps -> post). The
+    // captured graph bakes device pointers, so frames are staged through
+    // stable buffers and the per-frame plane copies stay outside the graph.
+    // graph_ok latches false on the first capture/launch failure.
+    bool graph_ok = true;
+    cudaGraphExec_t graph_exec = nullptr;
+    int graph_key[8] = {0};
+    void *stage_in = nullptr, *stage_out = nullptr;
+    size_t stage_in_bytes = 0, stage_out_bytes = 0;
+
     char errbuf[512] = {0};
 
     void set_error(const char *fmt, ...) {
@@ -398,6 +408,7 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     auto c = std::make_unique<aji_ctx>();
     c->logger.fn = params->log;
     c->logger.opaque = params->log_opaque;
+    c->graph_ok = !getenv("AJI_NO_GRAPH");  // debug/benchmark escape hatch
 
     if (cuInit(0) != CUDA_SUCCESS) {
         c->set_error("cuInit failed");
@@ -513,6 +524,10 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     for (Step &st : c->steps)
         aji_plan_destroy(st.plan);
     c->steps.clear();
+    if (c->graph_exec) {
+        cudaGraphExecDestroy(c->graph_exec);
+        c->graph_exec = nullptr;
+    }
     c->log_info.clear();
     c->log_steps.clear();
     c->active = false;
@@ -667,6 +682,121 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     return 1;
 }
 
+static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
+                     cudaStream_t stream);
+
+static bool ensure_stage(void **p, size_t *cur, size_t need)
+{
+    if (*p && *cur >= need)
+        return true;
+    cudaFree(*p);
+    *p = nullptr;
+    *cur = 0;
+    if (cudaMalloc(p, need) != cudaSuccess)
+        return false;
+    *cur = need;
+    return true;
+}
+
+static bool copy_plane(void *dst, size_t dpitch, const void *src,
+                       size_t spitch, size_t row_bytes, size_t rows,
+                       cudaStream_t s)
+{
+    return cudaMemcpy2DAsync(dst, dpitch, src, spitch, row_bytes, rows,
+                             cudaMemcpyDeviceToDevice, s) == cudaSuccess;
+}
+
+// Run the chain via a captured CUDA graph. Returns true if the frame was
+// handled (*ret holds the status); false means fall back to the plain path.
+static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
+                            const aji_frame *out, cudaStream_t stream,
+                            int *ret)
+{
+    const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
+    const size_t in_row = (size_t)in->width * bpp;
+    const size_t out_row = (size_t)out->width * bpp;
+    const size_t in_y = in_row * in->height;
+    const size_t out_y = out_row * out->height;
+
+    if (!ensure_stage(&c->stage_in, &c->stage_in_bytes, in_y * 3 / 2) ||
+        !ensure_stage(&c->stage_out, &c->stage_out_bytes, out_y * 3 / 2)) {
+        c->graph_ok = false;
+        return false;
+    }
+
+    // staging descriptors: same colorimetry tags, packed strides
+    aji_frame sin = *in, sout = *out;
+    sin.plane[0] = c->stage_in;
+    sin.plane[1] = (char *)c->stage_in + in_y;
+    sin.stride[0] = sin.stride[1] = (ptrdiff_t)in_row;
+    sout.plane[0] = c->stage_out;
+    sout.plane[1] = (char *)c->stage_out + out_y;
+    sout.stride[0] = sout.stride[1] = (ptrdiff_t)out_row;
+
+    if (!copy_plane(sin.plane[0], in_row, in->plane[0], in->stride[0],
+                    in_row, in->height, stream) ||
+        !copy_plane(sin.plane[1], in_row, in->plane[1], in->stride[1],
+                    in_row, in->height / 2, stream)) {
+        c->graph_ok = false;
+        return false;
+    }
+
+    const int key[8] = {in->format, in->width, in->height, in->siting,
+                        in->matrix, in->range, out->width, out->height};
+    if (!c->graph_exec || memcmp(key, c->graph_key, sizeof(key)) != 0) {
+        if (c->graph_exec) {
+            cudaGraphExecDestroy(c->graph_exec);
+            c->graph_exec = nullptr;
+        }
+        // Warmup run on the staging buffers: performs all lazy allocations
+        // (plans, TRT internals) so the capture below is allocation-free,
+        // and already computes this frame's output.
+        *ret = run_chain(c, &sin, &sout, stream);
+        if (*ret != AJI_OK)
+            return true;
+        cudaStreamSynchronize(stream);
+
+        cudaGraph_t graph = nullptr;
+        bool ok = cudaStreamBeginCapture(stream,
+                      cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+        if (ok) {
+            ok = run_chain(c, &sin, &sout, stream) == AJI_OK;
+            // EndCapture must run even on failure to unstick the stream.
+            cudaError_t ce = cudaStreamEndCapture(stream, &graph);
+            ok = ok && ce == cudaSuccess && graph;
+        }
+        if (ok)
+            ok = cudaGraphInstantiate(&c->graph_exec, graph, 0) == cudaSuccess;
+        if (graph)
+            cudaGraphDestroy(graph);
+        if (ok) {
+            memcpy(c->graph_key, key, sizeof(key));
+            c->verbose("chain captured as CUDA graph");
+        } else {
+            cudaGetLastError();  // clear sticky capture errors
+            c->graph_ok = false;
+            c->verbose("CUDA graph capture unavailable; per-call launches");
+            // the warmup output on staging is still valid - fall through
+        }
+    } else {
+        if (cudaGraphLaunch(c->graph_exec, stream) != cudaSuccess) {
+            c->graph_ok = false;
+            return false;  // plain path recomputes from the real frame
+        }
+    }
+
+    if (!copy_plane(out->plane[0], out->stride[0], sout.plane[0], out_row,
+                    out_row, out->height, stream) ||
+        !copy_plane(out->plane[1], out->stride[1], sout.plane[1], out_row,
+                    out_row, out->height / 2, stream)) {
+        c->set_error("staging copy-out failed");
+        *ret = AJI_ERR_CUDA;
+        return true;
+    }
+    *ret = AJI_OK;
+    return true;
+}
+
 extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
                                     const aji_frame *out, void *cu_stream)
 {
@@ -698,6 +828,24 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         return AJI_ERR_CUDA;
     }
     cudaStream_t stream = (cudaStream_t)cu_stream;
+
+    // Graph replay needs a non-default stream (capture restriction).
+    if (c->graph_ok && stream) {
+        int ret;
+        if (infer_via_graph(c, in, out, stream, &ret))
+            return ret;
+    }
+    return run_chain(c, in, out, stream);
+}
+
+// The chain body: pre -> (model/resize steps) -> post, launched on `stream`
+// against whatever plane pointers the frame descriptors carry (real frames
+// on the plain path, stable staging buffers on the graph path). Everything
+// in here must be capture-safe once warm: allocations only happen on plan
+// key changes, which a warmup run performs before any capture.
+static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
+                     cudaStream_t stream)
+{
     const aji_csp csp = make_csp(in);
 
     const int pkey[4] = {in->format, in->width, in->height, in->siting};
@@ -819,6 +967,10 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->steps.clear();
         aji_plan_destroy(c->pre_plan);
         aji_plan_destroy(c->post_plan);
+        if (c->graph_exec)
+            cudaGraphExecDestroy(c->graph_exec);
+        cudaFree(c->stage_in);
+        cudaFree(c->stage_out);
         c->engines.clear();
         c->direct.exec.reset();
         c->direct.engine.reset();
