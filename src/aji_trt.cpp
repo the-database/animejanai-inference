@@ -385,6 +385,33 @@ bool ensure_buffers(aji_ctx *c, size_t bytes)
     return true;
 }
 
+// Build-if-missing + load, with a self-healing retry: a cached engine that
+// fails to deserialize (e.g. built by a different trtexec version than the
+// loaded TensorRT runtime) is deleted and rebuilt once instead of wedging
+// playback until someone clears the cache by hand.
+bool ensure_engine(aji_ctx *c, const std::string &name,
+                   const std::string &settings, const std::string &epath,
+                   ModelEngine *me, int w, int h, int ch,
+                   const std::string *dir = nullptr)
+{
+    bool fresh = false;
+    if (!fs::exists(epath)) {
+        if (!build_engine(c, name, settings, epath, dir))
+            return false;
+        fresh = true;
+    }
+    if (load_engine(c, epath, me, w, h, ch))
+        return true;
+    if (fresh)
+        return false;
+    c->verbose("cached engine unusable, rebuilding: %s", epath.c_str());
+    std::error_code ec;
+    fs::remove(epath, ec);
+    if (!build_engine(c, name, settings, epath, dir))
+        return false;
+    return load_engine(c, epath, me, w, h, ch);
+}
+
 // rife model code -> file basename: 414 -> rife_v4.14, 4141 -> _lite,
 // ensemble appends _ensemble (rife_cuda.py's mapping).
 std::string rife_model_name(int code, bool ensemble)
@@ -447,11 +474,8 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
     const std::string epath =
         engine_path_for(c->rife_model_dir, model, settings);
-    if (!fs::exists(epath)) {
-        if (!build_engine(c, model, settings, epath, &c->rife_model_dir))
-            return false;
-    }
-    if (!load_engine(c, epath, &R.engine, R.pw, R.ph, 11))
+    if (!ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph, 11,
+                       &c->rife_model_dir))
         return false;
 
     const size_t plane = (size_t)R.pw * R.ph;
@@ -770,14 +794,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             settings.replace(pos, strlen("%video_resolution%"), dims);
 
         const std::string epath = engine_path_for(c->model_dir, m.name, settings);
-        if (!fs::exists(epath)) {
-            if (!build_engine(c, m.name, settings, epath)) {
-                finalize_log(c);
-                return AJI_ERR_ENGINE;
-            }
-        }
         ModelEngine me;
-        if (!load_engine(c, epath, &me, cw, ch)) {
+        if (!ensure_engine(c, m.name, settings, epath, &me, cw, ch, 3)) {
             finalize_log(c);
             return AJI_ERR_ENGINE;
         }
