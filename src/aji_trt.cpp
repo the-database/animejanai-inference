@@ -11,6 +11,7 @@
  * current; the CUDA runtime binds to the current driver context.
  */
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -19,8 +20,21 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -142,6 +156,19 @@ struct aji_ctx {
 
     void *buf[2] = {nullptr, nullptr};
     size_t buf_bytes = 0;
+
+    // Background engine builds (async_build): one trtexec at a time on a
+    // worker thread that touches no ctx state beyond these atomics. The
+    // caller thread owns build_epath/failed_builds (written only while no
+    // worker is running / in aji_poll).
+    bool async_build = false;
+    std::thread build_thread;
+    std::atomic<bool> build_running{false};
+    std::atomic<int> build_done_flag{0};
+    std::atomic<bool> build_ok{false};
+    std::atomic<intptr_t> build_child{0};
+    std::string build_epath;
+    std::set<std::string> failed_builds;
 
     // resampling plans: per-step resize plans live in steps[]; pre/post are
     // (re)built lazily per frame key since siting arrives with frames
@@ -265,9 +292,83 @@ void clean_stale_engines(aji_ctx *c)
     }
 }
 
-bool build_engine(aji_ctx *c, const std::string &onnx_name,
-                  const std::string &settings, const std::string &engine_path,
-                  const std::string *dir = nullptr)
+// Everything a build needs, with no aji_ctx references, so it can run on a
+// background thread.
+struct BuildSpec {
+    std::string cmdline;      // "trtexec" --onnx=... --saveEngine=...
+    std::string env_prefix;   // POSIX only, e.g. "LD_LIBRARY_PATH=..."
+    std::string engine_path;
+    std::string log_path;     // trtexec output, kept for diagnostics
+    std::string name;
+};
+
+// Run the build subprocess with no console window (win32) and its output
+// captured to spec.log_path. The child handle/pid is published to *child
+// while running so a teardown can stop it. Returns the exit code.
+int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
+{
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+    HANDLE log = CreateFileA(spec.log_path.c_str(), GENERIC_WRITE,
+                             FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = log;
+    si.hStdError = log;
+    PROCESS_INFORMATION pi = {};
+    std::string cmd = spec.cmdline;  // CreateProcess may modify the buffer
+    BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (log != INVALID_HANDLE_VALUE)
+        CloseHandle(log);
+    if (!ok)
+        return -1;
+    CloseHandle(pi.hThread);
+    child->store((intptr_t)pi.hProcess);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    child->store(0);
+    CloseHandle(pi.hProcess);
+    return (int)code;
+#else
+    std::string full = (spec.env_prefix.empty() ? "" : spec.env_prefix + " ") +
+                       spec.cmdline + " >\"" + spec.log_path + "\" 2>&1";
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", full.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    child->store((intptr_t)pid);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    child->store(0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+// Run a build to completion; on failure remove the half-written engine.
+// Thread-safe (touches no ctx state).
+bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
+{
+    int rc = run_build_process(spec, child);
+    if (rc != 0 || !fs::exists(spec.engine_path)) {
+        std::error_code ec;
+        fs::remove(spec.engine_path, ec);
+        return false;
+    }
+    return true;
+}
+
+bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
+                     const std::string &settings,
+                     const std::string &engine_path, const std::string *dir,
+                     BuildSpec *spec)
 {
     const std::string onnx_path =
         (fs::path(dir ? *dir : c->model_dir) / (onnx_name + ".onnx")).string();
@@ -275,26 +376,28 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
         c->set_error("model not found: %s", onnx_path.c_str());
         return false;
     }
+    spec->cmdline = "\"" + c->trtexec + "\" --onnx=\"" + onnx_path +
+                    "\" --saveEngine=\"" + engine_path + "\" " + settings;
+    spec->env_prefix = c->trtexec_env;
+    spec->engine_path = engine_path;
+    spec->log_path = engine_path + ".build.log";
+    spec->name = onnx_name;
+    return true;
+}
 
-    std::string cmd;
-#ifdef _WIN32
-    cmd = "\"\"" + c->trtexec + "\" --onnx=\"" + onnx_path + "\" --saveEngine=\"" +
-          engine_path + "\" " + settings + "\"";
-#else
-    if (!c->trtexec_env.empty())
-        cmd = c->trtexec_env + " ";
-    cmd += "\"" + c->trtexec + "\" --onnx=\"" + onnx_path + "\" --saveEngine=\"" +
-           engine_path + "\" " + settings + " >/dev/null 2>&1";
-#endif
-    c->verbose("building engine: %s", cmd.c_str());
+bool build_engine(aji_ctx *c, const std::string &onnx_name,
+                  const std::string &settings, const std::string &engine_path,
+                  const std::string *dir = nullptr)
+{
+    BuildSpec spec;
+    if (!make_build_spec(c, onnx_name, settings, engine_path, dir, &spec))
+        return false;
+    c->verbose("building engine: %s", spec.cmdline.c_str());
     c->log_steps.push_back("Building TensorRT engine for " + onnx_name +
                            " (first play at this resolution)");
-    int rc = std::system(cmd.c_str());
-    if (rc != 0 || !fs::exists(engine_path)) {
-        std::error_code ec;
-        fs::remove(engine_path, ec);  // don't leave a half-written engine
-        c->set_error("trtexec failed (exit %d) building engine for %s", rc,
-                     onnx_name.c_str());
+    if (!run_build_spec(spec, &c->build_child)) {
+        c->set_error("trtexec failed building engine for %s (see %s)",
+                     onnx_name.c_str(), spec.log_path.c_str());
         return false;
     }
     return true;
@@ -385,31 +488,85 @@ bool ensure_buffers(aji_ctx *c, size_t bytes)
     return true;
 }
 
+// Kick a background build of one engine; the configure that called this
+// returns passthrough, and aji_poll() tells the caller when to reconfigure.
+void start_async_build(aji_ctx *c, const BuildSpec &spec)
+{
+    if (c->build_thread.joinable())
+        c->build_thread.join();  // already-finished worker awaiting reap
+    c->build_epath = spec.engine_path;
+    c->build_done_flag = 0;
+    c->build_ok = false;
+    c->build_running = true;
+    c->log_steps.push_back("Building TensorRT engine for " + spec.name +
+                           " (first play at this resolution)");
+    c->verbose("background engine build: %s", spec.cmdline.c_str());
+    c->build_thread = std::thread([c, spec]() {
+        bool ok = run_build_spec(spec, &c->build_child);
+        c->build_ok = ok;
+        c->build_running = false;
+        c->build_done_flag = 1;
+    });
+}
+
 // Build-if-missing + load, with a self-healing retry: a cached engine that
 // fails to deserialize (e.g. built by a different trtexec version than the
 // loaded TensorRT runtime) is deleted and rebuilt once instead of wedging
 // playback until someone clears the cache by hand.
-bool ensure_engine(aji_ctx *c, const std::string &name,
-                   const std::string &settings, const std::string &epath,
-                   ModelEngine *me, int w, int h, int ch,
-                   const std::string *dir = nullptr)
+// Returns 1 loaded, 0 deferred to a background build (async_build; the
+// chain stays inactive and the build is logged), -1 failure.
+int ensure_engine(aji_ctx *c, const std::string &name,
+                  const std::string &settings, const std::string &epath,
+                  ModelEngine *me, int w, int h, int ch,
+                  const std::string *dir = nullptr)
 {
     bool fresh = false;
     if (!fs::exists(epath)) {
+        if (c->async_build) {
+            if (c->failed_builds.count(epath)) {
+                // permanent (until reconfigure changes the cache key):
+                // play passthrough instead of failing the filter
+                c->log_steps.push_back(
+                    "Engine build FAILED for " + name + " (see " + epath +
+                    ".build.log); playing without this chain");
+                return 0;
+            }
+            if (c->build_running.load()) {
+                // one build at a time; multi-engine chains cascade through
+                // repeated poll() -> reconfigure cycles
+                c->log_steps.push_back("Building TensorRT engine for " +
+                                       name + " (first play at this "
+                                       "resolution)");
+                return 0;
+            }
+            BuildSpec spec;
+            if (!make_build_spec(c, name, settings, epath, dir, &spec))
+                return -1;
+            start_async_build(c, spec);
+            return 0;
+        }
         if (!build_engine(c, name, settings, epath, dir))
-            return false;
+            return -1;
         fresh = true;
     }
     if (load_engine(c, epath, me, w, h, ch))
-        return true;
+        return 1;
     if (fresh)
-        return false;
+        return -1;
     c->verbose("cached engine unusable, rebuilding: %s", epath.c_str());
     std::error_code ec;
     fs::remove(epath, ec);
+    if (c->async_build) {
+        BuildSpec spec;
+        if (!make_build_spec(c, name, settings, epath, dir, &spec))
+            return -1;
+        if (!c->build_running.load())
+            start_async_build(c, spec);
+        return 0;
+    }
     if (!build_engine(c, name, settings, epath, dir))
-        return false;
-    return load_engine(c, epath, me, w, h, ch);
+        return -1;
+    return load_engine(c, epath, me, w, h, ch) ? 1 : -1;
 }
 
 // rife model code -> file basename: 414 -> rife_v4.14, 4141 -> _lite,
@@ -474,9 +631,13 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
     const std::string epath =
         engine_path_for(c->rife_model_dir, model, settings);
-    if (!ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph, 11,
-                       &c->rife_model_dir))
+    int er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
+                           11, &c->rife_model_dir);
+    if (er < 0)
         return false;
+    if (er == 0)
+        return true;  // building in the background; chain runs without
+                      // rife until aji_poll() triggers a reconfigure
 
     const size_t plane = (size_t)R.pw * R.ph;
     if (cudaMalloc(&R.in_tensor, plane * 11 * 2) != cudaSuccess ||
@@ -591,6 +752,7 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         c->slot = params->slot >= 0 ? params->slot : 1;
         c->rife_model_dir =
             params->rife_model_dir ? params->rife_model_dir : "";
+        c->async_build = params->async_build != 0;
         return c.release();
     }
 
@@ -795,9 +957,18 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
         const std::string epath = engine_path_for(c->model_dir, m.name, settings);
         ModelEngine me;
-        if (!ensure_engine(c, m.name, settings, epath, &me, cw, ch, 3)) {
+        int er = ensure_engine(c, m.name, settings, epath, &me, cw, ch, 3);
+        if (er < 0) {
             finalize_log(c);
             return AJI_ERR_ENGINE;
+        }
+        if (er == 0) {
+            // building in the background: passthrough until aji_poll()
+            // says to reconfigure
+            finalize_log(c);
+            if (out_w) *out_w = w;
+            if (out_h) *out_h = h;
+            return 0;
         }
         cw = me.out_w; ch = me.out_h;
         c->engines.push_back(std::move(me));
@@ -1111,6 +1282,20 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
     return c ? c->scale : 0;
 }
 
+extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
+{
+    if (!c || !c->build_done_flag.exchange(0))
+        return 0;
+    if (c->build_thread.joinable())
+        c->build_thread.join();
+    if (!c->build_ok.load()) {
+        c->failed_builds.insert(c->build_epath);
+        c->verbose("background engine build failed: %s (see .build.log)",
+                   c->build_epath.c_str());
+    }
+    return 1;  // reconfigure either way; failures latch to passthrough
+}
+
 extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 {
     if (!c || !c->rife.enabled)
@@ -1289,6 +1474,20 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
     if (!pc || !*pc)
         return;
     aji_ctx *c = *pc;
+    // Stop any in-flight engine build (player quit shouldn't wait minutes
+    // for trtexec); the worker's failure path removes the partial engine.
+    if (c->build_running.load()) {
+        intptr_t h = c->build_child.load();
+        if (h) {
+#ifdef _WIN32
+            TerminateProcess((HANDLE)h, 1);
+#else
+            kill((pid_t)h, SIGKILL);
+#endif
+        }
+    }
+    if (c->build_thread.joinable())
+        c->build_thread.join();
     {
         CtxGuard guard(c->cu_ctx);
         for (auto &b : c->buf)
