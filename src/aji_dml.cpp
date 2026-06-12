@@ -214,8 +214,15 @@ struct aji_ctx {
     // D3D12 side
     ComPtr<ID3D12Device> dev;
     ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<ID3D12CommandAllocator> alloc;
+    // Command allocators/lists are pooled: every recording segment gets
+    // its own pair, because an allocator must not be reset while its
+    // prior work is still executing (segments within one infer are only
+    // fenced at the end). cl_used rewinds to 0 after each full CPU wait.
+    ComPtr<ID3D12CommandAllocator> alloc;       // current segment's pair
     ComPtr<ID3D12GraphicsCommandList> cl;
+    std::vector<std::pair<ComPtr<ID3D12CommandAllocator>,
+                          ComPtr<ID3D12GraphicsCommandList>>> cl_pool;
+    size_t cl_used = 0;
     ComPtr<ID3D12Fence> fence;
     HANDLE fence_event = NULL;
     uint64_t fence_val = 0;
@@ -524,6 +531,23 @@ struct Recorder {
     bool begin() {
         if (open)
             return true;
+        if (c->cl_used == c->cl_pool.size()) {
+            ComPtr<ID3D12CommandAllocator> a;
+            ComPtr<ID3D12GraphicsCommandList> l;
+            if (FAILED(c->dev->CreateCommandAllocator(
+                    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))) ||
+                FAILED(c->dev->CreateCommandList(
+                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, a.Get(), NULL,
+                    IID_PPV_ARGS(&l))) ||
+                FAILED(l->Close())) {
+                c->set_error("command allocator/list creation failed");
+                return false;
+            }
+            c->cl_pool.emplace_back(a, l);
+        }
+        c->alloc = c->cl_pool[c->cl_used].first;
+        c->cl = c->cl_pool[c->cl_used].second;
+        c->cl_used++;
         if (FAILED(c->alloc->Reset()) ||
             FAILED(c->cl->Reset(c->alloc.Get(), NULL))) {
             c->set_error("command list reset failed");
@@ -709,6 +733,8 @@ bool record_resize(aji_ctx *c, Recorder &r, DmlPlan *p, ID3D12Resource *src,
 
 /* ---------------- shared textures + plane copies ---------------- */
 
+void diagnose_device(aji_ctx *c, const char *where);
+
 ID3D12Resource *open_shared(aji_ctx *c, void *tex11)
 {
     auto it = c->shared.find(tex11);
@@ -733,6 +759,7 @@ ID3D12Resource *open_shared(aji_ctx *c, void *tex11)
     CloseHandle(h);
     if (FAILED(hr)) {
         c->set_error("D3D12 OpenSharedHandle failed (0x%08x)", (unsigned)hr);
+        diagnose_device(c, "OpenSharedHandle");
         return nullptr;
     }
     c->shared[tex11] = res;
@@ -762,6 +789,57 @@ void transition_planes(aji_ctx *c, ID3D12Resource *tex, UINT subres,
         bs[p].Transition.StateAfter = to;
     }
     c->cl->ResourceBarrier(2, bs);
+}
+
+// On any failure, distinguish a removed device (and say why) from a
+// plain error; with the debug layer on (AJI_DML_DEBUG=1) also drain the
+// info queue so validation messages reach the player log.
+void diagnose_device(aji_ctx *c, const char *where)
+{
+    if (!c->dev)
+        return;
+    HRESULT rr = c->dev->GetDeviceRemovedReason();
+    if (FAILED(rr)) {
+        c->set_error("device removed (reason 0x%08x) detected at %s",
+                     (unsigned)rr, where);
+        ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+        if (SUCCEEDED(c->dev.As(&dred))) {
+            D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {};
+            if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
+                for (auto *n = bc.pHeadAutoBreadcrumbNode; n;
+                     n = n->pNext) {
+                    UINT done = n->pLastBreadcrumbValue
+                                    ? *n->pLastBreadcrumbValue : 0;
+                    if (done == n->BreadcrumbCount)
+                        continue;   // this command list completed fine
+                    c->verbose("dred: CL stopped at op %u/%u (last op %d)",
+                               done, n->BreadcrumbCount,
+                               done < n->BreadcrumbCount
+                                   ? (int)n->pCommandHistory[done] : -1);
+                }
+            }
+            D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+            if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) &&
+                pf.PageFaultVA)
+                c->verbose("dred: page fault at VA 0x%llx",
+                           (unsigned long long)pf.PageFaultVA);
+        }
+    }
+    ComPtr<ID3D12InfoQueue> iq;
+    if (SUCCEEDED(c->dev.As(&iq))) {
+        UINT64 n = iq->GetNumStoredMessages();
+        for (UINT64 i = 0; i < n; i++) {
+            SIZE_T len = 0;
+            iq->GetMessage(i, NULL, &len);
+            if (!len)
+                continue;
+            std::vector<char> buf(len);
+            D3D12_MESSAGE *m = (D3D12_MESSAGE *)buf.data();
+            if (SUCCEEDED(iq->GetMessage(i, m, &len)) && m->pDescription)
+                c->verbose("d3d12 debug: %s", m->pDescription);
+        }
+        iq->ClearStoredMessages();
+    }
 }
 
 ComPtr<ID3D12Resource> make_readback(ID3D12Device *dev, uint64_t bytes)
@@ -840,6 +918,7 @@ void chain_teardown(aji_ctx *c)
             WaitForSingleObject(c->fence_event, 10000);
         }
     }
+    c->cl_used = 0;     // teardown waited the queue idle just above
     for (auto &m : c->models)
         model_release(&m);
     c->models.clear();
@@ -1190,10 +1269,17 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
             return false;
     }
     // warm the rebound command list once (the discovery runs used the
-    // temporary binding)
+    // temporary binding), then drain the queue so the consts/warmup work
+    // is done before any later segment recycles the command allocators
     if (!c->ort_ck(g_ort->RunWithBinding(R.model.session, NULL,
                                          R.model.binding), "rife warmup"))
         return false;
+    c->fence_val++;
+    c->queue->Signal(c->fence.Get(), c->fence_val);
+    if (c->fence->GetCompletedValue() < c->fence_val) {
+        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
+        WaitForSingleObject(c->fence_event, 30000);
+    }
 
     char buf[200];
     const double factor = (double)R.num / R.den;
@@ -1258,6 +1344,23 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         return nullptr;
     }
 
+    if (getenv("AJI_DML_DEBUG")) {
+        ComPtr<ID3D12Debug> dbg;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+            dbg->EnableDebugLayer();
+            c->verbose("D3D12 debug layer enabled");
+        } else {
+            c->verbose("D3D12 debug layer unavailable (Graphics Tools "
+                       "not installed?)");
+        }
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            c->verbose("DRED breadcrumbs + page-fault tracking enabled");
+        }
+    }
+
     // D3D12 device on the same adapter
     ComPtr<IDXGIDevice> dxgi_dev;
     ComPtr<IDXGIAdapter> adapter;
@@ -1279,14 +1382,8 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     qd.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
-    if (FAILED(c->dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&c->queue))) ||
-        FAILED(c->dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                              IID_PPV_ARGS(&c->alloc))) ||
-        FAILED(c->dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                         c->alloc.Get(), NULL,
-                                         IID_PPV_ARGS(&c->cl))) ||
-        FAILED(c->cl->Close())) {
-        c->set_error("D3D12 queue/command list creation failed");
+    if (FAILED(c->dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&c->queue)))) {
+        c->set_error("D3D12 queue creation failed");
         return nullptr;
     }
     if (FAILED(c->dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
@@ -1590,6 +1687,12 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         return AJI_ERR_SHAPE;
     }
 
+    if (FAILED(c->dev->GetDeviceRemovedReason())) {
+        diagnose_device(c, "aji_infer entry");
+        return AJI_ERR;
+    }
+    c->cl_used = 0;     // the previous infer's final wait completed
+
     const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
     const aji_csp csp =
         aji_resample::make_csp(in->format, in->matrix, in->range);
@@ -1739,6 +1842,7 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
         if (WaitForSingleObject(c->fence_event, 10000) != WAIT_OBJECT_0) {
             c->set_error("GPU timeout waiting for the inference chain");
+            diagnose_device(c, "infer fence wait");
             return AJI_ERR;
         }
     }
@@ -1796,6 +1900,8 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                      R.w, R.h);
         return AJI_ERR_SHAPE;
     }
+
+    c->cl_used = 0;     // the previous infer's final wait completed
 
     const int fmt = a->format;
     const bool t16 = fmt == AJI_FMT_P010;
@@ -2040,6 +2146,7 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
         if (WaitForSingleObject(c->fence_event, 10000) != WAIT_OBJECT_0) {
             c->set_error("GPU timeout in rife inference");
+            diagnose_device(c, "rife fence wait");
             return AJI_ERR;
         }
     }
