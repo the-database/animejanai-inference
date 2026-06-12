@@ -246,7 +246,17 @@ int main(int argc, char **argv)
     double total_ms = 0;
     int timed = 0;
 
-    while (n < max_frames && fread(h_in, 1, frame_sz, fin) == frame_sz) {
+    while (n < max_frames) {
+        if (fread(h_in, 1, frame_sz, fin) != frame_sz) {
+            if (n == 0) {
+                fprintf(stderr, "input shorter than one frame\n");
+                return 1;
+            }
+            // loop the input so short seeds can drive long runs
+            fseek(fin, 0, SEEK_SET);
+            if (fread(h_in, 1, frame_sz, fin) != frame_sz)
+                break;
+        }
         CK(cudaMemcpyAsync(in.plane[0], h_in, y_sz, cudaMemcpyHostToDevice,
                            stream));
         CK(cudaMemcpyAsync(in.plane[1], (char *)h_in + y_sz, uv_sz,
