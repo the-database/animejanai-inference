@@ -142,9 +142,12 @@ NV_TENSORRT_MAJOR≥11 (drop --fp16/--bf16/--int8/--best/--buildOnly, --inputIOF
 enum values gone); --workspace→--memPoolSize), CRC still hashes the original string; the RIFE
 template became --stronglyTyped from the fp16 models (works on 10 and 11, validated both).
 Results: parity vs 10.16 Y 59.5 / UV 68.9 dB max 1 LSB, 4:4:4 flat output BIT-IDENTICAL, RIFE
-strongly-typed builds + runs, CUDA graphs capture, perf within ~6% at the engine level
-(3.42 vs 3.21 ms — and the chain converges to ~3.6 vs ~3.4 warm), and **cold engine builds
-drop ~60 s → ~10 s** — the first-play UX transforms. Windows runtime = vs-mlrt v16.test1
+strongly-typed builds + runs, CUDA graphs capture, perf: the WSL isolation on the V3
+Performance model measured ~6% slower (3.42 vs 3.21 ms), but the in-package benchmark on the
+SHIPPING V3.1 models (Windows, 5090, all 10 engines rebuilt on TRT 11) measures **+2% to +11%
+FASTER across every resolution/model** (1080p: Balanced 150→155.9, Performance 280.9→286;
+768x576 Performance +10.6%) — no release-blocking perf concern; and **cold engine builds drop
+~60 s → ~10 s** — the first-play UX transforms. Windows runtime = vs-mlrt v16.test1
 (nvinfer_11 import lib generated via dumpbin/lib; slim DLL set proven: nvinfer_11 + plugin +
 onnxparser + builder resources + cudart + trtexec — lean/dispatch/cuDNN/cuBLAS not needed).
 CAVEAT: v16.test1 is a pre-release — recheck for stable v16 before the package release. Debug
