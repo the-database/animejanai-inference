@@ -1,0 +1,1551 @@
+/*
+ * aji_dml.cpp — DirectML backend for the aji shim (Windows only).
+ *
+ * Mirrors aji_trt.cpp's conf-mode semantics (chain selection, resize
+ * steps, stats text) with ONNX Runtime's DirectML EP replacing TensorRT
+ * and D3D12 compute shaders (dml_shaders.h, ports of kernels.cu)
+ * replacing the CUDA kernels. There is no engine cache: sessions
+ * compile in well under a second at configure time.
+ *
+ * Frames arrive as shared D3D11 textures (aji_frame.plane[0] =
+ * ID3D11Texture2D*, plane[1] = subresource index). Everything runs on
+ * one D3D12 DIRECT queue created on the same adapter as the caller's
+ * D3D11 device: input-plane copies + pre kernels, then ORT's submitted
+ * work (the session shares our queue via the _DML1 EP append), then
+ * post kernels + output-plane copies. Cross-API ordering uses one
+ * shared fence: D3D11 signals after the caller's copy into the input
+ * texture, our queue waits; v1 completes synchronously (CPU wait at the
+ * end of infer), which also keeps command-allocator reuse trivial.
+ *
+ * Session recipe per the DML EP requirements and vs-mlrt's vsort:
+ * ORT_SEQUENTIAL + DisableMemPattern, DirectML.dll loaded from our own
+ * directory *before* onnxruntime.dll, first inference run twice.
+ */
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d11_4.h>
+#include <d3d12.h>
+#include <d3dcompiler.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+
+#include <DirectML.h>
+
+#include <onnxruntime_c_api.h>
+#include <dml_provider_factory.h>
+
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "aji.h"
+#include "aji_conf.h"
+#include "dml_shaders.h"
+#include "resample.h"
+
+using Microsoft::WRL::ComPtr;
+
+/* ---------------- module loading (DirectML before onnxruntime) -------- */
+
+namespace {
+
+const OrtApi *g_ort = nullptr;
+const OrtDmlApi *g_dml_api = nullptr;
+HRESULT(WINAPI *g_dml_create_device)(ID3D12Device *, DML_CREATE_DEVICE_FLAGS,
+                                     REFIID, void **) = nullptr;
+
+std::string own_dir(void)
+{
+    HMODULE self = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&own_dir, &self);
+    char path[MAX_PATH] = {0};
+    GetModuleFileNameA(self, path, sizeof(path));
+    char *slash = strrchr(path, '\\');
+    if (slash)
+        *slash = 0;
+    return path;
+}
+
+// Loads DirectML.dll then onnxruntime.dll from our own directory (the
+// order matters: onnxruntime delay-loads DirectML, and preloading ours
+// keeps the System32 copy out of the picture). Idempotent.
+bool load_ort(std::string *err)
+{
+    if (g_ort && g_dml_api && g_dml_create_device)
+        return true;
+    const std::string dir = own_dir();
+    const DWORD flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    HMODULE dml = LoadLibraryExA((dir + "\\DirectML.dll").c_str(), NULL, flags);
+    if (!dml) {
+        *err = "DirectML.dll not found next to aji_dml.dll (error " +
+               std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    HMODULE ort = LoadLibraryExA((dir + "\\onnxruntime.dll").c_str(), NULL,
+                                 flags);
+    if (!ort) {
+        *err = "onnxruntime.dll not found next to aji_dml.dll (error " +
+               std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    auto get_base = (const OrtApiBase *(ORT_API_CALL *)(void))
+        GetProcAddress(ort, "OrtGetApiBase");
+    if (!get_base) {
+        *err = "onnxruntime.dll has no OrtGetApiBase";
+        return false;
+    }
+    g_ort = get_base()->GetApi(ORT_API_VERSION);
+    if (!g_ort) {
+        *err = "onnxruntime.dll is older than the ORT headers we built "
+               "against (API " + std::to_string(ORT_API_VERSION) + ")";
+        return false;
+    }
+    if (g_ort->GetExecutionProviderApi("DML", ORT_API_VERSION,
+                                       (const void **)&g_dml_api)) {
+        *err = "this onnxruntime.dll has no DirectML execution provider";
+        return false;
+    }
+    *(FARPROC *)&g_dml_create_device = GetProcAddress(dml, "DMLCreateDevice");
+    if (!g_dml_create_device) {
+        *err = "DirectML.dll has no DMLCreateDevice";
+        return false;
+    }
+    return true;
+}
+
+std::wstring widen(const std::string &s)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
+    std::wstring w(n ? n - 1 : 0, L'\0');
+    if (n)
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    return w;
+}
+
+/* ---------------- D3D12 plumbing ---------------- */
+
+constexpr uint32_t align256(uint32_t v) { return (v + 255u) & ~255u; }
+
+// Root constants: must match cbuffer CB in dml_shaders.h (16 DWORDs).
+struct KernArgs {
+    int32_t di[4];
+    int32_t dj[4];
+    float kr, kb, yoff, yscale;
+    float coff, cscale, qdiv, qmax;
+};
+
+enum Kern {
+    K_UV_H = 0, K_V_F32, K_PRE_COMBINE, K_POST_MATRIX,
+    K_H_F32, K_UV_V_STORE, K_RS_H, K_RS_V,
+};
+const char *const KERN_ENTRY[] = {
+    "cs_uv_h", "cs_v_f32", "cs_pre_combine", "cs_post_matrix",
+    "cs_h_f32", "cs_uv_v_store", "cs_rs_h", "cs_rs_v",
+};
+
+struct DmlPass {
+    int taps = 0, src = 0, dst = 0;
+    ComPtr<ID3D12Resource> starts, wt;   // upload heap, GENERIC_READ
+};
+
+struct DmlPlan {
+    enum Kind { PRE, POST, RESIZE } kind = PRE;
+    int format = 0;
+    int w = 0, h = 0;       // pre/post luma dims; resize: src dims
+    int dw = 0, dh = 0;     // resize: dst dims
+    DmlPass ph, pv;
+    ComPtr<ID3D12Resource> tmp0, tmp1;   // f32 intermediates
+};
+
+struct DmlModel {
+    OrtSession *session = nullptr;
+    std::string in_name, out_name;
+    bool fp16 = true;
+    int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    OrtIoBinding *binding = nullptr;
+    OrtValue *in_val = nullptr, *out_val = nullptr;
+};
+
+struct Step {
+    enum Kind { RESIZE, MODEL } kind;
+    int out_w, out_h;
+    int model_idx = -1;                  // MODEL
+    std::unique_ptr<DmlPlan> plan;       // RESIZE
+    int in_buf = 0;                      // chain buffer ping-pong index
+    bool elem16_in = true, elem16_out = true;
+};
+
+} // namespace
+
+struct aji_ctx {
+    // logging / errors
+    aji_log_fn log_fn = nullptr;
+    void *log_opaque = nullptr;
+    char errbuf[512] = {0};
+
+    // conf mode state (mirrors aji_trt)
+    std::string conf_path, model_dir, rife_model_dir;
+    AjiConf conf;
+    int slot = 1;
+    bool active = false;
+    int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    std::string current_log;
+    std::vector<std::string> log_info, log_steps;
+
+    // D3D11 side (caller's device)
+    ComPtr<ID3D11Device> dev11;
+    ComPtr<ID3D11DeviceContext> ctx11;
+    ComPtr<ID3D11DeviceContext4> ctx11_4;
+    ComPtr<ID3D11Fence> fence11;
+
+    // D3D12 side
+    ComPtr<ID3D12Device> dev;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+    ComPtr<ID3D12Fence> fence;
+    HANDLE fence_event = NULL;
+    uint64_t fence_val = 0;
+    ComPtr<ID3D12RootSignature> rootsig;
+    std::map<uint32_t, ComPtr<ID3D12PipelineState>> psos;
+    ComPtr<IDMLDevice> dml_dev;
+
+    // ORT
+    OrtEnv *env = nullptr;
+    OrtMemoryInfo *mi_dml = nullptr;
+
+    // chain
+    std::vector<DmlModel> models;
+    std::vector<Step> steps;
+    ComPtr<ID3D12Resource> buf[2];
+    void *buf_alloc[2] = {nullptr, nullptr};  // OrtDmlApi GPU allocations
+    size_t buf_bytes = 0;
+    bool first_elem16 = true;   // element type cs_pre_combine writes
+    bool last_elem16 = true;    // element type cs_post_matrix reads
+
+    // lazy per-frame-format state
+    std::unique_ptr<DmlPlan> pre_plan, post_plan;
+    int pre_key[4] = {0}, post_key[4] = {0};
+    ComPtr<ID3D12Resource> in_y, in_uv, out_y, out_uv;  // plane staging
+    uint32_t in_pitch = 0, out_pitch = 0;
+    int stage_key[3] = {0};     // format, in dims valid for staging
+
+    // shared-texture cache (cleared on configure)
+    std::map<void *, ComPtr<ID3D12Resource>> shared;
+
+    void set_error(const char *fmt, ...) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(errbuf, sizeof(errbuf), fmt, ap);
+        va_end(ap);
+        if (log_fn)
+            log_fn(log_opaque, 1, errbuf);
+    }
+    void verbose(const char *fmt, ...) {
+        char buf[512];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        if (log_fn)
+            log_fn(log_opaque, 3, buf);
+    }
+    bool ort_ck(OrtStatus *st, const char *what) {
+        if (!st)
+            return true;
+        set_error("%s: %s", what, g_ort->GetErrorMessage(st));
+        g_ort->ReleaseStatus(st);
+        return false;
+    }
+};
+
+namespace {
+
+/* ---------------- small helpers ---------------- */
+
+int round_even(double v)
+{
+    int i = (int)(v + 0.5);
+    return i & ~1;
+}
+
+// scale_to_1080: fit into (box_w, box_h) preserving aspect.
+void fit_box(int w, int h, double box_w, double box_h, int *ow, int *oh)
+{
+    if ((double)w / h > 16.0 / 9.0) {
+        *ow = round_even(box_w);
+        *oh = round_even(box_w * h / w);
+    } else {
+        *ow = round_even(box_h * w / h);
+        *oh = round_even(box_h);
+    }
+}
+
+std::string fmt_num(double v)
+{
+    if (v >= 1e300)
+        return "inf";
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%g", v);
+    return buf;
+}
+
+void finalize_log(aji_ctx *c)
+{
+    std::string out;
+    for (auto &l : c->log_info)
+        out += l + "\n";
+    out += "\n";
+    for (size_t i = 0; i < c->log_steps.size(); i++)
+        out += std::to_string(i + 1) + ". " + c->log_steps[i] + "\n";
+    c->current_log = out;
+}
+
+ComPtr<ID3D12Resource> make_buffer(ID3D12Device *dev, uint64_t bytes,
+                                   bool upload)
+{
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = bytes ? bytes : 4;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = upload ? D3D12_RESOURCE_FLAG_NONE
+                      : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ComPtr<ID3D12Resource> res;
+    if (FAILED(dev->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            upload ? D3D12_RESOURCE_STATE_GENERIC_READ
+                   : D3D12_RESOURCE_STATE_COMMON,
+            NULL, IID_PPV_ARGS(&res))))
+        return nullptr;
+    return res;
+}
+
+bool build_pass(aji_ctx *c, DmlPass *p, int src, int dst, double shift,
+                int filter)
+{
+    aji_resample::weights w = aji_resample::compute(src, dst, shift, filter);
+    p->taps = w.taps;
+    p->src = src;
+    p->dst = dst;
+    p->starts = make_buffer(c->dev.Get(), (uint64_t)dst * 4, true);
+    p->wt = make_buffer(c->dev.Get(), w.wt.size() * 4, true);
+    if (!p->starts || !p->wt)
+        return false;
+    void *m = nullptr;
+    D3D12_RANGE none = {0, 0};
+    if (FAILED(p->starts->Map(0, &none, &m)))
+        return false;
+    memcpy(m, w.start.data(), (size_t)dst * 4);
+    p->starts->Unmap(0, NULL);
+    if (FAILED(p->wt->Map(0, &none, &m)))
+        return false;
+    memcpy(m, w.wt.data(), w.wt.size() * 4);
+    p->wt->Unmap(0, NULL);
+    return true;
+}
+
+std::unique_ptr<DmlPlan> pre_plan_create(aji_ctx *c, int format, int w, int h,
+                                         int siting, int filter)
+{
+    auto p = std::make_unique<DmlPlan>();
+    p->kind = DmlPlan::PRE;
+    p->format = format;
+    p->w = w;
+    p->h = h;
+    const int cw = w >> 1, ch = h >> 1;
+    double sx, sy;
+    aji_resample::chroma_shifts(siting, true, &sx, &sy);
+    p->tmp0 = make_buffer(c->dev.Get(), (uint64_t)2 * w * ch * 4, false);
+    p->tmp1 = make_buffer(c->dev.Get(), (uint64_t)2 * w * h * 4, false);
+    if (!build_pass(c, &p->ph, cw, w, sx, filter) ||
+        !build_pass(c, &p->pv, ch, h, sy, filter) || !p->tmp0 || !p->tmp1)
+        return nullptr;
+    return p;
+}
+
+std::unique_ptr<DmlPlan> post_plan_create(aji_ctx *c, int format, int w, int h,
+                                          int siting, int filter)
+{
+    auto p = std::make_unique<DmlPlan>();
+    p->kind = DmlPlan::POST;
+    p->format = format;
+    p->w = w;
+    p->h = h;
+    const int cw = w >> 1, ch = h >> 1;
+    double sx, sy;
+    aji_resample::chroma_shifts(siting, false, &sx, &sy);
+    p->tmp0 = make_buffer(c->dev.Get(), (uint64_t)2 * w * h * 4, false);
+    p->tmp1 = make_buffer(c->dev.Get(), (uint64_t)2 * cw * h * 4, false);
+    if (!build_pass(c, &p->ph, w, cw, sx, filter) ||
+        !build_pass(c, &p->pv, h, ch, sy, filter) || !p->tmp0 || !p->tmp1)
+        return nullptr;
+    return p;
+}
+
+std::unique_ptr<DmlPlan> resize_plan_create(aji_ctx *c, int sw, int sh,
+                                            int dw, int dh)
+{
+    auto p = std::make_unique<DmlPlan>();
+    p->kind = DmlPlan::RESIZE;
+    p->w = sw;
+    p->h = sh;
+    p->dw = dw;
+    p->dh = dh;
+    p->tmp0 = make_buffer(c->dev.Get(), (uint64_t)3 * dw * sh * 4, false);
+    if (!build_pass(c, &p->ph, sw, dw, 0.0, AJI_FILTER_SPLINE36) ||
+        !build_pass(c, &p->pv, sh, dh, 0.0, AJI_FILTER_SPLINE36) || !p->tmp0)
+        return nullptr;
+    return p;
+}
+
+/* PSO variant key: kern | t16<<8 | io16<<9 */
+ID3D12PipelineState *get_pso(aji_ctx *c, Kern k, bool t16, bool io16)
+{
+    const uint32_t key = (uint32_t)k | (t16 ? 0x100u : 0) | (io16 ? 0x200u : 0);
+    auto it = c->psos.find(key);
+    if (it != c->psos.end())
+        return it->second.Get();
+
+    char t16s[2] = {char('0' + t16), 0}, io16s[2] = {char('0' + io16), 0};
+    // dword-granular stores: u8 packs 4 luma / 2 chroma px, u16 2 / 1
+    const char *tpx = "1";
+    if (k == K_POST_MATRIX)
+        tpx = t16 ? "2" : "4";
+    else if (k == K_UV_V_STORE)
+        tpx = t16 ? "1" : "2";
+    const D3D_SHADER_MACRO defs[] = {
+        {"T16", t16s}, {"IO16", io16s}, {"TPX", tpx}, {NULL, NULL}};
+
+    ComPtr<ID3DBlob> blob, errs;
+    HRESULT hr = D3DCompile(DML_HLSL, sizeof(DML_HLSL) - 1, "aji_dml",
+                            defs, NULL, KERN_ENTRY[k], "cs_5_0",
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3 |
+                                D3DCOMPILE_IEEE_STRICTNESS,
+                            0, &blob, &errs);
+    if (FAILED(hr)) {
+        c->set_error("HLSL compile %s failed: %s", KERN_ENTRY[k],
+                     errs ? (const char *)errs->GetBufferPointer() : "?");
+        return nullptr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = c->rootsig.Get();
+    pd.CS = {blob->GetBufferPointer(), blob->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> pso;
+    if (FAILED(c->dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)))) {
+        c->set_error("compute PSO %s creation failed", KERN_ENTRY[k]);
+        return nullptr;
+    }
+    c->psos[key] = pso;
+    return c->psos[key].Get();
+}
+
+bool make_rootsig(aji_ctx *c)
+{
+    D3D12_ROOT_PARAMETER prm[6] = {};
+    prm[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    prm[0].Constants = {0, 0, 16};      // b0, space0, 16 DWORDs
+    for (int i = 0; i < 2; i++) {       // t0 starts, t1 weights
+        prm[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        prm[1 + i].Descriptor = {(UINT)i, 0};
+    }
+    for (int i = 0; i < 3; i++) {       // u0..u2 data
+        prm[3 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        prm[3 + i].Descriptor = {(UINT)i, 0};
+    }
+    D3D12_ROOT_SIGNATURE_DESC rs = {};
+    rs.NumParameters = 6;
+    rs.pParameters = prm;
+    ComPtr<ID3DBlob> blob, errs;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           &blob, &errs))) {
+        c->set_error("root signature serialize failed: %s",
+                     errs ? (const char *)errs->GetBufferPointer() : "?");
+        return false;
+    }
+    if (FAILED(c->dev->CreateRootSignature(0, blob->GetBufferPointer(),
+                                           blob->GetBufferSize(),
+                                           IID_PPV_ARGS(&c->rootsig)))) {
+        c->set_error("root signature creation failed");
+        return false;
+    }
+    return true;
+}
+
+/* ---------------- command recording ---------------- */
+
+struct Recorder {
+    aji_ctx *c;
+    bool open = false;
+
+    bool begin() {
+        if (open)
+            return true;
+        if (FAILED(c->alloc->Reset()) ||
+            FAILED(c->cl->Reset(c->alloc.Get(), NULL))) {
+            c->set_error("command list reset failed");
+            return false;
+        }
+        c->cl->SetComputeRootSignature(c->rootsig.Get());
+        open = true;
+        return true;
+    }
+    bool exec() {
+        if (!open)
+            return true;
+        if (FAILED(c->cl->Close())) {
+            c->set_error("command list close failed");
+            return false;
+        }
+        ID3D12CommandList *lists[] = {c->cl.Get()};
+        c->queue->ExecuteCommandLists(1, lists);
+        open = false;
+        return true;
+    }
+    void uav_barrier() {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        c->cl->ResourceBarrier(1, &b);
+    }
+    void transition(ID3D12Resource *r, D3D12_RESOURCE_STATES from,
+                    D3D12_RESOURCE_STATES to, UINT sub) {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition = {r, sub, from, to};
+        c->cl->ResourceBarrier(1, &b);
+    }
+    bool dispatch(Kern k, bool t16, bool io16, const KernArgs &args,
+                  ID3D12Resource *s0, ID3D12Resource *s1, ID3D12Resource *u0,
+                  ID3D12Resource *u1, ID3D12Resource *u2,
+                  int gx, int gy, int gz) {
+        ID3D12PipelineState *pso = get_pso(c, k, t16, io16);
+        if (!pso)
+            return false;
+        c->cl->SetPipelineState(pso);
+        c->cl->SetComputeRoot32BitConstants(0, 16, &args, 0);
+        if (s0) c->cl->SetComputeRootShaderResourceView(1, s0->GetGPUVirtualAddress());
+        if (s1) c->cl->SetComputeRootShaderResourceView(2, s1->GetGPUVirtualAddress());
+        if (u0) c->cl->SetComputeRootUnorderedAccessView(3, u0->GetGPUVirtualAddress());
+        if (u1) c->cl->SetComputeRootUnorderedAccessView(4, u1->GetGPUVirtualAddress());
+        if (u2) c->cl->SetComputeRootUnorderedAccessView(5, u2->GetGPUVirtualAddress());
+        c->cl->Dispatch((gx + 31) / 32, (gy + 7) / 8, gz);
+        return true;
+    }
+};
+
+KernArgs csp_args(const aji_csp &csp, float qdiv, float qmax)
+{
+    KernArgs a = {};
+    a.kr = csp.kr;
+    a.kb = csp.kb;
+    a.yoff = csp.yoff;
+    a.yscale = csp.yscale;
+    a.coff = csp.coff;
+    a.cscale = csp.cscale;
+    a.qdiv = qdiv;
+    a.qmax = qmax;
+    return a;
+}
+
+// pre: in_y/in_uv staging -> tensor in dst (cs_uv_h, cs_v_f32, cs_pre_combine)
+bool record_pre(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
+                ID3D12Resource *dst, bool io16)
+{
+    const bool t16 = p->format == AJI_FMT_P010;
+    const int w = p->w, h = p->h, ch = h >> 1;
+    KernArgs a = csp_args(csp, 0, 0);
+
+    a.di[0] = p->ph.src; a.di[1] = p->ph.dst; a.di[2] = p->ph.taps;
+    a.di[3] = ch; a.dj[0] = (int)c->in_pitch;
+    if (!r.dispatch(K_UV_H, t16, io16, a, p->ph.starts.Get(), p->ph.wt.Get(),
+                    c->in_uv.Get(), p->tmp0.Get(), NULL, w, ch, 1))
+        return false;
+    r.uav_barrier();
+
+    a.di[0] = w; a.di[1] = ch; a.di[2] = p->pv.taps; a.di[3] = h;
+    if (!r.dispatch(K_V_F32, t16, io16, a, p->pv.starts.Get(), p->pv.wt.Get(),
+                    p->tmp0.Get(), p->tmp1.Get(), NULL, w, h, 2))
+        return false;
+    r.uav_barrier();
+
+    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)c->in_pitch;
+    if (!r.dispatch(K_PRE_COMBINE, t16, io16, a, NULL, NULL, c->in_y.Get(),
+                    p->tmp1.Get(), dst, w / 2, h, 1))
+        return false;
+    r.uav_barrier();
+    return true;
+}
+
+// post: tensor src -> out_y/out_uv staging
+bool record_post(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
+                 ID3D12Resource *src, bool io16)
+{
+    const bool t16 = p->format == AJI_FMT_P010;
+    const int w = p->w, h = p->h, cw = w >> 1, ch = h >> 1;
+    const float qdiv = t16 ? 64.0f : 1.0f;
+    const float qmax = t16 ? 1023.0f : 255.0f;
+    KernArgs a = csp_args(csp, qdiv, qmax);
+    const int tpx_y = t16 ? 2 : 4, tpx_uv = t16 ? 1 : 2;
+
+    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)c->out_pitch;
+    if (!r.dispatch(K_POST_MATRIX, t16, io16, a, NULL, NULL, src,
+                    c->out_y.Get(), p->tmp0.Get(), (w + tpx_y - 1) / tpx_y, h,
+                    1))
+        return false;
+    r.uav_barrier();
+
+    a.di[0] = w; a.di[1] = cw; a.di[2] = p->ph.taps; a.di[3] = h;
+    if (!r.dispatch(K_H_F32, t16, io16, a, p->ph.starts.Get(), p->ph.wt.Get(),
+                    p->tmp0.Get(), p->tmp1.Get(), NULL, cw, h, 2))
+        return false;
+    r.uav_barrier();
+
+    a.di[0] = cw; a.di[1] = h; a.di[2] = p->pv.taps; a.di[3] = ch;
+    a.dj[0] = (int)c->out_pitch;
+    if (!r.dispatch(K_UV_V_STORE, t16, io16, a, p->pv.starts.Get(),
+                    p->pv.wt.Get(), p->tmp1.Get(), c->out_uv.Get(), NULL,
+                    (cw + tpx_uv - 1) / tpx_uv, ch, 1))
+        return false;
+    r.uav_barrier();
+    return true;
+}
+
+bool record_resize(aji_ctx *c, Recorder &r, DmlPlan *p, ID3D12Resource *src,
+                   ID3D12Resource *dst, bool in16, bool out16)
+{
+    KernArgs a = {};
+    a.di[0] = p->ph.src; a.di[1] = p->ph.dst; a.di[2] = p->ph.taps;
+    a.di[3] = p->h;
+    if (!r.dispatch(K_RS_H, false, in16, a, p->ph.starts.Get(), p->ph.wt.Get(),
+                    src, p->tmp0.Get(), NULL, p->dw, p->h, 3))
+        return false;
+    r.uav_barrier();
+    a.di[0] = p->dw; a.di[1] = p->h; a.di[2] = p->pv.taps; a.di[3] = p->dh;
+    if (!r.dispatch(K_RS_V, false, out16, a, p->pv.starts.Get(),
+                    p->pv.wt.Get(), p->tmp0.Get(), dst, NULL, p->dw / 2,
+                    p->dh, 3))
+        return false;
+    r.uav_barrier();
+    return true;
+}
+
+/* ---------------- shared textures + plane copies ---------------- */
+
+ID3D12Resource *open_shared(aji_ctx *c, void *tex11)
+{
+    auto it = c->shared.find(tex11);
+    if (it != c->shared.end())
+        return it->second.Get();
+    ComPtr<IDXGIResource1> dxgi;
+    if (FAILED(((IUnknown *)tex11)
+                   ->QueryInterface(IID_PPV_ARGS(&dxgi)))) {
+        c->set_error("frame texture is not a DXGI resource");
+        return nullptr;
+    }
+    HANDLE h = NULL;
+    if (FAILED(dxgi->CreateSharedHandle(
+            NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+            NULL, &h))) {
+        c->set_error("CreateSharedHandle failed (frame textures must be "
+                     "created with SHARED | SHARED_NTHANDLE)");
+        return nullptr;
+    }
+    ComPtr<ID3D12Resource> res;
+    HRESULT hr = c->dev->OpenSharedHandle(h, IID_PPV_ARGS(&res));
+    CloseHandle(h);
+    if (FAILED(hr)) {
+        c->set_error("D3D12 OpenSharedHandle failed (0x%08x)", (unsigned)hr);
+        return nullptr;
+    }
+    c->shared[tex11] = res;
+    return c->shared[tex11].Get();
+}
+
+DXGI_FORMAT plane_fmt(int format, int plane)
+{
+    if (format == AJI_FMT_P010)
+        return plane ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R16_UNORM;
+    return plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
+}
+
+// copy one plane between a shared texture and a staging buffer
+void copy_plane(aji_ctx *c, bool to_buffer, ID3D12Resource *tex, UINT subres,
+                int plane, int format, int w, int h, ID3D12Resource *buf,
+                uint32_t pitch)
+{
+    D3D12_RESOURCE_DESC td = tex->GetDesc();
+    D3D12_TEXTURE_COPY_LOCATION t = {};
+    t.pResource = tex;
+    t.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    t.SubresourceIndex = subres + (UINT)plane * td.DepthOrArraySize;
+
+    D3D12_TEXTURE_COPY_LOCATION b = {};
+    b.pResource = buf;
+    b.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    b.PlacedFootprint.Footprint.Format = plane_fmt(format, plane);
+    b.PlacedFootprint.Footprint.Width = plane ? w / 2 : w;
+    b.PlacedFootprint.Footprint.Height = plane ? h / 2 : h;
+    b.PlacedFootprint.Footprint.Depth = 1;
+    b.PlacedFootprint.Footprint.RowPitch = pitch;
+
+    if (to_buffer)
+        c->cl->CopyTextureRegion(&b, 0, 0, 0, &t, NULL);
+    else
+        c->cl->CopyTextureRegion(&t, 0, 0, 0, &b, NULL);
+}
+
+/* ---------------- ORT session handling ---------------- */
+
+void model_release(DmlModel *m)
+{
+    if (m->in_val)
+        g_ort->ReleaseValue(m->in_val);
+    if (m->out_val)
+        g_ort->ReleaseValue(m->out_val);
+    if (m->binding)
+        g_ort->ReleaseIoBinding(m->binding);
+    if (m->session)
+        g_ort->ReleaseSession(m->session);
+    m->in_val = m->out_val = nullptr;
+    m->binding = nullptr;
+    m->session = nullptr;
+}
+
+void chain_teardown(aji_ctx *c)
+{
+    // GPU must be idle before buffers/sessions go away
+    if (c->queue && c->fence) {
+        c->fence_val++;
+        c->queue->Signal(c->fence.Get(), c->fence_val);
+        if (c->fence->GetCompletedValue() < c->fence_val) {
+            c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
+            WaitForSingleObject(c->fence_event, 10000);
+        }
+    }
+    for (auto &m : c->models)
+        model_release(&m);
+    c->models.clear();
+    c->steps.clear();
+    for (int i = 0; i < 2; i++) {
+        if (c->buf_alloc[i]) {
+            g_dml_api->FreeGPUAllocation(c->buf_alloc[i]);
+            c->buf_alloc[i] = nullptr;
+        }
+        c->buf[i].Reset();
+    }
+    c->buf_bytes = 0;
+    c->pre_plan.reset();
+    c->post_plan.reset();
+    memset(c->pre_key, 0, sizeof(c->pre_key));
+    memset(c->post_key, 0, sizeof(c->post_key));
+    c->in_y.Reset();
+    c->in_uv.Reset();
+    c->out_y.Reset();
+    c->out_uv.Reset();
+    memset(c->stage_key, 0, sizeof(c->stage_key));
+    c->shared.clear();
+}
+
+// Create an ORT tensor over `bytes` of a D3D12 buffer (DML allocation).
+OrtValue *make_tensor(aji_ctx *c, void *dml_alloc, size_t bytes, int n, int ch,
+                      int h, int w, bool fp16)
+{
+    int64_t dims[4] = {n, ch, h, w};
+    OrtValue *v = nullptr;
+    if (!c->ort_ck(g_ort->CreateTensorWithDataAsOrtValue(
+                       c->mi_dml, dml_alloc, bytes, dims, 4,
+                       fp16 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
+                            : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                       &v),
+                   "CreateTensorWithDataAsOrtValue"))
+        return nullptr;
+    return v;
+}
+
+// Create the session + discover the model's output dims for (in_w, in_h).
+// Runs the model twice on a temporary input (the DML EP builds its
+// reusable command list during the first executions — vsort's "replay").
+bool model_open(aji_ctx *c, DmlModel *m, const std::string &onnx_path,
+                int in_w, int in_h)
+{
+    OrtSessionOptions *so = nullptr;
+    if (!c->ort_ck(g_ort->CreateSessionOptions(&so), "CreateSessionOptions"))
+        return false;
+    g_ort->SetSessionExecutionMode(so, ORT_SEQUENTIAL);
+    g_ort->DisableMemPattern(so);
+    g_ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL);
+    OrtStatus *st = g_dml_api->SessionOptionsAppendExecutionProvider_DML1(
+        so, c->dml_dev.Get(), c->queue.Get());
+    if (st) {
+        c->set_error("DML EP append failed: %s", g_ort->GetErrorMessage(st));
+        g_ort->ReleaseStatus(st);
+        g_ort->ReleaseSessionOptions(so);
+        return false;
+    }
+
+    std::wstring wpath = widen(onnx_path);
+    st = g_ort->CreateSession(c->env, wpath.c_str(), so, &m->session);
+    g_ort->ReleaseSessionOptions(so);
+    if (st) {
+        c->set_error("failed to load %s: %s", onnx_path.c_str(),
+                     g_ort->GetErrorMessage(st));
+        g_ort->ReleaseStatus(st);
+        return false;
+    }
+
+    OrtAllocator *alloc = nullptr;
+    g_ort->GetAllocatorWithDefaultOptions(&alloc);
+    size_t n_in = 0, n_out = 0;
+    g_ort->SessionGetInputCount(m->session, &n_in);
+    g_ort->SessionGetOutputCount(m->session, &n_out);
+    if (n_in != 1 || n_out != 1) {
+        c->set_error("%s: expected 1 input/1 output, has %zu/%zu",
+                     onnx_path.c_str(), n_in, n_out);
+        return false;
+    }
+    char *name = nullptr;
+    g_ort->SessionGetInputName(m->session, 0, alloc, &name);
+    m->in_name = name;
+    alloc->Free(alloc, name);
+    g_ort->SessionGetOutputName(m->session, 0, alloc, &name);
+    m->out_name = name;
+    alloc->Free(alloc, name);
+
+    OrtTypeInfo *ti = nullptr;
+    const OrtTensorTypeAndShapeInfo *tti = nullptr;
+    ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+    if (!c->ort_ck(g_ort->SessionGetInputTypeInfo(m->session, 0, &ti),
+                   "GetInputTypeInfo"))
+        return false;
+    g_ort->CastTypeInfoToTensorInfo(ti, &tti);
+    g_ort->GetTensorElementType(tti, &et);
+    g_ort->ReleaseTypeInfo(ti);
+    if (et != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 &&
+        et != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        c->set_error("%s: unsupported input element type %d",
+                     onnx_path.c_str(), (int)et);
+        return false;
+    }
+    m->fp16 = et == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+    m->in_w = in_w;
+    m->in_h = in_h;
+
+    // discovery: bind a zeroed temp input, let ORT allocate the output
+    const size_t elem = m->fp16 ? 2 : 4;
+    const size_t in_bytes = (size_t)3 * in_w * in_h * elem;
+    ComPtr<ID3D12Resource> tmp = make_buffer(c->dev.Get(), in_bytes, false);
+    if (!tmp) {
+        c->set_error("discovery buffer allocation failed");
+        return false;
+    }
+    void *tmp_alloc = nullptr;
+    if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(tmp.Get(),
+                                                                 &tmp_alloc),
+                   "CreateGPUAllocationFromD3DResource"))
+        return false;
+    bool ok = false;
+    OrtValue *in_val = nullptr;
+    OrtValue **outs = nullptr;
+    size_t n_outs = 0;
+    do {
+        in_val = make_tensor(c, tmp_alloc, in_bytes, 1, 3, in_h, in_w,
+                             m->fp16);
+        if (!in_val)
+            break;
+        if (!c->ort_ck(g_ort->CreateIoBinding(m->session, &m->binding),
+                       "CreateIoBinding"))
+            break;
+        if (!c->ort_ck(g_ort->BindInput(m->binding, m->in_name.c_str(),
+                                        in_val), "BindInput"))
+            break;
+        if (!c->ort_ck(g_ort->BindOutputToDevice(m->binding,
+                                                 m->out_name.c_str(),
+                                                 c->mi_dml),
+                       "BindOutputToDevice"))
+            break;
+        // run twice (command-list warmup), then read the output shape
+        if (!c->ort_ck(g_ort->RunWithBinding(m->session, NULL, m->binding),
+                       "RunWithBinding (discovery)"))
+            break;
+        if (!c->ort_ck(g_ort->RunWithBinding(m->session, NULL, m->binding),
+                       "RunWithBinding (warmup)"))
+            break;
+        if (!c->ort_ck(g_ort->GetBoundOutputValues(m->binding, alloc, &outs,
+                                                   &n_outs),
+                       "GetBoundOutputValues") || n_outs != 1)
+            break;
+        OrtTensorTypeAndShapeInfo *si = nullptr;
+        if (!c->ort_ck(g_ort->GetTensorTypeAndShape(outs[0], &si),
+                       "GetTensorTypeAndShape"))
+            break;
+        int64_t dims[4] = {0};
+        size_t nd = 0;
+        g_ort->GetDimensionsCount(si, &nd);
+        if (nd == 4)
+            g_ort->GetDimensions(si, dims, 4);
+        g_ort->ReleaseTensorTypeAndShapeInfo(si);
+        if (nd != 4 || dims[1] != 3 || dims[2] < 2 || dims[3] < 2) {
+            c->set_error("%s: unexpected output shape", onnx_path.c_str());
+            break;
+        }
+        m->out_w = (int)dims[3];
+        m->out_h = (int)dims[2];
+        ok = true;
+    } while (0);
+
+    if (outs) {
+        for (size_t i = 0; i < n_outs; i++)
+            g_ort->ReleaseValue(outs[i]);
+        alloc->Free(alloc, outs);
+    }
+    if (in_val)
+        g_ort->ReleaseValue(in_val);
+    g_ort->ClearBoundInputs(m->binding);
+    g_ort->ClearBoundOutputs(m->binding);
+    g_dml_api->FreeGPUAllocation(tmp_alloc);
+    // tmp buffer: the queue is idle here only after the runs complete;
+    // RunWithBinding with device outputs returns after submission, so
+    // wait before the temp buffer dies.
+    c->fence_val++;
+    c->queue->Signal(c->fence.Get(), c->fence_val);
+    if (c->fence->GetCompletedValue() < c->fence_val) {
+        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
+        WaitForSingleObject(c->fence_event, 30000);
+    }
+    return ok;
+}
+
+// Bind a model's IO to the chain buffers (called once buffers exist).
+bool model_bind(aji_ctx *c, DmlModel *m, int in_buf)
+{
+    const size_t elem = m->fp16 ? 2 : 4;
+    m->in_val = make_tensor(c, c->buf_alloc[in_buf],
+                            (size_t)3 * m->in_w * m->in_h * elem, 1, 3,
+                            m->in_h, m->in_w, m->fp16);
+    m->out_val = make_tensor(c, c->buf_alloc[in_buf ^ 1],
+                             (size_t)3 * m->out_w * m->out_h * elem, 1, 3,
+                             m->out_h, m->out_w, m->fp16);
+    if (!m->in_val || !m->out_val)
+        return false;
+    if (!c->ort_ck(g_ort->BindInput(m->binding, m->in_name.c_str(),
+                                    m->in_val), "BindInput") ||
+        !c->ort_ck(g_ort->BindOutput(m->binding, m->out_name.c_str(),
+                                     m->out_val), "BindOutput"))
+        return false;
+    return true;
+}
+
+bool push_resize_step(aji_ctx *c, int *cw, int *ch, int nw, int nh)
+{
+    Step st;
+    st.kind = Step::RESIZE;
+    st.out_w = nw;
+    st.out_h = nh;
+    st.plan = resize_plan_create(c, *cw, *ch, nw, nh);
+    if (!st.plan) {
+        c->set_error("resize plan %dx%d -> %dx%d allocation failed",
+                     *cw, *ch, nw, nh);
+        return false;
+    }
+    c->steps.push_back(std::move(st));
+    *cw = nw;
+    *ch = nh;
+    return true;
+}
+
+} // namespace
+
+/* ---------------- C ABI ---------------- */
+
+extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
+{
+    if (!params || params->api_version != AJI_API_VERSION)
+        return nullptr;
+
+    auto c = std::make_unique<aji_ctx>();
+    c->log_fn = params->log;
+    c->log_opaque = params->log_opaque;
+
+    std::string err;
+    if (!load_ort(&err)) {
+        c->set_error("%s", err.c_str());
+        return nullptr;
+    }
+    if (!params->conf_path) {
+        c->set_error("the DirectML backend has no direct (engine_path) mode");
+        return nullptr;
+    }
+    if (!params->d3d11_device) {
+        c->set_error("the DirectML backend needs the player's D3D11 device "
+                     "(hwdec=d3d11va; CUDA frames go to the TensorRT "
+                     "backend)");
+        return nullptr;
+    }
+
+    c->conf_path = params->conf_path;
+    c->model_dir = params->model_dir ? params->model_dir : "";
+    c->rife_model_dir = params->rife_model_dir ? params->rife_model_dir : "";
+    c->slot = params->slot ? params->slot : 1;
+    if (!aji_conf_load(c->conf_path.c_str(), &c->conf, &err))
+        c->verbose("conf load: %s", err.c_str());
+
+    // D3D11 side
+    c->dev11 = (ID3D11Device *)params->d3d11_device;
+    c->dev11->GetImmediateContext(&c->ctx11);
+    if (FAILED(c->ctx11.As(&c->ctx11_4))) {
+        c->set_error("ID3D11DeviceContext4 unavailable (needs Windows 10 "
+                     "1703+)");
+        return nullptr;
+    }
+
+    // D3D12 device on the same adapter
+    ComPtr<IDXGIDevice> dxgi_dev;
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(c->dev11.As(&dxgi_dev)) ||
+        FAILED(dxgi_dev->GetAdapter(&adapter))) {
+        c->set_error("could not get the D3D11 device's adapter");
+        return nullptr;
+    }
+    DXGI_ADAPTER_DESC ad = {};
+    adapter->GetDesc(&ad);
+    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                                 IID_PPV_ARGS(&c->dev)))) {
+        c->set_error("D3D12CreateDevice failed on %ls (DirectML needs a "
+                     "DX12 GPU)", ad.Description);
+        return nullptr;
+    }
+    c->verbose("DirectML on %ls", ad.Description);
+
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    qd.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+    if (FAILED(c->dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&c->queue))) ||
+        FAILED(c->dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              IID_PPV_ARGS(&c->alloc))) ||
+        FAILED(c->dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         c->alloc.Get(), NULL,
+                                         IID_PPV_ARGS(&c->cl))) ||
+        FAILED(c->cl->Close())) {
+        c->set_error("D3D12 queue/command list creation failed");
+        return nullptr;
+    }
+    if (FAILED(c->dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
+                                   IID_PPV_ARGS(&c->fence)))) {
+        c->set_error("D3D12 fence creation failed");
+        return nullptr;
+    }
+    c->fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+
+    // share the fence into D3D11 for the input-ready handoff
+    HANDLE fh = NULL;
+    ComPtr<ID3D11Device5> dev11_5;
+    if (FAILED(c->dev->CreateSharedHandle(c->fence.Get(), NULL, GENERIC_ALL,
+                                          NULL, &fh)) ||
+        FAILED(c->dev11.As(&dev11_5)) ||
+        FAILED(dev11_5->OpenSharedFence(fh, IID_PPV_ARGS(&c->fence11)))) {
+        if (fh)
+            CloseHandle(fh);
+        c->set_error("shared fence D3D11<->D3D12 setup failed");
+        return nullptr;
+    }
+    CloseHandle(fh);
+
+    if (FAILED(g_dml_create_device(c->dev.Get(), DML_CREATE_DEVICE_FLAG_NONE,
+                                   IID_PPV_ARGS(&c->dml_dev)))) {
+        c->set_error("DMLCreateDevice failed");
+        return nullptr;
+    }
+    if (!make_rootsig(c.get()))
+        return nullptr;
+
+    if (!c->ort_ck(g_ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "aji_dml",
+                                    &c->env), "CreateEnv"))
+        return nullptr;
+    if (!c->ort_ck(g_ort->CreateMemoryInfo("DML", OrtDeviceAllocator, 0,
+                                           OrtMemTypeDefault, &c->mi_dml),
+                   "CreateMemoryInfo"))
+        return nullptr;
+
+    return c.release();
+}
+
+extern "C" AJI_EXPORT int aji_set_slot(aji_ctx *c, int slot)
+{
+    if (!c)
+        return AJI_ERR;
+    c->slot = slot;
+    return AJI_OK;
+}
+
+extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
+                                        int *out_w, int *out_h)
+{
+    if (!c || w < 2 || h < 2 || (w & 1) || (h & 1))
+        return AJI_ERR_SHAPE;
+
+    // re-read the conf each configure so edits apply without restart
+    std::string err;
+    aji_conf_load(c->conf_path.c_str(), &c->conf, &err);
+
+    chain_teardown(c);
+    c->log_info.clear();
+    c->log_steps.clear();
+    c->active = false;
+    c->in_w = w;
+    c->in_h = h;
+    c->out_w = w;
+    c->out_h = h;
+
+    auto sit = c->conf.slots.find(c->slot);
+    std::string profile = sit != c->conf.slots.end()
+                              ? sit->second.profile_name : "(missing slot)";
+    if (c->slot == 0)
+        profile = "Off";
+    else if (c->slot < 10)
+        profile = std::to_string(c->slot) + ". " + profile;
+    c->log_info.push_back("Upscale Profile: " + profile);
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "Original Video Resolution: %dx%d;    Original Video FPS: %.3f",
+                 w, h, fps);
+        c->log_info.push_back(buf);
+    }
+
+    const AjiChainConf *chain = nullptr;
+    if (sit != c->conf.slots.end()) {
+        const double px = (double)w * h;
+        for (const auto &ch : sit->second.chains) {
+            if (ch.min_px <= px && px <= ch.max_px &&
+                ch.min_fps <= fps && fps <= ch.max_fps) {
+                chain = &ch;
+                break;
+            }
+        }
+    }
+    if (!chain) {
+        c->log_info.push_back("No Chains Activated");
+        finalize_log(c);
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        return 0;
+    }
+
+    c->log_info.push_back(
+        "Active Upscale Chain: " + std::to_string(chain->index) +
+        ";    Resolution Range: " + chain->min_resolution + " - " +
+        chain->max_resolution + ";    FPS Range: " + fmt_num(chain->min_fps) +
+        " - " + fmt_num(chain->max_fps));
+
+    int cw = w, ch = h;
+    bool any_model = false;
+
+    for (const auto &m : chain->models) {
+        double factor = m.resize_factor_before_upscale;
+        if (m.resize_height_before_upscale != 0)
+            factor = 100;
+
+        char buf[160];
+        if (factor != 100) {
+            int nw = round_even(cw * factor / 100.0);
+            int nh = round_even(ch * factor / 100.0);
+            if (nw >= 2 && nh >= 2 && (nw != cw || nh != ch)) {
+                if (!push_resize_step(c, &cw, &ch, nw, nh))
+                    return AJI_ERR;
+                snprintf(buf, sizeof(buf),
+                         "Applied Resize Factor Before Upscale: %g%%;    "
+                         "New Video Resolution: %dx%d", factor, cw, ch);
+                c->log_steps.push_back(buf);
+            }
+        }
+        if (m.resize_height_before_upscale != 0 &&
+            (int)m.resize_height_before_upscale != ch) {
+            int nw, nh;
+            fit_box(cw, ch, m.resize_height_before_upscale * 16.0 / 9.0,
+                    m.resize_height_before_upscale, &nw, &nh);
+            if (!push_resize_step(c, &cw, &ch, nw, nh))
+                return AJI_ERR;
+            snprintf(buf, sizeof(buf),
+                     "Applied Resize Height Before Upscale: %gpx;    "
+                     "New Video Resolution: %dx%d",
+                     m.resize_height_before_upscale, cw, ch);
+            c->log_steps.push_back(buf);
+        } else if (ch > 1080) {
+            int nw, nh;
+            fit_box(cw, ch, 1920, 1080, &nw, &nh);
+            if (!push_resize_step(c, &cw, &ch, nw, nh))
+                return AJI_ERR;
+            snprintf(buf, sizeof(buf),
+                     "Applied Resize to Video Larger than 1080p;    "
+                     "New Video Resolution: %dx%d", cw, ch);
+            c->log_steps.push_back(buf);
+        }
+
+        if (m.name.empty())
+            continue;
+
+        DmlModel dm;
+        const std::string onnx = c->model_dir + "\\" + m.name + ".onnx";
+        if (!model_open(c, &dm, onnx, cw, ch)) {
+            model_release(&dm);
+            finalize_log(c);
+            return AJI_ERR_ENGINE;
+        }
+        cw = dm.out_w;
+        ch = dm.out_h;
+        c->models.push_back(std::move(dm));
+        Step st;
+        st.kind = Step::MODEL;
+        st.out_w = cw;
+        st.out_h = ch;
+        st.model_idx = (int)c->models.size() - 1;
+        c->steps.push_back(std::move(st));
+        any_model = true;
+        snprintf(buf, sizeof(buf),
+                 "Applied Model: %s;    New Video Resolution: %dx%d",
+                 m.name.c_str(), cw, ch);
+        c->log_steps.push_back(buf);
+    }
+
+    if (chain->rife)
+        c->log_steps.push_back(
+            "RIFE is not supported by the DirectML backend yet; "
+            "interpolation disabled");
+
+    finalize_log(c);
+
+    if (!any_model && c->steps.empty()) {
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        return 0;
+    }
+
+    // assign chain-buffer ping-pong + element types, then allocate
+    size_t max_bytes = 0;
+    {
+        int cur = 0;
+        bool elem16 = c->models.empty() ? true : c->models[0].fp16;
+        c->first_elem16 = elem16;
+        int sw = w, sh = h;
+        size_t in_elem = c->models.empty() ? 2 : (c->models[0].fp16 ? 2 : 4);
+        max_bytes = (size_t)3 * sw * sh * in_elem;
+        for (size_t i = 0; i < c->steps.size(); i++) {
+            Step &st = c->steps[i];
+            st.in_buf = cur;
+            st.elem16_in = elem16;
+            if (st.kind == Step::MODEL) {
+                DmlModel &m = c->models[st.model_idx];
+                if (m.fp16 != elem16) {
+                    c->set_error("mixed fp16/fp32 models in one chain are "
+                                 "not supported by the DirectML backend");
+                    return AJI_ERR_CONF;
+                }
+                st.elem16_out = m.fp16;
+            } else {
+                // a resize feeding a model adopts that model's IO type
+                bool next16 = elem16;
+                for (size_t j = i + 1; j < c->steps.size(); j++) {
+                    if (c->steps[j].kind == Step::MODEL) {
+                        next16 = c->models[c->steps[j].model_idx].fp16;
+                        break;
+                    }
+                }
+                st.elem16_out = next16;
+            }
+            elem16 = st.elem16_out;
+            cur ^= 1;
+            sw = st.out_w;
+            sh = st.out_h;
+            max_bytes = (size_t)3 * sw * sh * (elem16 ? 2 : 4) > max_bytes
+                            ? (size_t)3 * sw * sh * (elem16 ? 2 : 4)
+                            : max_bytes;
+        }
+        c->last_elem16 = elem16;
+        if (!c->models.empty() && c->first_elem16 != c->models[0].fp16) {
+            c->set_error("internal: pre-kernel element type mismatch");
+            return AJI_ERR;
+        }
+    }
+
+    for (int i = 0; i < 2; i++) {
+        c->buf[i] = make_buffer(c->dev.Get(), max_bytes, false);
+        if (!c->buf[i]) {
+            c->set_error("chain buffer allocation (%zu bytes) failed",
+                         max_bytes);
+            return AJI_ERR;
+        }
+        if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
+                           c->buf[i].Get(), &c->buf_alloc[i]),
+                       "CreateGPUAllocationFromD3DResource"))
+            return AJI_ERR;
+    }
+    c->buf_bytes = max_bytes;
+
+    for (Step &st : c->steps) {
+        if (st.kind != Step::MODEL)
+            continue;
+        if (!model_bind(c, &c->models[st.model_idx], st.in_buf))
+            return AJI_ERR_ENGINE;
+    }
+
+    c->out_w = cw;
+    c->out_h = ch;
+    c->active = true;
+    if (out_w) *out_w = cw;
+    if (out_h) *out_h = ch;
+    return 1;
+}
+
+extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
+                                    const aji_frame *out, void *cu_stream)
+{
+    (void)cu_stream;
+    if (!c || !in || !out)
+        return AJI_ERR;
+    if (!c->active) {
+        c->set_error("aji_infer without an active configuration");
+        return AJI_ERR;
+    }
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010) {
+        c->set_error("unsupported input format %d", in->format);
+        return AJI_ERR_FORMAT;
+    }
+    if (out->format != in->format) {
+        c->set_error("output format must match input");
+        return AJI_ERR_FORMAT;
+    }
+    if (in->width != c->in_w || in->height != c->in_h ||
+        out->width != c->out_w || out->height != c->out_h) {
+        c->set_error("frame dims %dx%d->%dx%d do not match configured "
+                     "%dx%d->%dx%d", in->width, in->height, out->width,
+                     out->height, c->in_w, c->in_h, c->out_w, c->out_h);
+        return AJI_ERR_SHAPE;
+    }
+
+    const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
+    const aji_csp csp =
+        aji_resample::make_csp(in->format, in->matrix, in->range);
+
+    // (re)build staging + plans on format/dim changes
+    const int skey[3] = {in->format, in->width, in->height};
+    if (memcmp(skey, c->stage_key, sizeof(skey)) != 0) {
+        c->in_pitch = align256((uint32_t)(in->width * bpp));
+        c->out_pitch = align256((uint32_t)(out->width * bpp));
+        c->in_y = make_buffer(c->dev.Get(),
+                              (uint64_t)c->in_pitch * in->height, false);
+        c->in_uv = make_buffer(c->dev.Get(),
+                               (uint64_t)c->in_pitch * (in->height / 2),
+                               false);
+        c->out_y = make_buffer(c->dev.Get(),
+                               (uint64_t)c->out_pitch * out->height, false);
+        c->out_uv = make_buffer(c->dev.Get(),
+                                (uint64_t)c->out_pitch * (out->height / 2),
+                                false);
+        if (!c->in_y || !c->in_uv || !c->out_y || !c->out_uv) {
+            c->set_error("plane staging allocation failed");
+            return AJI_ERR;
+        }
+        memcpy(c->stage_key, skey, sizeof(skey));
+    }
+    const int pkey[4] = {in->format, in->width, in->height, in->siting};
+    if (!c->pre_plan || memcmp(pkey, c->pre_key, sizeof(pkey)) != 0) {
+        c->pre_plan = pre_plan_create(c, in->format, in->width, in->height,
+                                      in->siting, AJI_FILTER_SPLINE36);
+        if (!c->pre_plan) {
+            c->set_error("pre plan allocation failed");
+            return AJI_ERR;
+        }
+        memcpy(c->pre_key, pkey, sizeof(pkey));
+    }
+    // the reference pipeline's final 4:2:0 subsample is always LEFT-sited
+    const int qkey[4] = {out->format, c->out_w, c->out_h, AJI_SITING_LEFT};
+    if (!c->post_plan || memcmp(qkey, c->post_key, sizeof(qkey)) != 0) {
+        c->post_plan = post_plan_create(c, out->format, c->out_w, c->out_h,
+                                        AJI_SITING_LEFT, AJI_FILTER_SPLINE36);
+        if (!c->post_plan) {
+            c->set_error("post plan allocation failed");
+            return AJI_ERR;
+        }
+        memcpy(c->post_key, qkey, sizeof(qkey));
+    }
+
+    ID3D12Resource *in_tex = open_shared(c, in->plane[0]);
+    ID3D12Resource *out_tex = open_shared(c, out->plane[0]);
+    if (!in_tex || !out_tex)
+        return AJI_ERR;
+    const UINT in_sub = (UINT)(intptr_t)in->plane[1];
+    const UINT out_sub = (UINT)(intptr_t)out->plane[1];
+
+    // input-ready handoff: D3D11's queued work (the caller's copy into
+    // the input texture) must land before our queue reads it
+    c->fence_val++;
+    c->ctx11_4->Signal(c->fence11.Get(), c->fence_val);
+    c->ctx11->Flush();
+    c->queue->Wait(c->fence.Get(), c->fence_val);
+
+    Recorder r{c};
+    if (!r.begin())
+        return AJI_ERR;
+    r.transition(in_tex, D3D12_RESOURCE_STATE_COMMON,
+                 D3D12_RESOURCE_STATE_COPY_SOURCE,
+                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width, in->height,
+               c->in_y.Get(), c->in_pitch);
+    copy_plane(c, true, in_tex, in_sub, 1, in->format, in->width, in->height,
+               c->in_uv.Get(), c->in_pitch);
+    r.transition(in_tex, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                 D3D12_RESOURCE_STATE_COMMON,
+                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    {
+        D3D12_RESOURCE_BARRIER bs[2] = {};
+        for (int i = 0; i < 2; i++) {
+            bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bs[i].Transition.Subresource = 0;
+            bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            bs[i].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        bs[0].Transition.pResource = c->in_y.Get();
+        bs[1].Transition.pResource = c->in_uv.Get();
+        c->cl->ResourceBarrier(2, bs);
+    }
+    if (!record_pre(c, r, c->pre_plan.get(), csp, c->buf[0].Get(),
+                    c->first_elem16))
+        return AJI_ERR;
+    if (!r.exec())
+        return AJI_ERR;
+
+    int cur = 0;
+    for (Step &st : c->steps) {
+        if (st.kind == Step::MODEL) {
+            DmlModel &m = c->models[st.model_idx];
+            if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
+                           "RunWithBinding"))
+                return AJI_ERR_ENGINE;
+        } else {
+            if (!r.begin() ||
+                !record_resize(c, r, st.plan.get(), c->buf[cur].Get(),
+                               c->buf[cur ^ 1].Get(), st.elem16_in,
+                               st.elem16_out) ||
+                !r.exec())
+                return AJI_ERR;
+        }
+        cur ^= 1;
+    }
+
+    if (!r.begin())
+        return AJI_ERR;
+    if (!record_post(c, r, c->post_plan.get(), csp, c->buf[cur].Get(),
+                     c->last_elem16))
+        return AJI_ERR;
+    {
+        D3D12_RESOURCE_BARRIER bs[2] = {};
+        for (int i = 0; i < 2; i++) {
+            bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bs[i].Transition.Subresource = 0;
+            bs[i].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            bs[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        }
+        bs[0].Transition.pResource = c->out_y.Get();
+        bs[1].Transition.pResource = c->out_uv.Get();
+        c->cl->ResourceBarrier(2, bs);
+    }
+    r.transition(out_tex, D3D12_RESOURCE_STATE_COMMON,
+                 D3D12_RESOURCE_STATE_COPY_DEST,
+                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
+               out->height, c->out_y.Get(), c->out_pitch);
+    copy_plane(c, false, out_tex, out_sub, 1, out->format, out->width,
+               out->height, c->out_uv.Get(), c->out_pitch);
+    r.transition(out_tex, D3D12_RESOURCE_STATE_COPY_DEST,
+                 D3D12_RESOURCE_STATE_COMMON,
+                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    if (!r.exec())
+        return AJI_ERR;
+
+    // v1 completes synchronously: keeps allocator reuse + texture
+    // lifetimes trivial, and the output texture is ready for any D3D11
+    // consumer the moment we return.
+    c->fence_val++;
+    c->queue->Signal(c->fence.Get(), c->fence_val);
+    if (c->fence->GetCompletedValue() < c->fence_val) {
+        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
+        if (WaitForSingleObject(c->fence_event, 10000) != WAIT_OBJECT_0) {
+            c->set_error("GPU timeout waiting for the inference chain");
+            return AJI_ERR;
+        }
+    }
+    return AJI_OK;
+}
+
+extern "C" AJI_EXPORT const char *aji_current_log(aji_ctx *c)
+{
+    return c ? c->current_log.c_str() : "";
+}
+
+extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
+{
+    (void)c;
+    return 0;   // conf mode only
+}
+
+extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
+{
+    (void)c;
+    (void)num;
+    (void)den;
+    return 0;   // RIFE not implemented yet on DirectML
+}
+
+extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
+{
+    (void)c;
+    return 0;   // no background builds on DirectML
+}
+
+extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b, double t,
+                                         const aji_frame *out, void *cu_stream)
+{
+    (void)a; (void)b; (void)t; (void)out; (void)cu_stream;
+    if (c)
+        c->set_error("RIFE is not supported by the DirectML backend yet");
+    return AJI_ERR;
+}
+
+extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)
+{
+    return c ? c->errbuf : "no context";
+}
+
+extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
+{
+    if (!pc || !*pc)
+        return;
+    aji_ctx *c = *pc;
+    chain_teardown(c);
+    if (c->mi_dml)
+        g_ort->ReleaseMemoryInfo(c->mi_dml);
+    if (c->env)
+        g_ort->ReleaseEnv(c->env);
+    if (c->fence_event)
+        CloseHandle(c->fence_event);
+    delete c;
+    *pc = nullptr;
+}

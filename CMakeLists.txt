@@ -62,6 +62,29 @@ add_dependencies(aji_harness aji_trt)
 set_target_properties(aji_harness PROPERTIES
     BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
 
+# aji_dml: DirectML backend (Windows only). Needs the ONNX Runtime
+# DirectML headers (Microsoft.ML.OnnxRuntime.DirectML nupkg) and the
+# DirectML header (Microsoft.AI.DirectML nupkg); onnxruntime.dll and
+# DirectML.dll are loaded at runtime from the shim's own directory, so
+# nothing is import-linked.
+if(WIN32)
+    set(AJI_ORT_ROOT "" CACHE PATH
+        "Microsoft.ML.OnnxRuntime.DirectML package root")
+    set(AJI_DML_ROOT "" CACHE PATH
+        "Microsoft.AI.DirectML package root")
+    add_library(aji_dml SHARED src/aji_dml.cpp src/aji_conf.cpp)
+    target_include_directories(aji_dml
+        PUBLIC include
+        PRIVATE "${AJI_ORT_ROOT}/build/native/include"
+                "${AJI_DML_ROOT}/include")
+    target_link_libraries(aji_dml PRIVATE d3d12 d3d11 dxgi d3dcompiler)
+    set_target_properties(aji_dml PROPERTIES CXX_VISIBILITY_PRESET hidden)
+
+    add_executable(aji_harness_dml src/harness_dml.cpp)
+    target_link_libraries(aji_harness_dml PRIVATE aji d3d11)
+    add_dependencies(aji_harness_dml aji_dml)
+endif()
+
 # Parity test tool: compiles the kernels directly (the shared lib hides
 # the launcher symbols), no TensorRT dependency.
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
