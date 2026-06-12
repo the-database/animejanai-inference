@@ -21,36 +21,18 @@
 
 #include "aji.h"
 #include "kernels.h"
+#include "resample.h"
 
 extern "C" aji_csp aji_make_csp(int format, int matrix, int range)
 {
-    aji_csp c = {};
-    switch (matrix) {
-    case AJI_MATRIX_BT601:  c.kr = 0.299f;  c.kb = 0.114f;  break;
-    case AJI_MATRIX_BT2020: c.kr = 0.2627f; c.kb = 0.0593f; break;
-    case AJI_MATRIX_BT709:
-    default:                c.kr = 0.2126f; c.kb = 0.0722f; break;
-    }
-    const bool p010 = format == AJI_FMT_P010;
-    const float m = p010 ? 256.0f : 1.0f;          // 8-bit-reference scale
-    const float maxraw = p010 ? 65472.0f : 255.0f; // (2^bd - 1) << (16 - bd)
-    if (range == AJI_RANGE_FULL) {
-        c.yoff = 0.0f;
-        c.yscale = maxraw;
-        c.coff = p010 ? 32768.0f : 128.0f;
-        c.cscale = maxraw;
-    } else {
-        c.yoff = 16.0f * m;
-        c.yscale = 219.0f * m;
-        c.coff = 128.0f * m;
-        c.cscale = 224.0f * m;
-    }
-    return c;
+    return aji_resample::make_csp(format, matrix, range);
 }
 
-/* ---------------- weight tables (zimg compute_filter) ---------------- */
+/* -------- weight tables (zimg compute_filter; math in resample.h) -------- */
 
 namespace {
+
+using aji_resample::chroma_shifts;
 
 struct pass {
     int taps = 0, src = 0, dst = 0;
@@ -58,65 +40,22 @@ struct pass {
     const float *wt = nullptr;    // [dst * taps], normalized
 };
 
-double spline36(double x)
-{
-    x = fabs(x);
-    if (x < 1.0)
-        return ((13.0 / 11.0 * x - 453.0 / 209.0) * x - 3.0 / 209.0) * x + 1.0;
-    if (x < 2.0) {
-        x -= 1.0;
-        return ((-6.0 / 11.0 * x + 270.0 / 209.0) * x - 156.0 / 209.0) * x;
-    }
-    if (x < 3.0) {
-        x -= 2.0;
-        return ((1.0 / 11.0 * x - 45.0 / 209.0) * x + 26.0 / 209.0) * x;
-    }
-    return 0.0;
-}
-
-double bilinear(double x)
-{
-    x = fabs(x);
-    return x < 1.0 ? 1.0 - x : 0.0;
-}
-
 bool build_pass(pass *p, int src, int dst, double shift, int filter)
 {
-    const double scale = (double)dst / src;
-    const double step = scale < 1.0 ? scale : 1.0;
-    double (*f)(double) = filter == AJI_FILTER_BILINEAR ? bilinear : spline36;
-    const double support = filter == AJI_FILTER_BILINEAR ? 1.0 : 3.0;
-    int taps = (int)ceil(support / step) * 2;
-    if (taps < 1)
-        taps = 1;
-
-    std::vector<int> start(dst);
-    std::vector<float> wt((size_t)dst * taps);
-    std::vector<double> row(taps);
-    for (int i = 0; i < dst; i++) {
-        const double pos = (i + 0.5) / scale + shift;
-        // round_halfup(pos - taps/2) + 0.5 = first tap center
-        const double begin = floor(pos - taps / 2.0 + 0.5) + 0.5;
-        double sum = 0.0;
-        for (int j = 0; j < taps; j++) {
-            row[j] = f((begin + j - pos) * step);
-            sum += row[j];
-        }
-        start[i] = (int)(begin - 0.5);
-        for (int j = 0; j < taps; j++)
-            wt[(size_t)i * taps + j] = (float)(row[j] / sum);
-    }
+    aji_resample::weights w = aji_resample::compute(src, dst, shift, filter);
 
     int *d_start = nullptr;
     float *d_wt = nullptr;
     if (cudaMalloc(&d_start, dst * sizeof(int)) != cudaSuccess ||
-        cudaMalloc(&d_wt, wt.size() * sizeof(float)) != cudaSuccess) {
+        cudaMalloc(&d_wt, w.wt.size() * sizeof(float)) != cudaSuccess) {
         cudaFree(d_start);
         return false;
     }
-    cudaMemcpy(d_start, start.data(), dst * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_wt, wt.data(), wt.size() * sizeof(float), cudaMemcpyHostToDevice);
-    p->taps = taps;
+    cudaMemcpy(d_start, w.start.data(), dst * sizeof(int),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_wt, w.wt.data(), w.wt.size() * sizeof(float),
+               cudaMemcpyHostToDevice);
+    p->taps = w.taps;
     p->src = src;
     p->dst = dst;
     p->start = d_start;
@@ -129,20 +68,6 @@ void free_pass(pass *p)
     cudaFree((void *)p->start);
     cudaFree((void *)p->wt);
     *p = {};
-}
-
-/* Chroma plane shifts in zimg convention (source-plane units): where an
- * output sample's center lands in the source grid, beyond the plain
- * (i + 0.5) / scale mapping. Derived from the siting offsets. */
-void chroma_shifts(int siting, bool up, double *sx, double *sy)
-{
-    if (up) {  // 420 chroma -> luma grid
-        *sx = siting == AJI_SITING_CENTER ? 0.0 : 0.25;
-        *sy = siting == AJI_SITING_TOPLEFT ? 0.25 : 0.0;
-    } else {   // luma grid -> 420 chroma
-        *sx = siting == AJI_SITING_CENTER ? 0.0 : -0.5;
-        *sy = siting == AJI_SITING_TOPLEFT ? -0.5 : 0.0;
-    }
 }
 
 } // namespace
