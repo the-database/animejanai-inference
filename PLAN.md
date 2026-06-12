@@ -186,6 +186,14 @@ and sets `hwdec` accordingly before playback (mpv.conf keeps the nvdec default).
 **No engine cache for DML** → no build monitor, no trtexec, no timing cache. Session creation
 (seconds) happens inline in configure; revisit async creation only if the spike shows >3 s.
 
+**Known perf characteristic (measured 2026-06-12, 5090):** RIFE on DML runs the shipped fp32
+models — 13.8 ms/interp at 1080p (realtime), 55.4 ms at 4K (upscale+RIFE 2x ≈ 63 ms vs the
+41.7 ms 24fps budget → drops; matches 3.3.x-class capability, not a regression). Post-gate
+levers, in order of value: (1) fp16 rife models for DML (~2× — 3.3.x converted in-plugin via
+vsort; for us either CI-time python conversion or a C++ float16 graph rewrite + onnx dep);
+(2) DML graph capture (`ep.dml.enable_graph_capture`) — legal now that IO is bound to stable
+GPU buffers, cuts per-op dispatch; needs a parity re-run to validate freshness.
+
 **Packaging:** builder fetches the two NuGets (nupkg = zip) at pinned versions → `inference/`;
 licenses into third-party notices; parity harness gains a DML backend run (PSNR thresholds vs
 CUDA goldens — cross-backend fp16 differences expected); engine-monitor lua needs no change
