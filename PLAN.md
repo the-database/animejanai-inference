@@ -231,14 +231,17 @@ own levers; none are gate items):
   stream while at it (note the review suggested leastPriority "so inference preempts the VO"
   — that's backwards: leastPriority *yields*; yielding to the VO's display-deadline mapper
   copies is probably what we actually want, but it's an experiment either way).
-- **yuv444p16 output option (CUDA/TensorRT only).** The post-kernel currently decimates the
-  model's RGB back to 4:2:0 and the VO immediately reconstructs RGB. Emitting yuv444p16 CUDA
-  frames skips the chroma down-sampling passes and keeps the model's full-resolution chroma;
-  FFmpeg's CUDA hwframes and mpv's CUDA↔Vulkan mapper both support it (~50 µs/frame extra
-  mapper bandwidth at 4K). Exceeds-parity quality option — default stays 4:2:0 for the parity
-  harness; not portable to the D3D11/DML pool path (DXGI has no planar 16-bit 4:4:4 video
-  format). (RGBAF16 re-checked and still rejected: hwcontext_cuda lacks it, matching the
-  Phase 0 finding.)
+- **yuv444p16 output — DONE 2026-06-12, and it is the DEFAULT** (user decision: parity with
+  the reference's forced 4:2:0 subsample is a floor, not a ceiling). Shim `0471775` (API v6:
+  aji_frame plane[3]; planless pre444/post444 — simpler AND faster than the resampling
+  4:2:0 path; 16-bit csp scales; scd 16-bit norm; graph staging 3-plane; RIFE consumes 4:4:4
+  directly, its chroma upsample disappears) + mpv `fd70a56105` (output-444 bool, default
+  yes on CUDA; DirectML stays 4:2:0 — no planar 16-bit 4:4:4 DXGI pool format). Validated:
+  Y ±1 LSB vs 4:2:0, chroma means match with sub-8-bit precision retained, RIFE-on-444
+  interpolating, cuda[yuv444p16] maps natively through gpu-next/Vulkan with zero downloads.
+  Costs: ~+300 MB pool VRAM at 4K (option-controllable); conversions got faster. Gotcha for
+  headless logs: --vo=null hw-downloads ALL hw formats (no interops) — not a regression
+  signal. (RGBAF16 re-checked and still rejected: hwcontext_cuda lacks it.)
 - **Passthrough ref-forwarding — DONE 2026-06-12** (mpv `git log`-adjacent commit): bypass
   forwards the decoder frame ref (both hw paths); RIFE chains keep the copy (decoder-ring
   pinning rationale). **Stream priority — evaluated, closed without code:** the review
