@@ -186,13 +186,19 @@ and sets `hwdec` accordingly before playback (mpv.conf keeps the nvdec default).
 **No engine cache for DML** → no build monitor, no trtexec, no timing cache. Session creation
 (seconds) happens inline in configure; revisit async creation only if the spike shows >3 s.
 
-**Known perf characteristic (measured 2026-06-12, 5090):** RIFE on DML runs the shipped fp32
-models — 13.8 ms/interp at 1080p (realtime), 55.4 ms at 4K (upscale+RIFE 2x ≈ 63 ms vs the
-41.7 ms 24fps budget → drops; matches 3.3.x-class capability, not a regression). Post-gate
-levers, in order of value: (1) fp16 rife models for DML (~2× — 3.3.x converted in-plugin via
-vsort; for us either CI-time python conversion or a C++ float16 graph rewrite + onnx dep);
-(2) DML graph capture (`ep.dml.enable_graph_capture`) — legal now that IO is bound to stable
-GPU buffers, cuts per-op dispatch; needs a parity re-run to validate freshness.
+**fp16 RIFE models SHIPPED (2026-06-12, `ded603c` + sibling `7e83a2a`, release
+`models-rife-fp16-1`):** all 47 rife onnx converted by tools/convert_rife_fp16.py — fp16
+everywhere except an fp32 island around the GridSample grid math (whole-graph fp16 measured
+32 dB vs the TRT reference: fp16's ~1e-3 ulp quantizes the normalized sampling grid 1-2 px;
+conv-only islands were SLOWER than fp32 — per-conv casts dominate). Numbers (5090):
+DML 13.8→**11.1** ms/interp 1080p, 55.4→**41.0** ms 4K, **43.9 dB** vs TRT (fp32 baseline
+48.0, zero bias); TRT engines from fp16 onnx ≡ fp32-built engines (62.2 dB) — and are the
+strongly-typed input **TRT 11 requires**, so that migration's model work is done. Package:
+rife dir 1011→507 MB (~3.6→~3.1 GB total); builder downloads one 307 MB asset instead of 27
+vs-mlrt archives. Slot-5-class 4K upscale+RIFE 2x is now ~49 ms vs the 41.7 ms budget —
+closer but still drops at 4K (fine at 1080p output); remaining lever: (2) DML graph capture
+(`ep.dml.enable_graph_capture`) — legal now that IO is bound to stable GPU buffers, cuts
+per-op dispatch; needs a parity re-run to validate freshness.
 
 **Post-gate perf/quality backlog** (consolidated from an external code review 2026-06-12 +
 own levers; none are gate items):

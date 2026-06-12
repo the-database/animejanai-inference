@@ -1415,8 +1415,10 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     if (!make_rootsig(c.get()))
         return nullptr;
 
-    if (!c->ort_ck(g_ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "aji_dml",
-                                    &c->env), "CreateEnv"))
+    if (!c->ort_ck(g_ort->CreateEnv(getenv("AJI_ORT_VERBOSE")
+                                        ? ORT_LOGGING_LEVEL_VERBOSE
+                                        : ORT_LOGGING_LEVEL_WARNING,
+                                    "aji_dml", &c->env), "CreateEnv"))
         return nullptr;
     if (!c->ort_ck(g_ort->CreateMemoryInfo("DML", OrtDeviceAllocator, 0,
                                            OrtMemTypeDefault, &c->mi_dml),
