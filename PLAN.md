@@ -191,10 +191,16 @@ licenses into third-party notices; parity harness gains a DML backend run (PSNR 
 CUDA goldens — cross-backend fp16 differences expected); engine-monitor lua needs no change
 (DML never emits "Building" lines).
 
-Slices: **3b** spike (Windows, CPU-tensor ORT+DML on SPANF3 fp16, fps + graph-capture probe +
-RIFE fp32 functional) → **3c** dispatcher split (mechanical, unblocks parallel work) → **3d**
-`aji_dml.cpp` full backend (conf mode, chains, D3D12 path, HLSL kernels, parity) → **3e**
-filter IMGFMT_D3D11 + API v5 → **3f** packaging + hwdec lua + docs.
+Slices: **3b** spike — DONE 2026-06-12 (`3b4d2e7`: 5090 CPU-tensor 1080p→4K Performance 14.0 ms,
+Balanced 20.5 ms, RIFE fp32 functional; graph capture + CPU tensors silently replays STALE data —
+only legal with IoBinding) → **3c** dispatcher split — DONE (`1bcc4e3`) → **3d** `aji_dml.cpp`
+upscale path — DONE (`eea14a3`: IoBinding on a shared DIRECT queue, HLSL kernel ports, shared
+D3D11 textures + fence handoff, synchronous v1; parity vs CUDA backend NV12 ~61 dB max 1 LSB /
+P010 67-71 dB max 3 LSB(10b); 7.6 ms/frame 1080p→4K — half the CPU-tensor spike; API v5 =
+`d3d11_device` create param, mpv vendored header synced `794ba466c8`) → **3d.2** RIFE on DML
+(pad/11-ch/SCDetect kernels + fp32 session; configure currently logs it disabled) → **3e**
+filter IMGFMT_D3D11 input path → **3f** packaging (builder ships aji_trt/aji_dml/onnxruntime/
+DirectML DLLs) + hwdec-by-backend lua + docs.
 
 ### Deferred pending demand — NCNN/Vulkan backend
 - Not scheduled. v1's premise was outdated: `video/out/hwdec/hwdec_vulkan.c` exists (FFmpeg ≥ 6.1 Vulkan decode, all vendors) — if this is ever built, it's `hwdec=vulkan` + NCNN sharing the device/images, not a decode bridge. Audience is Linux ∩ non-NVIDIA ∩ realtime-AI-upscaling; until demand shows up, document GLSL shaders as the non-NVIDIA fallback. Migration shim: `backend=ncnn` in animejanai.conf routes to DML with a logged warning (Phase 3).
