@@ -123,6 +123,44 @@ frames, Windows host). WSL2 isolation of the same sweep (V3
 Performance, 1080p->4K, yuv444p16 + download): 100.7 -> 129.8 fps
 (+29%) at depth 3.
 
+## 3.3.0 (VapourSynth) fresh baseline vs pipelined native (2026-06-12)
+
+User-run 3.3.0 benchmark the same day on the same machine (verbatim;
+stronger than the older 3.3.0 rows above by 10-27%, so this is the
+baseline of record):
+
+```
+1920x1080 2x (2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16)   :   78.99 fps
+1920x1080 2x (2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16):   79.46 fps
+1280x720  2x (2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16)   :  182.79 fps
+1280x720  2x (2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16):  188.07 fps
+768x576   2x (2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16)   :  368.96 fps
+768x576   2x (2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16):  377.40 fps
+640x480   2x (2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16)   :  539.62 fps
+640x480   2x (2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16):  557.25 fps
+480x360   2x (2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16)   : 1122.03 fps
+480x360   2x (2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16): 1204.47 fps
+```
+
+Against the native depth-3 rows above (note the native side carries
+the `--vo=null` hw-download handicap that the vspipe baseline does not):
+
+| fps | 480x360 | 640x480 | 768x576 | 1280x720 | 1920x1080 |
+|---|---|---|---|---|---|
+| Balanced 3.3.0 | 1122.0 | 539.6 | 369.0 | 182.8 | 79.0 |
+| Balanced native d3 | 1012.1 | 679.3 | 509.7 | 269.8 | 107.1 |
+| delta | -10% | +26% | +38% | +48% | +36% |
+| Performance 3.3.0 | 1204.5 | 557.3 | 377.4 | 188.1 | 79.5 |
+| Performance native d3 | 1412.4 | 963.4 | 715.3 | 395.3 | 168.4 |
+| delta | +17% | +73% | +90% | +110% | +112% |
+
+Reading: the VS baseline plateaus at ~79 fps for BOTH models at 1080p
+(Balanced == Performance), i.e. it is CPU-bound (ffms2 software decode
++ Python/zimg), not GPU-bound; the native path differentiates the
+models properly and wins 9 of 10 cells. The sole loss (480x360
+Balanced, -10%) is the per-frame fixed-cost corner at >1000 fps,
+42x the realtime budget.
+
 ## RIFE interpolation cost, DirectML (aji_harness_dml --rife, ms/interp)
 
 | | 1920x1080 | 3840x2160 |
