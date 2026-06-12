@@ -409,6 +409,57 @@ bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
     return true;
 }
 
+#if NV_TENSORRT_MAJOR >= 11
+// trtexec 11 dropped the weak-typing era flags; user confs migrated
+// from 3.3.x may still carry them. Strip from the command line only -
+// the engine-name CRC keeps hashing the original settings string.
+std::string sanitize_settings_trt11(std::string s)
+{
+    static const char *dropped[] = {"--fp16", "--bf16", "--int8", "--best",
+                                    "--buildOnly"};
+    for (const char *flag : dropped) {
+        size_t pos = 0;
+        while ((pos = s.find(flag, pos)) != std::string::npos) {
+            size_t end = pos + strlen(flag);
+            // only whole flags (--fp16 but not --fp16something)
+            if (end < s.size() && s[end] != ' ') {
+                pos = end;
+                continue;
+            }
+            while (end < s.size() && s[end] == ' ')
+                end++;
+            s.erase(pos, end - pos);
+        }
+    }
+    // typed IO formats are weak-typing flags: types now come from the
+    // network, and the fp16:/fp32: value prefixes no longer parse
+    // the cuDNN/cuBLAS tactic-source enum values are gone too (their
+    // tactics were already removed during 10.x)
+    static const char *dropped_kv[] = {"--inputIOFormats=",
+                                       "--outputIOFormats=",
+                                       "--tacticSources="};
+    for (const char *flag : dropped_kv) {
+        size_t pos;
+        while ((pos = s.find(flag)) != std::string::npos) {
+            size_t end = s.find(' ', pos);
+            end = end == std::string::npos ? s.size() : end + 1;
+            s.erase(pos, end - pos);
+        }
+    }
+    // --workspace=N became --memPoolSize=workspace:NM
+    size_t pos = s.find("--workspace=");
+    if (pos != std::string::npos) {
+        size_t vs = pos + strlen("--workspace=");
+        size_t ve = s.find(' ', vs);
+        std::string val = s.substr(vs, ve == std::string::npos ? ve
+                                                               : ve - vs);
+        s.replace(pos, (ve == std::string::npos ? s.size() : ve) - pos,
+                  "--memPoolSize=workspace:" + val + "M");
+    }
+    return s;
+}
+#endif
+
 bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
                      const std::string &settings,
                      const std::string &engine_path, const std::string *dir,
@@ -429,8 +480,14 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
     const std::string tcache =
         (fs::path(dir ? *dir : c->model_dir) / (onnx_name + ".timing.cache"))
             .string();
+#if NV_TENSORRT_MAJOR >= 11
+    const std::string cmd_settings = sanitize_settings_trt11(settings);
+#else
+    const std::string &cmd_settings = settings;
+#endif
     spec->cmdline = "\"" + c->trtexec + "\" --onnx=\"" + onnx_path +
-                    "\" --saveEngine=\"" + engine_path + "\" " + settings +
+                    "\" --saveEngine=\"" + engine_path + "\" " +
+                    cmd_settings +
                     " --timingCacheFile=\"" + tcache + "\"";
     spec->env_prefix = c->trtexec_env;
     spec->engine_path = engine_path;
@@ -684,9 +741,11 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         rife_model_name(chain->rife_model, chain->rife_ensemble);
     char dims[64];
     snprintf(dims, sizeof(dims), "1x11x%dx%d", R.ph, R.pw);
-    // vsmlrt's RIFE TRT backend: fp16 build with fp16 I/O, no cuDNN/cuBLAS
-    const std::string settings = std::string("--fp16 --optShapes=input:") +
-        dims + " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
+    // strongly-typed build from the fp16-typed rife onnx (the shipped
+    // models keep the sampling-grid math fp32 in-graph); no cuDNN/cuBLAS
+    const std::string settings = std::string(
+        "--stronglyTyped --optShapes=input:") + dims +
+        " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
     const std::string epath =
         engine_path_for(c->rife_model_dir, model, settings);
