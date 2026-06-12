@@ -36,6 +36,9 @@ struct aji_backend {
     int (*set_slot)(aji_ctx *, int);
     int (*configure)(aji_ctx *, int, int, double, int *, int *);
     int (*infer)(aji_ctx *, const aji_frame *, const aji_frame *, void *);
+    uint64_t (*flush)(aji_ctx *, void *);
+    int (*done)(aji_ctx *, uint64_t);
+    int (*wait)(aji_ctx *, uint64_t);
     const char *(*current_log)(aji_ctx *);
     int (*scale_factor)(aji_ctx *);
     int (*rife_factor)(aji_ctx *, int *, int *);
@@ -151,6 +154,9 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(set_slot,     "aji_set_slot");
     SYM(configure,    "aji_configure");
     SYM(infer,        "aji_infer");
+    SYM(flush,        "aji_flush");
+    SYM(done,         "aji_done");
+    SYM(wait,         "aji_wait");
     SYM(current_log,  "aji_current_log");
     SYM(scale_factor, "aji_scale_factor");
     SYM(rife_factor,  "aji_rife_factor");
@@ -227,6 +233,21 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
                                     const aji_frame *out, void *cu_stream)
 {
     return c->be.infer(c->inner, in, out, cu_stream);
+}
+
+extern "C" AJI_EXPORT uint64_t aji_flush(aji_ctx *c, void *cu_stream)
+{
+    return c->be.flush(c->inner, cu_stream);
+}
+
+extern "C" AJI_EXPORT int aji_done(aji_ctx *c, uint64_t ticket)
+{
+    return c->be.done(c->inner, ticket);
+}
+
+extern "C" AJI_EXPORT int aji_wait(aji_ctx *c, uint64_t ticket)
+{
+    return c->be.wait(c->inner, ticket);
 }
 
 extern "C" AJI_EXPORT const char *aji_current_log(aji_ctx *c)

@@ -11,6 +11,7 @@
  * current; the CUDA runtime binds to the current driver context.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>
@@ -206,6 +207,17 @@ struct aji_ctx {
     int graph_key[9] = {0};
     void *stage_in = nullptr, *stage_out = nullptr;
     size_t stage_in_bytes = 0, stage_out_bytes = 0;
+
+    // Completion tickets (aji_flush/done/wait): an event ring on the
+    // caller's stream. Tickets complete in submission order, so any
+    // fired event also retires every earlier ticket (tick_completed
+    // watermark). The ring bounds in-flight tickets; reusing a slot
+    // synchronizes its previous recording first, which never blocks in
+    // practice (callers queue 2-4 frames, the ring holds 8).
+    static constexpr int TICK_RING = 8;
+    cudaEvent_t tick_ev[TICK_RING] = {};
+    uint64_t tick_next = 1;
+    uint64_t tick_completed = 0;
 
     char errbuf[512] = {0};
 
@@ -952,6 +964,11 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         return AJI_ERR_CUDA;
     }
 
+    // Ticketed (pipelined) callers drain before reconfiguring, but the
+    // teardown below frees device state in-flight work may reference -
+    // make that unconditional.
+    cudaDeviceSynchronize();
+
     c->engines.clear();
     for (Step &st : c->steps)
         aji_plan_destroy(st.plan);
@@ -1420,6 +1437,79 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
     return AJI_OK;
 }
 
+extern "C" AJI_EXPORT uint64_t aji_flush(aji_ctx *c, void *cu_stream)
+{
+    if (!c)
+        return 0;
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return 0;
+    }
+    cudaEvent_t &ev = c->tick_ev[c->tick_next % aji_ctx::TICK_RING];
+    if (!ev && cudaEventCreateWithFlags(&ev, cudaEventDisableTiming)
+                   != cudaSuccess) {
+        c->set_error("ticket event creation failed");
+        return 0;
+    }
+    if (c->tick_next > aji_ctx::TICK_RING) {
+        // slot reuse: retire the ring-old ticket this event tracked
+        if (cudaEventSynchronize(ev) != cudaSuccess) {
+            c->set_error("ticket event sync failed");
+            return 0;
+        }
+        c->tick_completed = std::max(c->tick_completed,
+                                     c->tick_next - aji_ctx::TICK_RING);
+    }
+    if (cudaEventRecord(ev, (cudaStream_t)cu_stream) != cudaSuccess) {
+        c->set_error("ticket event record failed");
+        return 0;
+    }
+    return c->tick_next++;
+}
+
+extern "C" AJI_EXPORT int aji_done(aji_ctx *c, uint64_t ticket)
+{
+    if (!c)
+        return AJI_ERR;
+    if (ticket <= c->tick_completed)
+        return 1;
+    if (ticket >= c->tick_next)
+        return AJI_ERR;
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok)
+        return AJI_ERR_CUDA;
+    cudaError_t e = cudaEventQuery(c->tick_ev[ticket % aji_ctx::TICK_RING]);
+    if (e == cudaSuccess) {
+        c->tick_completed = std::max(c->tick_completed, ticket);
+        return 1;
+    }
+    if (e == cudaErrorNotReady)
+        return 0;
+    c->set_error("ticket query failed: %s", cudaGetErrorString(e));
+    return AJI_ERR_CUDA;
+}
+
+extern "C" AJI_EXPORT int aji_wait(aji_ctx *c, uint64_t ticket)
+{
+    if (!c)
+        return AJI_ERR;
+    if (ticket <= c->tick_completed)
+        return AJI_OK;
+    if (ticket >= c->tick_next)
+        return AJI_ERR;
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok)
+        return AJI_ERR_CUDA;
+    if (cudaEventSynchronize(c->tick_ev[ticket % aji_ctx::TICK_RING])
+            != cudaSuccess) {
+        c->set_error("ticket wait failed");
+        return AJI_ERR_CUDA;
+    }
+    c->tick_completed = std::max(c->tick_completed, ticket);
+    return AJI_OK;
+}
+
 extern "C" AJI_EXPORT const char *aji_current_log(aji_ctx *c)
 {
     return c ? c->current_log.c_str() : "";
@@ -1691,6 +1781,11 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->build_thread.join();
     {
         CtxGuard guard(c->cu_ctx);
+        cudaDeviceSynchronize();    // in-flight ticketed work
+        for (cudaEvent_t &ev : c->tick_ev) {
+            if (ev)
+                cudaEventDestroy(ev);
+        }
         for (auto &b : c->buf)
             cudaFree(b);
         for (Step &st : c->steps)

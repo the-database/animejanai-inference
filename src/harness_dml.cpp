@@ -346,6 +346,10 @@ int main(int argc, char **argv)
 
         QueryPerformanceCounter(&t0);
         int ir = aji_infer(aji, &fin, &fout, NULL);
+        // aji_infer only submits since ABI v7; wait the ticket so the
+        // timing stays device time and the readback below sees the result
+        if (ir == AJI_OK)
+            ir = aji_wait(aji, aji_flush(aji, NULL));
         QueryPerformanceCounter(&t1);
         if (ir != AJI_OK) {
             fprintf(stderr, "aji_infer failed (%d): %s\n", ir,

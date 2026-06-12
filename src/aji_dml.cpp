@@ -216,16 +216,29 @@ struct aji_ctx {
     ComPtr<ID3D12CommandQueue> queue;
     // Command allocators/lists are pooled: every recording segment gets
     // its own pair, because an allocator must not be reset while its
-    // prior work is still executing (segments within one infer are only
-    // fenced at the end). cl_used rewinds to 0 after each full CPU wait.
+    // prior work is still executing. Frames are pipelined (no CPU wait
+    // per infer), so entries retire by fence: a recorded entry sits in
+    // cl_busy tagged with the done_fence value that covers it (UINT64_MAX
+    // until the frame's end-of-frame signal) and returns to cl_free once
+    // that value completes.
+    struct ClEntry {
+        ComPtr<ID3D12CommandAllocator> alloc;
+        ComPtr<ID3D12GraphicsCommandList> cl;
+    };
     ComPtr<ID3D12CommandAllocator> alloc;       // current segment's pair
     ComPtr<ID3D12GraphicsCommandList> cl;
-    std::vector<std::pair<ComPtr<ID3D12CommandAllocator>,
-                          ComPtr<ID3D12GraphicsCommandList>>> cl_pool;
-    size_t cl_used = 0;
+    std::vector<ClEntry> cl_free;
+    std::vector<std::pair<ClEntry, uint64_t>> cl_busy;
     ComPtr<ID3D12Fence> fence;
     HANDLE fence_event = NULL;
     uint64_t fence_val = 0;
+    // End-of-frame markers (aji_flush/done/wait tickets + cl retirement)
+    // live on a queue-private fence, deliberately separate from `fence`:
+    // that one is also signaled from the D3D11 side (input handoffs), and
+    // a fence's completed value is its maximum, so a later D3D11 signal
+    // would falsely complete an earlier end-of-frame marker.
+    ComPtr<ID3D12Fence> done_fence;
+    uint64_t done_val = 0;
     ComPtr<ID3D12RootSignature> rootsig;
     std::map<uint32_t, ComPtr<ID3D12PipelineState>> psos;
     ComPtr<IDMLDevice> dml_dev;
@@ -531,23 +544,36 @@ struct Recorder {
     bool begin() {
         if (open)
             return true;
-        if (c->cl_used == c->cl_pool.size()) {
-            ComPtr<ID3D12CommandAllocator> a;
-            ComPtr<ID3D12GraphicsCommandList> l;
+        // retire recordings whose covering end-of-frame marker completed
+        const uint64_t done = c->done_fence->GetCompletedValue();
+        for (size_t i = 0; i < c->cl_busy.size();) {
+            if (c->cl_busy[i].second <= done) {
+                c->cl_free.push_back(std::move(c->cl_busy[i].first));
+                c->cl_busy.erase(c->cl_busy.begin() + i);
+            } else {
+                i++;
+            }
+        }
+        if (c->cl_free.empty()) {
+            // pool grows to the live working set: segments/frame x
+            // pipelined frames
+            aji_ctx::ClEntry e;
             if (FAILED(c->dev->CreateCommandAllocator(
-                    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))) ||
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&e.alloc))) ||
                 FAILED(c->dev->CreateCommandList(
-                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, a.Get(), NULL,
-                    IID_PPV_ARGS(&l))) ||
-                FAILED(l->Close())) {
+                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, e.alloc.Get(), NULL,
+                    IID_PPV_ARGS(&e.cl))) ||
+                FAILED(e.cl->Close())) {
                 c->set_error("command allocator/list creation failed");
                 return false;
             }
-            c->cl_pool.emplace_back(a, l);
+            c->cl_free.push_back(std::move(e));
         }
-        c->alloc = c->cl_pool[c->cl_used].first;
-        c->cl = c->cl_pool[c->cl_used].second;
-        c->cl_used++;
+        c->alloc = c->cl_free.back().alloc;
+        c->cl = c->cl_free.back().cl;
+        c->cl_busy.emplace_back(std::move(c->cl_free.back()), UINT64_MAX);
+        c->cl_free.pop_back();
         if (FAILED(c->alloc->Reset()) ||
             FAILED(c->cl->Reset(c->alloc.Get(), NULL))) {
             c->set_error("command list reset failed");
@@ -598,6 +624,43 @@ struct Recorder {
         c->cl->Dispatch((gx + 31) / 32, (gy + 7) / 8, gz);
         return true;
     }
+};
+
+// Queue an end-of-frame marker on the done fence; its value is the ticket
+// aji_flush/done/wait operate on, and it retires every command recording
+// made since the previous marker.
+uint64_t signal_done(aji_ctx *c)
+{
+    if (!c->queue || !c->done_fence)
+        return 0;
+    c->done_val++;
+    c->queue->Signal(c->done_fence.Get(), c->done_val);
+    for (auto &b : c->cl_busy) {
+        if (b.second == UINT64_MAX)
+            b.second = c->done_val;
+    }
+    return c->done_val;
+}
+
+bool wait_done_val(aji_ctx *c, uint64_t v, DWORD timeout_ms)
+{
+    if (!c->done_fence || c->done_fence->GetCompletedValue() >= v)
+        return true;
+    c->done_fence->SetEventOnCompletion(v, c->fence_event);
+    return WaitForSingleObject(c->fence_event, timeout_ms) == WAIT_OBJECT_0;
+}
+
+// CPU-wait the queue idle (teardown, warmups whose temp resources die).
+bool drain_queue(aji_ctx *c, DWORD timeout_ms)
+{
+    return wait_done_val(c, signal_done(c), timeout_ms);
+}
+
+// Tags this frame's recordings (and unblocks aji_flush tickets) on every
+// exit from a pipelined entry point, error paths included.
+struct DoneGuard {
+    aji_ctx *c;
+    ~DoneGuard() { signal_done(c); }
 };
 
 KernArgs csp_args(const aji_csp &csp, float qdiv, float qmax)
@@ -909,16 +972,13 @@ void rife_teardown(aji_ctx *c);
 
 void chain_teardown(aji_ctx *c)
 {
-    // GPU must be idle before buffers/sessions go away
-    if (c->queue && c->fence) {
-        c->fence_val++;
-        c->queue->Signal(c->fence.Get(), c->fence_val);
-        if (c->fence->GetCompletedValue() < c->fence_val) {
-            c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
-            WaitForSingleObject(c->fence_event, 10000);
-        }
-    }
-    c->cl_used = 0;     // teardown waited the queue idle just above
+    // GPU must be idle before buffers/sessions go away (in-flight
+    // pipelined frames included)
+    drain_queue(c, 10000);
+    // teardown waited the queue idle just above
+    for (auto &b : c->cl_busy)
+        c->cl_free.push_back(std::move(b.first));
+    c->cl_busy.clear();
     for (auto &m : c->models)
         model_release(&m);
     c->models.clear();
@@ -1104,12 +1164,7 @@ bool model_open(aji_ctx *c, DmlModel *m, const std::string &onnx_path,
     // tmp buffer: the queue is idle here only after the runs complete;
     // RunWithBinding with device outputs returns after submission, so
     // wait before the temp buffer dies.
-    c->fence_val++;
-    c->queue->Signal(c->fence.Get(), c->fence_val);
-    if (c->fence->GetCompletedValue() < c->fence_val) {
-        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
-        WaitForSingleObject(c->fence_event, 30000);
-    }
+    drain_queue(c, 30000);
     return ok;
 }
 
@@ -1274,12 +1329,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     if (!c->ort_ck(g_ort->RunWithBinding(R.model.session, NULL,
                                          R.model.binding), "rife warmup"))
         return false;
-    c->fence_val++;
-    c->queue->Signal(c->fence.Get(), c->fence_val);
-    if (c->fence->GetCompletedValue() < c->fence_val) {
-        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
-        WaitForSingleObject(c->fence_event, 30000);
-    }
+    drain_queue(c, 30000);
 
     char buf[200];
     const double factor = (double)R.num / R.den;
@@ -1389,6 +1439,11 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     if (FAILED(c->dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
                                    IID_PPV_ARGS(&c->fence)))) {
         c->set_error("D3D12 fence creation failed");
+        return nullptr;
+    }
+    if (FAILED(c->dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&c->done_fence)))) {
+        c->set_error("D3D12 done-fence creation failed");
         return nullptr;
     }
     c->fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -1693,7 +1748,10 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         diagnose_device(c, "aji_infer entry");
         return AJI_ERR;
     }
-    c->cl_used = 0;     // the previous infer's final wait completed
+    // Pipelined: everything below only submits; the end-of-frame marker
+    // (queued by the guard on every exit) is what callers gate on via
+    // aji_flush/aji_done/aji_wait before consuming the output texture.
+    DoneGuard done_guard{c};
 
     const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
     const aji_csp csp =
@@ -1835,19 +1893,8 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     if (!r.exec())
         return AJI_ERR;
 
-    // v1 completes synchronously: keeps allocator reuse + texture
-    // lifetimes trivial, and the output texture is ready for any D3D11
-    // consumer the moment we return.
-    c->fence_val++;
-    c->queue->Signal(c->fence.Get(), c->fence_val);
-    if (c->fence->GetCompletedValue() < c->fence_val) {
-        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
-        if (WaitForSingleObject(c->fence_event, 10000) != WAIT_OBJECT_0) {
-            c->set_error("GPU timeout waiting for the inference chain");
-            diagnose_device(c, "infer fence wait");
-            return AJI_ERR;
-        }
-    }
+    // No CPU wait: the guard queues this frame's end-of-frame marker and
+    // the caller synchronizes through the ticket API.
     return AJI_OK;
 }
 
@@ -1879,6 +1926,44 @@ extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
     return 0;   // no background builds on DirectML
 }
 
+extern "C" AJI_EXPORT uint64_t aji_flush(aji_ctx *c, void *cu_stream)
+{
+    (void)cu_stream;
+    if (!c || !c->done_fence)
+        return 0;
+    // every aji_infer exit already queued a marker; a fresh one also
+    // covers any submissions made since (rife, warmups)
+    return signal_done(c);
+}
+
+extern "C" AJI_EXPORT int aji_done(aji_ctx *c, uint64_t ticket)
+{
+    if (!c)
+        return AJI_ERR;
+    if (ticket == 0)
+        return 1;
+    if (!c->done_fence || ticket > c->done_val)
+        return AJI_ERR;
+    return c->done_fence->GetCompletedValue() >= ticket ? 1 : 0;
+}
+
+extern "C" AJI_EXPORT int aji_wait(aji_ctx *c, uint64_t ticket)
+{
+    if (!c)
+        return AJI_ERR;
+    if (ticket == 0)
+        return AJI_OK;
+    if (!c->done_fence || ticket > c->done_val)
+        return AJI_ERR;
+    if (!wait_done_val(c, ticket, 10000)) {
+        c->set_error("GPU timeout waiting for ticket %llu",
+                     (unsigned long long)ticket);
+        diagnose_device(c, "ticket wait");
+        return AJI_ERR;
+    }
+    return AJI_OK;
+}
+
 extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *b, double t,
                                          const aji_frame *out, void *cu_stream)
@@ -1903,7 +1988,9 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         return AJI_ERR_SHAPE;
     }
 
-    c->cl_used = 0;     // the previous infer's final wait completed
+    // Synchronous by contract (scene-change readback): recordings still
+    // retire through the marker the guard queues on every exit.
+    DoneGuard done_guard{c};
 
     const int fmt = a->format;
     const bool t16 = fmt == AJI_FMT_P010;
@@ -2022,14 +2109,9 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     }
     if (!r.exec())
         return AJI_ERR;
-    c->fence_val++;
-    c->queue->Signal(c->fence.Get(), c->fence_val);
-    if (c->fence->GetCompletedValue() < c->fence_val) {
-        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
-        if (WaitForSingleObject(c->fence_event, 10000) != WAIT_OBJECT_0) {
-            c->set_error("GPU timeout in rife scene detect");
-            return AJI_ERR;
-        }
+    if (!wait_done_val(c, signal_done(c), 10000)) {
+        c->set_error("GPU timeout in rife scene detect");
+        return AJI_ERR;
     }
     float sum = 0.0f;
     {
@@ -2142,15 +2224,11 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     if (!r.exec())
         return AJI_ERR;
 
-    c->fence_val++;
-    c->queue->Signal(c->fence.Get(), c->fence_val);
-    if (c->fence->GetCompletedValue() < c->fence_val) {
-        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
-        if (WaitForSingleObject(c->fence_event, 10000) != WAIT_OBJECT_0) {
-            c->set_error("GPU timeout in rife inference");
-            diagnose_device(c, "rife fence wait");
-            return AJI_ERR;
-        }
+    // synchronous exception: the interpolated output is complete on return
+    if (!wait_done_val(c, signal_done(c), 10000)) {
+        c->set_error("GPU timeout in rife inference");
+        diagnose_device(c, "rife fence wait");
+        return AJI_ERR;
     }
     return AJI_OK;
 }
