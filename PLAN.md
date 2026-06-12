@@ -118,12 +118,86 @@ Day 1, before any code: smoke-test the handoff with `--vf=lavfi=[scale_cuda=1920
 
 **Release gate redefined (2026-06-12): the next release is v3.4.0 and ships only at feature parity with 3.3.x** — replacing the pipeline must not lose existing features. In-gate: Phase 3 (DirectML backend incl. honoring the conf's `backend=` key, which the shim currently ignores), fractional RIFE factors, and the ConfEditor benchmark rework (editor repo). Out-of-gate: Linux (Phase 5 — never supported, purely additive), TRT 11 (infrastructure), NCNN (stays deferred: with DirectML at parity its unique audience on a Windows package is ~nil).
 
-### Phase 3 — DirectML backend (Windows non-NVIDIA), ~4–6 weeks, after the NVIDIA build ships
-- `aji-dml` shim implementation via ONNX Runtime's C API; mpv filter unchanged except accepting `IMGFMT_D3D11`.
-- The real work is unchanged from v1: D3D11↔D3D12 shared handles + fence sync inside the shim. No host round-trip.
+### Phase 3 — DirectML backend (Windows non-NVIDIA) — recon complete 2026-06-12, design locked
+
+**Parity bar (verified against 3.3.x source):** `backend` is a **global** key in `[global]` of
+animejanai.conf — case-insensitive, `directml` → DML, `ncnn` → NCNN, anything else (incl. absent)
+→ TensorRT. 3.3.x DML ran `core.ort.Model(fp16=True, provider="DML")` on **CPU frames**
+(`hwdec=auto-copy-safe`), implicit adapter 0, no engine cache, and **RIFE on DML was supported**
+(`BackendV2.ORT_DML(fp16=True)`) — so `aji_dml` must implement `aji_infer_rife` for parity.
+NCNN stays deferred: conf value `ncnn` aliases to DML with a log warning (its audience is
+non-NVIDIA Windows, which DML serves; pre-DX12 GPUs fall out of support).
+
+**Runtime stack (locked):** ONNX Runtime **1.24.4** (`Microsoft.ML.OnnxRuntime.DirectML` — the
+last DML-flavored release; DML is in "sustained engineering", no 1.25+/1.26 DML packages exist)
++ `Microsoft.AI.DirectML` **1.15.4** (last release). `onnxruntime.dll` ~16.5 MB +
+`DirectML.dll` ~17.7 MB → `animejanai/inference/`. Both redistributable (MIT + DirectML redist
+license §1(a), Windows/Xbox only); ship both ThirdPartyNotices. **Load order matters:**
+DirectML.dll must be loaded (full path, own dir) *before* onnxruntime.dll (vsort win32.cpp
+precedent).
+
+**Session recipe (vsort-proven + ORT docs):** `ORT_SEQUENTIAL` + `DisableMemPattern` (both
+mandatory for the DML EP); EP append via `OrtDmlApi` (`GetExecutionProviderApi("DML",
+ORT_API_VERSION)`); run the **first inference twice** (DML command-list warmup — vsort's
+"replay" workaround); at most one `Run()` in flight per session. Steady-state lever:
+`ep.dml.enable_graph_capture` (requires static shapes, all-DML partition, stable bindings —
+exactly our case; probe in the spike, fall back if rejected). GridSample (RIFE) is in-EP HLSL,
+opset ≤ 20, 4D only; **fp16 GridSample needs Native16BitShaderOps else it falls back to CPU** →
+RIFE models keep fp32 IO for v1 (capability parity; fp16 conversion at package-build time is a
+later optimization). Upscale models: our shipped ONNX are already fp16 → feed fp16 tensors
+directly (type must match model IO exactly).
+
+**Device:** create our own ID3D12Device + IDMLDevice + DIRECT queue on the **same adapter as
+mpv's D3D11 device** (match by LUID), pass via `SessionOptionsAppendExecutionProvider_DML1`.
+Strictly better than 3.3.x (implicit adapter 0 regardless of decode device).
+
+**Data path (GPU-resident — beats 3.3.x's decode→CPU→GPU→CPU→GPU round-trip):**
+1. Filter: decoder D3D11 textures are **not shareable and not implicitly synchronized**
+   (`vf_amf.c:493` precedent) → `CopySubresourceRegion` decode slice → filter-owned
+   `ArraySize=1` texture with `MISC_SHARED_NTHANDLE`, `Flush()`; output-pool textures likewise
+   need MiscFlags set on the `AVD3D11VAFramesContext` before init.
+2. Shim: `OpenSharedHandle` per unique texture (cached); D3D12: `CopyTextureRegion`
+   texture→buffer (PLACED_FOOTPRINT per NV12/P010 plane) → HLSL compute pre-kernel (port of
+   kernels.cu math: NV12/P010 → fp16 RGB NCHW; BT.601/709/2020, limited/full, left/center/
+   topleft siting) → bind via `CreateGPUAllocationFromD3DResource` + IoBinding → `Run()`
+   (submits to our queue) → HLSL post-kernel → `CopyTextureRegion` buffer→output texture.
+   DML tensors must live in D3D12 **buffers** (not textures), hence the texture↔buffer copies
+   around the kernels.
+3. Sync: shared `ID3D11Fence`/`ID3D12Fence` pair — D3D11 signals after the input copy, the
+   D3D12 queue waits; D3D12 signals after the post-kernel, the filter's D3D11 context waits
+   before releasing the frame downstream.
+
+**Filter:** `mp_refqueue_add_in_format` ×2 (CUDA + D3D11), runtime dispatch on the frames-ctx
+device type; D3D11 branch requests the IMGFMT_D3D11 hwdec device, stages frames vf_amf-style;
+`aji_frame.plane[0]/[1]` carry `ID3D11Texture2D*` + subresource index on the DML path
+(documented per-backend meaning); `cu_stream` is NULL. **API v5:** create params gain
+`void *d3d11_device`.
+
+**Dispatch (honors the `backend=` key):** `aji.dll` becomes a thin dispatcher — parses
+`[global] backend` via the existing aji_conf, `LoadLibraryEx`es sibling **`aji_trt.dll`** /
+**`aji_dml.dll`** from its own directory, forwards the whole C ABI. Filter unchanged
+(`lib=aji.dll`). nvinfer DLLs never load on AMD/Intel machines. Direct mode (engine_path —
+harness) → TRT. POSIX: `dlopen("$ORIGIN/libaji_<backend>.so")`.
+
+**hwdec coordination:** the input format must match the backend (nvdec→CUDA for TRT,
+d3d11va→D3D11 for DML). A tiny lua startup hook reads `[global] backend` from animejanai.conf
+and sets `hwdec` accordingly before playback (mpv.conf keeps the nvdec default).
+
+**No engine cache for DML** → no build monitor, no trtexec, no timing cache. Session creation
+(seconds) happens inline in configure; revisit async creation only if the spike shows >3 s.
+
+**Packaging:** builder fetches the two NuGets (nupkg = zip) at pinned versions → `inference/`;
+licenses into third-party notices; parity harness gains a DML backend run (PSNR thresholds vs
+CUDA goldens — cross-backend fp16 differences expected); engine-monitor lua needs no change
+(DML never emits "Building" lines).
+
+Slices: **3b** spike (Windows, CPU-tensor ORT+DML on SPANF3 fp16, fps + graph-capture probe +
+RIFE fp32 functional) → **3c** dispatcher split (mechanical, unblocks parallel work) → **3d**
+`aji_dml.cpp` full backend (conf mode, chains, D3D12 path, HLSL kernels, parity) → **3e**
+filter IMGFMT_D3D11 + API v5 → **3f** packaging + hwdec lua + docs.
 
 ### Deferred pending demand — NCNN/Vulkan backend
-- Not scheduled. v1's premise was outdated: `video/out/hwdec/hwdec_vulkan.c` exists (FFmpeg ≥ 6.1 Vulkan decode, all vendors) — if this is ever built, it's `hwdec=vulkan` + NCNN sharing the device/images, not a decode bridge. Audience is Linux ∩ non-NVIDIA ∩ realtime-AI-upscaling; until demand shows up, document GLSL shaders as the non-NVIDIA fallback.
+- Not scheduled. v1's premise was outdated: `video/out/hwdec/hwdec_vulkan.c` exists (FFmpeg ≥ 6.1 Vulkan decode, all vendors) — if this is ever built, it's `hwdec=vulkan` + NCNN sharing the device/images, not a decode bridge. Audience is Linux ∩ non-NVIDIA ∩ realtime-AI-upscaling; until demand shows up, document GLSL shaders as the non-NVIDIA fallback. Migration shim: `backend=ncnn` in animejanai.conf routes to DML with a logged warning (Phase 3).
 
 ### Phase 5 — Config editor & Linux packaging, ~1–3 weeks, after NVIDIA milestone
 - Linux distribution: self-contained tarball/AppImage built on the oldest supported Ubuntu LTS; documented build-from-source path; skip Flatpak/Snap/Docker for v1; never bundle the NVIDIA kernel driver; verify TRT redistribution under NVIDIA's SLA (vs-mlrt publicly redistributing TRT DLLs in GitHub releases is precedent it's tolerated — still verify).
