@@ -239,11 +239,14 @@ own levers; none are gate items):
   harness; not portable to the D3D11/DML pool path (DXGI has no planar 16-bit 4:4:4 video
   format). (RGBAF16 re-checked and still rejected: hwcontext_cuda lacks it, matching the
   Phase 0 finding.)
-- **Passthrough ref-forwarding.** Slot-0/no-chain currently does a device copy into a pool
-  frame. Forwarding the input mp_image ref is free and as safe as filterless playback — but
-  ONLY while RIFE is off: RIFE buffers prev/cur (+ the outq), which would pin decoder-ring
-  surfaces — exactly the documented copy-on-arrival starvation rationale. Conditional
-  micro-optimization.
+- **Passthrough ref-forwarding — DONE 2026-06-12** (mpv `git log`-adjacent commit): bypass
+  forwards the decoder frame ref (both hw paths); RIFE chains keep the copy (decoder-ring
+  pinning rationale). **Stream priority — evaluated, closed without code:** the review
+  suggested cuStreamCreateWithPriority(leastPriority) "so inference preempts the VO" — that
+  is backwards, and the actionable space is empty either way: VO/decoder streams run at
+  default priority 0, lowering the inference stream is a no-op against priority-0 peers, and
+  raising it would let inference preempt display-deadline mapper copies (jank). Revisit only
+  inside the pipelining work where the stream topology changes.
 
 (The same review also flagged the packaged `hwdec=auto-copy-safe` — already found and fixed
 in 3f; re-checking it surfaced the REAL adjacent gap, fixed in `c82742f`: the package pins
