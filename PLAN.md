@@ -362,9 +362,19 @@ parsing + GitHub release downloads + 7za extraction):
 - End-to-end validated on the pkg-mock install: detect (RTX 5090 → sm120), infer-from-disk,
   remove → reinstall round-trip (47 rife files), `--auto` no-op when satisfied and
   reinstall when not, all four lua hint cases.
+- **AnimeJaNai Manager GUI shipped 2026-06-12** (editor repo, tag 0.1.0, asset
+  `AnimeJaNaiManager-portable-x64.zip`): the config editor is renamed AnimeJaNai Manager,
+  moved to the install root next to mpvnet.exe, and grew a Components tab driven by
+  `AnimeJaNaiUpdater --components --json`. Recommendations are highlighted (never
+  pre-checked); RIFE is an optional default-on-fresh-installs choice; backend toggles and
+  per-chain RIFE checkboxes are component-aware (TensorRT disabled when unusable, conf
+  auto-flips to DirectML with a recorded `backend_auto_fallback` marker and flips BACK to
+  TensorRT the moment it is installed — manual backend clicks clear the marker). First-run
+  dialog installs the whole recommended set in one click (3.3.0 "prepackaged" parity).
+  Package repo consumes it: builder extracts to root, Ctrl+E launches it, lua hints point
+  at it.
 - Still pending at release time: slim-core-vs-full default decision (above), real
-  release-asset flow (needs a published release with pack assets), ConfEditor surfacing of
-  the manager (optional polish).
+  release-asset flow for packs (needs a published package release with pack assets).
 
 ### Phase 5 — Config editor & Linux packaging, ~1–3 weeks, after NVIDIA milestone
 - Linux distribution: self-contained tarball/AppImage built on the oldest supported Ubuntu LTS; documented build-from-source path; skip Flatpak/Snap/Docker for v1; never bundle the NVIDIA kernel driver; verify TRT redistribution under NVIDIA's SLA (vs-mlrt publicly redistributing TRT DLLs in GitHub releases is precedent it's tolerated — still verify).
