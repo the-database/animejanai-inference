@@ -116,7 +116,7 @@ Day 1, before any code: smoke-test the handoff with `--vf=lavfi=[scale_cuda=1920
 
 **NVIDIA milestone = Phases 0 + 1 + 1.5 + 2 — COMPLETE 2026-06-12.**
 
-**Release gate redefined (2026-06-12): the next release is v3.4.0 and ships only at feature parity with 3.3.x** — replacing the pipeline must not lose existing features. In-gate: Phase 3 (DirectML backend incl. honoring the conf's `backend=` key, which the shim currently ignores), fractional RIFE factors, and the ConfEditor benchmark rework (editor repo). Out-of-gate: Linux (Phase 5 — never supported, purely additive), TRT 11 (infrastructure), NCNN (stays deferred: with DirectML at parity its unique audience on a Windows package is ~nil).
+**Release gate redefined (2026-06-12): the next release is v3.4.0 and ships only at feature parity with 3.3.x** — replacing the pipeline must not lose existing features. In-gate: Phase 3 (DirectML backend — CODE-COMPLETE 2026-06-12), fractional RIFE factors (DONE 2026-06-12, mpv `5b26e84ffb`: filter-side output-grid phase accumulator, vsmlrt video_player semantics; both backends verified), and the ConfEditor benchmark rework (editor repo — the remaining gate item). Out-of-gate: Linux (Phase 5 — never supported, purely additive), TRT 11 (infrastructure), NCNN (stays deferred: with DirectML at parity its unique audience on a Windows package is ~nil).
 
 ### Phase 3 — DirectML backend (Windows non-NVIDIA) — recon complete 2026-06-12, design locked
 
