@@ -177,6 +177,10 @@ int main(int argc, char **argv)
             fd[i].plane[0] = fr[i];
         }
 
+        LARGE_INTEGER rfreq, rt0, rt1;
+        QueryPerformanceFrequency(&rfreq);
+        double rife_ms = 0;
+        int rife_timed = 0;
         int prev = -1, cur = 0, n = 0, interp = 0, scenes = 0;
         while (n < frames && fread(raw, 1, fb, fi) == fb) {
             D3D11_MAPPED_SUBRESOURCE map = {};
@@ -196,8 +200,15 @@ int main(int argc, char **argv)
             ctx->CopyResource(fr[cur], st_in);
 
             if (prev >= 0 && fo) {
+                QueryPerformanceCounter(&rt0);
                 int ret = aji_infer_rife(aji, &fd[prev], &fd[cur], 0.5,
                                          &fd[2], NULL);
+                QueryPerformanceCounter(&rt1);
+                if (interp + scenes >= 1) {   // skip the lazy-init call
+                    rife_ms += (double)(rt1.QuadPart - rt0.QuadPart) *
+                               1000.0 / rfreq.QuadPart;
+                    rife_timed++;
+                }
                 int emit;
                 if (ret == AJI_OK) {
                     emit = 2;
@@ -241,8 +252,10 @@ int main(int argc, char **argv)
             }
             n++;
         }
-        printf("rife: %d source frames, %d interpolated, %d scene skips\n",
-               n, interp, scenes);
+        printf("rife: %d source frames, %d interpolated, %d scene skips"
+               ", %.1f ms/interp avg (%d timed)\n",
+               n, interp, scenes, rife_timed ? rife_ms / rife_timed : 0.0,
+               rife_timed);
         if (fo)
             fclose(fo);
         fclose(fi);
