@@ -330,15 +330,41 @@ parsing + GitHub release downloads + 7za extraction):
   TRT pack on an AMD→NVIDIA move); existing clean_stale_engines already handles the old
   GPU's engine cache.
 - The dispatcher split makes this safe at runtime: missing backends are per-DLL, nothing
-  loads until selected. Needed hardening either way: a friendly OSD/editor prompt (pointing
-  at the manager) when the configured backend's components are absent — today it is a
-  correct-but-dry log line.
-- manifest.json grows an installed-components list; the updater's overlay/full logic
-  becomes component-aware (per-component versions in deps).
+  loads until selected.
 - Open design option for when this lands: ship core with DirectML as the working default so
   FIRST PLAY works on every GPU minutes after a ~460 MB download, with the manager offering
   the TensorRT pack to NVIDIA users as an upgrade ("best performance") — turns the 3.6 GB
-  wall into a progressive enhancement.
+  wall into a progressive enhancement. **Still open — decide at release time** (the packs +
+  manager below work against both full and slim cores).
+
+**IMPLEMENTED 2026-06-12** (package repo `a0e80f6`, branch native-filter-migration):
+
+- Builder `--packs` emits `component-{trt-runtime,rife,trt-smXX,trt-ptx}.7z` + `packs.json`
+  (per-pack file lists, bytes, package_version) from the built tree; archives are rooted at
+  the install dir so extraction over an install IS installation. `--packs-only [dir]` emits
+  from an existing tree without rebuilding (validated against the TRT 11 pkg-mock:
+  trt-runtime 171 MB / rife 441 MB / trt-ptx 197 MB / trt-sm120 214 MB compressed).
+- AnimeJaNaiUpdater = the Manager: `--components` (GPU detect + installed/available/
+  RECOMMENDED listing), `--install <pack>`, `--remove <pack>` (per-file deletion from
+  packs.json; engine caches and user files untouched), `--auto` (install whatever the
+  detected hardware recommends). NVIDIA detect via NVML P/Invoke
+  (`nvmlDeviceGetCudaComputeCapability` → sm75…sm120 pack name, unpublished SM → trt-ptx;
+  no nvml.dll → non-NVIDIA → DirectML-in-core recommendation). State in `components.json`
+  at the install root, inferred from disk for pre-manager installs; a version guard refuses
+  packs published for a different package_version (update first, then install components).
+  `ANIMEJANAI_PACKS_DIR` env var overrides the release lookup for local testing.
+- `animejanai_backend.lua` warns (log + one-shot OSD on first file-loaded) when the
+  configured backend or an enabled RIFE chain needs a missing pack, naming the exact
+  Manager command — covers: no nvinfer_11.dll (trt-runtime), no builder resources (soft —
+  cached engines still run), `chain_*_rife=yes` with an empty rife dir.
+- deploy.yml builds with `--packs` and uploads the component archives + packs.json as
+  release assets alongside the full package, overlay, and manifest.
+- End-to-end validated on the pkg-mock install: detect (RTX 5090 → sm120), infer-from-disk,
+  remove → reinstall round-trip (47 rife files), `--auto` no-op when satisfied and
+  reinstall when not, all four lua hint cases.
+- Still pending at release time: slim-core-vs-full default decision (above), real
+  release-asset flow (needs a published release with pack assets), ConfEditor surfacing of
+  the manager (optional polish).
 
 ### Phase 5 — Config editor & Linux packaging, ~1–3 weeks, after NVIDIA milestone
 - Linux distribution: self-contained tarball/AppImage built on the oldest supported Ubuntu LTS; documented build-from-source path; skip Flatpak/Snap/Docker for v1; never bundle the NVIDIA kernel driver; verify TRT redistribution under NVIDIA's SLA (vs-mlrt publicly redistributing TRT DLLs in GitHub releases is precedent it's tolerated — still verify).
