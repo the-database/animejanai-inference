@@ -239,19 +239,29 @@ per-op dispatch; needs a parity re-run to validate freshness.
 
 **Post-gate perf/quality backlog** (consolidated from an external code review 2026-06-12 +
 own levers; none are gate items):
-- **Pipelined inference (both backends).** Today one frame is in flight: the filter blocks on
-  cuStreamSynchronize (CUDA) / the end-of-frame fence wait (DML), so device time adds to the
-  frame budget instead of hiding behind display pacing. Deferred WITH data (5090 ≈ 310 fps
-  headroom at 1080p→4K) — it matters for mid-range GPUs, 4K sources, and high-factor RIFE.
-  Sketch when picked up: slot ring (queue-depth 2–3), per-slot stage/tensor buffers (or one
-  CUDA graph per slot; the DML side's per-segment allocator pool already points this way),
-  CUevent / fence value recorded per slot, emit on completion (cuLaunchHostFunc or a watcher
-  thread → mp_filter_wakeup), hold each input frame ref until its slot's event fires. RIFE's
-  scene decision is a mid-chain CPU readback — defer it to emission time or keep RIFE as a
-  documented synchronous exception. Footnote: try cuStreamCreateWithPriority for the infer
-  stream while at it (note the review suggested leastPriority "so inference preempts the VO"
-  — that's backwards: leastPriority *yields*; yielding to the VO's display-deadline mapper
-  copies is probably what we actually want, but it's an experiment either way).
+- **Pipelined inference (both backends) — DONE 2026-06-12** (shim `78169f4` ABI v7 + mpv
+  `7e936eb60c`). Shape it landed in, vs the sketch: completion **tickets**
+  (aji_flush/aji_done/aji_wait — TRT: CUevent ring on the caller's stream with an in-order
+  completed watermark; DML: a NEW queue-private done-fence, because the existing shared
+  fence is also signaled from D3D11 input handoffs and a fence's completed value is its
+  max, so a later D3D11 signal would falsely complete an earlier marker). No per-slot
+  tensor buffers or per-slot graphs needed — successive aji_infer calls are
+  stream/queue-ordered, which makes the shared chain/stage buffers safe; the filter-side
+  ring is just {src-identity, out, ticket} and the refqueue's future-ref window
+  (queue-depth − 1; option default 3, max 4) supplies the input read-ahead AND keeps
+  decoder surfaces pinned until emission waits each ticket (no extra refs, no
+  cuLaunchHostFunc — emission blocks on the head ticket with N+1/N+2 already queued). DML
+  extras: command allocators retire by fence tag (free/busy lists) instead of
+  rewind-after-the-per-frame-wait; mpv's D3D11 input staging texture became a per-slot
+  ring (cross-API copies are unordered). RIFE took the documented-synchronous-exception
+  branch (scene decision = CPU readback; depth forced 1). Validated bit-identical
+  (framemd5 depth 1 vs 3: TRT incl. RIFE slots + graph replay on WSL, DML 2168 frames on
+  the host); seeks/loops/runtime slot switches clean. End-to-end best-of-3 (BENCHMARKS.md
+  has the tables): TRT +6–16% Balanced / +11–34% Performance, DML +30–36%; the in-package
+  tool is unchanged by design (synchronous harness) and reproduces the TRT 11 rows = no
+  regression. The 4K RIFE budget item is NOT lifted by this (RIFE stays sync) — still on
+  the DML graph-capture lever. Stream-priority experiment: stays closed (the stream
+  topology didn't change — same single infer stream).
 - **yuv444p16 output — DONE 2026-06-12, and it is the DEFAULT** (user decision: parity with
   the reference's forced 4:2:0 subsample is a floor, not a ceiling). Shim `0471775` (API v6:
   aji_frame plane[3]; planless pre444/post444 — simpler AND faster than the resampling

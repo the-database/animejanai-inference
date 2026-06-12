@@ -80,6 +80,49 @@ per-frame fixed cost, the target of the pipelining backlog item.
 | Balanced | 442.7 | 389.7 | 291.7 | 157.2 | 65.7 |
 | Performance | 667.1 | 588.6 | 467.5 | 265.9 | 126.2 |
 
+## Pipelined inference (queue-depth 3) — 2026-06-12
+
+Shim ABI v7 + filter pipelining (in-flight frame ring; see PLAN). The
+in-package tool is unchanged by design (synchronous harness, one frame
+in flight) — re-run with the v7 shim it reproduces the TRT 11.0 rows
+within noise (Balanced 1920x1080 159.3 vs 155.9; Performance 293.4 vs
+286.0), confirming no regression on the synchronous path.
+
+End-to-end playback, same methodology as the 3.3.0-vs-native table but
+on TRT 11 / live desktop, best of 3 runs per cell, `output-444=no` so
+the `--vo=null` implicit hw-download stays NV12-sized and comparable
+with the earlier rows (real playback maps output natively and has no
+such download). depth 1 = the old synchronous behavior; depth 3 = the
+shipping default.
+
+TensorRT backend:
+
+| fps | 480x360 | 640x480 | 768x576 | 1280x720 | 1920x1080 |
+|---|---|---|---|---|---|
+| Balanced depth 1 | 874.1 | 613.5 | 459.6 | 248.3 | 101.1 |
+| Balanced depth 3 | 1012.1 | 679.3 | 509.7 | 269.8 | 107.1 |
+| delta | +16% | +11% | +11% | +9% | +6% |
+| Performance depth 1 | 1052.6 | 792.4 | 628.9 | 341.5 | 151.1 |
+| Performance depth 3 | 1412.4 | 963.4 | 715.3 | 395.3 | 168.4 |
+| delta | +34% | +22% | +14% | +16% | +11% |
+
+DirectML backend (largest win — its per-frame CPU fence wait used to
+serialize ORT dispatch with the device):
+
+| fps | 1280x720 | 1920x1080 |
+|---|---|---|
+| Balanced depth 1 | 115.5 | 52.0 |
+| Balanced depth 3 | 156.6 | 67.8 |
+| Performance depth 1 | 177.1 | 87.5 |
+| Performance depth 3 | 240.2 | 117.7 |
+| Performance delta | +36% | +35% |
+
+Correctness: framemd5 bit-identical depth 1 vs depth 3 on both
+backends (TRT incl. RIFE slots and CUDA-graph replay, WSL; DML 2168
+frames, Windows host). WSL2 isolation of the same sweep (V3
+Performance, 1080p->4K, yuv444p16 + download): 100.7 -> 129.8 fps
+(+29%) at depth 3.
+
 ## RIFE interpolation cost, DirectML (aji_harness_dml --rife, ms/interp)
 
 | | 1920x1080 | 3840x2160 |
