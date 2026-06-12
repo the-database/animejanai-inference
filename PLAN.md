@@ -114,7 +114,9 @@ Day 1, before any code: smoke-test the handoff with `--vf=lavfi=[scale_cuda=1920
 - **Bloat attack: evaluated and REJECTED (2026-06-12).** Prebuilt engines only work as (a) static per-resolution — leaves unfixable holes for unanticipated resolutions once the builder is dropped (no upscaling for those files), or (b) dynamic-shape + hardware-compatible — ruled out by direct measurement (dynamic engines' perf drop is too large; this is also why static became the default trt_engine_settings). The per-SM builder resources ship (package 3.6 GB); the async build UX (pause/narrate/auto-resume + persistent timing cache, ~10-60 s first play) is the mitigation.
 - Rework `deploy.yml` (pre-existing `dotnet-version: '8.x'` vs `net10.0` mismatch).
 
-**NVIDIA milestone = Phases 0 + 1 + 1.5 + 2 ≈ 3–4 months realistic for one person.**
+**NVIDIA milestone = Phases 0 + 1 + 1.5 + 2 — COMPLETE 2026-06-12.**
+
+**Release gate redefined (2026-06-12): the next release is v3.4.0 and ships only at feature parity with 3.3.x** — replacing the pipeline must not lose existing features. In-gate: Phase 3 (DirectML backend incl. honoring the conf's `backend=` key, which the shim currently ignores), fractional RIFE factors, and the ConfEditor benchmark rework (editor repo). Out-of-gate: Linux (Phase 5 — never supported, purely additive), TRT 11 (infrastructure), NCNN (stays deferred: with DirectML at parity its unique audience on a Windows package is ~nil).
 
 ### Phase 3 — DirectML backend (Windows non-NVIDIA), ~4–6 weeks, after the NVIDIA build ships
 - `aji-dml` shim implementation via ONNX Runtime's C API; mpv filter unchanged except accepting `IMGFMT_D3D11`.
