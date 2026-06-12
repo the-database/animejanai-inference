@@ -220,6 +220,42 @@ lua-driven hwdec (d3d11[nv12]→DirectML 4K / cuda[nv12]→TensorRT 4K).
 ### Deferred pending demand — NCNN/Vulkan backend
 - Not scheduled. v1's premise was outdated: `video/out/hwdec/hwdec_vulkan.c` exists (FFmpeg ≥ 6.1 Vulkan decode, all vendors) — if this is ever built, it's `hwdec=vulkan` + NCNN sharing the device/images, not a decode bridge. Audience is Linux ∩ non-NVIDIA ∩ realtime-AI-upscaling; until demand shows up, document GLSL shaders as the non-NVIDIA fallback. Migration shim: `backend=ncnn` in animejanai.conf routes to DML with a logged warning (Phase 3).
 
+### Post-gate: distribution slimming — one download + a component manager
+
+*Analysis 2026-06-12; decision deferred until the v3.4.0 gate work (#29) is done — may fold
+into 3.4.0, may follow it.*
+
+**Measured package decomposition (3.61 GB dry build):** TensorRT pack ~2.19 GB (61% — of
+which 1.82 GB is per-SM engine-builder resources spanning 8 GPU generations, individually
+111–433 MB); RIFE models 0.96 GB (27%); core ~0.46 GB (13% = player + editor + upscale onnx
+(14 MB!) + dispatcher + ORT/DirectML runtime (35 MB — ships in every configuration, it is
+also the NVIDIA fallback)). A DirectML-only install is ~460 MB — an 87% download reduction
+for exactly the audience most likely to bounce off 3.6 GB.
+
+**Decided direction (user, 2026-06-12): NOT multiple download SKUs** — vs-mlrt's wall of
+variant downloads is the named anti-pattern. Instead: **one download + an "AnimeJaNai
+Manager"** (likely a repurposed/extended AnimeJaNaiUpdater, which already does manifest
+parsing + GitHub release downloads + 7za extraction):
+
+- Manager inspects the hardware (DXGI adapter enum; NVIDIA SM generation via device-id
+  table / nvml / the shim's own gpu_token machinery) and recommends components.
+- Installs/uninstalls component packs hosted as separate release assets: TensorRT runtime,
+  **per-SM builder-resource packs** (the natural unit — a Blackwell user needs sm120+ptx
+  ≈ 480 MB, not all 1.82 GB), RIFE models.
+- Hardware changes: re-run the manager → new recommendation (new SM pack on a GPU upgrade,
+  TRT pack on an AMD→NVIDIA move); existing clean_stale_engines already handles the old
+  GPU's engine cache.
+- The dispatcher split makes this safe at runtime: missing backends are per-DLL, nothing
+  loads until selected. Needed hardening either way: a friendly OSD/editor prompt (pointing
+  at the manager) when the configured backend's components are absent — today it is a
+  correct-but-dry log line.
+- manifest.json grows an installed-components list; the updater's overlay/full logic
+  becomes component-aware (per-component versions in deps).
+- Open design option for when this lands: ship core with DirectML as the working default so
+  FIRST PLAY works on every GPU minutes after a ~460 MB download, with the manager offering
+  the TensorRT pack to NVIDIA users as an upgrade ("best performance") — turns the 3.6 GB
+  wall into a progressive enhancement.
+
 ### Phase 5 — Config editor & Linux packaging, ~1–3 weeks, after NVIDIA milestone
 - Linux distribution: self-contained tarball/AppImage built on the oldest supported Ubuntu LTS; documented build-from-source path; skip Flatpak/Snap/Docker for v1; never bundle the NVIDIA kernel driver; verify TRT redistribution under NVIDIA's SLA (vs-mlrt publicly redistributing TRT DLLs in GitHub releases is precedent it's tolerated — still verify).
 - Config editor: document config-file editing for Linux first; an Avalonia rewrite of `AnimeJaNaiConfEditor` is **not committed** until the NVIDIA build has shipped and demand is shown.
