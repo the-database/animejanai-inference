@@ -194,6 +194,41 @@ vsort; for us either CI-time python conversion or a C++ float16 graph rewrite + 
 (2) DML graph capture (`ep.dml.enable_graph_capture`) — legal now that IO is bound to stable
 GPU buffers, cuts per-op dispatch; needs a parity re-run to validate freshness.
 
+**Post-gate perf/quality backlog** (consolidated from an external code review 2026-06-12 +
+own levers; none are gate items):
+- **Pipelined inference (both backends).** Today one frame is in flight: the filter blocks on
+  cuStreamSynchronize (CUDA) / the end-of-frame fence wait (DML), so device time adds to the
+  frame budget instead of hiding behind display pacing. Deferred WITH data (5090 ≈ 310 fps
+  headroom at 1080p→4K) — it matters for mid-range GPUs, 4K sources, and high-factor RIFE.
+  Sketch when picked up: slot ring (queue-depth 2–3), per-slot stage/tensor buffers (or one
+  CUDA graph per slot; the DML side's per-segment allocator pool already points this way),
+  CUevent / fence value recorded per slot, emit on completion (cuLaunchHostFunc or a watcher
+  thread → mp_filter_wakeup), hold each input frame ref until its slot's event fires. RIFE's
+  scene decision is a mid-chain CPU readback — defer it to emission time or keep RIFE as a
+  documented synchronous exception. Footnote: try cuStreamCreateWithPriority for the infer
+  stream while at it (note the review suggested leastPriority "so inference preempts the VO"
+  — that's backwards: leastPriority *yields*; yielding to the VO's display-deadline mapper
+  copies is probably what we actually want, but it's an experiment either way).
+- **yuv444p16 output option (CUDA/TensorRT only).** The post-kernel currently decimates the
+  model's RGB back to 4:2:0 and the VO immediately reconstructs RGB. Emitting yuv444p16 CUDA
+  frames skips the chroma down-sampling passes and keeps the model's full-resolution chroma;
+  FFmpeg's CUDA hwframes and mpv's CUDA↔Vulkan mapper both support it (~50 µs/frame extra
+  mapper bandwidth at 4K). Exceeds-parity quality option — default stays 4:2:0 for the parity
+  harness; not portable to the D3D11/DML pool path (DXGI has no planar 16-bit 4:4:4 video
+  format). (RGBAF16 re-checked and still rejected: hwcontext_cuda lacks it, matching the
+  Phase 0 finding.)
+- **Passthrough ref-forwarding.** Slot-0/no-chain currently does a device copy into a pool
+  frame. Forwarding the input mp_image ref is free and as safe as filterless playback — but
+  ONLY while RIFE is off: RIFE buffers prev/cur (+ the outq), which would pin decoder-ring
+  surfaces — exactly the documented copy-on-arrival starvation rationale. Conditional
+  micro-optimization.
+
+(The same review also flagged the packaged `hwdec=auto-copy-safe` — already found and fixed
+in 3f; re-checking it surfaced the REAL adjacent gap, fixed in `c82742f`: the package pins
+`gpu-api=vulkan,auto` and mpv has no D3D11→Vulkan interop, so backend=DirectML on any
+Vulkan-capable machine would have hw-downloaded every output frame; the backend lua now
+pairs the render API with the backend — verified both ways, zero hwdownload.)
+
 **Packaging:** builder fetches the two NuGets (nupkg = zip) at pinned versions → `inference/`;
 licenses into third-party notices; parity harness gains a DML backend run (PSNR thresholds vs
 CUDA goldens — cross-backend fp16 differences expected); engine-monitor lua needs no change
