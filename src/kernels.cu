@@ -231,6 +231,90 @@ __global__ void k_uv_v_store(const float *src, int cw, pass py, aji_csp csp,
     uvrow[2 * x + 1] = (T)quant(v * csp.cscale + csp.coff, qdiv, qmax);
 }
 
+/* -------- 4:4:4 16-bit planar: pure matrix, no resampling -------- */
+
+__global__ void k_post444(const __half *src, int w, int h, aji_csp csp,
+                          uint8_t *yp, ptrdiff_t ys,
+                          uint8_t *cbp, ptrdiff_t cbs,
+                          uint8_t *crp, ptrdiff_t crs)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+    const size_t plane = (size_t)w * h, idx = (size_t)y * w + x;
+
+    const float r = __half2float(src[idx]);
+    const float g = __half2float(src[plane + idx]);
+    const float b = __half2float(src[2 * plane + idx]);
+
+    const float Y = csp.kr * r + (1.0f - csp.kr - csp.kb) * g + csp.kb * b;
+    const float U = (b - Y) / (2.0f * (1.0f - csp.kb));
+    const float V = (r - Y) / (2.0f * (1.0f - csp.kr));
+
+    ((uint16_t *)(yp  + (size_t)y * ys))[x]  =
+        (uint16_t)quant(Y * csp.yscale + csp.yoff, 1.0f, 65535.0f);
+    ((uint16_t *)(cbp + (size_t)y * cbs))[x] =
+        (uint16_t)quant(U * csp.cscale + csp.coff, 1.0f, 65535.0f);
+    ((uint16_t *)(crp + (size_t)y * crs))[x] =
+        (uint16_t)quant(V * csp.cscale + csp.coff, 1.0f, 65535.0f);
+}
+
+extern "C" int aji_run_post444(int w, int h, const void *src_f16,
+                               const aji_csp *csp,
+                               void *y_plane, ptrdiff_t y_stride,
+                               void *cb_plane, ptrdiff_t cb_stride,
+                               void *cr_plane, ptrdiff_t cr_stride,
+                               void *stream)
+{
+    k_post444<<<dim3((w + 31) / 32, (h + 7) / 8), dim3(32, 8), 0,
+                (cudaStream_t)stream>>>(
+        (const __half *)src_f16, w, h, *csp,
+        (uint8_t *)y_plane, y_stride, (uint8_t *)cb_plane, cb_stride,
+        (uint8_t *)cr_plane, cr_stride);
+    return (int)cudaGetLastError();
+}
+
+__global__ void k_pre444(const uint8_t *yp, ptrdiff_t ys,
+                         const uint8_t *cbp, ptrdiff_t cbs,
+                         const uint8_t *crp, ptrdiff_t crs,
+                         int w, int h, aji_csp csp, __half *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+    const size_t plane = (size_t)w * h, idx = (size_t)y * w + x;
+
+    const float Y = (((const uint16_t *)(yp  + (size_t)y * ys))[x]
+                     - csp.yoff) / csp.yscale;
+    const float U = (((const uint16_t *)(cbp + (size_t)y * cbs))[x]
+                     - csp.coff) / csp.cscale;
+    const float V = (((const uint16_t *)(crp + (size_t)y * crs))[x]
+                     - csp.coff) / csp.cscale;
+
+    const float kg = 1.0f - csp.kr - csp.kb;
+    dst[idx]             = __float2half(Y + 2.0f * (1.0f - csp.kr) * V);
+    dst[2 * plane + idx] = __float2half(Y + 2.0f * (1.0f - csp.kb) * U);
+    dst[plane + idx]     = __float2half(
+        Y - (2.0f * csp.kb * (1.0f - csp.kb) * U +
+             2.0f * csp.kr * (1.0f - csp.kr) * V) / kg);
+}
+
+extern "C" int aji_run_pre444(int w, int h,
+                              const void *y_plane, ptrdiff_t y_stride,
+                              const void *cb_plane, ptrdiff_t cb_stride,
+                              const void *cr_plane, ptrdiff_t cr_stride,
+                              const aji_csp *csp, void *dst_f16, void *stream)
+{
+    k_pre444<<<dim3((w + 31) / 32, (h + 7) / 8), dim3(32, 8), 0,
+               (cudaStream_t)stream>>>(
+        (const uint8_t *)y_plane, y_stride, (const uint8_t *)cb_plane,
+        cb_stride, (const uint8_t *)cr_plane, cr_stride, w, h, *csp,
+        (__half *)dst_f16);
+    return (int)cudaGetLastError();
+}
+
 /* ---------------- resize: RGB fp16 -> RGB fp16 ---------------- */
 
 __global__ void k_rs_h(const __half *src, int h, pass px, float *dst)
@@ -530,10 +614,13 @@ extern "C" int aji_scd_diff(int format, const void *ya, ptrdiff_t stride_a,
             (const uint8_t *)ya, stride_a, (const uint8_t *)yb, stride_b,
             w, h, 1.0f / 255.0f, accum_dev);
     } else {
-        // P010 raw values are MSB-aligned 10-bit
+        // P010 raw values are MSB-aligned 10-bit; YUV444P16 uses the
+        // full 16-bit container
+        const float peak = format == AJI_FMT_YUV444P16 ? 65535.0f
+                                                       : 65472.0f;
         k_scd_diff<uint16_t><<<GRID(w, h, 1), 0, s>>>(
             (const uint8_t *)ya, stride_a, (const uint8_t *)yb, stride_b,
-            w, h, 1.0f / 65472.0f, accum_dev);
+            w, h, 1.0f / peak, accum_dev);
     }
     return (int)cudaGetLastError();
 }

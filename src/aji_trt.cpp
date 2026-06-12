@@ -203,7 +203,7 @@ struct aji_ctx {
     // graph_ok latches false on the first capture/launch failure.
     bool graph_ok = true;
     cudaGraphExec_t graph_exec = nullptr;
-    int graph_key[8] = {0};
+    int graph_key[9] = {0};
     void *stage_in = nullptr, *stage_out = nullptr;
     size_t stage_in_bytes = 0, stage_out_bytes = 0;
 
@@ -1104,14 +1104,17 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
                             const aji_frame *out, cudaStream_t stream,
                             int *ret)
 {
+    const bool out444 = out->format == AJI_FMT_YUV444P16;
     const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
+    const int obpp = out444 ? 2 : bpp;
     const size_t in_row = (size_t)in->width * bpp;
-    const size_t out_row = (size_t)out->width * bpp;
+    const size_t out_row = (size_t)out->width * obpp;
     const size_t in_y = in_row * in->height;
     const size_t out_y = out_row * out->height;
 
     if (!ensure_stage(&c->stage_in, &c->stage_in_bytes, in_y * 3 / 2) ||
-        !ensure_stage(&c->stage_out, &c->stage_out_bytes, out_y * 3 / 2)) {
+        !ensure_stage(&c->stage_out, &c->stage_out_bytes,
+                      out444 ? out_y * 3 : out_y * 3 / 2)) {
         c->graph_ok = false;
         return false;
     }
@@ -1124,6 +1127,10 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
     sout.plane[0] = c->stage_out;
     sout.plane[1] = (char *)c->stage_out + out_y;
     sout.stride[0] = sout.stride[1] = (ptrdiff_t)out_row;
+    if (out444) {
+        sout.plane[2] = (char *)c->stage_out + 2 * out_y;
+        sout.stride[2] = (ptrdiff_t)out_row;
+    }
 
     if (!copy_plane(sin.plane[0], in_row, in->plane[0], in->stride[0],
                     in_row, in->height, stream) ||
@@ -1133,8 +1140,9 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
         return false;
     }
 
-    const int key[8] = {in->format, in->width, in->height, in->siting,
-                        in->matrix, in->range, out->width, out->height};
+    const int key[9] = {in->format, in->width, in->height, in->siting,
+                        in->matrix, in->range, out->width, out->height,
+                        out->format};
     if (!c->graph_exec || memcmp(key, c->graph_key, sizeof(key)) != 0) {
         if (c->graph_exec) {
             cudaGraphExecDestroy(c->graph_exec);
@@ -1180,7 +1188,11 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
     if (!copy_plane(out->plane[0], out->stride[0], sout.plane[0], out_row,
                     out_row, out->height, stream) ||
         !copy_plane(out->plane[1], out->stride[1], sout.plane[1], out_row,
-                    out_row, out->height / 2, stream)) {
+                    out_row, out444 ? out->height : out->height / 2,
+                    stream) ||
+        (out444 &&
+         !copy_plane(out->plane[2], out->stride[2], sout.plane[2], out_row,
+                     out_row, out->height, stream))) {
         c->set_error("staging copy-out failed");
         *ret = AJI_ERR_CUDA;
         return true;
@@ -1202,8 +1214,8 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
-    if (out->format != in->format) {
-        c->set_error("output format must match input");
+    if (out->format != in->format && out->format != AJI_FMT_YUV444P16) {
+        c->set_error("output format must match input (or be YUV444P16)");
         return AJI_ERR_FORMAT;
     }
     if (in->width != c->in_w || in->height != c->in_h ||
@@ -1303,6 +1315,24 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
         }
     }
 
+    if (out->format == AJI_FMT_YUV444P16) {
+        // full-resolution chroma: pure matrix + 16-bit quantize, no
+        // resampling and no plan (this exceeds the reference pipeline,
+        // which always subsampled back to 4:2:0)
+        const aji_csp ocsp = aji_make_csp(AJI_FMT_YUV444P16, in->matrix,
+                                          in->range);
+        int err4 = aji_run_post444(cw, ch, c->buf[cur], &ocsp,
+                                   out->plane[0], out->stride[0],
+                                   out->plane[1], out->stride[1],
+                                   out->plane[2], out->stride[2], stream);
+        if (err4) {
+            c->set_error("post444 kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err4));
+            return AJI_ERR_CUDA;
+        }
+        return AJI_OK;
+    }
+
     // The reference pipeline's final resize.Spline36(format=YUV420...) call
     // always subsamples with LEFT placement: VS/zimg only propagates chroma
     // location between subsampled formats, and RGB sources have none, so the
@@ -1378,8 +1408,9 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         return AJI_ERR;
     }
     if (a->format != b->format || a->format != out->format ||
-        (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010)) {
-        c->set_error("rife frame formats must match (nv12/p010)");
+        (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010 &&
+         a->format != AJI_FMT_YUV444P16)) {
+        c->set_error("rife frame formats must match (nv12/p010/yuv444p16)");
         return AJI_ERR_FORMAT;
     }
     if (a->width != R.w || a->height != R.h || b->width != R.w ||
@@ -1396,7 +1427,8 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     }
     cudaStream_t stream = (cudaStream_t)cu_stream;
     const int fmt = a->format;
-    const int bpp = fmt == AJI_FMT_P010 ? 2 : 1;
+    const bool f444 = fmt == AJI_FMT_YUV444P16;
+    const int bpp = fmt == AJI_FMT_NV12 ? 1 : 2;
     const size_t prow = (size_t)R.pw * bpp;
     const size_t py = prow * R.ph;
     const size_t plane = (size_t)R.pw * R.ph;          // fp16 elements
@@ -1405,16 +1437,21 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     if (R.format != fmt) {
         aji_plan_destroy(R.pre);
         aji_plan_destroy(R.post);
-        R.pre = aji_pre_plan_create(fmt, R.pw, R.ph, AJI_SITING_LEFT,
-                                    AJI_FILTER_BILINEAR);
-        R.post = aji_post_plan_create(fmt, R.pw, R.ph, AJI_SITING_LEFT,
-                                      AJI_FILTER_BILINEAR);
+        R.pre = R.post = nullptr;
+        if (!f444) {
+            R.pre = aji_pre_plan_create(fmt, R.pw, R.ph, AJI_SITING_LEFT,
+                                        AJI_FILTER_BILINEAR);
+            R.post = aji_post_plan_create(fmt, R.pw, R.ph, AJI_SITING_LEFT,
+                                          AJI_FILTER_BILINEAR);
+        }
         cudaFree(R.pad_a);
         cudaFree(R.pad_b);
         cudaFree(R.pad_o);
         R.pad_a = R.pad_b = R.pad_o = nullptr;
-        const size_t pad_bytes = py + py / 2;
-        if (!R.pre || !R.post ||
+        // 4:2:0: Y plane + interleaved CbCr; 4:4:4 16-bit: three planes
+        // (no resampling plans needed - conversions are planless)
+        const size_t pad_bytes = f444 ? 3 * py : py + py / 2;
+        if ((!f444 && (!R.pre || !R.post)) ||
             cudaMalloc(&R.pad_a, pad_bytes) != cudaSuccess ||
             cudaMalloc(&R.pad_b, pad_bytes) != cudaSuccess ||
             cudaMalloc(&R.pad_o, pad_bytes) != cudaSuccess) {
@@ -1424,12 +1461,19 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         }
         // pad borders are studio black like std.AddBorders; interiors get
         // overwritten per frame, so fill whole planes once
-        const unsigned yblack = fmt == AJI_FMT_P010 ? 16 * 256 : 16;
-        const unsigned cblack = fmt == AJI_FMT_P010 ? 128 * 256 : 128;
+        const unsigned yblack = fmt == AJI_FMT_NV12 ? 16 : 16 * 256;
+        const unsigned cblack = fmt == AJI_FMT_NV12 ? 128 : 128 * 256;
         for (void *p : {R.pad_a, R.pad_b}) {
             aji_fill_plane(fmt, p, prow, R.pw, R.ph, yblack, stream);
-            aji_fill_plane(fmt, (char *)p + py, prow, R.pw, R.ph / 2, cblack,
-                           stream);
+            if (f444) {
+                aji_fill_plane(fmt, (char *)p + py, prow, R.pw, R.ph,
+                               cblack, stream);
+                aji_fill_plane(fmt, (char *)p + 2 * py, prow, R.pw, R.ph,
+                               cblack, stream);
+            } else {
+                aji_fill_plane(fmt, (char *)p + py, prow, R.pw, R.ph / 2,
+                               cblack, stream);
+            }
         }
         R.format = fmt;
     }
@@ -1459,26 +1503,48 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     const size_t doff_y = (size_t)R.pad_t * prow + (size_t)R.pad_l * bpp;
     const size_t doff_uv = py + (size_t)(R.pad_t / 2) * prow +
                            (size_t)R.pad_l * bpp;
+    const size_t doff_p = (size_t)R.pad_t * prow + (size_t)R.pad_l * bpp;
     const aji_frame *src[2] = {a, b};
     void *pad[2] = {R.pad_a, R.pad_b};
     for (int i = 0; i < 2; i++) {
-        if (!copy_plane((char *)pad[i] + doff_y, prow, src[i]->plane[0],
-                        src[i]->stride[0], (size_t)R.w * bpp, R.h, stream) ||
-            !copy_plane((char *)pad[i] + doff_uv, prow, src[i]->plane[1],
-                        src[i]->stride[1], (size_t)R.w * bpp, R.h / 2,
-                        stream)) {
+        bool ok;
+        if (f444) {
+            ok = true;
+            for (int pl = 0; pl < 3 && ok; pl++)
+                ok = copy_plane((char *)pad[i] + pl * py + doff_p, prow,
+                                src[i]->plane[pl], src[i]->stride[pl],
+                                (size_t)R.w * bpp, R.h, stream);
+        } else {
+            ok = copy_plane((char *)pad[i] + doff_y, prow, src[i]->plane[0],
+                            src[i]->stride[0], (size_t)R.w * bpp, R.h,
+                            stream) &&
+                 copy_plane((char *)pad[i] + doff_uv, prow,
+                            src[i]->plane[1], src[i]->stride[1],
+                            (size_t)R.w * bpp, R.h / 2, stream);
+        }
+        if (!ok) {
             c->set_error("rife staging copy failed");
             return AJI_ERR_CUDA;
         }
     }
 
-    // padded YUV -> RGB into input channels 0-2 (frame a) and 3-5 (b),
-    // bilinear chroma, hardcoded BT.709 like rife_cuda.py
+    // padded YUV -> RGB into input channels 0-2 (frame a) and 3-5 (b);
+    // 4:2:0 upsamples chroma bilinearly like rife_cuda.py, 4:4:4 needs
+    // no resampling at all. Matrix hardcoded BT.709 like the reference.
     const aji_csp csp = aji_make_csp(fmt, AJI_MATRIX_BT709, a->range);
     char *tin = (char *)R.in_tensor;
     for (int i = 0; i < 2; i++) {
-        err = aji_run_pre(R.pre, pad[i], prow, (char *)pad[i] + py, prow,
-                          &csp, tin + plane * 2 * (i * 3), stream);
+        if (f444) {
+            err = aji_run_pre444(R.pw, R.ph,
+                                 pad[i], prow,
+                                 (char *)pad[i] + py, prow,
+                                 (char *)pad[i] + 2 * py, prow,
+                                 &csp, tin + plane * 2 * (i * 3), stream);
+        } else {
+            err = aji_run_pre(R.pre, pad[i], prow, (char *)pad[i] + py,
+                              prow, &csp, tin + plane * 2 * (i * 3),
+                              stream);
+        }
         if (err) {
             c->set_error("rife pre kernel failed: %s",
                          cudaGetErrorString((cudaError_t)err));
@@ -1503,20 +1569,37 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         return AJI_ERR_ENGINE;
     }
 
-    // RGB -> padded YUV (bilinear, 709), then crop the window out
-    err = aji_run_post(R.post, R.out_tensor, &csp, R.pad_o, prow,
-                       (char *)R.pad_o + py, prow, stream);
+    // RGB -> padded YUV, then crop the window out
+    if (f444) {
+        err = aji_run_post444(R.pw, R.ph, R.out_tensor, &csp,
+                              R.pad_o, prow,
+                              (char *)R.pad_o + py, prow,
+                              (char *)R.pad_o + 2 * py, prow, stream);
+    } else {
+        err = aji_run_post(R.post, R.out_tensor, &csp, R.pad_o, prow,
+                           (char *)R.pad_o + py, prow, stream);
+    }
     if (err) {
         c->set_error("rife post kernel failed: %s",
                      cudaGetErrorString((cudaError_t)err));
         return AJI_ERR_CUDA;
     }
-    if (!copy_plane(out->plane[0], out->stride[0],
-                    (char *)R.pad_o + doff_y, prow, (size_t)R.w * bpp, R.h,
-                    stream) ||
-        !copy_plane(out->plane[1], out->stride[1],
-                    (char *)R.pad_o + doff_uv, prow, (size_t)R.w * bpp,
-                    R.h / 2, stream)) {
+    bool ok;
+    if (f444) {
+        ok = true;
+        for (int pl = 0; pl < 3 && ok; pl++)
+            ok = copy_plane(out->plane[pl], out->stride[pl],
+                            (char *)R.pad_o + pl * py + doff_p, prow,
+                            (size_t)R.w * bpp, R.h, stream);
+    } else {
+        ok = copy_plane(out->plane[0], out->stride[0],
+                        (char *)R.pad_o + doff_y, prow, (size_t)R.w * bpp,
+                        R.h, stream) &&
+             copy_plane(out->plane[1], out->stride[1],
+                        (char *)R.pad_o + doff_uv, prow,
+                        (size_t)R.w * bpp, R.h / 2, stream);
+    }
+    if (!ok) {
         c->set_error("rife crop copy failed");
         return AJI_ERR_CUDA;
     }

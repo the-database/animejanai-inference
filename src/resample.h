@@ -106,13 +106,16 @@ inline aji_csp make_csp(int format, int matrix, int range)
     case AJI_MATRIX_BT709:
     default:                c.kr = 0.2126f; c.kb = 0.0722f; break;
     }
-    const bool p010 = format == AJI_FMT_P010;
-    const float m = p010 ? 256.0f : 1.0f;          // 8-bit-reference scale
-    const float maxraw = p010 ? 65472.0f : 255.0f; // (2^bd - 1) << (16 - bd)
+    // 8-bit-reference scale: P010 raw values are 10-bit << 6, YUV444P16
+    // uses the full 16-bit container (8-bit << 8 reference points)
+    const float m = format == AJI_FMT_P010 ? 256.0f :
+                    format == AJI_FMT_YUV444P16 ? 256.0f : 1.0f;
+    const float maxraw = format == AJI_FMT_P010 ? 65472.0f :
+                         format == AJI_FMT_YUV444P16 ? 65535.0f : 255.0f;
     if (range == AJI_RANGE_FULL) {
         c.yoff = 0.0f;
         c.yscale = maxraw;
-        c.coff = p010 ? 32768.0f : 128.0f;
+        c.coff = m == 256.0f ? 32768.0f : 128.0f;
         c.cscale = maxraw;
     } else {
         c.yoff = 16.0f * m;

@@ -45,12 +45,13 @@ int main(int argc, char **argv)
     const char *conf = NULL, *model_dir = NULL, *trtexec = NULL, *trtexec_env = NULL;
     const char *rife_model_dir = NULL;
     const char *format = "nv12", *matrix = "709", *range = "limited", *siting = "left";
-    int w = 0, h = 0, max_frames = 1 << 30, slot = 1, rife = 0;
+    int w = 0, h = 0, max_frames = 1 << 30, slot = 1, rife = 0, out444 = 0;
 
     double fps = 23.976;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--rife")) { rife = 1; continue; }
+        if (!strcmp(argv[i], "--out444")) { out444 = 1; continue; }
         if (i >= argc - 1) break;
         if (!strcmp(argv[i], "--engine")) engine = argv[++i];
         else if (!strcmp(argv[i], "--conf")) conf = argv[++i];
@@ -208,7 +209,9 @@ int main(int argc, char **argv)
     }
     printf("configured: %dx%d %s -> %dx%d\n", w, h, format, ow, oh);
 
-    const size_t oy_sz = (size_t)ow * oh * bpp, ouv_sz = oy_sz / 2;
+    const int obpp = out444 ? 2 : bpp;
+    const size_t oy_sz = (size_t)ow * oh * obpp;
+    const size_t ouv_sz = out444 ? 2 * oy_sz : oy_sz / 2;  // Cb+Cr or CbCr
 
     FILE *fin = fopen(input, "rb");
     if (!fin) { perror(input); return 1; }
@@ -228,13 +231,17 @@ int main(int argc, char **argv)
     aji_frame in = {.width = w, .height = h, .format = fmt,
                     .matrix = mat, .range = rng, .siting = sit,
                     .stride = {(ptrdiff_t)(w * bpp), (ptrdiff_t)(w * bpp)}};
-    aji_frame out = {.width = ow, .height = oh, .format = fmt,
+    aji_frame out = {.width = ow, .height = oh,
+                     .format = out444 ? AJI_FMT_YUV444P16 : fmt,
                      .matrix = mat, .range = rng, .siting = sit,
-                     .stride = {(ptrdiff_t)(ow * bpp), (ptrdiff_t)(ow * bpp)}};
+                     .stride = {(ptrdiff_t)(ow * obpp), (ptrdiff_t)(ow * obpp),
+                                (ptrdiff_t)(ow * obpp)}};
     CK(cudaMalloc(&in.plane[0], y_sz));
     CK(cudaMalloc(&in.plane[1], uv_sz));
     CK(cudaMalloc(&out.plane[0], oy_sz));
-    CK(cudaMalloc(&out.plane[1], ouv_sz));
+    CK(cudaMalloc(&out.plane[1], out444 ? oy_sz : ouv_sz));
+    if (out444)
+        CK(cudaMalloc(&out.plane[2], oy_sz));
 
     cudaStream_t stream;
     CK(cudaStreamCreate(&stream));
@@ -273,8 +280,12 @@ int main(int argc, char **argv)
         if (fout) {
             CK(cudaMemcpyAsync(h_out, out.plane[0], oy_sz,
                                cudaMemcpyDeviceToHost, stream));
-            CK(cudaMemcpyAsync((char *)h_out + oy_sz, out.plane[1], ouv_sz,
+            CK(cudaMemcpyAsync((char *)h_out + oy_sz, out.plane[1],
+                               out444 ? oy_sz : ouv_sz,
                                cudaMemcpyDeviceToHost, stream));
+            if (out444)
+                CK(cudaMemcpyAsync((char *)h_out + 2 * oy_sz, out.plane[2],
+                                   oy_sz, cudaMemcpyDeviceToHost, stream));
         }
         CK(cudaStreamSynchronize(stream));
 
