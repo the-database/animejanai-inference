@@ -116,7 +116,23 @@ Day 1, before any code: smoke-test the handoff with `--vf=lavfi=[scale_cuda=1920
 
 **NVIDIA milestone = Phases 0 + 1 + 1.5 + 2 — COMPLETE 2026-06-12.**
 
-**Release gate redefined (2026-06-12): the next release is v3.4.0 and ships only at feature parity with 3.3.x** — replacing the pipeline must not lose existing features. In-gate: Phase 3 (DirectML backend — CODE-COMPLETE 2026-06-12), fractional RIFE factors (DONE 2026-06-12, mpv `5b26e84ffb`: filter-side output-grid phase accumulator, vsmlrt video_player semantics; both backends verified), and the ConfEditor benchmark rework (editor repo — the remaining gate item). Out-of-gate: Linux (Phase 5 — never supported, purely additive), TRT 11 (infrastructure), NCNN (stays deferred: with DirectML at parity its unique audience on a Windows package is ~nil).
+**Release gate redefined (2026-06-12): the next release is v3.4.0 and ships only at feature parity with 3.3.x** — replacing the pipeline must not lose existing features. In-gate: Phase 3 (DirectML backend — CODE-COMPLETE 2026-06-12), fractional RIFE factors (DONE
+2026-06-12, mpv `5b26e84ffb`), and the benchmark rework (DONE 2026-06-12, sibling `6baef56` —
+**no editor changes needed**: the editor's Benchmark button shells
+`benchmarks\animejanai_benchmark_all.bat` in a console, a file-based contract; the bat now
+drives a native benchmark.ps1 over the configured backend, bundled testsrc2 seeds, built-in
+slots 1010/1011, writing benchmark.txt like 3.3.x; ConfEditorVersion bump unnecessary).
+
+**3.3.0 vs native, measured 2026-06-12 (RTX 5090, same V3.1 SPANF3 models, same clips, 500
+frames, end-to-end playback: 3.3.0 = ffms2+VS/vspipe fps, native = hw-decode mpv --untimed,
+log-window fps):** TensorRT Balanced 480x360 886→936 / 640x480 481→651 / 768x576 312→492 /
+720p 176→278 / 1080p 73.7→111.9 fps (1.5-1.6×); Performance 1109→1075 / 507→818 / 338→648 /
+176→379 / 77.2→174.7 fps (up to **2.3×**). DirectML (3.3.0 vsort vs native aji_dml):
+720p 104→123 / 112→185, 1080p 43.4→55.3 / 49.8→**91.9** fps (1.3-1.9×). The native side runs
+ONE frame in flight vs VS's 8-deep pipeline and still wins everywhere except ~480x360 parity
+(per-frame fixed costs) — the pipelining backlog item lifts exactly that. In-package
+benchmark tool (inference-only, what users see): TRT 1080p Bal 150 / Perf 281 fps; DML 66 /
+126 fps. Out-of-gate: Linux (Phase 5 — never supported, purely additive), TRT 11 (infrastructure), NCNN (stays deferred: with DirectML at parity its unique audience on a Windows package is ~nil).
 
 ### Phase 3 — DirectML backend (Windows non-NVIDIA) — recon complete 2026-06-12, design locked
 
