@@ -292,6 +292,43 @@ void clean_stale_engines(aji_ctx *c)
     }
 }
 
+// Human-readable build resolution from the trtexec shape flags: the WxH of
+// --optShapes for static engines, or "minWxH-maxWxH" when min/max differ
+// (dynamic engines from custom trt_engine_settings).
+std::string shapes_label(const std::string &settings)
+{
+    auto dims = [&](const char *key) -> std::string {
+        size_t p = settings.find(key);
+        if (p == std::string::npos)
+            return "";
+        p = settings.find(':', p);  // --xxxShapes=input:NxCxHxW
+        if (p == std::string::npos)
+            return "";
+        long v[8];
+        int n = 0;
+        size_t i = p + 1;
+        while (n < 8 && i < settings.size() &&
+               isdigit((unsigned char)settings[i])) {
+            v[n++] = strtol(settings.c_str() + i, nullptr, 10);
+            while (i < settings.size() && isdigit((unsigned char)settings[i]))
+                i++;
+            if (i < settings.size() && settings[i] == 'x')
+                i++;
+        }
+        if (n < 2)
+            return "";
+        return std::to_string(v[n - 1]) + "x" + std::to_string(v[n - 2]);
+    };
+    const std::string mn = dims("--minShapes");
+    const std::string mx = dims("--maxShapes");
+    const std::string op = dims("--optShapes");
+    if (!mn.empty() && !mx.empty() && mn != mx)
+        return mn + "-" + mx;
+    if (!op.empty())
+        return op;
+    return !mx.empty() ? mx : mn;
+}
+
 // Everything a build needs, with no aji_ctx references, so it can run on a
 // background thread.
 struct BuildSpec {
@@ -300,6 +337,7 @@ struct BuildSpec {
     std::string engine_path;
     std::string log_path;     // trtexec output, kept for diagnostics
     std::string name;
+    std::string res;          // shapes_label() of the build settings
 };
 
 // Run the build subprocess with no console window (win32) and its output
@@ -352,14 +390,20 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 #endif
 }
 
-// Run a build to completion; on failure remove the half-written engine.
-// Thread-safe (touches no ctx state).
+// Run a build to completion; on failure remove the half-written engine and
+// append the exit code to the build log (crash/kill diagnosis). Thread-safe
+// (touches no ctx state).
 bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
     int rc = run_build_process(spec, child);
     if (rc != 0 || !fs::exists(spec.engine_path)) {
         std::error_code ec;
         fs::remove(spec.engine_path, ec);
+        if (FILE *f = fopen(spec.log_path.c_str(), "a")) {
+            fprintf(f, "\n[aji] build process exit code: %d (0x%x)\n", rc,
+                    (unsigned)rc);
+            fclose(f);
+        }
         return false;
     }
     return true;
@@ -392,6 +436,7 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
     spec->engine_path = engine_path;
     spec->log_path = engine_path + ".build.log";
     spec->name = onnx_name;
+    spec->res = shapes_label(settings);
     return true;
 }
 
@@ -404,6 +449,7 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
         return false;
     c->verbose("building engine: %s", spec.cmdline.c_str());
     c->log_steps.push_back("Building TensorRT engine for " + onnx_name +
+                           " for " + spec.res +
                            " (first play at this resolution)");
     if (!run_build_spec(spec, &c->build_child)) {
         c->set_error("trtexec failed building engine for %s (see %s)",
@@ -509,6 +555,7 @@ void start_async_build(aji_ctx *c, const BuildSpec &spec)
     c->build_ok = false;
     c->build_running = true;
     c->log_steps.push_back("Building TensorRT engine for " + spec.name +
+                           " for " + spec.res +
                            " (first play at this resolution)");
     c->verbose("background engine build: %s", spec.cmdline.c_str());
     c->build_thread = std::thread([c, spec]() {
@@ -537,7 +584,8 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                 // permanent (until reconfigure changes the cache key):
                 // play passthrough instead of failing the filter
                 c->log_steps.push_back(
-                    "Engine build FAILED for " + name + " (see " + epath +
+                    "Engine build FAILED for " + name + " for " +
+                    shapes_label(settings) + " (see " + epath +
                     ".build.log); playing without this chain");
                 return 0;
             }
@@ -545,8 +593,9 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                 // one build at a time; multi-engine chains cascade through
                 // repeated poll() -> reconfigure cycles
                 c->log_steps.push_back("Building TensorRT engine for " +
-                                       name + " (first play at this "
-                                       "resolution)");
+                                       name + " for " +
+                                       shapes_label(settings) +
+                                       " (first play at this resolution)");
                 return 0;
             }
             BuildSpec spec;
