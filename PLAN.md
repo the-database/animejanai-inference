@@ -132,7 +132,24 @@ log-window fps):** TensorRT Balanced 480x360 886→936 / 640x480 481→651 / 768
 ONE frame in flight vs VS's 8-deep pipeline and still wins everywhere except ~480x360 parity
 (per-frame fixed costs) — the pipelining backlog item lifts exactly that. In-package
 benchmark tool (inference-only, what users see): TRT 1080p Bal 150 / Perf 281 fps; DML 66 /
-126 fps. Out-of-gate: Linux (Phase 5 — never supported, purely additive), TRT 11 (infrastructure), NCNN (stays deferred: with DirectML at parity its unique audience on a Windows package is ~nil).
+126 fps. Out-of-gate: Linux (Phase 5 — never supported, purely additive), NCNN (stays deferred: with DirectML at parity its unique audience on a Windows package is ~nil).
+
+**TRT 11 migration — DONE 2026-06-12** (shim `69b12a1`, builder `2f6d2f8`; user folded it into the
+expanded v3.4.0 scope): the runtime API surface compiled UNCHANGED against 11.0.0.114; the work
+was trtexec's weak-typing flag removals — settings sanitize at cmdline-build when
+NV_TENSORRT_MAJOR≥11 (drop --fp16/--bf16/--int8/--best/--buildOnly, --inputIOFormats/
+--outputIOFormats (the fp16: value prefix no longer parses), --tacticSources (cuDNN/cuBLAS
+enum values gone); --workspace→--memPoolSize), CRC still hashes the original string; the RIFE
+template became --stronglyTyped from the fp16 models (works on 10 and 11, validated both).
+Results: parity vs 10.16 Y 59.5 / UV 68.9 dB max 1 LSB, 4:4:4 flat output BIT-IDENTICAL, RIFE
+strongly-typed builds + runs, CUDA graphs capture, perf within ~6% at the engine level
+(3.42 vs 3.21 ms — and the chain converges to ~3.6 vs ~3.4 warm), and **cold engine builds
+drop ~60 s → ~10 s** — the first-play UX transforms. Windows runtime = vs-mlrt v16.test1
+(nvinfer_11 import lib generated via dumpbin/lib; slim DLL set proven: nvinfer_11 + plugin +
+onnxparser + builder resources + cudart + trtexec — lean/dispatch/cuDNN/cuBLAS not needed).
+CAVEAT: v16.test1 is a pre-release — recheck for stable v16 before the package release. Debug
+note: an mpv exit mid-build kills the trtexec child BY DESIGN (quit-doesn't-stall) — short
+untimed test runs produce truncated build logs with exit 1; not a failure.
 
 ### Phase 3 — DirectML backend (Windows non-NVIDIA) — recon complete 2026-06-12, design locked
 
