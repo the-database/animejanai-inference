@@ -139,8 +139,9 @@ void cs_v_f32(uint3 id : SV_DispatchThreadID)
 
 // ---- cs_pre_combine: Y raw + upsampled chroma f32 -> RGB tensor ----
 // 2 px per thread (x covers w/2; w is always even). di = {w, h},
-// dj.x = y row stride bytes. d0 = y raw, d1 = uvf f32 (2 planes w*h),
-// d2 = tensor out.
+// dj.x = y row stride bytes, dj.y = destination element offset (RIFE
+// writes channel blocks of a shared input tensor). d0 = y raw,
+// d1 = uvf f32 (2 planes w*h), d2 = tensor out.
 [numthreads(32, 8, 1)]
 void cs_pre_combine(uint3 id : SV_DispatchThreadID)
 {
@@ -164,7 +165,7 @@ void cs_pre_combine(uint3 id : SV_DispatchThreadID)
         rgb[k * 3 + 1] = Y - (2.0f * kb * (1.0f - kb) * U +
                               2.0f * kr * (1.0f - kr) * V) / kg;
     }
-    uint base = (uint)y * (uint)w + (uint)x0;
+    uint base = (uint)dj.y + (uint)y * (uint)w + (uint)x0;
     [unroll]
     for (int p = 0; p < 3; p++) {
         uint e = p * plane + base;
@@ -175,6 +176,127 @@ void cs_pre_combine(uint3 id : SV_DispatchThreadID)
         d2.Store((e + 1u) * 4u, asuint(rgb[3 + p]));
 #endif
     }
+}
+
+// ---- cs_fill: fill a dword range with a constant ----
+// di.x = dword count, dj.x = start dword, dj.y = value bits. d0 = dst.
+[numthreads(256, 1, 1)]
+void cs_fill(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < (uint)di.x)
+        d0.Store(((uint)dj.x + id.x) * 4u, (uint)dj.y);
+}
+
+// ---- cs_window: copy a byte window between two pitched buffers ----
+// Used to embed frames into the RIFE pad interior and crop them back
+// out. Partial dwords at the window edges read-modify-write so the
+// black pad border survives. di = {window bytes per row, rows, dwords
+// per row}, dj = {src byte offset, src pitch, dst byte offset, dst
+// pitch}. d0 = src, d1 = dst. Offsets/pitches are even; pitches %4==0.
+[numthreads(32, 8, 1)]
+void cs_window(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)di.z || id.y >= (uint)di.y)
+        return;
+    uint row_src = (uint)dj.x + id.y * (uint)dj.y;
+    uint row_dst = (uint)dj.z + id.y * (uint)dj.w;
+    uint wstart = row_dst, wend = row_dst + (uint)di.x;
+    uint base = (row_dst & ~3u) + id.x * 4u;
+    uint val = 0u, mask = 0u;
+    [unroll]
+    for (uint b = 0; b < 4; b++) {
+        uint db = base + b;
+        if (db >= wstart && db < wend) {
+            val |= load_u8(d0, row_src + (db - wstart)) << (b * 8u);
+            mask |= 0xffu << (b * 8u);
+        }
+    }
+    if (mask != 0xffffffffu)
+        val |= d1.Load(base) & ~mask;
+    d1.Store(base, val);
+}
+
+// ---- cs_rife_consts: mesh + multiplier channels (RIFE input 7..10) ----
+// 2 px per thread on the fp16 path (w = padded width, always even).
+// di = {w, h}, dj.x = base element offset (7 * plane). d0 = tensor.
+[numthreads(32, 8, 1)]
+void cs_rife_consts(uint3 id : SV_DispatchThreadID)
+{
+    int w = di.x, h = di.y;
+#if IO16
+    int x0 = id.x * 2, y = id.y;
+    if (x0 >= w || y >= h)
+        return;
+    uint plane = (uint)w * (uint)h;
+    uint base = (uint)dj.x + (uint)y * (uint)w + (uint)x0;
+    float vx0 = 2.0f * x0 / (w - 1) - 1.0f;
+    float vx1 = 2.0f * (x0 + 1) / (w - 1) - 1.0f;
+    float vy = 2.0f * y / (h - 1) - 1.0f;
+    d0.Store(base * 2u, f32tof16(vx0) | (f32tof16(vx1) << 16u));
+    d0.Store((plane + base) * 2u, f32tof16(vy) | (f32tof16(vy) << 16u));
+    uint mw = f32tof16(2.0f / (w - 1));
+    uint mh = f32tof16(2.0f / (h - 1));
+    d0.Store((2u * plane + base) * 2u, mw | (mw << 16u));
+    d0.Store((3u * plane + base) * 2u, mh | (mh << 16u));
+#else
+    int x = id.x, y = id.y;
+    if (x >= w || y >= h)
+        return;
+    uint plane = (uint)w * (uint)h;
+    uint base = (uint)dj.x + (uint)y * (uint)w + (uint)x;
+    d0.Store(base * 4u, asuint(2.0f * x / (w - 1) - 1.0f));
+    d0.Store((plane + base) * 4u, asuint(2.0f * y / (h - 1) - 1.0f));
+    d0.Store((2u * plane + base) * 4u, asuint(2.0f / (w - 1)));
+    d0.Store((3u * plane + base) * 4u, asuint(2.0f / (h - 1)));
+#endif
+}
+
+// ---- cs_scd_partial: per-group sum of |Ya - Yb| * norm ----
+// (misc.SCDetect's metric; HLSL has no float atomics, so this is a
+// two-pass reduction.) di = {w, h, groups_x}, dj = {pitch_a, pitch_b},
+// kr = norm. d0 = plane a, d1 = plane b, d2 = partials (one float per
+// group).
+groupshared float scd_gs[256];
+[numthreads(32, 8, 1)]
+void cs_scd_partial(uint3 id : SV_DispatchThreadID,
+                    uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    float d = 0.0f;
+    if (id.x < (uint)di.x && id.y < (uint)di.y) {
+        float a = RAWLOAD(d0, id.y * (uint)dj.x + id.x * RAWSIZE);
+        float b = RAWLOAD(d1, id.y * (uint)dj.y + id.x * RAWSIZE);
+        d = abs(a - b) * kr;
+    }
+    scd_gs[gi] = d;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint n = 128; n > 0; n >>= 1) {
+        if (gi < n)
+            scd_gs[gi] += scd_gs[gi + n];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0)
+        d2.Store((gid.y * (uint)di.z + gid.x) * 4u, asuint(scd_gs[0]));
+}
+
+// ---- cs_scd_final: one group sums all partials ----
+// di.x = partial count. d0 = partials, d1 = result (one float).
+[numthreads(256, 1, 1)]
+void cs_scd_final(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    float a = 0.0f;
+    for (uint i = gi; i < (uint)di.x; i += 256u)
+        a += load_f32e(d0, i);
+    scd_gs[gi] = a;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint n = 128; n > 0; n >>= 1) {
+        if (gi < n)
+            scd_gs[gi] += scd_gs[gi + n];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0)
+        d1.Store(0u, asuint(scd_gs[0]));
 }
 
 // ---- cs_post_matrix: RGB tensor -> quantized Y raw + chroma f32 ----

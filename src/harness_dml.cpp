@@ -61,17 +61,20 @@ static ID3D11Texture2D *make_tex(ID3D11Device *dev, int w, int h,
 int main(int argc, char **argv)
 {
     const char *input = NULL, *output = NULL, *conf = NULL, *mdir = NULL;
-    int w = 0, h = 0, frames = 1, slot = 1;
+    const char *rife_mdir = NULL;
+    int w = 0, h = 0, frames = 1, slot = 1, rife = 0;
     int format = AJI_FMT_NV12, matrix = AJI_MATRIX_BT709;
     int range = AJI_RANGE_LIMITED, siting = AJI_SITING_LEFT;
     double fps = 23.976;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
+        if (!strcmp(a, "--rife")) { rife = 1; continue; }
         if (!strcmp(a, "--input")) { input = v; i++; }
         else if (!strcmp(a, "--output")) { output = v; i++; }
         else if (!strcmp(a, "--conf")) { conf = v; i++; }
         else if (!strcmp(a, "--model-dir")) { mdir = v; i++; }
+        else if (!strcmp(a, "--rife-model-dir")) { rife_mdir = v; i++; }
         else if (!strcmp(a, "--width")) { w = atoi(v); i++; }
         else if (!strcmp(a, "--height")) { h = atoi(v); i++; }
         else if (!strcmp(a, "--frames")) { frames = atoi(v); i++; }
@@ -111,6 +114,7 @@ int main(int argc, char **argv)
     p.api_version = AJI_API_VERSION;
     p.conf_path = conf;
     p.model_dir = mdir;
+    p.rife_model_dir = rife_mdir;
     p.slot = slot;
     p.d3d11_device = dev;
     p.log = log_cb;
@@ -129,6 +133,123 @@ int main(int argc, char **argv)
     }
     printf("configured: %dx%d %s -> %dx%d\n", w, h,
            format == AJI_FMT_P010 ? "p010" : "nv12", ow, oh);
+
+    if (rife) {
+        // Interpolation-only loop replicating aji_harness --rife: emits
+        // f0, i01, f1, i12, ... with the left frame substituted on scene
+        // changes. Needs a 2/1 rife chain (and no scaling steps).
+        int rn = 0, rd = 0;
+        if (!aji_rife_factor(aji, &rn, &rd) || rn != 2 * rd || ow != w ||
+            oh != h) {
+            fprintf(stderr, "rife test needs an active scale-free 2/1 rife "
+                            "chain\n");
+            return 1;
+        }
+        const int bpp2 = format == AJI_FMT_P010 ? 2 : 1;
+        const DXGI_FORMAT dxf = format == AJI_FMT_P010 ? DXGI_FORMAT_P010
+                                                       : DXGI_FORMAT_NV12;
+        ID3D11Texture2D *fr[3], *st_in, *st_out;
+        for (int i = 0; i < 3; i++)
+            fr[i] = make_tex(dev, w, h, dxf, false, false);
+        st_in = make_tex(dev, w, h, dxf, true, true);
+        st_out = make_tex(dev, w, h, dxf, true, false);
+        if (!fr[0] || !fr[1] || !fr[2] || !st_in || !st_out) {
+            fprintf(stderr, "rife texture creation failed\n");
+            return 1;
+        }
+        FILE *fi = fopen(input, "rb");
+        if (!fi) { fprintf(stderr, "cannot open %s\n", input); return 1; }
+        FILE *fo = output ? fopen(output, "wb") : NULL;
+        if (output && !fo) { fprintf(stderr, "cannot open %s\n", output);
+                             return 1; }
+        const size_t fb = (size_t)w * h * bpp2 * 3 / 2;
+        char *raw = (char *)malloc(fb);
+
+        aji_frame fd[3];
+        for (int i = 0; i < 3; i++) {
+            fd[i] = aji_frame{};
+            fd[i].width = w;
+            fd[i].height = h;
+            fd[i].format = format;
+            fd[i].matrix = matrix;
+            fd[i].range = range;
+            fd[i].siting = siting;
+            fd[i].plane[0] = fr[i];
+        }
+
+        int prev = -1, cur = 0, n = 0, interp = 0, scenes = 0;
+        while (n < frames && fread(raw, 1, fb, fi) == fb) {
+            D3D11_MAPPED_SUBRESOURCE map = {};
+            if (FAILED(ctx->Map(st_in, 0, D3D11_MAP_WRITE, 0, &map)))
+                return 1;
+            const char *s = raw;
+            char *d = (char *)map.pData;
+            for (int y = 0; y < h; y++)
+                memcpy(d + (size_t)y * map.RowPitch,
+                       s + (size_t)y * w * bpp2, (size_t)w * bpp2);
+            s += (size_t)w * h * bpp2;
+            d += (size_t)map.RowPitch * h;
+            for (int y = 0; y < h / 2; y++)
+                memcpy(d + (size_t)y * map.RowPitch,
+                       s + (size_t)y * w * bpp2, (size_t)w * bpp2);
+            ctx->Unmap(st_in, 0);
+            ctx->CopyResource(fr[cur], st_in);
+
+            if (prev >= 0 && fo) {
+                int ret = aji_infer_rife(aji, &fd[prev], &fd[cur], 0.5,
+                                         &fd[2], NULL);
+                int emit;
+                if (ret == AJI_OK) {
+                    emit = 2;
+                    interp++;
+                } else if (ret == AJI_SCENE) {
+                    emit = prev;
+                    scenes++;
+                } else {
+                    fprintf(stderr, "aji_infer_rife: %d: %s\n", ret,
+                            aji_last_error(aji));
+                    return 1;
+                }
+                ctx->CopyResource(st_out, fr[emit]);
+                if (FAILED(ctx->Map(st_out, 0, D3D11_MAP_READ, 0, &map)))
+                    return 1;
+                const char *ss = (const char *)map.pData;
+                char *dd = raw;   // reuse as out scratch after the upload
+                char *tmp = (char *)malloc(fb);
+                dd = tmp;
+                for (int y = 0; y < h; y++)
+                    memcpy(dd + (size_t)y * w * bpp2,
+                           ss + (size_t)y * map.RowPitch, (size_t)w * bpp2);
+                ss += (size_t)map.RowPitch * h;
+                dd += (size_t)w * h * bpp2;
+                for (int y = 0; y < h / 2; y++)
+                    memcpy(dd + (size_t)y * w * bpp2,
+                           ss + (size_t)y * map.RowPitch, (size_t)w * bpp2);
+                ctx->Unmap(st_out, 0);
+                fwrite(tmp, 1, fb, fo);
+                free(tmp);
+            }
+            if (fo)
+                fwrite(raw, 1, fb, fo);
+            if (prev < 0) {
+                prev = cur;
+                cur = 1;
+            } else {
+                int tmp2 = prev;
+                prev = cur;
+                cur = tmp2;
+            }
+            n++;
+        }
+        printf("rife: %d source frames, %d interpolated, %d scene skips\n",
+               n, interp, scenes);
+        if (fo)
+            fclose(fo);
+        fclose(fi);
+        aji_destroy(&aji);
+        return 0;
+    }
+
     if (r == 0) {
         fprintf(stderr, "no chain active; nothing to do\n");
         return 0;

@@ -147,10 +147,13 @@ struct KernArgs {
 enum Kern {
     K_UV_H = 0, K_V_F32, K_PRE_COMBINE, K_POST_MATRIX,
     K_H_F32, K_UV_V_STORE, K_RS_H, K_RS_V,
+    K_FILL, K_WINDOW, K_RIFE_CONSTS, K_SCD_PARTIAL, K_SCD_FINAL,
 };
 const char *const KERN_ENTRY[] = {
     "cs_uv_h", "cs_v_f32", "cs_pre_combine", "cs_post_matrix",
     "cs_h_f32", "cs_uv_v_store", "cs_rs_h", "cs_rs_v",
+    "cs_fill", "cs_window", "cs_rife_consts", "cs_scd_partial",
+    "cs_scd_final",
 };
 
 struct DmlPass {
@@ -242,6 +245,31 @@ struct aji_ctx {
 
     // shared-texture cache (cleared on configure)
     std::map<void *, ComPtr<ID3D12Resource>> shared;
+
+    // RIFE: interpolation between already-upscaled frames, mirroring
+    // aji_trt (centered mod-64 pad, bilinear 709 conversions, vsmlrt v1
+    // 11-channel fp32 input). Format-dependent staging builds lazily on
+    // the first aji_infer_rife.
+    struct {
+        bool enabled = false;
+        int num = 1, den = 1;
+        double scd_threshold = 0.150;
+        DmlModel model;
+        int w = 0, h = 0;            // unpadded = chain output dims
+        int pw = 0, ph = 0;          // padded to mod-64
+        int pad_l = 0, pad_t = 0;    // centered, rounded down to even
+        int format = 0;              // staging/plans built for this format
+        std::unique_ptr<DmlPlan> pre, post;   // bilinear, 709
+        // tight-pitch (pw*bpp) padded YUV planes
+        ComPtr<ID3D12Resource> pad_y[3], pad_uv[3];   // a, b, out
+        // 256-pitch texture staging at w x h
+        ComPtr<ID3D12Resource> st_y[3], st_uv[3];
+        uint32_t st_pitch = 0;
+        ComPtr<ID3D12Resource> in_tensor, out_tensor; // 11 / 3 planes
+        void *in_alloc = nullptr, *out_alloc = nullptr;
+        ComPtr<ID3D12Resource> scd_part, scd_sum, scd_read;
+        int scd_groups = 0;
+    } rife;
 
     void set_error(const char *fmt, ...) {
         va_list ap;
@@ -562,18 +590,20 @@ KernArgs csp_args(const aji_csp &csp, float qdiv, float qmax)
     return a;
 }
 
-// pre: in_y/in_uv staging -> tensor in dst (cs_uv_h, cs_v_f32, cs_pre_combine)
+// pre: y/uv plane buffers -> tensor in dst at dst_off elements
+// (cs_uv_h, cs_v_f32, cs_pre_combine)
 bool record_pre(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
-                ID3D12Resource *dst, bool io16)
+                ID3D12Resource *y_buf, ID3D12Resource *uv_buf, uint32_t pitch,
+                ID3D12Resource *dst, int dst_off, bool io16)
 {
     const bool t16 = p->format == AJI_FMT_P010;
     const int w = p->w, h = p->h, ch = h >> 1;
     KernArgs a = csp_args(csp, 0, 0);
 
     a.di[0] = p->ph.src; a.di[1] = p->ph.dst; a.di[2] = p->ph.taps;
-    a.di[3] = ch; a.dj[0] = (int)c->in_pitch;
+    a.di[3] = ch; a.dj[0] = (int)pitch;
     if (!r.dispatch(K_UV_H, t16, io16, a, p->ph.starts.Get(), p->ph.wt.Get(),
-                    c->in_uv.Get(), p->tmp0.Get(), NULL, w, ch, 1))
+                    uv_buf, p->tmp0.Get(), NULL, w, ch, 1))
         return false;
     r.uav_barrier();
 
@@ -583,17 +613,18 @@ bool record_pre(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
         return false;
     r.uav_barrier();
 
-    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)c->in_pitch;
-    if (!r.dispatch(K_PRE_COMBINE, t16, io16, a, NULL, NULL, c->in_y.Get(),
+    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch; a.dj[1] = dst_off;
+    if (!r.dispatch(K_PRE_COMBINE, t16, io16, a, NULL, NULL, y_buf,
                     p->tmp1.Get(), dst, w / 2, h, 1))
         return false;
     r.uav_barrier();
     return true;
 }
 
-// post: tensor src -> out_y/out_uv staging
+// post: tensor src -> y/uv plane buffers
 bool record_post(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
-                 ID3D12Resource *src, bool io16)
+                 ID3D12Resource *src, ID3D12Resource *y_buf,
+                 ID3D12Resource *uv_buf, uint32_t pitch, bool io16)
 {
     const bool t16 = p->format == AJI_FMT_P010;
     const int w = p->w, h = p->h, cw = w >> 1, ch = h >> 1;
@@ -602,10 +633,9 @@ bool record_post(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
     KernArgs a = csp_args(csp, qdiv, qmax);
     const int tpx_y = t16 ? 2 : 4, tpx_uv = t16 ? 1 : 2;
 
-    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)c->out_pitch;
+    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch;
     if (!r.dispatch(K_POST_MATRIX, t16, io16, a, NULL, NULL, src,
-                    c->out_y.Get(), p->tmp0.Get(), (w + tpx_y - 1) / tpx_y, h,
-                    1))
+                    y_buf, p->tmp0.Get(), (w + tpx_y - 1) / tpx_y, h, 1))
         return false;
     r.uav_barrier();
 
@@ -616,13 +646,46 @@ bool record_post(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
     r.uav_barrier();
 
     a.di[0] = cw; a.di[1] = h; a.di[2] = p->pv.taps; a.di[3] = ch;
-    a.dj[0] = (int)c->out_pitch;
+    a.dj[0] = (int)pitch;
     if (!r.dispatch(K_UV_V_STORE, t16, io16, a, p->pv.starts.Get(),
-                    p->pv.wt.Get(), p->tmp1.Get(), c->out_uv.Get(), NULL,
+                    p->pv.wt.Get(), p->tmp1.Get(), uv_buf, NULL,
                     (cw + tpx_uv - 1) / tpx_uv, ch, 1))
         return false;
     r.uav_barrier();
     return true;
+}
+
+// dword-fill a range of a buffer
+bool record_fill(aji_ctx *c, Recorder &r, ID3D12Resource *dst,
+                 uint32_t start_dword, uint32_t dwords, uint32_t value)
+{
+    KernArgs a = {};
+    a.di[0] = (int)dwords;
+    a.dj[0] = (int)start_dword;
+    a.dj[1] = (int)value;
+    if (!r.dispatch(K_FILL, false, false, a, NULL, NULL, dst, NULL, NULL,
+                    32 * ((dwords + 255) / 256) /* gx*32 = groups*256 thr */,
+                    1, 1))
+        return false;
+    return true;
+}
+
+// copy a w_bytes x rows window between pitched buffers
+bool record_window(aji_ctx *c, Recorder &r, ID3D12Resource *src,
+                   uint32_t src_off, uint32_t src_pitch, ID3D12Resource *dst,
+                   uint32_t dst_off, uint32_t dst_pitch, uint32_t w_bytes,
+                   uint32_t rows)
+{
+    KernArgs a = {};
+    a.di[0] = (int)w_bytes;
+    a.di[1] = (int)rows;
+    a.di[2] = (int)(((dst_off & 3u) + w_bytes + 3u) / 4u);
+    a.dj[0] = (int)src_off;
+    a.dj[1] = (int)src_pitch;
+    a.dj[2] = (int)dst_off;
+    a.dj[3] = (int)dst_pitch;
+    return r.dispatch(K_WINDOW, false, false, a, NULL, NULL, src, dst, NULL,
+                      a.di[2], rows, 1);
 }
 
 bool record_resize(aji_ctx *c, Recorder &r, DmlPlan *p, ID3D12Resource *src,
@@ -683,6 +746,44 @@ DXGI_FORMAT plane_fmt(int format, int plane)
     return plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
 }
 
+// Transition both planes of one array slice. Frames can be slices of a
+// single pool array texture (a/b/out of aji_infer_rife in particular),
+// so whole-resource barriers would double-transition shared resources.
+void transition_planes(aji_ctx *c, ID3D12Resource *tex, UINT subres,
+                       D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_DESC td = tex->GetDesc();
+    D3D12_RESOURCE_BARRIER bs[2] = {};
+    for (int p = 0; p < 2; p++) {
+        bs[p].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bs[p].Transition.pResource = tex;
+        bs[p].Transition.Subresource = subres + (UINT)p * td.DepthOrArraySize;
+        bs[p].Transition.StateBefore = from;
+        bs[p].Transition.StateAfter = to;
+    }
+    c->cl->ResourceBarrier(2, bs);
+}
+
+ComPtr<ID3D12Resource> make_readback(ID3D12Device *dev, uint64_t bytes)
+{
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = bytes;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> res;
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                            D3D12_RESOURCE_STATE_COPY_DEST,
+                                            NULL, IID_PPV_ARGS(&res))))
+        return nullptr;
+    return res;
+}
+
 // copy one plane between a shared texture and a staging buffer
 void copy_plane(aji_ctx *c, bool to_buffer, ID3D12Resource *tex, UINT subres,
                 int plane, int format, int w, int h, ID3D12Resource *buf,
@@ -726,6 +827,8 @@ void model_release(DmlModel *m)
     m->session = nullptr;
 }
 
+void rife_teardown(aji_ctx *c);
+
 void chain_teardown(aji_ctx *c)
 {
     // GPU must be idle before buffers/sessions go away
@@ -759,6 +862,7 @@ void chain_teardown(aji_ctx *c)
     c->out_uv.Reset();
     memset(c->stage_key, 0, sizeof(c->stage_key));
     c->shared.clear();
+    rife_teardown(c);
 }
 
 // Create an ORT tensor over `bytes` of a D3D12 buffer (DML allocation).
@@ -781,7 +885,7 @@ OrtValue *make_tensor(aji_ctx *c, void *dml_alloc, size_t bytes, int n, int ch,
 // Runs the model twice on a temporary input (the DML EP builds its
 // reusable command list during the first executions — vsort's "replay").
 bool model_open(aji_ctx *c, DmlModel *m, const std::string &onnx_path,
-                int in_w, int in_h)
+                int in_w, int in_h, int in_ch)
 {
     OrtSessionOptions *so = nullptr;
     if (!c->ort_ck(g_ort->CreateSessionOptions(&so), "CreateSessionOptions"))
@@ -847,7 +951,7 @@ bool model_open(aji_ctx *c, DmlModel *m, const std::string &onnx_path,
 
     // discovery: bind a zeroed temp input, let ORT allocate the output
     const size_t elem = m->fp16 ? 2 : 4;
-    const size_t in_bytes = (size_t)3 * in_w * in_h * elem;
+    const size_t in_bytes = (size_t)in_ch * in_w * in_h * elem;
     ComPtr<ID3D12Resource> tmp = make_buffer(c->dev.Get(), in_bytes, false);
     if (!tmp) {
         c->set_error("discovery buffer allocation failed");
@@ -863,7 +967,7 @@ bool model_open(aji_ctx *c, DmlModel *m, const std::string &onnx_path,
     OrtValue **outs = nullptr;
     size_t n_outs = 0;
     do {
-        in_val = make_tensor(c, tmp_alloc, in_bytes, 1, 3, in_h, in_w,
+        in_val = make_tensor(c, tmp_alloc, in_bytes, 1, in_ch, in_h, in_w,
                              m->fp16);
         if (!in_val)
             break;
@@ -965,6 +1069,147 @@ bool push_resize_step(aji_ctx *c, int *cw, int *ch, int nw, int nh)
     c->steps.push_back(std::move(st));
     *cw = nw;
     *ch = nh;
+    return true;
+}
+
+/* ---------------- RIFE ---------------- */
+
+std::string rife_model_name(int code, bool ensemble)
+{
+    std::string s = std::to_string(code);
+    if (s.size() < 2)
+        return "";
+    std::string dec = s.size() == 2 ? s.substr(1, 1) : s.substr(1, 2);
+    std::string name = "rife_v" + s.substr(0, 1) + "." + dec;
+    if (s.size() == 4 && s.back() == '1')
+        name += "_lite";
+    if (ensemble)
+        name += "_ensemble";
+    return name;
+}
+
+void rife_teardown(aji_ctx *c)
+{
+    auto &R = c->rife;
+    model_release(&R.model);
+    if (R.in_alloc)
+        g_dml_api->FreeGPUAllocation(R.in_alloc);
+    if (R.out_alloc)
+        g_dml_api->FreeGPUAllocation(R.out_alloc);
+    R.in_alloc = R.out_alloc = nullptr;
+    R = {};
+}
+
+// Configure-time RIFE setup: geometry, session, bindings, the constant
+// input channels. Format-dependent staging builds lazily in
+// aji_infer_rife. Mirrors aji_trt's setup_rife (and its stats text).
+bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
+                double fps)
+{
+    auto &R = c->rife;
+    R.w = w;
+    R.h = h;
+    R.pw = (w + 63) / 64 * 64;
+    R.ph = (h + 63) / 64 * 64;
+    // centered like animejanai_core's AddBorders split, but rounded down
+    // to even so 4:2:0 chroma stays aligned
+    R.pad_l = ((R.pw - w) / 2) & ~1;
+    R.pad_t = ((R.ph - h) / 2) & ~1;
+    R.num = chain->rife_factor_num;
+    R.den = chain->rife_factor_den;
+    R.scd_threshold = chain->rife_scd_threshold;
+
+    const std::string model =
+        rife_model_name(chain->rife_model, chain->rife_ensemble);
+    if (model.empty()) {
+        c->set_error("invalid rife model code %d", chain->rife_model);
+        return false;
+    }
+    const std::string onnx = c->rife_model_dir + "\\" + model + ".onnx";
+    if (!model_open(c, &R.model, onnx, R.pw, R.ph, 11))
+        return false;
+    if (R.model.out_w != R.pw || R.model.out_h != R.ph) {
+        c->set_error("%s: output %dx%d does not match padded input %dx%d",
+                     onnx.c_str(), R.model.out_w, R.model.out_h, R.pw, R.ph);
+        return false;
+    }
+
+    const size_t plane = (size_t)R.pw * R.ph;
+    const size_t elem = R.model.fp16 ? 2 : 4;
+    R.in_tensor = make_buffer(c->dev.Get(), plane * 11 * elem, false);
+    R.out_tensor = make_buffer(c->dev.Get(), plane * 3 * elem, false);
+    if (!R.in_tensor || !R.out_tensor) {
+        c->set_error("rife tensor allocation failed");
+        return false;
+    }
+    if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
+                       R.in_tensor.Get(), &R.in_alloc), "rife in alloc") ||
+        !c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
+                       R.out_tensor.Get(), &R.out_alloc), "rife out alloc"))
+        return false;
+    R.model.in_val = make_tensor(c, R.in_alloc, plane * 11 * elem, 1, 11,
+                                 R.ph, R.pw, R.model.fp16);
+    R.model.out_val = make_tensor(c, R.out_alloc, plane * 3 * elem, 1, 3,
+                                  R.ph, R.pw, R.model.fp16);
+    if (!R.model.in_val || !R.model.out_val)
+        return false;
+    if (!c->ort_ck(g_ort->BindInput(R.model.binding,
+                                    R.model.in_name.c_str(),
+                                    R.model.in_val), "rife BindInput") ||
+        !c->ort_ck(g_ort->BindOutput(R.model.binding,
+                                     R.model.out_name.c_str(),
+                                     R.model.out_val), "rife BindOutput"))
+        return false;
+
+    // scene-detect reduction buffers (unpadded luma)
+    const int gx = (w + 31) / 32, gy = (h + 7) / 8;
+    R.scd_groups = gx * gy;
+    R.scd_part = make_buffer(c->dev.Get(), (uint64_t)R.scd_groups * 4, false);
+    R.scd_sum = make_buffer(c->dev.Get(), 4, false);
+    R.scd_read = make_readback(c->dev.Get(), 4);
+    if (!R.scd_part || !R.scd_sum || !R.scd_read) {
+        c->set_error("rife scd buffer allocation failed");
+        return false;
+    }
+
+    // constant channels 7..10 (mesh + multipliers), one-time fill
+    {
+        Recorder r{c};
+        if (!r.begin())
+            return false;
+        KernArgs a = {};
+        a.di[0] = R.pw;
+        a.di[1] = R.ph;
+        a.dj[0] = (int)(plane * 7);
+        if (!r.dispatch(K_RIFE_CONSTS, false, R.model.fp16, a, NULL, NULL,
+                        R.in_tensor.Get(), NULL, NULL,
+                        R.model.fp16 ? R.pw / 2 : R.pw, R.ph, 1))
+            return false;
+        r.uav_barrier();
+        if (!r.exec())
+            return false;
+    }
+    // warm the rebound command list once (the discovery runs used the
+    // temporary binding)
+    if (!c->ort_ck(g_ort->RunWithBinding(R.model.session, NULL,
+                                         R.model.binding), "rife warmup"))
+        return false;
+
+    char buf[200];
+    const double factor = (double)R.num / R.den;
+    if (R.pw != w || R.ph != h) {
+        snprintf(buf, sizeof(buf),
+                 "Padded to %dx%d, applied RIFE v%d Interpolation %.3fx, "
+                 "cropped back to %dx%d;    New Video FPS: %.3f",
+                 R.pw, R.ph, chain->rife_model, factor, w, h, fps * factor);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "Applied RIFE v%d Interpolation %.3fx;    "
+                 "New Video FPS: %.3f",
+                 chain->rife_model, factor, fps * factor);
+    }
+    c->log_steps.push_back(buf);
+    R.enabled = true;
     return true;
 }
 
@@ -1201,7 +1446,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
         DmlModel dm;
         const std::string onnx = c->model_dir + "\\" + m.name + ".onnx";
-        if (!model_open(c, &dm, onnx, cw, ch)) {
+        if (!model_open(c, &dm, onnx, cw, ch, 3)) {
             model_release(&dm);
             finalize_log(c);
             return AJI_ERR_ENGINE;
@@ -1222,10 +1467,18 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         c->log_steps.push_back(buf);
     }
 
-    if (chain->rife)
-        c->log_steps.push_back(
-            "RIFE is not supported by the DirectML backend yet; "
-            "interpolation disabled");
+    if (chain->rife) {
+        if (!c->rife_model_dir.empty()) {
+            if (!setup_rife(c, chain, cw, ch, fps)) {
+                finalize_log(c);
+                return AJI_ERR_ENGINE;
+            }
+        } else {
+            c->log_steps.push_back(
+                "RIFE requested by the chain but no rife model dir is "
+                "configured; interpolation disabled");
+        }
+    }
 
     finalize_log(c);
 
@@ -1401,16 +1654,14 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     Recorder r{c};
     if (!r.begin())
         return AJI_ERR;
-    r.transition(in_tex, D3D12_RESOURCE_STATE_COMMON,
-                 D3D12_RESOURCE_STATE_COPY_SOURCE,
-                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATE_COPY_SOURCE);
     copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width, in->height,
                c->in_y.Get(), c->in_pitch);
     copy_plane(c, true, in_tex, in_sub, 1, in->format, in->width, in->height,
                c->in_uv.Get(), c->in_pitch);
-    r.transition(in_tex, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                 D3D12_RESOURCE_STATE_COMMON,
-                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                      D3D12_RESOURCE_STATE_COMMON);
     {
         D3D12_RESOURCE_BARRIER bs[2] = {};
         for (int i = 0; i < 2; i++) {
@@ -1424,7 +1675,8 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         bs[1].Transition.pResource = c->in_uv.Get();
         c->cl->ResourceBarrier(2, bs);
     }
-    if (!record_pre(c, r, c->pre_plan.get(), csp, c->buf[0].Get(),
+    if (!record_pre(c, r, c->pre_plan.get(), csp, c->in_y.Get(),
+                    c->in_uv.Get(), c->in_pitch, c->buf[0].Get(), 0,
                     c->first_elem16))
         return AJI_ERR;
     if (!r.exec())
@@ -1451,6 +1703,7 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     if (!r.begin())
         return AJI_ERR;
     if (!record_post(c, r, c->post_plan.get(), csp, c->buf[cur].Get(),
+                     c->out_y.Get(), c->out_uv.Get(), c->out_pitch,
                      c->last_elem16))
         return AJI_ERR;
     {
@@ -1466,16 +1719,14 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         bs[1].Transition.pResource = c->out_uv.Get();
         c->cl->ResourceBarrier(2, bs);
     }
-    r.transition(out_tex, D3D12_RESOURCE_STATE_COMMON,
-                 D3D12_RESOURCE_STATE_COPY_DEST,
-                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATE_COPY_DEST);
     copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
                out->height, c->out_y.Get(), c->out_pitch);
     copy_plane(c, false, out_tex, out_sub, 1, out->format, out->width,
                out->height, c->out_uv.Get(), c->out_pitch);
-    r.transition(out_tex, D3D12_RESOURCE_STATE_COPY_DEST,
-                 D3D12_RESOURCE_STATE_COMMON,
-                 D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COPY_DEST,
+                      D3D12_RESOURCE_STATE_COMMON);
     if (!r.exec())
         return AJI_ERR;
 
@@ -1507,10 +1758,13 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 
 extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 {
-    (void)c;
-    (void)num;
-    (void)den;
-    return 0;   // RIFE not implemented yet on DirectML
+    if (!c || !c->rife.enabled)
+        return 0;
+    if (num)
+        *num = c->rife.num;
+    if (den)
+        *den = c->rife.den;
+    return 1;
 }
 
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
@@ -1523,10 +1777,273 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *b, double t,
                                          const aji_frame *out, void *cu_stream)
 {
-    (void)a; (void)b; (void)t; (void)out; (void)cu_stream;
-    if (c)
-        c->set_error("RIFE is not supported by the DirectML backend yet");
-    return AJI_ERR;
+    (void)cu_stream;
+    if (!c || !a || !b || !out)
+        return AJI_ERR;
+    auto &R = c->rife;
+    if (!R.enabled) {
+        c->set_error("aji_infer_rife without an active RIFE configuration");
+        return AJI_ERR;
+    }
+    if (a->format != b->format || a->format != out->format ||
+        (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010)) {
+        c->set_error("rife frame formats must match (nv12/p010)");
+        return AJI_ERR_FORMAT;
+    }
+    if (a->width != R.w || a->height != R.h || b->width != R.w ||
+        b->height != R.h || out->width != R.w || out->height != R.h) {
+        c->set_error("rife frame dims do not match configured %dx%d",
+                     R.w, R.h);
+        return AJI_ERR_SHAPE;
+    }
+
+    const int fmt = a->format;
+    const bool t16 = fmt == AJI_FMT_P010;
+    const bool io16 = R.model.fp16;
+    const int bpp = t16 ? 2 : 1;
+    const uint32_t prow = (uint32_t)(R.pw * bpp);   // tight padded pitch
+    const size_t plane = (size_t)R.pw * R.ph;
+
+    // format-dependent staging + plans, built on first use; pad borders
+    // get a one-time studio-black fill (interiors are overwritten)
+    if (R.format != fmt) {
+        R.pre = pre_plan_create(c, fmt, R.pw, R.ph, AJI_SITING_LEFT,
+                                AJI_FILTER_BILINEAR);
+        R.post = post_plan_create(c, fmt, R.pw, R.ph, AJI_SITING_LEFT,
+                                  AJI_FILTER_BILINEAR);
+        R.st_pitch = align256((uint32_t)(R.w * bpp));
+        bool ok = R.pre && R.post;
+        for (int i = 0; i < 3 && ok; i++) {
+            R.pad_y[i] = make_buffer(c->dev.Get(),
+                                     (uint64_t)prow * R.ph, false);
+            R.pad_uv[i] = make_buffer(c->dev.Get(),
+                                      (uint64_t)prow * (R.ph / 2), false);
+            R.st_y[i] = make_buffer(c->dev.Get(),
+                                    (uint64_t)R.st_pitch * R.h, false);
+            R.st_uv[i] = make_buffer(c->dev.Get(),
+                                     (uint64_t)R.st_pitch * (R.h / 2), false);
+            ok = R.pad_y[i] && R.pad_uv[i] && R.st_y[i] && R.st_uv[i];
+        }
+        if (!ok) {
+            c->set_error("rife staging allocation failed");
+            R.format = 0;
+            return AJI_ERR;
+        }
+        const uint32_t ypat = t16 ? 0x10001000u : 0x10101010u;
+        const uint32_t cpat = t16 ? 0x80008000u : 0x80808080u;
+        Recorder rf{c};
+        if (!rf.begin())
+            return AJI_ERR;
+        for (int i = 0; i < 2; i++) {
+            record_fill(c, rf, R.pad_y[i].Get(), 0, prow * R.ph / 4, ypat);
+            record_fill(c, rf, R.pad_uv[i].Get(), 0, prow * (R.ph / 2) / 4,
+                        cpat);
+        }
+        rf.uav_barrier();
+        if (!rf.exec())
+            return AJI_ERR;
+        R.format = fmt;
+    }
+
+    ID3D12Resource *a_tex = open_shared(c, a->plane[0]);
+    ID3D12Resource *b_tex = open_shared(c, b->plane[0]);
+    ID3D12Resource *o_tex = open_shared(c, out->plane[0]);
+    if (!a_tex || !b_tex || !o_tex)
+        return AJI_ERR;
+    const UINT a_sub = (UINT)(intptr_t)a->plane[1];
+    const UINT b_sub = (UINT)(intptr_t)b->plane[1];
+    const UINT o_sub = (UINT)(intptr_t)out->plane[1];
+
+    // input-ready handoff (no-op when a/b were written by our own queue)
+    c->fence_val++;
+    c->ctx11_4->Signal(c->fence11.Get(), c->fence_val);
+    c->ctx11->Flush();
+    c->queue->Wait(c->fence.Get(), c->fence_val);
+
+    // stage both frames + scene-detect on the unpadded luma
+    Recorder r{c};
+    if (!r.begin())
+        return AJI_ERR;
+    ID3D12Resource *tex[2] = {a_tex, b_tex};
+    const UINT sub[2] = {a_sub, b_sub};
+    for (int i = 0; i < 2; i++) {
+        transition_planes(c, tex[i], sub[i], D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_plane(c, true, tex[i], sub[i], 0, fmt, R.w, R.h,
+                   R.st_y[i].Get(), R.st_pitch);
+        copy_plane(c, true, tex[i], sub[i], 1, fmt, R.w, R.h,
+                   R.st_uv[i].Get(), R.st_pitch);
+        transition_planes(c, tex[i], sub[i],
+                          D3D12_RESOURCE_STATE_COPY_SOURCE,
+                          D3D12_RESOURCE_STATE_COMMON);
+    }
+    {
+        D3D12_RESOURCE_BARRIER bs[4] = {};
+        ID3D12Resource *st[4] = {R.st_y[0].Get(), R.st_uv[0].Get(),
+                                 R.st_y[1].Get(), R.st_uv[1].Get()};
+        for (int i = 0; i < 4; i++) {
+            bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bs[i].Transition.pResource = st[i];
+            bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            bs[i].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        c->cl->ResourceBarrier(4, bs);
+    }
+    {
+        KernArgs sa = {};
+        sa.di[0] = R.w;
+        sa.di[1] = R.h;
+        sa.di[2] = (R.w + 31) / 32;
+        sa.dj[0] = (int)R.st_pitch;
+        sa.dj[1] = (int)R.st_pitch;
+        sa.kr = t16 ? 1.0f / 65472.0f : 1.0f / 255.0f;
+        if (!r.dispatch(K_SCD_PARTIAL, t16, false, sa, NULL, NULL,
+                        R.st_y[0].Get(), R.st_y[1].Get(), R.scd_part.Get(),
+                        R.w, R.h, 1))
+            return AJI_ERR;
+        r.uav_barrier();
+        KernArgs sf = {};
+        sf.di[0] = R.scd_groups;
+        if (!r.dispatch(K_SCD_FINAL, false, false, sf, NULL, NULL,
+                        R.scd_part.Get(), R.scd_sum.Get(), NULL, 32, 1, 1))
+            return AJI_ERR;
+        r.transition(R.scd_sum.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                     D3D12_RESOURCE_STATE_COPY_SOURCE, 0);
+        c->cl->CopyBufferRegion(R.scd_read.Get(), 0, R.scd_sum.Get(), 0, 4);
+    }
+    if (!r.exec())
+        return AJI_ERR;
+    c->fence_val++;
+    c->queue->Signal(c->fence.Get(), c->fence_val);
+    if (c->fence->GetCompletedValue() < c->fence_val) {
+        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
+        if (WaitForSingleObject(c->fence_event, 10000) != WAIT_OBJECT_0) {
+            c->set_error("GPU timeout in rife scene detect");
+            return AJI_ERR;
+        }
+    }
+    float sum = 0.0f;
+    {
+        void *m = nullptr;
+        D3D12_RANGE rr = {0, 4};
+        if (FAILED(R.scd_read->Map(0, &rr, &m)))
+            return AJI_ERR;
+        memcpy(&sum, m, 4);
+        D3D12_RANGE none = {0, 0};
+        R.scd_read->Unmap(0, &none);
+    }
+    // The reference runs SCDetect on the padded clip; the constant borders
+    // contribute zero difference, so its mean divides by the padded area.
+    if (sum / ((double)R.pw * R.ph) > R.scd_threshold)
+        return AJI_SCENE;
+
+    // embed the frames into the pad interiors, convert, run, convert back
+    const uint32_t doff_y = (uint32_t)R.pad_t * prow +
+                            (uint32_t)(R.pad_l * bpp);
+    const uint32_t doff_uv = (uint32_t)(R.pad_t / 2) * prow +
+                             (uint32_t)(R.pad_l * bpp);
+    if (!r.begin())
+        return AJI_ERR;
+    for (int i = 0; i < 2; i++) {
+        if (!record_window(c, r, R.st_y[i].Get(), 0, R.st_pitch,
+                           R.pad_y[i].Get(), doff_y, prow,
+                           (uint32_t)(R.w * bpp), R.h) ||
+            !record_window(c, r, R.st_uv[i].Get(), 0, R.st_pitch,
+                           R.pad_uv[i].Get(), doff_uv, prow,
+                           (uint32_t)(R.w * bpp), R.h / 2))
+            return AJI_ERR;
+    }
+    r.uav_barrier();
+    // padded YUV -> RGB into channels 0-2 (a) and 3-5 (b), bilinear
+    // chroma, hardcoded BT.709 like rife_cuda.py
+    const aji_csp csp =
+        aji_resample::make_csp(fmt, AJI_MATRIX_BT709, a->range);
+    for (int i = 0; i < 2; i++) {
+        if (!record_pre(c, r, R.pre.get(), csp, R.pad_y[i].Get(),
+                        R.pad_uv[i].Get(), prow, R.in_tensor.Get(),
+                        (int)(plane * 3 * i), io16))
+            return AJI_ERR;
+    }
+    // channel 6: the timestep plane
+    {
+        uint32_t value, dwords, start;
+        if (io16) {
+            uint32_t x;
+            float ft = (float)t;
+            memcpy(&x, &ft, 4);
+            uint32_t sign = (x >> 16) & 0x8000;
+            int32_t e = (int32_t)((x >> 23) & 0xff) - 127 + 15;
+            uint32_t half = e <= 0 ? sign
+                            : e >= 31 ? (sign | 0x7c00)
+                            : (sign | (e << 10) | ((x & 0x7fffff) >> 13));
+            value = half | (half << 16);
+            start = (uint32_t)(plane * 6 / 2);
+            dwords = (uint32_t)(plane / 2);
+        } else {
+            float ft = (float)t;
+            memcpy(&value, &ft, 4);
+            start = (uint32_t)(plane * 6);
+            dwords = (uint32_t)plane;
+        }
+        if (!record_fill(c, r, R.in_tensor.Get(), start, dwords, value))
+            return AJI_ERR;
+        r.uav_barrier();
+    }
+    if (!r.exec())
+        return AJI_ERR;
+
+    if (!c->ort_ck(g_ort->RunWithBinding(R.model.session, NULL,
+                                         R.model.binding),
+                   "rife RunWithBinding"))
+        return AJI_ERR_ENGINE;
+
+    // RGB -> padded YUV (bilinear, 709), crop the window out, hand back
+    if (!r.begin())
+        return AJI_ERR;
+    if (!record_post(c, r, R.post.get(), csp, R.out_tensor.Get(),
+                     R.pad_y[2].Get(), R.pad_uv[2].Get(), prow, io16))
+        return AJI_ERR;
+    if (!record_window(c, r, R.pad_y[2].Get(), doff_y, prow,
+                       R.st_y[2].Get(), 0, R.st_pitch,
+                       (uint32_t)(R.w * bpp), R.h) ||
+        !record_window(c, r, R.pad_uv[2].Get(), doff_uv, prow,
+                       R.st_uv[2].Get(), 0, R.st_pitch,
+                       (uint32_t)(R.w * bpp), R.h / 2))
+        return AJI_ERR;
+    {
+        D3D12_RESOURCE_BARRIER bs[2] = {};
+        ID3D12Resource *st[2] = {R.st_y[2].Get(), R.st_uv[2].Get()};
+        for (int i = 0; i < 2; i++) {
+            bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bs[i].Transition.pResource = st[i];
+            bs[i].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            bs[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        }
+        c->cl->ResourceBarrier(2, bs);
+    }
+    transition_planes(c, o_tex, o_sub, D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATE_COPY_DEST);
+    copy_plane(c, false, o_tex, o_sub, 0, fmt, R.w, R.h, R.st_y[2].Get(),
+               R.st_pitch);
+    copy_plane(c, false, o_tex, o_sub, 1, fmt, R.w, R.h, R.st_uv[2].Get(),
+               R.st_pitch);
+    transition_planes(c, o_tex, o_sub, D3D12_RESOURCE_STATE_COPY_DEST,
+                      D3D12_RESOURCE_STATE_COMMON);
+    if (!r.exec())
+        return AJI_ERR;
+
+    c->fence_val++;
+    c->queue->Signal(c->fence.Get(), c->fence_val);
+    if (c->fence->GetCompletedValue() < c->fence_val) {
+        c->fence->SetEventOnCompletion(c->fence_val, c->fence_event);
+        if (WaitForSingleObject(c->fence_event, 10000) != WAIT_OBJECT_0) {
+            c->set_error("GPU timeout in rife inference");
+            return AJI_ERR;
+        }
+    }
+    return AJI_OK;
 }
 
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)
