@@ -63,6 +63,42 @@ add_dependencies(aji_harness aji_trt)
 set_target_properties(aji_harness PROPERTIES
     BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
 
+# aji_encode: offline file->file upscale/interpolate CLI. aji_harness's
+# libaji call sequence + real libav demux/decode/encode/mux. TensorRT-only
+# (v1). Built only when the ffmpeg/libav development libraries are present;
+# on Windows pass -DAJI_FFMPEG_ROOT=<dir with include/ and lib/>.
+if(WIN32)
+    set(AJI_FFMPEG_ROOT "" CACHE PATH "ffmpeg dev root (include/, lib/)")
+    if(AJI_FFMPEG_ROOT)
+        add_executable(aji_encode src/encode.c)
+        target_include_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/include")
+        target_link_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/lib")
+        target_link_libraries(aji_encode PRIVATE aji CUDA::cudart CUDA::cuda_driver
+            avformat avcodec avutil avfilter swscale)
+        add_dependencies(aji_encode aji_trt)
+        set_target_properties(aji_encode PROPERTIES
+            BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
+    else()
+        message(STATUS "AJI_FFMPEG_ROOT not set; skipping aji_encode target")
+    endif()
+else()
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(FFMPEG IMPORTED_TARGET
+            libavformat libavcodec libavutil libavfilter libswscale)
+    endif()
+    if(FFMPEG_FOUND)
+        add_executable(aji_encode src/encode.c)
+        target_link_libraries(aji_encode PRIVATE
+            aji CUDA::cudart CUDA::cuda_driver PkgConfig::FFMPEG)
+        add_dependencies(aji_encode aji_trt)
+        set_target_properties(aji_encode PROPERTIES
+            BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
+    else()
+        message(STATUS "ffmpeg/libav not found via pkg-config; skipping aji_encode target")
+    endif()
+endif()
+
 # aji_dml: DirectML backend (Windows only). Needs the ONNX Runtime
 # DirectML headers (Microsoft.ML.OnnxRuntime.DirectML nupkg) and the
 # DirectML header (Microsoft.AI.DirectML nupkg); onnxruntime.dll and
