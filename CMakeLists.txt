@@ -7,7 +7,14 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native)
+    # Ship kernels for every supported GPU generation (Turing..Blackwell), NOT
+    # "native": native builds only for the build machine's GPU, so the shipped
+    # binary dies with "no kernel image is available for execution on the device"
+    # on every other architecture (e.g. built on a 5090/sm120 => fails on a
+    # 4090/sm89). The trailing -virtual emits PTX so future archs JIT-compile.
+    # Keep in sync with the TensorRT builder packs (sm75/80/86/89/90/100/120).
+    # Local dev can still override with -DCMAKE_CUDA_ARCHITECTURES=native.
+    set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual)
 endif()
 
 # TensorRT location (default: userland dpkg -x extract on Linux; on Windows
