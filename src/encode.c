@@ -73,6 +73,10 @@
 enum decoder_mode { DEC_AUTO, DEC_NVDEC, DEC_CPU };
 enum progress_mode { PROG_NONE, PROG_LINE, PROG_JSON };
 
+/* output chroma subsampling + bit depth, chosen via --pix-fmt and decoupled
+ * from the source. 16-bit 4:4:4 is libaji's intermediate, never the file. */
+enum out_pixfmt { OUT_420P8, OUT_420P10, OUT_444P8, OUT_444P10 };
+
 typedef struct {
     const char *input, *output;
     const char *conf, *model_dir, *rife_model_dir;
@@ -81,6 +85,7 @@ typedef struct {
     const char *backend;
     const char *vcodec;
     const char *vquality;
+    enum out_pixfmt pix_fmt;
     int final_h;            /* --final-resize-height, 0 = none */
     int final_pct;          /* --final-resize-factor, 0 = none */
     int overwrite;
@@ -197,11 +202,15 @@ typedef struct {
     int             src_w, src_h;
     int             up_w, up_h;      /* libaji upscale output (pool dims) */
     int             out_w, out_h;    /* final encode dims (after resize) */
-    int             ten_bit;
+    int             ten_bit;         /* OUTPUT is 10-bit (from --pix-fmt) */
+    int             is_444;          /* OUTPUT is 4:4:4 (from --pix-fmt) */
+    int             src_aji_fmt;     /* input aji_frame.format from source */
+    int             out_aji_fmt;     /* output aji_frame.format from --pix-fmt */
+    enum AVPixelFormat out_pixfmt;   /* final software-encoder pix_fmt */
     int             passthrough;     /* no chain active: transcode only */
     int             rife;            /* RIFE active */
     int             rnum, rden;
-    enum AVPixelFormat sw_fmt;       /* NV12 or P010LE */
+    enum AVPixelFormat sw_fmt;       /* pool sw_format: NV12/P010LE/YUV444P16LE */
     AVBufferRef    *aji_pool;        /* CUDA frames pool aji writes into */
 
     /* output */
@@ -302,9 +311,11 @@ static int open_input(enc_ctx *c)
     c->src_w = par->width;
     c->src_h = par->height;
 
+    /* input aji_frame.format mirrors the source bit depth (NVDEC emits NV12
+     * for 8-bit, P010 for 10-bit). The OUTPUT format is decoupled and set by
+     * resolve_pixfmt() from --pix-fmt. */
     const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(par->format);
-    c->ten_bit = d && d->comp[0].depth > 8;
-    c->sw_fmt  = c->ten_bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+    c->src_aji_fmt = (d && d->comp[0].depth > 8) ? AJI_FMT_P010 : AJI_FMT_NV12;
 
     c->color_space = par->color_space;
     c->color_range = par->color_range;
@@ -324,6 +335,47 @@ static int open_input(enc_ctx *c)
     return 0;
 fail:
     return -1;
+}
+
+/* Resolve the output chroma + bit depth from --pix-fmt. Sets the final
+ * encoder pix_fmt + flags, then picks the libaji output format and CUDA pool
+ * sw_format.
+ *
+ * libaji constraint: aji_infer's output format must equal the input format or
+ * be YUV444P16 (it won't, e.g., turn NV12 into P010). So we use a direct
+ * NV12/P010 output only when it exactly matches the source 4:2:0 format
+ * (enabling NVENC zero-copy); for every other request (bit-depth change,
+ * chroma change, or 4:4:4) we route through libaji's 16-bit 4:4:4
+ * intermediate and downconvert to the target with swscale on the host. */
+static void resolve_pixfmt(enc_ctx *c)
+{
+    int nvenc = c->o.vcodec && strstr(c->o.vcodec, "nvenc");
+    switch (c->o.pix_fmt) {
+    case OUT_420P8:  c->ten_bit=0; c->is_444=0; break;
+    case OUT_420P10: c->ten_bit=1; c->is_444=0; break;
+    case OUT_444P8:  c->ten_bit=0; c->is_444=1; break;
+    case OUT_444P10: c->ten_bit=1; c->is_444=1; break;
+    }
+    /* Encoder-input (and swscale-target) format. NVENC accepts only the
+     * semi-planar 4:2:0 host formats (nv12/p010le), not planar yuv420p*;
+     * software encoders take the planar forms. 4:4:4 is software-only. */
+    if (c->is_444)
+        c->out_pixfmt = c->ten_bit ? AV_PIX_FMT_YUV444P10LE : AV_PIX_FMT_YUV444P;
+    else if (nvenc)
+        c->out_pixfmt = c->ten_bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+    else
+        c->out_pixfmt = c->ten_bit ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+
+    int direct = (c->o.pix_fmt == OUT_420P8  && c->src_aji_fmt == AJI_FMT_NV12) ||
+                 (c->o.pix_fmt == OUT_420P10 && c->src_aji_fmt == AJI_FMT_P010);
+    if (direct) {
+        c->out_aji_fmt = c->src_aji_fmt;
+        c->sw_fmt = (c->src_aji_fmt == AJI_FMT_P010) ? AV_PIX_FMT_P010LE
+                                                     : AV_PIX_FMT_NV12;
+    } else {
+        c->out_aji_fmt = AJI_FMT_YUV444P16;
+        c->sw_fmt = AV_PIX_FMT_YUV444P16LE;
+    }
 }
 
 static int open_decoder(enc_ctx *c)
@@ -435,10 +487,12 @@ static int init_aji_pool(enc_ctx *c)
     /* cover in-flight ring/RIFE frames plus those the encoder holds
      * (NVENC async depth + B-frames) — the pool is fixed-size */
     fc->initial_pool_size = c->ring_depth + 48;
-    AV(av_hwframe_ctx_init(c->aji_pool));
+    if (av_hwframe_ctx_init(c->aji_pool) < 0) {
+        loge("CUDA frame pool init failed for sw_format=%s",
+             av_get_pix_fmt_name(c->sw_fmt));
+        return -1;
+    }
     return 0;
-fail:
-    return -1;
 }
 
 /* ---- map a decoded AVFrame into an aji_frame ----------------------------- */
@@ -447,7 +501,8 @@ static void fill_aji_frame(enc_ctx *c, aji_frame *f, AVFrame *av, int output)
 {
     f->width  = av->width;
     f->height = av->height;
-    f->format = c->sw_fmt == AV_PIX_FMT_P010LE ? AJI_FMT_P010 : AJI_FMT_NV12;
+    /* input mirrors the source format; output uses the --pix-fmt selection */
+    f->format = output ? c->out_aji_fmt : c->src_aji_fmt;
     f->matrix = aji_matrix_from_av(c->color_space);
     f->range  = aji_range_from_av(c->color_range);
     f->siting = aji_siting_from_av(c->chroma_loc);
@@ -457,7 +512,6 @@ static void fill_aji_frame(enc_ctx *c, aji_frame *f, AVFrame *av, int output)
     f->stride[0] = av->linesize[0];
     f->stride[1] = av->linesize[1];
     f->stride[2] = av->linesize[2];
-    (void)output;
 }
 
 /* ---- output: encoder, muxer, streams ------------------------------------- */
@@ -503,6 +557,28 @@ static void parse_vquality(const char *s, AVDictionary **d)
     av_free(buf);
 }
 
+/* Pick the encoder profile required for the chosen pix_fmt, unless the caller
+ * already set one in --vquality. ffv1 needs none. */
+static void inject_profile(const char *vcodec, enum out_pixfmt pf,
+                           AVDictionary **opts)
+{
+    if (av_dict_get(*opts, "profile", 0, 0))
+        return;
+    const char *p = NULL;
+    if (!strcmp(vcodec, "libx265")) {
+        p = pf == OUT_420P10 ? "main10" :
+            pf == OUT_444P8  ? "main444-8" :
+            pf == OUT_444P10 ? "main444-10" : NULL;
+    } else if (!strcmp(vcodec, "libx264")) {
+        p = pf == OUT_420P10 ? "high10" :
+            (pf == OUT_444P8 || pf == OUT_444P10) ? "high444" : NULL;
+    } else if (strstr(vcodec, "nvenc")) {
+        p = pf == OUT_420P10 ? "main10" : NULL;   /* nvenc is 4:2:0 only here */
+    }
+    if (p)
+        av_dict_set(opts, "profile", p, 0);
+}
+
 static int open_encoder(enc_ctx *c, AVFrame *first)
 {
     const AVCodec *codec = avcodec_find_encoder_by_name(c->o.vcodec);
@@ -529,16 +605,14 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
         c->enc->hw_frames_ctx = av_buffer_ref(first->hw_frames_ctx);
         if (!c->enc->hw_frames_ctx) { loge("no hw_frames_ctx"); return -1; }
     } else {
-        c->enc->pix_fmt = c->ten_bit ? AV_PIX_FMT_YUV420P10LE
-                                     : AV_PIX_FMT_YUV420P;
+        c->enc->pix_fmt = c->out_pixfmt;
     }
     if (c->ofmt && (c->ofmt->oformat->flags & AVFMT_GLOBALHEADER))
         c->enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     AVDictionary *opts = NULL;
     parse_vquality(c->o.vquality, &opts);
-    if (c->ten_bit && is_nvenc(c->o.vcodec) && !av_dict_get(opts, "profile", 0, 0))
-        av_dict_set(&opts, "profile", "main10", 0);
+    inject_profile(c->o.vcodec, c->o.pix_fmt, &opts);
 
     int r = avcodec_open2(c->enc, codec, &opts);
     AVDictionaryEntry *e = NULL;
@@ -720,16 +794,22 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
     AVFrame *resized = NULL;
     int rc = -1;
 
-    int nvenc = is_nvenc(c->o.vcodec);
+    /* Zero-copy only when the libaji output is a CUDA NV12/P010 frame NVENC
+     * can read directly. Anything routed through the YUV444P16 intermediate
+     * (bit-depth/chroma change or 4:4:4) is downloaded and converted with
+     * swscale, then handed to the encoder (NVENC uploads host frames itself;
+     * software encoders consume them directly). */
+    int zerocopy = is_nvenc(c->o.vcodec) &&
+                   c->out_aji_fmt != AJI_FMT_YUV444P16;
 
-    if (nvenc && resize_needed(c)) {
+    if (zerocopy && resize_needed(c)) {
         if (init_resize(c, cuda_out) < 0) goto done;
         AV(av_buffersrc_add_frame_flags(c->buf_src, cuda_out,
                                         AV_BUFFERSRC_FLAG_KEEP_REF));
         resized = av_frame_alloc();
         AV(av_buffersink_get_frame(c->buf_sink, resized));
         to_encode = resized;
-    } else if (nvenc) {
+    } else if (zerocopy) {
         to_encode = cuda_out;          /* zero-copy CUDA frame straight in */
     } else {
         /* software encode: download to host then convert/resize via swscale.
@@ -743,7 +823,7 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
             host = dl;
         }
         AVFrame *sw = av_frame_alloc();
-        sw->format = c->ten_bit ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+        sw->format = c->out_pixfmt;
         sw->width  = c->out_w;
         sw->height = c->out_h;
         AV(av_frame_get_buffer(sw, 0));
@@ -1106,6 +1186,8 @@ static void usage(void)
 "--model-dir <d> [--rife-model-dir <d>] [--trtexec <p>]\n"
 "           [--vcodec hevc_nvenc|h264_nvenc|libx265|libx264|ffv1]"
 " [--vquality \"<args>\"]\n"
+"           [--pix-fmt yuv420p|yuv420p10|yuv444p|yuv444p10]"
+" (default yuv420p10; 4:4:4 = software encoder)\n"
 "           [--final-resize-height H | --final-resize-factor PCT]"
 " [--overwrite]\n"
 "           [--no-audio] [--no-subs] [--no-chapters]"
@@ -1124,6 +1206,7 @@ int main(int argc, char **argv)
     c.o.progress = PROG_LINE;
     c.o.decoder = DEC_AUTO;
     c.o.pipeline_depth = 4;
+    c.o.pix_fmt = OUT_420P10;     /* default: 10-bit 4:2:0 (matches old pipeline) */
     g_log = stderr;
 
     for (int i = 1; i < argc; i++) {
@@ -1147,6 +1230,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--backend")) c.o.backend = argv[++i];
         else if (!strcmp(a, "--vcodec")) c.o.vcodec = argv[++i];
         else if (!strcmp(a, "--vquality")) c.o.vquality = argv[++i];
+        else if (!strcmp(a, "--pix-fmt")) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "yuv420p"))        c.o.pix_fmt = OUT_420P8;
+            else if (!strcmp(v, "yuv420p10")) c.o.pix_fmt = OUT_420P10;
+            else if (!strcmp(v, "yuv444p"))   c.o.pix_fmt = OUT_444P8;
+            else if (!strcmp(v, "yuv444p10")) c.o.pix_fmt = OUT_444P10;
+            else { loge("unknown --pix-fmt '%s' (yuv420p|yuv420p10|yuv444p|"
+                        "yuv444p10)", v); return 2; }
+        }
         else if (!strcmp(a, "--final-resize-height")) c.o.final_h = atoi(argv[++i]);
         else if (!strcmp(a, "--final-resize-factor")) c.o.final_pct = atoi(argv[++i]);
         else if (!strcmp(a, "--progress")) {
@@ -1188,12 +1280,18 @@ int main(int argc, char **argv)
         loge("--final-resize-height and --final-resize-factor are exclusive");
         return 2;
     }
+    if (c.o.pix_fmt >= OUT_444P8 && is_nvenc(c.o.vcodec)) {
+        loge("4:4:4 output needs a software encoder (libx265 main444 / "
+             "libx264 high444); %s 4:4:4 not supported in v1", c.o.vcodec);
+        return 2;
+    }
     c.ring_depth = c.o.pipeline_depth;
     if (c.ring_depth < 1) c.ring_depth = 1;
     if (c.ring_depth > MAX_RING - 1) c.ring_depth = MAX_RING - 1;
 
     int rc = 1;
     if (open_input(&c) < 0) goto out;
+    resolve_pixfmt(&c);    /* needs src_aji_fmt from open_input */
     if (setup_cuda(&c) < 0) goto out;
     if (init_aji(&c) < 0) goto out;
 
