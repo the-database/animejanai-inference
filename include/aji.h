@@ -143,7 +143,12 @@ AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
  * ticket taken after this call completes (see aji_flush). Successive
  * calls are ordered on the same stream/queue, so queuing the next frame
  * before the previous one completes is safe. Frame dims must match the
- * last aji_configure(). */
+ * last aji_configure().
+ *
+ * The output format is independent of the input: any 4:2:0 input (NV12 or
+ * P010) may be written as NV12, P010 (e.g. an 8-bit source to a 10-bit file,
+ * or the reverse) or YUV444P16 (TensorRT only); the backend matrixes and
+ * quantizes to the output format. */
 AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
                          const aji_frame *out, void *cu_stream);
 

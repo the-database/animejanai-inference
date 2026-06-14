@@ -366,15 +366,18 @@ static void resolve_pixfmt(enc_ctx *c)
     else
         c->out_pixfmt = c->ten_bit ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
 
-    int direct = (c->o.pix_fmt == OUT_420P8  && c->src_aji_fmt == AJI_FMT_NV12) ||
-                 (c->o.pix_fmt == OUT_420P10 && c->src_aji_fmt == AJI_FMT_P010);
-    if (direct) {
-        c->out_aji_fmt = c->src_aji_fmt;
-        c->sw_fmt = (c->src_aji_fmt == AJI_FMT_P010) ? AV_PIX_FMT_P010LE
-                                                     : AV_PIX_FMT_NV12;
-    } else {
-        c->out_aji_fmt = AJI_FMT_YUV444P16;
-        c->sw_fmt = AV_PIX_FMT_YUV444P16LE;
+    /* libaji output format + CUDA pool sw_format, chosen purely by --pix-fmt
+     * (libaji converts any 4:2:0 input to NV12/P010 on-GPU, so 4:2:0 outputs
+     * are zero-copy regardless of source). Only 4:4:4 uses the YUV444P16
+     * intermediate (downloaded + downconverted by the software path). */
+    switch (c->o.pix_fmt) {
+    case OUT_420P8:
+        c->out_aji_fmt = AJI_FMT_NV12;      c->sw_fmt = AV_PIX_FMT_NV12;        break;
+    case OUT_420P10:
+        c->out_aji_fmt = AJI_FMT_P010;      c->sw_fmt = AV_PIX_FMT_P010LE;      break;
+    case OUT_444P8:
+    case OUT_444P10:
+        c->out_aji_fmt = AJI_FMT_YUV444P16; c->sw_fmt = AV_PIX_FMT_YUV444P16LE; break;
     }
 }
 

@@ -1182,7 +1182,9 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
 {
     const bool out444 = out->format == AJI_FMT_YUV444P16;
     const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
-    const int obpp = out444 ? 2 : bpp;
+    // output bytes/sample is the OUTPUT format's (NV12 is the only 8-bit one);
+    // input bpp must not leak in here, or NV12->P010 staging is half-sized.
+    const int obpp = out->format == AJI_FMT_NV12 ? 1 : 2;
     const size_t in_row = (size_t)in->width * bpp;
     const size_t out_row = (size_t)out->width * obpp;
     const size_t in_y = in_row * in->height;
@@ -1290,8 +1292,13 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
-    if (out->format != in->format && out->format != AJI_FMT_YUV444P16) {
-        c->set_error("output format must match input (or be YUV444P16)");
+    // Output is independent of input: any 4:2:0 (NV12/P010) or 4:4:4
+    // (YUV444P16). The post-kernel quantizes to the output format's depth,
+    // so NV12->P010 (8-bit source, 10-bit output) and P010->NV12 are on-GPU.
+    if (out->format != AJI_FMT_NV12 && out->format != AJI_FMT_P010 &&
+        out->format != AJI_FMT_YUV444P16) {
+        c->set_error("unsupported output format %d (nv12/p010/yuv444p16)",
+                     out->format);
         return AJI_ERR_FORMAT;
     }
     if (in->width != c->in_w || in->height != c->in_h ||
@@ -1427,7 +1434,11 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
         memcpy(c->post_key, qkey, sizeof(qkey));
     }
 
-    err = aji_run_post(c->post_plan, c->buf[cur], &csp,
+    // Quantize to the OUTPUT format's depth/range (NV12 8-bit vs P010 10-bit),
+    // not the input's — `csp` above is the input format's, used by the pre
+    // kernel. Same matrix/range as the input (the model preserves them).
+    const aji_csp ocsp = aji_make_csp(out->format, in->matrix, in->range);
+    err = aji_run_post(c->post_plan, c->buf[cur], &ocsp,
                        out->plane[0], out->stride[0], out->plane[1],
                        out->stride[1], stream);
     if (err) {
