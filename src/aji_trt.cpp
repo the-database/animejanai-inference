@@ -849,11 +849,7 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     auto c = std::make_unique<aji_ctx>();
     c->logger.fn = params->log;
     c->logger.opaque = params->log_opaque;
-    // CUDA graphs OFF by default: replay stuttered on some Ampere (sm86) /
-    // driver combos for a negligible gain (the chain is TensorRT-bound; the
-    // graphed pre/post kernels are ~0.2 ms). Opt in with AJI_GRAPH=1 for
-    // experimentation; AJI_NO_GRAPH still force-disables.
-    c->graph_ok = getenv("AJI_GRAPH") != nullptr && getenv("AJI_NO_GRAPH") == nullptr;
+    c->graph_ok = !getenv("AJI_NO_GRAPH");  // debug/benchmark escape hatch
 
     if (cuInit(0) != CUDA_SUCCESS) {
         c->set_error("cuInit failed");
