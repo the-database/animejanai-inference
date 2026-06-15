@@ -49,11 +49,13 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// TRT 11: strongly-typed is the default (--stronglyTyped is a no-op), and sanitize_settings_trt11
+// strips --inputIOFormats/--outputIOFormats/--tacticSources anyway (types come from the network;
+// the cuDNN/cuBLAS tactic sources are gone). So the only flags worth carrying are the builder
+// optimization level, the build shape profile, and skip-inference (we do the inference ourselves).
 const char *DEFAULT_TRT_ENGINE_SETTINGS =
-    "--stronglyTyped --optShapes=input:%video_resolution% "
-    "--inputIOFormats=fp16:chw --outputIOFormats=fp16:chw "
-    "--builderOptimizationLevel=5 "
-    "--tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
+    "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% "
+    "--skipInference";
 
 class Logger : public nvinfer1::ILogger {
 public:
