@@ -1183,7 +1183,8 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
                             int *ret)
 {
     const bool out444 = out->format == AJI_FMT_YUV444P16;
-    const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
+    const bool in444 = in->format == AJI_FMT_YUV444P16;
+    const int bpp = (in->format == AJI_FMT_P010 || in444) ? 2 : 1;
     // output bytes/sample is the OUTPUT format's (NV12 is the only 8-bit one);
     // input bpp must not leak in here, or NV12->P010 staging is half-sized.
     const int obpp = out->format == AJI_FMT_NV12 ? 1 : 2;
@@ -1192,7 +1193,8 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
     const size_t in_y = in_row * in->height;
     const size_t out_y = out_row * out->height;
 
-    if (!ensure_stage(&c->stage_in, &c->stage_in_bytes, in_y * 3 / 2) ||
+    if (!ensure_stage(&c->stage_in, &c->stage_in_bytes,
+                      in444 ? in_y * 3 : in_y * 3 / 2) ||
         !ensure_stage(&c->stage_out, &c->stage_out_bytes,
                       out444 ? out_y * 3 : out_y * 3 / 2)) {
         c->graph_ok = false;
@@ -1204,6 +1206,10 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
     sin.plane[0] = c->stage_in;
     sin.plane[1] = (char *)c->stage_in + in_y;
     sin.stride[0] = sin.stride[1] = (ptrdiff_t)in_row;
+    if (in444) {
+        sin.plane[2] = (char *)c->stage_in + 2 * in_y;
+        sin.stride[2] = (ptrdiff_t)in_row;
+    }
     sout.plane[0] = c->stage_out;
     sout.plane[1] = (char *)c->stage_out + out_y;
     sout.stride[0] = sout.stride[1] = (ptrdiff_t)out_row;
@@ -1212,10 +1218,15 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
         sout.stride[2] = (ptrdiff_t)out_row;
     }
 
+    // 4:2:0 chroma is half-height (one interleaved CbCr plane); 4:4:4 is three
+    // full-height planes.
     if (!copy_plane(sin.plane[0], in_row, in->plane[0], in->stride[0],
                     in_row, in->height, stream) ||
         !copy_plane(sin.plane[1], in_row, in->plane[1], in->stride[1],
-                    in_row, in->height / 2, stream)) {
+                    in_row, in444 ? in->height : in->height / 2, stream) ||
+        (in444 &&
+         !copy_plane(sin.plane[2], in_row, in->plane[2], in->stride[2],
+                     in_row, in->height, stream))) {
         c->graph_ok = false;
         return false;
     }
@@ -1290,7 +1301,8 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->set_error("aji_infer without an active configuration");
         return AJI_ERR;
     }
-    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010) {
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
+        in->format != AJI_FMT_YUV444P16) {
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
@@ -1337,22 +1349,31 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
 {
     const aji_csp csp = make_csp(in);
 
-    const int pkey[4] = {in->format, in->width, in->height, in->siting};
-    if (!c->pre_plan || memcmp(pkey, c->pre_key, sizeof(pkey)) != 0) {
-        aji_plan_destroy(c->pre_plan);
-        c->pre_plan = aji_pre_plan_create(in->format, in->width, in->height,
-                                          in->siting, AJI_FILTER_SPLINE36);
-        if (!c->pre_plan) {
-            c->set_error("pre plan allocation failed");
-            return AJI_ERR_CUDA;
+    // 4:4:4 input is already full-resolution: pure matrix convert, no chroma
+    // upsample and no plan (aji_pre_plan_create hardcodes w>>1/h>>1 chroma and
+    // would silently corrupt 444). Mirrors the RIFE f444 branch.
+    const bool in444 = in->format == AJI_FMT_YUV444P16;
+    if (!in444) {
+        const int pkey[4] = {in->format, in->width, in->height, in->siting};
+        if (!c->pre_plan || memcmp(pkey, c->pre_key, sizeof(pkey)) != 0) {
+            aji_plan_destroy(c->pre_plan);
+            c->pre_plan = aji_pre_plan_create(in->format, in->width, in->height,
+                                              in->siting, AJI_FILTER_SPLINE36);
+            if (!c->pre_plan) {
+                c->set_error("pre plan allocation failed");
+                return AJI_ERR_CUDA;
+            }
+            memcpy(c->pre_key, pkey, sizeof(pkey));
         }
-        memcpy(c->pre_key, pkey, sizeof(pkey));
     }
 
     int cur = 0;
-    int err = aji_run_pre(c->pre_plan, in->plane[0], in->stride[0],
-                          in->plane[1], in->stride[1], &csp, c->buf[cur],
-                          stream);
+    int err = in444
+        ? aji_run_pre444(in->width, in->height, in->plane[0], in->stride[0],
+                         in->plane[1], in->stride[1], in->plane[2],
+                         in->stride[2], &csp, c->buf[cur], stream)
+        : aji_run_pre(c->pre_plan, in->plane[0], in->stride[0],
+                      in->plane[1], in->stride[1], &csp, c->buf[cur], stream);
     if (err) {
         c->set_error("pre-kernel failed: %s", cudaGetErrorString((cudaError_t)err));
         return AJI_ERR_CUDA;
