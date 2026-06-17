@@ -148,13 +148,13 @@ enum Kern {
     K_UV_H = 0, K_V_F32, K_PRE_COMBINE, K_POST_MATRIX,
     K_H_F32, K_UV_V_STORE, K_RS_H, K_RS_V,
     K_FILL, K_WINDOW, K_RIFE_CONSTS, K_SCD_PARTIAL, K_SCD_FINAL,
-    K_PRE_RGB10, K_POST_RGB10,
+    K_PRE_RGB10,
 };
 const char *const KERN_ENTRY[] = {
     "cs_uv_h", "cs_v_f32", "cs_pre_combine", "cs_post_matrix",
     "cs_h_f32", "cs_uv_v_store", "cs_rs_h", "cs_rs_v",
     "cs_fill", "cs_window", "cs_rife_consts", "cs_scd_partial",
-    "cs_scd_final", "cs_pre_rgb10", "cs_post_rgb10",
+    "cs_scd_final", "cs_pre_rgb10",
 };
 
 struct DmlPass {
@@ -441,8 +441,6 @@ std::unique_ptr<DmlPlan> post_plan_create(aji_ctx *c, int format, int w, int h,
     p->format = format;
     p->w = w;
     p->h = h;
-    if (format == AJI_FMT_RGB10A2)
-        return p;   // RGB output is a pure pack: no resample plan/scratch
     const int cw = w >> 1, ch = h >> 1;
     double sx, sy;
     aji_resample::chroma_shifts(siting, false, &sx, &sy);
@@ -727,21 +725,6 @@ bool record_pre_rgb10(aji_ctx *c, Recorder &r, DmlPlan *p, ID3D12Resource *rgb_b
     a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch; a.dj[1] = dst_off;
     if (!r.dispatch(K_PRE_RGB10, false, io16, a, NULL, NULL, rgb_buf, NULL,
                     dst, w / 2, h, 1))
-        return false;
-    r.uav_barrier();
-    return true;
-}
-
-// post for packed 10-bit RGB output: a single pack pass from the tensor — the
-// inverse of record_pre_rgb10. rgb_buf = the packed R10G10B10A2 plane.
-bool record_post_rgb10(aji_ctx *c, Recorder &r, DmlPlan *p, ID3D12Resource *src,
-                       ID3D12Resource *rgb_buf, uint32_t pitch, bool io16)
-{
-    const int w = p->w, h = p->h;
-    KernArgs a = {};
-    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch;
-    if (!r.dispatch(K_POST_RGB10, false, io16, a, NULL, NULL, src, rgb_buf,
-                    NULL, w, h, 1))
         return false;
     r.uav_barrier();
     return true;
@@ -1784,9 +1767,14 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
-    // RGB10 (a hwuploaded 4:4:4 source) round-trips as full-res RGB; 4:2:0
-    // stays 4:2:0. Either way the post path assumes in == out.
-    if (out->format != in->format) {
+    // Output is always 4:2:0 (no shared planar-4:4:4 or RGB d3d11 pool that
+    // works through gpu-next): RGB10 input (a hwuploaded 4:4:4 source)
+    // upscales to NV12/P010; 4:2:0 input round-trips to the same format.
+    if (out->format != AJI_FMT_NV12 && out->format != AJI_FMT_P010) {
+        c->set_error("unsupported output format %d (nv12/p010)", out->format);
+        return AJI_ERR_FORMAT;
+    }
+    if (in->format != AJI_FMT_RGB10A2 && out->format != in->format) {
         c->set_error("output format must match input");
         return AJI_ERR_FORMAT;
     }
@@ -1807,13 +1795,18 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     // aji_flush/aji_done/aji_wait before consuming the output texture.
     DoneGuard done_guard{c};
 
-    // RGB10 round-trips as a single 4-byte packed plane (no chroma, no
-    // matrix); NV12 luma is 1 byte, P010 2. out == in (checked above).
+    // RGB10 input is a single 4-byte packed plane (no chroma, no matrix);
+    // NV12 luma is 1 byte, P010 2. Output is always 4:2:0 (NV12 1 / P010 2).
     const bool in_rgb = in->format == AJI_FMT_RGB10A2;
     const int in_bpp = in_rgb ? 4 : (in->format == AJI_FMT_P010 ? 2 : 1);
-    const int out_bpp = in_bpp;
+    const int out_bpp = out->format == AJI_FMT_NV12 ? 1 : 2;
     const aji_csp csp =
         aji_resample::make_csp(in->format, in->matrix, in->range);
+    // The post quantizes to the OUTPUT format with the frame's matrix/range
+    // (== csp when in == out; for RGB input the filter tags a YUV matrix so
+    // the output P010 is a normal BT.601/709 encode).
+    const aji_csp out_csp =
+        aji_resample::make_csp(out->format, in->matrix, in->range);
 
     // (re)build staging + plans on format/dim changes
     const int skey[3] = {in->format, in->width, in->height};
@@ -1829,11 +1822,10 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
                                         false);
         c->out_y = make_buffer(c->dev.Get(),
                                (uint64_t)c->out_pitch * out->height, false);
-        c->out_uv = in_rgb ? nullptr
-                           : make_buffer(c->dev.Get(),
-                                         (uint64_t)c->out_pitch * (out->height / 2),
-                                         false);
-        if (!c->in_y || !c->out_y || (!in_rgb && (!c->in_uv || !c->out_uv))) {
+        c->out_uv = make_buffer(c->dev.Get(),
+                                (uint64_t)c->out_pitch * (out->height / 2),
+                                false);
+        if (!c->in_y || !c->out_y || !c->out_uv || (!in_rgb && !c->in_uv)) {
             c->set_error("plane staging allocation failed");
             return AJI_ERR;
         }
@@ -1953,37 +1945,14 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
 
     if (!r.begin())
         return AJI_ERR;
-    if (in_rgb) {
-        if (!record_post_rgb10(c, r, c->post_plan.get(), c->buf[cur].Get(),
-                               c->out_y.Get(), c->out_pitch, c->last_elem16))
-            return AJI_ERR;
-    } else if (!record_post(c, r, c->post_plan.get(), csp, c->buf[cur].Get(),
-                            c->out_y.Get(), c->out_uv.Get(), c->out_pitch,
-                            c->last_elem16)) {
+    // Output is always 4:2:0 (NV12/P010), including for RGB input — the post
+    // matrixes the model's RGB to YUV using out_csp, exactly as the 4:2:0
+    // round-trip does, and goes out the proven shared-P010/NV12 pool path.
+    if (!record_post(c, r, c->post_plan.get(), out_csp, c->buf[cur].Get(),
+                     c->out_y.Get(), c->out_uv.Get(), c->out_pitch,
+                     c->last_elem16))
         return AJI_ERR;
-    }
-    if (in_rgb) {
-        // Single packed R10G10B10A2 output plane (one subresource).
-        D3D12_RESOURCE_BARRIER ub = {};
-        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        ub.Transition.pResource = c->out_y.Get();
-        ub.Transition.Subresource = 0;
-        ub.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        ub.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        c->cl->ResourceBarrier(1, &ub);
-        D3D12_RESOURCE_BARRIER tb = {};
-        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        tb.Transition.pResource = out_tex;
-        tb.Transition.Subresource = out_sub;
-        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        c->cl->ResourceBarrier(1, &tb);
-        copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
-                   out->height, c->out_y.Get(), c->out_pitch);
-        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-        c->cl->ResourceBarrier(1, &tb);
-    } else {
+    {
         D3D12_RESOURCE_BARRIER bs[2] = {};
         for (int i = 0; i < 2; i++) {
             bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1995,15 +1964,15 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         bs[0].Transition.pResource = c->out_y.Get();
         bs[1].Transition.pResource = c->out_uv.Get();
         c->cl->ResourceBarrier(2, bs);
-        transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COMMON,
-                          D3D12_RESOURCE_STATE_COPY_DEST);
-        copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
-                   out->height, c->out_y.Get(), c->out_pitch);
-        copy_plane(c, false, out_tex, out_sub, 1, out->format, out->width,
-                   out->height, c->out_uv.Get(), c->out_pitch);
-        transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COPY_DEST,
-                          D3D12_RESOURCE_STATE_COMMON);
     }
+    transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATE_COPY_DEST);
+    copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
+               out->height, c->out_y.Get(), c->out_pitch);
+    copy_plane(c, false, out_tex, out_sub, 1, out->format, out->width,
+               out->height, c->out_uv.Get(), c->out_pitch);
+    transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COPY_DEST,
+                      D3D12_RESOURCE_STATE_COMMON);
     if (!r.exec())
         return AJI_ERR;
 

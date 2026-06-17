@@ -214,25 +214,6 @@ void cs_pre_rgb10(uint3 id : SV_DispatchThreadID)
     }
 }
 
-// ---- cs_post_rgb10: RGB tensor -> packed 10-bit RGB (x2bgr10 / R10G10B10A2) ----
-// Inverse of cs_pre_rgb10: a pure pack+quantize, no YUV matrix, no resample —
-// the model output stays full-res RGB. di = {w, h}, dj.x = row stride bytes.
-// d0 = tensor in, d1 = packed RGB u32 out (R low 10, alpha = 3).
-[numthreads(32, 8, 1)]
-void cs_post_rgb10(uint3 id : SV_DispatchThreadID)
-{
-    int w = di.x, h = di.y;
-    int x = id.x, y = id.y;
-    if (x >= w || y >= h)
-        return;
-    uint plane = (uint)w * (uint)h, idx = (uint)y * (uint)w + x;
-    uint R = (uint)quant(TLOAD(d0, idx) * 1023.0f, 1.0f, 1023.0f);
-    uint G = (uint)quant(TLOAD(d0, plane + idx) * 1023.0f, 1.0f, 1023.0f);
-    uint B = (uint)quant(TLOAD(d0, 2u * plane + idx) * 1023.0f, 1.0f, 1023.0f);
-    d1.Store((uint)y * (uint)dj.x + (uint)x * 4u,
-             R | (G << 10) | (B << 20) | (3u << 30));
-}
-
 // ---- cs_fill: fill a dword range with a constant ----
 // di.x = dword count, dj.x = start dword, dj.y = value bits. d0 = dst.
 [numthreads(256, 1, 1)]
