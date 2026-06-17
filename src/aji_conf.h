@@ -45,3 +45,10 @@ struct AjiConf {
 // Loads path (missing file = built-in defaults only). Returns false only on
 // hard errors; *err gets the message.
 bool aji_conf_load(const char *path, AjiConf *out, std::string *err);
+
+// Returns the first model in the chain whose <name>.onnx is absent from
+// model_dir, or "" if all are present (empty names are no-op steps). Chain
+// selection uses this to skip a chain with a missing model file so a stale
+// config reference degrades to passthrough instead of failing playback.
+std::string aji_chain_missing_model(const std::string &model_dir,
+                                    const AjiChainConf &chain);

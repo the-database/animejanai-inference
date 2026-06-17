@@ -24,6 +24,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -310,6 +311,19 @@ void apply_sharp_presets(AjiConf *conf, const Section &global)
 }
 
 } // namespace
+
+std::string aji_chain_missing_model(const std::string &model_dir,
+                                    const AjiChainConf &chain)
+{
+    for (const auto &m : chain.models) {
+        if (m.name.empty())
+            continue;
+        if (!std::filesystem::exists(
+                std::filesystem::path(model_dir) / (m.name + ".onnx")))
+            return m.name;
+    }
+    return std::string();
+}
 
 bool aji_conf_load(const char *path, AjiConf *out, std::string *err)
 {

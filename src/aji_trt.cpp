@@ -1011,6 +1011,16 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         for (const auto &ch : sit->second.chains) {
             if (ch.min_px <= px && px <= ch.max_px &&
                 ch.min_fps <= fps && fps <= ch.max_fps) {
+                // Skip a matching chain whose model file is missing (e.g. a
+                // stale config reference after a model rename): degrade to the
+                // next chain / passthrough instead of failing playback.
+                std::string missing = aji_chain_missing_model(c->model_dir, ch);
+                if (!missing.empty()) {
+                    c->log_info.push_back(
+                        "Chain " + std::to_string(ch.index) +
+                        " skipped: model not found: " + missing + ".onnx");
+                    continue;
+                }
                 chain = &ch;
                 break;
             }
