@@ -178,24 +178,6 @@ void cs_pre_combine(uint3 id : SV_DispatchThreadID)
     }
 }
 
-// ---- cs_chroma444: two raw 16-bit chroma planes -> 2 planar fp32 ----
-// 4:4:4 chroma is already full-resolution, so this just widens the raw
-// Cb/Cr samples into the f32 (raw-units) layout cs_pre_combine consumes
-// (d1 there) — no resample, no plan. di = {w, h}, dj.x = chroma row
-// stride bytes. d0 = Cb raw u16, d1 = Cr raw u16, d2 = uvf f32 out.
-[numthreads(32, 8, 1)]
-void cs_chroma444(uint3 id : SV_DispatchThreadID)
-{
-    int w = di.x, h = di.y;
-    int x = id.x, y = id.y;
-    if (x >= w || y >= h)
-        return;
-    uint plane = (uint)w * (uint)h, idx = (uint)y * (uint)w + x;
-    uint off = (uint)y * (uint)dj.x + (uint)x * 2u;   // 16-bit samples
-    d2.Store(idx * 4u, asuint(float(load_u16(d0, off))));
-    d2.Store((plane + idx) * 4u, asuint(float(load_u16(d1, off))));
-}
-
 // ---- cs_fill: fill a dword range with a constant ----
 // di.x = dword count, dj.x = start dword, dj.y = value bits. d0 = dst.
 [numthreads(256, 1, 1)]

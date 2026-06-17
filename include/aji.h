@@ -120,12 +120,7 @@ typedef struct aji_frame {
     void *plane[3];           /* CUdeviceptr: Y, CbCr (4:2:0) or Y, Cb, Cr
                                  (4:4:4). DirectML: plane[0] is the
                                  ID3D11Texture2D*, plane[1] the subresource
-                                 index. For 4:4:4 input on DirectML the
-                                 texture is a 3-slice R16_UNORM Texture2DArray
-                                 (Y, Cb, Cr); plane[1] is the base subresource
-                                 and slices base+0/1/2 are read. DirectML
-                                 4:4:4 is input only — output is always
-                                 4:2:0. */
+                                 index. */
     ptrdiff_t stride[3];      /* bytes */
 } aji_frame;
 
