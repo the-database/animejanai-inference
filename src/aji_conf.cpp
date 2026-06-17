@@ -220,7 +220,7 @@ AjiChainConf builtin_chain(int index, double min_px, double max_px,
 
 const char *HD_BAL = "2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16";
 const char *HD_PERF = "2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16";
-const char *SD = "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op23_dynamo";
+const char *SD = "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo";
 
 void add_builtin_slots(AjiConf *conf)
 {
