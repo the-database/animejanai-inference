@@ -13,6 +13,11 @@
  *               ( --engine E.engine | --conf animejanai.conf
  *                 --model-dir DIR --trtexec PATH [--trtexec-env K=V]
  *                 [--slot N] )
+ *
+ * --rife: interpolation-only parity loop (inputs already at output res).
+ * --rife-chain: times the full upscale+RIFE chain per source frame, honoring
+ *   the slot's configured order (aji_rife_before_upscale). Use slots 1012
+ *   (upscale then RIFE) vs 1013 (RIFE then upscale) for the order A/B.
  */
 
 #include <stdio.h>
@@ -46,11 +51,13 @@ int main(int argc, char **argv)
     const char *rife_model_dir = NULL;
     const char *format = "nv12", *matrix = "709", *range = "limited", *siting = "left";
     int w = 0, h = 0, max_frames = 1 << 30, slot = 1, rife = 0, out444 = 0;
+    int rife_chain = 0;
 
     double fps = 23.976;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--rife")) { rife = 1; continue; }
+        if (!strcmp(argv[i], "--rife-chain")) { rife_chain = 1; continue; }
         if (!strcmp(argv[i], "--out444")) { out444 = 1; continue; }
         if (i >= argc - 1) break;
         if (!strcmp(argv[i], "--engine")) engine = argv[++i];
@@ -109,6 +116,166 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("%s\n", aji_current_log(aji));
+
+    if (rife_chain) {
+        // Full upscale+RIFE chain timing, honoring the chain's configured
+        // order (aji_rife_before_upscale). Times the device work per source
+        // frame so both orders compare on the same workload. Default order
+        // (upscale then RIFE) upscales each source frame once; RIFE-first
+        // (RIFE then upscale) upscales every source AND interpolated frame,
+        // so the heavy upscaler runs ~factor x as often.
+        if (act == 0) {
+            printf("no chain active (passthrough); nothing to do\n");
+            aji_destroy(&aji);
+            return 0;
+        }
+        int rn = 0, rd = 0;
+        if (!aji_rife_factor(aji, &rn, &rd) || rd == 0) {
+            fprintf(stderr, "rife-chain needs an active rife chain "
+                            "(slot 1012/1013, or a conf chain with rife=yes)\n");
+            return 1;
+        }
+        const int before = aji_rife_before_upscale(aji);
+        const double factor = (double)rn / rd;
+        printf("rife-chain: %dx%d -> %dx%d, factor %d/%d, order: %s\n",
+               w, h, ow, oh, rn, rd,
+               before ? "RIFE then upscale" : "upscale then RIFE");
+
+        const int mat = !strcmp(matrix, "601") ? AJI_MATRIX_BT601 :
+                        !strcmp(matrix, "2020") ? AJI_MATRIX_BT2020 : AJI_MATRIX_BT709;
+        const int rng = !strcmp(range, "full") ? AJI_RANGE_FULL : AJI_RANGE_LIMITED;
+        const int sit = !strcmp(siting, "center") ? AJI_SITING_CENTER :
+                        !strcmp(siting, "topleft") ? AJI_SITING_TOPLEFT : AJI_SITING_LEFT;
+        const size_t oy_sz = (size_t)ow * oh * bpp;
+        const size_t ouv_sz = oy_sz / 2;
+
+        // source ring (w x h) + a source-res interp slot (used by RIFE-first);
+        // upscaled ring (ow x oh) + an upscaled interp slot (used by default).
+        aji_frame s[2], smid, up[2], umid;
+        for (int i = 0; i < 2; i++) {
+            s[i] = (aji_frame){.width = w, .height = h, .format = fmt,
+                               .matrix = mat, .range = rng, .siting = sit,
+                               .stride = {(ptrdiff_t)(w * bpp),
+                                          (ptrdiff_t)(w * bpp)}};
+            CK(cudaMalloc(&s[i].plane[0], y_sz));
+            CK(cudaMalloc(&s[i].plane[1], uv_sz));
+            up[i] = (aji_frame){.width = ow, .height = oh, .format = fmt,
+                                .matrix = mat, .range = rng, .siting = sit,
+                                .stride = {(ptrdiff_t)(ow * bpp),
+                                           (ptrdiff_t)(ow * bpp)}};
+            CK(cudaMalloc(&up[i].plane[0], oy_sz));
+            CK(cudaMalloc(&up[i].plane[1], ouv_sz));
+        }
+        smid = (aji_frame){.width = w, .height = h, .format = fmt,
+                           .matrix = mat, .range = rng, .siting = sit,
+                           .stride = {(ptrdiff_t)(w * bpp), (ptrdiff_t)(w * bpp)}};
+        CK(cudaMalloc(&smid.plane[0], y_sz));
+        CK(cudaMalloc(&smid.plane[1], uv_sz));
+        umid = (aji_frame){.width = ow, .height = oh, .format = fmt,
+                           .matrix = mat, .range = rng, .siting = sit,
+                           .stride = {(ptrdiff_t)(ow * bpp), (ptrdiff_t)(ow * bpp)}};
+        CK(cudaMalloc(&umid.plane[0], oy_sz));
+        CK(cudaMalloc(&umid.plane[1], ouv_sz));
+
+        FILE *fin = fopen(input, "rb");
+        if (!fin) { perror(input); return 1; }
+        void *h_in;
+        CK(cudaMallocHost(&h_in, frame_sz));
+        cudaStream_t stream;
+        CK(cudaStreamCreate(&stream));
+        cudaEvent_t ev0, ev1;
+        CK(cudaEventCreate(&ev0));
+        CK(cudaEventCreate(&ev1));
+
+        int n = 0, warmup = 3, prev = -1, cur = 0, interp = 0, scenes = 0;
+        double total_ms = 0;
+        int timed = 0;
+        while (n < max_frames) {
+            if (fread(h_in, 1, frame_sz, fin) != frame_sz) {
+                if (n == 0) {
+                    fprintf(stderr, "input shorter than one frame\n");
+                    return 1;
+                }
+                fseek(fin, 0, SEEK_SET);   // loop the input so short seeds run long
+                if (fread(h_in, 1, frame_sz, fin) != frame_sz)
+                    break;
+            }
+            CK(cudaMemcpyAsync(s[cur].plane[0], h_in, y_sz,
+                               cudaMemcpyHostToDevice, stream));
+            CK(cudaMemcpyAsync(s[cur].plane[1], (char *)h_in + y_sz, uv_sz,
+                               cudaMemcpyHostToDevice, stream));
+
+            CK(cudaEventRecord(ev0, stream));
+            int ret = AJI_OK;
+            if (before) {
+                // interpolate the source pair, then upscale every frame
+                if (prev >= 0) {
+                    int r = aji_infer_rife(aji, &s[prev], &s[cur], 0.5,
+                                           &smid, stream);
+                    if (r == AJI_OK) {
+                        interp++;
+                        ret = aji_infer(aji, &smid, &umid, stream);
+                    } else if (r == AJI_SCENE) {
+                        scenes++;
+                        ret = aji_infer(aji, &s[prev], &umid, stream);
+                    } else {
+                        fprintf(stderr, "aji_infer_rife: %d: %s\n", r,
+                                aji_last_error(aji));
+                        return 1;
+                    }
+                }
+                if (ret == AJI_OK)
+                    ret = aji_infer(aji, &s[cur], &up[cur], stream);
+            } else {
+                // upscale, then interpolate the upscaled pair
+                ret = aji_infer(aji, &s[cur], &up[cur], stream);
+                if (ret == AJI_OK && prev >= 0) {
+                    int r = aji_infer_rife(aji, &up[prev], &up[cur], 0.5,
+                                           &umid, stream);
+                    if (r == AJI_OK) interp++;
+                    else if (r == AJI_SCENE) scenes++;
+                    else {
+                        fprintf(stderr, "aji_infer_rife: %d: %s\n", r,
+                                aji_last_error(aji));
+                        return 1;
+                    }
+                }
+            }
+            if (ret != AJI_OK) {
+                fprintf(stderr, "aji_infer: %d: %s\n", ret, aji_last_error(aji));
+                return 1;
+            }
+            CK(cudaEventRecord(ev1, stream));
+            CK(cudaStreamSynchronize(stream));
+
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, ev0, ev1));
+            if (n >= warmup) {
+                total_ms += ms;
+                timed++;
+            }
+            if (prev < 0) {
+                prev = cur;
+                cur = 1;
+            } else {
+                int tmp = prev;
+                prev = cur;
+                cur = tmp;
+            }
+            n++;
+        }
+
+        double avg = timed ? total_ms / timed : 0.0;
+        printf("rife-chain: %d source frames, %d interpolated, %d scene skips\n",
+               n, interp, scenes);
+        printf("device chain time: %.3f ms/source-frame avg (%d timed); "
+               "source %.2f fps, output %.2f fps\n",
+               avg, timed, avg > 0 ? 1000.0 / avg : 0.0,
+               avg > 0 ? factor * 1000.0 / avg : 0.0);
+        fclose(fin);
+        aji_destroy(&aji);
+        return 0;
+    }
 
     if (rife) {
         // Interpolation-only test loop, replicating the reference's 2x

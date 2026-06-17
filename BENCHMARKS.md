@@ -170,3 +170,32 @@ Balanced, -10%) is the per-frame fixed-cost corner at >1000 fps,
 
 TensorRT RIFE at 4K runs in single-digit ms (engine-dominated) on both
 TRT versions.
+
+## RIFE/upscale order — `aji_harness --rife-chain` (2026-06-17)
+
+Built-in slots 1012/1013 are the same HD Balanced + RIFE 2x chain in the two
+orders (1012 = upscale then RIFE; 1013 = RIFE then upscale, the new default).
+`aji_harness --rife-chain` times the full chain per source frame:
+
+```
+aji_harness --conf test-animejanai.conf --model-dir onnx --rife-model-dir rife-fp16 \
+    --trtexec trtexec.exe --slot 1012 \
+    --input 1920x1080.raw --width 1920 --height 1080 --format nv12 --frames 240 --rife-chain
+# then --slot 1013
+```
+
+RTX 5090, TRT 11, CUDA 13.3; 1920x1080 -> 3840x2160, RIFE v4.14 2x; device
+chain time per source frame, 240-frame loop (237 timed):
+
+| order | ms/source-frame | source fps | output fps |
+|---|---|---|---|
+| 1012 upscale -> RIFE | 31.2 | 32.1 | 64.2 |
+| 1013 RIFE -> upscale (default) | 21.7 | 46.0 | 92.0 |
+
+**RIFE-first wins ~1.4x — the opposite of the naive expectation.** The cost is
+dominated by RIFE, not the upscaler: the SPAN Balanced upscale (1920->3840) is
+~5 ms, RIFE at 1080p ~6 ms, RIFE at 4K ~25 ms. Upscale-first pays 4K RIFE every
+frame; RIFE-first pays 1080p RIFE plus a second cheap upscale pass. The RIFE
+factor scales the margin (5x widens it) but never flips the winner; a much
+heavier upscale model eventually would. Measured synchronous/single-stream (the
+harness model); real playback pipelines, but the per-frame ordering cost carries.

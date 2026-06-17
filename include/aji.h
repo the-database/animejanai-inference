@@ -183,14 +183,29 @@ AJI_EXPORT int aji_scale_factor(aji_ctx *c);
  * num/den if RIFE is active after the last aji_configure(), else 0. */
 AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den);
 
+/* RIFE ordering of the active chain. Returns 1 if RIFE is active AND runs
+ * before the upscale models (interpolating source-resolution frames, which
+ * the upscale models then process), else 0 (RIFE inactive, or the default
+ * order where it interpolates the already-upscaled frames). When this returns
+ * 1, aji_infer_rife() takes source-resolution frame pairs and the caller
+ * upscales each interpolated frame with aji_infer(); when 0, the caller
+ * upscales first and aji_infer_rife() takes the upscaled pairs. Added without
+ * an API_VERSION bump: purely additive, callers built against an older header
+ * simply never query it and get the default order. */
+AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c);
+
 /* Async builds: returns 1 (once) when a background engine build finished;
  * the caller should re-run aji_configure, which now finds the engine in
  * the cache (or logs the failure and stays passthrough). Cheap to call
  * per frame. */
 AJI_EXPORT int aji_poll(aji_ctx *c);
 
-/* Interpolate between two already-upscaled frames (dims = configure's
- * output dims) at time point t in (0,1). Returns AJI_OK with *out
+/* Interpolate between two frames at time point t in (0,1). In the default
+ * order the inputs are already-upscaled frames (dims = configure's output
+ * dims); when aji_rife_before_upscale() returns 1 they are source-resolution
+ * frames (dims = configure's input dims) and the caller upscales the result.
+ * Either way the dims must match what the active chain configured. Returns
+ * AJI_OK with *out
  * written, or AJI_SCENE if the pair straddles a scene change (out is
  * untouched; emit a duplicate of `a` instead, like the reference
  * pipeline). The documented synchronous exception to the ticket model:

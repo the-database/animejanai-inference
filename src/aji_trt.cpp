@@ -185,10 +185,13 @@ struct aji_ctx {
     // the first aji_infer_rife (frames carry the format).
     struct {
         bool enabled = false;
+        bool before_upscale = false; // interpolate at source res, before the
+                                     // upscale models (else: after, the default)
         int num = 1, den = 1;
         double scd_threshold = 0.150;
         ModelEngine engine;
-        int w = 0, h = 0;            // unpadded = chain output dims
+        int w = 0, h = 0;            // unpadded; chain output dims, or the
+                                     // source dims when before_upscale
         int pw = 0, ph = 0;          // padded to mod-64
         int pad_l = 0, pad_t = 0;    // centered, rounded down to even
         int format = 0;              // staging/plans built for this format
@@ -1120,10 +1123,17 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     if (chain->rife) {
         if (!c->rife_model_dir.empty()) {
-            if (!setup_rife(c, chain, cw, ch, fps)) {
+            // RIFE-first interpolates the source frames (w, h); the upscale
+            // models then run on every frame. The default interpolates the
+            // already-upscaled frames (cw, ch). aji_infer_rife validates its
+            // inputs against these configured dims either way.
+            const int rw = chain->rife_before_upscale ? w : cw;
+            const int rh = chain->rife_before_upscale ? h : ch;
+            if (!setup_rife(c, chain, rw, rh, fps)) {
                 finalize_log(c);
                 return AJI_ERR_ENGINE;
             }
+            c->rife.before_upscale = chain->rife_before_upscale;
         } else {
             c->log_steps.push_back(
                 "RIFE requested by the chain but no rife model dir is "
@@ -1577,6 +1587,11 @@ extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
     if (den)
         *den = c->rife.den;
     return 1;
+}
+
+extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
+{
+    return (c && c->rife.enabled && c->rife.before_upscale) ? 1 : 0;
 }
 
 extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,

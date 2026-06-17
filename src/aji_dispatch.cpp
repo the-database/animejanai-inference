@@ -42,6 +42,7 @@ struct aji_backend {
     const char *(*current_log)(aji_ctx *);
     int (*scale_factor)(aji_ctx *);
     int (*rife_factor)(aji_ctx *, int *, int *);
+    int (*rife_before_upscale)(aji_ctx *);
     int (*poll)(aji_ctx *);
     int (*infer_rife)(aji_ctx *, const aji_frame *, const aji_frame *,
                       double, const aji_frame *, void *);
@@ -160,6 +161,7 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(current_log,  "aji_current_log");
     SYM(scale_factor, "aji_scale_factor");
     SYM(rife_factor,  "aji_rife_factor");
+    SYM(rife_before_upscale, "aji_rife_before_upscale");
     SYM(poll,         "aji_poll");
     SYM(infer_rife,   "aji_infer_rife");
     SYM(last_error,   "aji_last_error");
@@ -263,6 +265,11 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 {
     return c->be.rife_factor(c->inner, num, den);
+}
+
+extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
+{
+    return c->be.rife_before_upscale(c->inner);
 }
 
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)

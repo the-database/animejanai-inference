@@ -176,6 +176,7 @@ AjiChainConf parse_chain(const Section &sec, int chain)
     c.rife_ensemble = parse_yes(get("rife_ensemble", "no"));
     c.rife_scd_threshold =
         to_double(get("rife_scene_detect_threshold", "0.150"), 0.150);
+    c.rife_before_upscale = parse_yes(get("rife_before_upscale", "yes"));
     return c;
 }
 
@@ -255,6 +256,32 @@ void add_builtin_slots(AjiConf *conf)
         AjiSlotConf s;
         s.chains.push_back(builtin_chain(1, 0, 1e300, "0x0", "infxinf", 1e300, HD_PERF));
         conf->slots[1011] = std::move(s);
+    }
+    // Benchmark slots for comparing the RIFE/upscale order: identical HD
+    // Balanced model and 2x interpolation, differing only in rife_before_upscale.
+    // 1012 = upscale then interpolate; 1013 = interpolate then upscale (default).
+    // Exercised headlessly by aji_harness --rife-chain.
+    {
+        AjiSlotConf s;
+        s.profile_name = "Benchmark Balanced RIFE 2x (upscale then RIFE)";
+        AjiChainConf ch = builtin_chain(1, 0, 1e300, "0x0", "infxinf", 1e300, HD_BAL);
+        ch.rife = true;
+        ch.rife_factor_num = 2;
+        ch.rife_factor_den = 1;
+        ch.rife_before_upscale = false;
+        s.chains.push_back(ch);
+        conf->slots[1012] = std::move(s);
+    }
+    {
+        AjiSlotConf s;
+        s.profile_name = "Benchmark Balanced RIFE 2x (RIFE then upscale)";
+        AjiChainConf ch = builtin_chain(1, 0, 1e300, "0x0", "infxinf", 1e300, HD_BAL);
+        ch.rife = true;
+        ch.rife_factor_num = 2;
+        ch.rife_factor_den = 1;
+        ch.rife_before_upscale = true;
+        s.chains.push_back(ch);
+        conf->slots[1013] = std::move(s);
     }
 }
 

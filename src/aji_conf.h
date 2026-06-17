@@ -24,6 +24,10 @@ struct AjiChainConf {
     int rife_model = 414;                      // e.g. 414 = rife_v4.14
     bool rife_ensemble = false;
     double rife_scd_threshold = 0.150;         // misc.SCDetect threshold
+    bool rife_before_upscale = true;           // interpolate at the source
+                                               // resolution, then upscale every
+                                               // frame (default; faster than
+                                               // interpolating upscaled frames)
 };
 
 struct AjiSlotConf {
