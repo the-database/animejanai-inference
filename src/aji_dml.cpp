@@ -148,12 +148,13 @@ enum Kern {
     K_UV_H = 0, K_V_F32, K_PRE_COMBINE, K_POST_MATRIX,
     K_H_F32, K_UV_V_STORE, K_RS_H, K_RS_V,
     K_FILL, K_WINDOW, K_RIFE_CONSTS, K_SCD_PARTIAL, K_SCD_FINAL,
+    K_CHROMA444,
 };
 const char *const KERN_ENTRY[] = {
     "cs_uv_h", "cs_v_f32", "cs_pre_combine", "cs_post_matrix",
     "cs_h_f32", "cs_uv_v_store", "cs_rs_h", "cs_rs_v",
     "cs_fill", "cs_window", "cs_rife_consts", "cs_scd_partial",
-    "cs_scd_final",
+    "cs_scd_final", "cs_chroma444",
 };
 
 struct DmlPass {
@@ -259,7 +260,8 @@ struct aji_ctx {
     // lazy per-frame-format state
     std::unique_ptr<DmlPlan> pre_plan, post_plan;
     int pre_key[4] = {0}, post_key[4] = {0};
-    ComPtr<ID3D12Resource> in_y, in_uv, out_y, out_uv;  // plane staging
+    ComPtr<ID3D12Resource> in_y, in_uv, in_v, out_y, out_uv;  // plane staging
+    // in_v: third chroma plane, only for 4:4:4 input (in_uv = Cb, in_v = Cr)
     uint32_t in_pitch = 0, out_pitch = 0;
     int stage_key[3] = {0};     // format, in dims valid for staging
 
@@ -416,6 +418,15 @@ std::unique_ptr<DmlPlan> pre_plan_create(aji_ctx *c, int format, int w, int h,
     p->format = format;
     p->w = w;
     p->h = h;
+    if (format == AJI_FMT_YUV444P16) {
+        // 4:4:4 is already full-res: no chroma resample passes, just the
+        // f32 chroma scratch that cs_chroma444 fills and cs_pre_combine
+        // consumes (2 full-res planes). No ph/pv/tmp0.
+        p->tmp1 = make_buffer(c->dev.Get(), (uint64_t)2 * w * h * 4, false);
+        if (!p->tmp1)
+            return nullptr;
+        return p;
+    }
     const int cw = w >> 1, ch = h >> 1;
     double sx, sy;
     aji_resample::chroma_shifts(siting, true, &sx, &sy);
@@ -708,6 +719,32 @@ bool record_pre(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
     return true;
 }
 
+// pre for 4:4:4 input: three full-res 16-bit planes -> tensor. cs_chroma444
+// widens raw Cb/Cr into the f32 chroma layout (no resample), then the shared
+// cs_pre_combine matrixes Y + that chroma into RGB. yuv444p16 is always
+// 16-bit, so t16 is forced on regardless of the (4:2:0-derived) variant key.
+bool record_pre444(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
+                   ID3D12Resource *y_buf, ID3D12Resource *cb_buf,
+                   ID3D12Resource *cr_buf, uint32_t pitch, ID3D12Resource *dst,
+                   int dst_off, bool io16)
+{
+    const int w = p->w, h = p->h;
+    KernArgs a = csp_args(csp, 0, 0);
+
+    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch;
+    if (!r.dispatch(K_CHROMA444, true, io16, a, NULL, NULL, cb_buf, cr_buf,
+                    p->tmp1.Get(), w, h, 1))
+        return false;
+    r.uav_barrier();
+
+    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch; a.dj[1] = dst_off;
+    if (!r.dispatch(K_PRE_COMBINE, true, io16, a, NULL, NULL, y_buf,
+                    p->tmp1.Get(), dst, w / 2, h, 1))
+        return false;
+    r.uav_barrier();
+    return true;
+}
+
 // post: tensor src -> y/uv plane buffers
 bool record_post(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
                  ID3D12Resource *src, ID3D12Resource *y_buf,
@@ -831,6 +868,10 @@ ID3D12Resource *open_shared(aji_ctx *c, void *tex11)
 
 DXGI_FORMAT plane_fmt(int format, int plane)
 {
+    // 4:4:4 input arrives as three full-res single-channel 16-bit slices
+    // (Y, Cb, Cr), each read as plane 0 of its own array subresource.
+    if (format == AJI_FMT_YUV444P16)
+        return DXGI_FORMAT_R16_UNORM;
     if (format == AJI_FMT_P010)
         return plane ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R16_UNORM;
     return plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
@@ -997,6 +1038,7 @@ void chain_teardown(aji_ctx *c)
     memset(c->post_key, 0, sizeof(c->post_key));
     c->in_y.Reset();
     c->in_uv.Reset();
+    c->in_v.Reset();
     c->out_y.Reset();
     c->out_uv.Reset();
     memset(c->stage_key, 0, sizeof(c->stage_key));
@@ -1728,11 +1770,19 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->set_error("aji_infer without an active configuration");
         return AJI_ERR;
     }
-    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010) {
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
+        in->format != AJI_FMT_YUV444P16) {
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
-    if (out->format != in->format) {
+    // DML can't pool a planar 4:4:4 output (no DXGI format), so output is
+    // always 4:2:0; a 4:4:4 source upscales to NV12/P010. 4:2:0 input still
+    // round-trips to the same format (the post path assumes in == out).
+    if (out->format != AJI_FMT_NV12 && out->format != AJI_FMT_P010) {
+        c->set_error("unsupported output format %d (nv12/p010)", out->format);
+        return AJI_ERR_FORMAT;
+    }
+    if (in->format != AJI_FMT_YUV444P16 && out->format != in->format) {
         c->set_error("output format must match input");
         return AJI_ERR_FORMAT;
     }
@@ -1753,7 +1803,8 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     // aji_flush/aji_done/aji_wait before consuming the output texture.
     DoneGuard done_guard{c};
 
-    const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
+    const bool in444 = in->format == AJI_FMT_YUV444P16;
+    const int bpp = (in->format == AJI_FMT_P010 || in444) ? 2 : 1;
     const aji_csp csp =
         aji_resample::make_csp(in->format, in->matrix, in->range);
 
@@ -1764,15 +1815,22 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->out_pitch = align256((uint32_t)(out->width * bpp));
         c->in_y = make_buffer(c->dev.Get(),
                               (uint64_t)c->in_pitch * in->height, false);
+        // 4:4:4: in_uv = Cb, in_v = Cr, both full height. 4:2:0: in_uv is
+        // the half-height interleaved CbCr plane, in_v unused.
         c->in_uv = make_buffer(c->dev.Get(),
-                               (uint64_t)c->in_pitch * (in->height / 2),
+                               (uint64_t)c->in_pitch *
+                                   (in444 ? in->height : in->height / 2),
                                false);
+        c->in_v = in444 ? make_buffer(c->dev.Get(),
+                                      (uint64_t)c->in_pitch * in->height, false)
+                        : nullptr;
         c->out_y = make_buffer(c->dev.Get(),
                                (uint64_t)c->out_pitch * out->height, false);
         c->out_uv = make_buffer(c->dev.Get(),
                                 (uint64_t)c->out_pitch * (out->height / 2),
                                 false);
-        if (!c->in_y || !c->in_uv || !c->out_y || !c->out_uv) {
+        if (!c->in_y || !c->in_uv || !c->out_y || !c->out_uv ||
+            (in444 && !c->in_v)) {
             c->set_error("plane staging allocation failed");
             return AJI_ERR;
         }
@@ -1817,31 +1875,70 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     Recorder r{c};
     if (!r.begin())
         return AJI_ERR;
-    transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COMMON,
-                      D3D12_RESOURCE_STATE_COPY_SOURCE);
-    copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width, in->height,
-               c->in_y.Get(), c->in_pitch);
-    copy_plane(c, true, in_tex, in_sub, 1, in->format, in->width, in->height,
-               c->in_uv.Get(), c->in_pitch);
-    transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                      D3D12_RESOURCE_STATE_COMMON);
-    {
-        D3D12_RESOURCE_BARRIER bs[2] = {};
-        for (int i = 0; i < 2; i++) {
+    if (in444) {
+        // Input is a 3-slice R16 array (Y, Cb, Cr full-res), each slice a
+        // separate subresource. Stage the three slices into three plane
+        // buffers, then run the no-resample 4:4:4 pre.
+        ID3D12Resource *dstbuf[3] = {c->in_y.Get(), c->in_uv.Get(),
+                                     c->in_v.Get()};
+        D3D12_RESOURCE_BARRIER tb[3] = {};
+        for (UINT s = 0; s < 3; s++) {
+            tb[s].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            tb[s].Transition.pResource = in_tex;
+            tb[s].Transition.Subresource = in_sub + s;
+            tb[s].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            tb[s].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        }
+        c->cl->ResourceBarrier(3, tb);
+        for (UINT s = 0; s < 3; s++)
+            copy_plane(c, true, in_tex, in_sub + s, 0, in->format, in->width,
+                       in->height, dstbuf[s], c->in_pitch);
+        for (UINT s = 0; s < 3; s++) {
+            tb[s].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            tb[s].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        }
+        c->cl->ResourceBarrier(3, tb);
+        D3D12_RESOURCE_BARRIER bs[3] = {};
+        for (int i = 0; i < 3; i++) {
             bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bs[i].Transition.pResource = dstbuf[i];
             bs[i].Transition.Subresource = 0;
             bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
             bs[i].Transition.StateAfter =
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         }
-        bs[0].Transition.pResource = c->in_y.Get();
-        bs[1].Transition.pResource = c->in_uv.Get();
-        c->cl->ResourceBarrier(2, bs);
+        c->cl->ResourceBarrier(3, bs);
+        if (!record_pre444(c, r, c->pre_plan.get(), csp, c->in_y.Get(),
+                           c->in_uv.Get(), c->in_v.Get(), c->in_pitch,
+                           c->buf[0].Get(), 0, c->first_elem16))
+            return AJI_ERR;
+    } else {
+        transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width,
+                   in->height, c->in_y.Get(), c->in_pitch);
+        copy_plane(c, true, in_tex, in_sub, 1, in->format, in->width,
+                   in->height, c->in_uv.Get(), c->in_pitch);
+        transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                          D3D12_RESOURCE_STATE_COMMON);
+        {
+            D3D12_RESOURCE_BARRIER bs[2] = {};
+            for (int i = 0; i < 2; i++) {
+                bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                bs[i].Transition.Subresource = 0;
+                bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                bs[i].Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+            bs[0].Transition.pResource = c->in_y.Get();
+            bs[1].Transition.pResource = c->in_uv.Get();
+            c->cl->ResourceBarrier(2, bs);
+        }
+        if (!record_pre(c, r, c->pre_plan.get(), csp, c->in_y.Get(),
+                        c->in_uv.Get(), c->in_pitch, c->buf[0].Get(), 0,
+                        c->first_elem16))
+            return AJI_ERR;
     }
-    if (!record_pre(c, r, c->pre_plan.get(), csp, c->in_y.Get(),
-                    c->in_uv.Get(), c->in_pitch, c->buf[0].Get(), 0,
-                    c->first_elem16))
-        return AJI_ERR;
     if (!r.exec())
         return AJI_ERR;
 
