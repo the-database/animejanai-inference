@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!-- Force the process ANSI code page to UTF-8 (Windows 10 1903+). Without this,
+       the CRT narrows the wide command line to char** argv using the system ANSI
+       code page, mangling non-ASCII path characters to '?' before they reach
+       FFmpeg/fopen/CreateProcessA. avformat_open_input() then fails with
+       "Invalid argument" on Unicode input paths (encode.c:300). With UTF-8 active,
+       argv, fopen and CreateProcessA all receive correct UTF-8 paths, and FFmpeg
+       converts UTF-8 -> wide internally. -->
+  <application>
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

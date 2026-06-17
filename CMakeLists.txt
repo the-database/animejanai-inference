@@ -77,7 +77,9 @@ set_target_properties(aji_harness PROPERTIES
 if(WIN32)
     set(AJI_FFMPEG_ROOT "" CACHE PATH "ffmpeg dev root (include/, lib/)")
     if(AJI_FFMPEG_ROOT)
-        add_executable(aji_encode src/encode.c)
+        # The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so the exe's
+        # argv/fopen/CreateProcessA handle Unicode (non-ASCII) file paths correctly.
+        add_executable(aji_encode src/encode.c src/aji_encode.manifest)
         target_include_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/include")
         target_link_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/lib")
         target_link_libraries(aji_encode PRIVATE aji CUDA::cudart CUDA::cuda_driver
