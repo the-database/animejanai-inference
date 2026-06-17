@@ -148,12 +148,13 @@ enum Kern {
     K_UV_H = 0, K_V_F32, K_PRE_COMBINE, K_POST_MATRIX,
     K_H_F32, K_UV_V_STORE, K_RS_H, K_RS_V,
     K_FILL, K_WINDOW, K_RIFE_CONSTS, K_SCD_PARTIAL, K_SCD_FINAL,
+    K_PRE_RGB10, K_POST_RGB10,
 };
 const char *const KERN_ENTRY[] = {
     "cs_uv_h", "cs_v_f32", "cs_pre_combine", "cs_post_matrix",
     "cs_h_f32", "cs_uv_v_store", "cs_rs_h", "cs_rs_v",
     "cs_fill", "cs_window", "cs_rife_consts", "cs_scd_partial",
-    "cs_scd_final",
+    "cs_scd_final", "cs_pre_rgb10", "cs_post_rgb10",
 };
 
 struct DmlPass {
@@ -416,6 +417,8 @@ std::unique_ptr<DmlPlan> pre_plan_create(aji_ctx *c, int format, int w, int h,
     p->format = format;
     p->w = w;
     p->h = h;
+    if (format == AJI_FMT_RGB10A2)
+        return p;   // RGB input is a pure unpack: no resample plan/scratch
     const int cw = w >> 1, ch = h >> 1;
     double sx, sy;
     aji_resample::chroma_shifts(siting, true, &sx, &sy);
@@ -435,6 +438,8 @@ std::unique_ptr<DmlPlan> post_plan_create(aji_ctx *c, int format, int w, int h,
     p->format = format;
     p->w = w;
     p->h = h;
+    if (format == AJI_FMT_RGB10A2)
+        return p;   // RGB output is a pure pack: no resample plan/scratch
     const int cw = w >> 1, ch = h >> 1;
     double sx, sy;
     aji_resample::chroma_shifts(siting, false, &sx, &sy);
@@ -708,6 +713,37 @@ bool record_pre(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
     return true;
 }
 
+// pre for packed 10-bit RGB input (x2bgr10): a single unpack pass straight to
+// the tensor — no YUV matrix and no chroma resample (the source is already
+// full-res RGB). rgb_buf = the packed R10G10B10A2 plane.
+bool record_pre_rgb10(aji_ctx *c, Recorder &r, DmlPlan *p, ID3D12Resource *rgb_buf,
+                      uint32_t pitch, ID3D12Resource *dst, int dst_off, bool io16)
+{
+    const int w = p->w, h = p->h;
+    KernArgs a = {};
+    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch; a.dj[1] = dst_off;
+    if (!r.dispatch(K_PRE_RGB10, false, io16, a, NULL, NULL, rgb_buf, NULL,
+                    dst, w / 2, h, 1))
+        return false;
+    r.uav_barrier();
+    return true;
+}
+
+// post for packed 10-bit RGB output: a single pack pass from the tensor — the
+// inverse of record_pre_rgb10. rgb_buf = the packed R10G10B10A2 plane.
+bool record_post_rgb10(aji_ctx *c, Recorder &r, DmlPlan *p, ID3D12Resource *src,
+                       ID3D12Resource *rgb_buf, uint32_t pitch, bool io16)
+{
+    const int w = p->w, h = p->h;
+    KernArgs a = {};
+    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch;
+    if (!r.dispatch(K_POST_RGB10, false, io16, a, NULL, NULL, src, rgb_buf,
+                    NULL, w, h, 1))
+        return false;
+    r.uav_barrier();
+    return true;
+}
+
 // post: tensor src -> y/uv plane buffers
 bool record_post(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
                  ID3D12Resource *src, ID3D12Resource *y_buf,
@@ -831,6 +867,9 @@ ID3D12Resource *open_shared(aji_ctx *c, void *tex11)
 
 DXGI_FORMAT plane_fmt(int format, int plane)
 {
+    // packed 10-bit RGB: one plane, 4 bytes/pixel
+    if (format == AJI_FMT_RGB10A2)
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
     if (format == AJI_FMT_P010)
         return plane ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R16_UNORM;
     return plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
@@ -1728,10 +1767,13 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->set_error("aji_infer without an active configuration");
         return AJI_ERR;
     }
-    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010) {
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
+        in->format != AJI_FMT_RGB10A2) {
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
+    // RGB10 (a hwuploaded 4:4:4 source) round-trips as full-res RGB; 4:2:0
+    // stays 4:2:0. Either way the post path assumes in == out.
     if (out->format != in->format) {
         c->set_error("output format must match input");
         return AJI_ERR_FORMAT;
@@ -1753,26 +1795,33 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     // aji_flush/aji_done/aji_wait before consuming the output texture.
     DoneGuard done_guard{c};
 
-    const int bpp = in->format == AJI_FMT_P010 ? 2 : 1;
+    // RGB10 round-trips as a single 4-byte packed plane (no chroma, no
+    // matrix); NV12 luma is 1 byte, P010 2. out == in (checked above).
+    const bool in_rgb = in->format == AJI_FMT_RGB10A2;
+    const int in_bpp = in_rgb ? 4 : (in->format == AJI_FMT_P010 ? 2 : 1);
+    const int out_bpp = in_bpp;
     const aji_csp csp =
         aji_resample::make_csp(in->format, in->matrix, in->range);
 
     // (re)build staging + plans on format/dim changes
     const int skey[3] = {in->format, in->width, in->height};
     if (memcmp(skey, c->stage_key, sizeof(skey)) != 0) {
-        c->in_pitch = align256((uint32_t)(in->width * bpp));
-        c->out_pitch = align256((uint32_t)(out->width * bpp));
+        c->in_pitch = align256((uint32_t)(in->width * in_bpp));
+        c->out_pitch = align256((uint32_t)(out->width * out_bpp));
         c->in_y = make_buffer(c->dev.Get(),
                               (uint64_t)c->in_pitch * in->height, false);
-        c->in_uv = make_buffer(c->dev.Get(),
-                               (uint64_t)c->in_pitch * (in->height / 2),
-                               false);
+        // RGB input is a single packed plane; no chroma plane buffer.
+        c->in_uv = in_rgb ? nullptr
+                          : make_buffer(c->dev.Get(),
+                                        (uint64_t)c->in_pitch * (in->height / 2),
+                                        false);
         c->out_y = make_buffer(c->dev.Get(),
                                (uint64_t)c->out_pitch * out->height, false);
-        c->out_uv = make_buffer(c->dev.Get(),
-                                (uint64_t)c->out_pitch * (out->height / 2),
-                                false);
-        if (!c->in_y || !c->in_uv || !c->out_y || !c->out_uv) {
+        c->out_uv = in_rgb ? nullptr
+                           : make_buffer(c->dev.Get(),
+                                         (uint64_t)c->out_pitch * (out->height / 2),
+                                         false);
+        if (!c->in_y || !c->out_y || (!in_rgb && (!c->in_uv || !c->out_uv))) {
             c->set_error("plane staging allocation failed");
             return AJI_ERR;
         }
@@ -1817,31 +1866,58 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     Recorder r{c};
     if (!r.begin())
         return AJI_ERR;
-    transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COMMON,
-                      D3D12_RESOURCE_STATE_COPY_SOURCE);
-    copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width, in->height,
-               c->in_y.Get(), c->in_pitch);
-    copy_plane(c, true, in_tex, in_sub, 1, in->format, in->width, in->height,
-               c->in_uv.Get(), c->in_pitch);
-    transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                      D3D12_RESOURCE_STATE_COMMON);
-    {
-        D3D12_RESOURCE_BARRIER bs[2] = {};
-        for (int i = 0; i < 2; i++) {
-            bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            bs[i].Transition.Subresource = 0;
-            bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            bs[i].Transition.StateAfter =
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (in_rgb) {
+        // Single packed R10G10B10A2 plane (one subresource) -> one buffer.
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = in_tex;
+        b.Transition.Subresource = in_sub;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        c->cl->ResourceBarrier(1, &b);
+        copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width,
+                   in->height, c->in_y.Get(), c->in_pitch);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        c->cl->ResourceBarrier(1, &b);
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ub.Transition.pResource = c->in_y.Get();
+        ub.Transition.Subresource = 0;
+        ub.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        ub.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        c->cl->ResourceBarrier(1, &ub);
+        if (!record_pre_rgb10(c, r, c->pre_plan.get(), c->in_y.Get(),
+                              c->in_pitch, c->buf[0].Get(), 0,
+                              c->first_elem16))
+            return AJI_ERR;
+    } else {
+        transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width,
+                   in->height, c->in_y.Get(), c->in_pitch);
+        copy_plane(c, true, in_tex, in_sub, 1, in->format, in->width,
+                   in->height, c->in_uv.Get(), c->in_pitch);
+        transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                          D3D12_RESOURCE_STATE_COMMON);
+        {
+            D3D12_RESOURCE_BARRIER bs[2] = {};
+            for (int i = 0; i < 2; i++) {
+                bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                bs[i].Transition.Subresource = 0;
+                bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                bs[i].Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+            bs[0].Transition.pResource = c->in_y.Get();
+            bs[1].Transition.pResource = c->in_uv.Get();
+            c->cl->ResourceBarrier(2, bs);
         }
-        bs[0].Transition.pResource = c->in_y.Get();
-        bs[1].Transition.pResource = c->in_uv.Get();
-        c->cl->ResourceBarrier(2, bs);
+        if (!record_pre(c, r, c->pre_plan.get(), csp, c->in_y.Get(),
+                        c->in_uv.Get(), c->in_pitch, c->buf[0].Get(), 0,
+                        c->first_elem16))
+            return AJI_ERR;
     }
-    if (!record_pre(c, r, c->pre_plan.get(), csp, c->in_y.Get(),
-                    c->in_uv.Get(), c->in_pitch, c->buf[0].Get(), 0,
-                    c->first_elem16))
-        return AJI_ERR;
     if (!r.exec())
         return AJI_ERR;
 
@@ -1865,11 +1941,37 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
 
     if (!r.begin())
         return AJI_ERR;
-    if (!record_post(c, r, c->post_plan.get(), csp, c->buf[cur].Get(),
-                     c->out_y.Get(), c->out_uv.Get(), c->out_pitch,
-                     c->last_elem16))
+    if (in_rgb) {
+        if (!record_post_rgb10(c, r, c->post_plan.get(), c->buf[cur].Get(),
+                               c->out_y.Get(), c->out_pitch, c->last_elem16))
+            return AJI_ERR;
+    } else if (!record_post(c, r, c->post_plan.get(), csp, c->buf[cur].Get(),
+                            c->out_y.Get(), c->out_uv.Get(), c->out_pitch,
+                            c->last_elem16)) {
         return AJI_ERR;
-    {
+    }
+    if (in_rgb) {
+        // Single packed R10G10B10A2 output plane (one subresource).
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ub.Transition.pResource = c->out_y.Get();
+        ub.Transition.Subresource = 0;
+        ub.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ub.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        c->cl->ResourceBarrier(1, &ub);
+        D3D12_RESOURCE_BARRIER tb = {};
+        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition.pResource = out_tex;
+        tb.Transition.Subresource = out_sub;
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        c->cl->ResourceBarrier(1, &tb);
+        copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
+                   out->height, c->out_y.Get(), c->out_pitch);
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        c->cl->ResourceBarrier(1, &tb);
+    } else {
         D3D12_RESOURCE_BARRIER bs[2] = {};
         for (int i = 0; i < 2; i++) {
             bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1881,15 +1983,15 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         bs[0].Transition.pResource = c->out_y.Get();
         bs[1].Transition.pResource = c->out_uv.Get();
         c->cl->ResourceBarrier(2, bs);
+        transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
+                   out->height, c->out_y.Get(), c->out_pitch);
+        copy_plane(c, false, out_tex, out_sub, 1, out->format, out->width,
+                   out->height, c->out_uv.Get(), c->out_pitch);
+        transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_COMMON);
     }
-    transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COMMON,
-                      D3D12_RESOURCE_STATE_COPY_DEST);
-    copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
-               out->height, c->out_y.Get(), c->out_pitch);
-    copy_plane(c, false, out_tex, out_sub, 1, out->format, out->width,
-               out->height, c->out_uv.Get(), c->out_pitch);
-    transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COPY_DEST,
-                      D3D12_RESOURCE_STATE_COMMON);
     if (!r.exec())
         return AJI_ERR;
 

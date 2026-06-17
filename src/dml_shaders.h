@@ -178,6 +178,61 @@ void cs_pre_combine(uint3 id : SV_DispatchThreadID)
     }
 }
 
+// ---- cs_pre_rgb10: packed 10-bit RGB (x2bgr10 / R10G10B10A2) -> RGB tensor ----
+// What mpv hwuploads a 4:4:4 source to on D3D11. Already full-res RGB, so this
+// is a pure unpack+normalize — no YUV matrix, no chroma resample, no plan. 2 px
+// per thread (x covers w/2; w is even) to match the f16 dword-packed store.
+// di = {w, h}, dj.x = row stride bytes, dj.y = dst element offset. d0 = packed
+// RGB u32 (R in low 10 bits), d2 = tensor out.
+[numthreads(32, 8, 1)]
+void cs_pre_rgb10(uint3 id : SV_DispatchThreadID)
+{
+    int w = di.x, h = di.y;
+    int x0 = id.x * 2, y = id.y;
+    if (x0 >= w || y >= h)
+        return;
+    uint plane = (uint)w * (uint)h;
+    float rgb[6];
+    [unroll]
+    for (int k = 0; k < 2; k++) {
+        int x = x0 + k;
+        uint px = d0.Load((uint)y * (uint)dj.x + (uint)x * 4u);
+        rgb[k * 3 + 0] = float(px & 0x3ffu) / 1023.0f;          // R (low 10)
+        rgb[k * 3 + 1] = float((px >> 10) & 0x3ffu) / 1023.0f;  // G
+        rgb[k * 3 + 2] = float((px >> 20) & 0x3ffu) / 1023.0f;  // B
+    }
+    uint base = (uint)dj.y + (uint)y * (uint)w + (uint)x0;
+    [unroll]
+    for (int p = 0; p < 3; p++) {
+        uint e = p * plane + base;
+#if IO16
+        d2.Store(e * 2u, f32tof16(rgb[p]) | (f32tof16(rgb[3 + p]) << 16u));
+#else
+        d2.Store(e * 4u, asuint(rgb[p]));
+        d2.Store((e + 1u) * 4u, asuint(rgb[3 + p]));
+#endif
+    }
+}
+
+// ---- cs_post_rgb10: RGB tensor -> packed 10-bit RGB (x2bgr10 / R10G10B10A2) ----
+// Inverse of cs_pre_rgb10: a pure pack+quantize, no YUV matrix, no resample —
+// the model output stays full-res RGB. di = {w, h}, dj.x = row stride bytes.
+// d0 = tensor in, d1 = packed RGB u32 out (R low 10, alpha = 3).
+[numthreads(32, 8, 1)]
+void cs_post_rgb10(uint3 id : SV_DispatchThreadID)
+{
+    int w = di.x, h = di.y;
+    int x = id.x, y = id.y;
+    if (x >= w || y >= h)
+        return;
+    uint plane = (uint)w * (uint)h, idx = (uint)y * (uint)w + x;
+    uint R = (uint)quant(TLOAD(d0, idx) * 1023.0f, 1.0f, 1023.0f);
+    uint G = (uint)quant(TLOAD(d0, plane + idx) * 1023.0f, 1.0f, 1023.0f);
+    uint B = (uint)quant(TLOAD(d0, 2u * plane + idx) * 1023.0f, 1.0f, 1023.0f);
+    d1.Store((uint)y * (uint)dj.x + (uint)x * 4u,
+             R | (G << 10) | (B << 20) | (3u << 30));
+}
+
 // ---- cs_fill: fill a dword range with a constant ----
 // di.x = dword count, dj.x = start dword, dj.y = value bits. d0 = dst.
 [numthreads(256, 1, 1)]
