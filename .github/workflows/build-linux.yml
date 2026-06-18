@@ -10,14 +10,28 @@ on:
       release_tag:
         description: 'Release tag (matches AjiVersion in the assembler)'
         required: true
+  push:
+    branches: [linux-support]
+    paths:
+      - .github/workflows/build-linux.yml
+      - CMakeLists.txt
+      - 'src/**'
+      - 'include/**'
+
+env:
+  DEFAULT_TAG: v0.6.0
 
 jobs:
   build-linux:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/the-database/animejanai-linux-build:ubuntu2204
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     permissions:
       contents: write
+      packages: read
     steps:
     - uses: actions/checkout@v4
 
@@ -37,8 +51,8 @@ jobs:
     - name: Publish release
       uses: ncipollo/release-action@v1
       with:
-        tag: ${{ github.event.inputs.release_tag }}
-        name: ${{ github.event.inputs.release_tag }}
+        tag: ${{ github.event.inputs.release_tag || env.DEFAULT_TAG }}
+        name: ${{ github.event.inputs.release_tag || env.DEFAULT_TAG }}
         draft: false
         prerelease: false
         allowUpdates: true
