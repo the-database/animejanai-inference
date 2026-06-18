@@ -1,0 +1,46 @@
+name: Build Linux (aji)
+
+# Builds libaji.so + libaji_trt.so (TensorRT/CUDA backend) on the Ubuntu 22.04
+# baseline image and publishes aji-linux-x64.tar.zst. The mpv-upscale-2x_animejanai
+# assembler downloads this (InstallAji). Kept in lockstep with the mpv fork's
+# Linux build (same TensorRT 11 + CUDA 13.2 from the image).
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (matches AjiVersion in the assembler)'
+        required: true
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/the-database/animejanai-linux-build:ubuntu2204
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build aji (full per-SM kernel set)
+      run: |
+        cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
+          -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+        cmake --build build -j"$(nproc)"
+
+    - name: Stage + tar (flat, extracts into animejanai/inference)
+      run: |
+        mkdir -p stage
+        cp build/libaji.so build/libaji_trt.so build/aji_harness build/aji_kernel_test stage/
+        chmod +x stage/*
+        tar --zstd -C stage -cf aji-linux-x64.tar.zst .
+
+    - name: Publish release
+      uses: ncipollo/release-action@v1
+      with:
+        tag: ${{ github.event.inputs.release_tag }}
+        name: ${{ github.event.inputs.release_tag }}
+        draft: false
+        prerelease: false
+        allowUpdates: true
+        artifacts: aji-linux-x64.tar.zst
+        token: ${{ secrets.GITHUB_TOKEN }}
