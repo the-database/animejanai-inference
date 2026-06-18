@@ -1675,19 +1675,17 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     if (chain->rife) {
         if (!c->rife_model_dir.empty()) {
-            // DirectML runs RIFE after upscaling regardless of the chain's
-            // rife_before_upscale: RIFE-first is implemented for the
-            // TensorRT/CUDA path only. before_upscale stays false, so
-            // aji_rife_before_upscale() reports the effective (post-upscale)
-            // order and the mpv filter matches it.
-            if (chain->rife_before_upscale)
-                c->log_steps.push_back(
-                    "rife_before_upscale is not supported on DirectML; "
-                    "interpolating after upscaling");
-            if (!setup_rife(c, chain, cw, ch, fps)) {
+            // RIFE-first interpolates the source frames (w, h); the upscale
+            // models then run on every frame. The default interpolates the
+            // already-upscaled frames (cw, ch). aji_infer_rife validates its
+            // inputs against these configured dims either way.
+            const int rw = chain->rife_before_upscale ? w : cw;
+            const int rh = chain->rife_before_upscale ? h : ch;
+            if (!setup_rife(c, chain, rw, rh, fps)) {
                 finalize_log(c);
                 return AJI_ERR_ENGINE;
             }
+            c->rife.before_upscale = chain->rife_before_upscale;
         } else {
             c->log_steps.push_back(
                 "RIFE requested by the chain but no rife model dir is "

@@ -12,6 +12,11 @@
  *                   [--range limited|full] [--siting left|center|topleft]
  *                   [--fps F] [--frames N] [--output out.raw]
  *                   --conf animejanai.conf --model-dir DIR [--slot N]
+ *
+ * --rife: interpolation-only parity loop (scale-free 2/1 chain).
+ * --rife-chain: times the full upscale+RIFE chain per source frame, honoring
+ *   the slot's order (aji_rife_before_upscale). Slots 1012 (upscale then RIFE)
+ *   vs 1013 (RIFE then upscale) give the DirectML order A/B.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -62,7 +67,7 @@ int main(int argc, char **argv)
 {
     const char *input = NULL, *output = NULL, *conf = NULL, *mdir = NULL;
     const char *rife_mdir = NULL;
-    int w = 0, h = 0, frames = 1, slot = 1, rife = 0;
+    int w = 0, h = 0, frames = 1, slot = 1, rife = 0, rife_chain = 0;
     int format = AJI_FMT_NV12, matrix = AJI_MATRIX_BT709;
     int range = AJI_RANGE_LIMITED, siting = AJI_SITING_LEFT;
     double fps = 23.976;
@@ -70,6 +75,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
         if (!strcmp(a, "--rife")) { rife = 1; continue; }
+        if (!strcmp(a, "--rife-chain")) { rife_chain = 1; continue; }
         if (!strcmp(a, "--input")) { input = v; i++; }
         else if (!strcmp(a, "--output")) { output = v; i++; }
         else if (!strcmp(a, "--conf")) { conf = v; i++; }
@@ -258,6 +264,150 @@ int main(int argc, char **argv)
                rife_timed);
         if (fo)
             fclose(fo);
+        fclose(fi);
+        aji_destroy(&aji);
+        return 0;
+    }
+
+    if (rife_chain) {
+        // Full upscale+RIFE chain timing, honoring the chain's order
+        // (aji_rife_before_upscale), mirroring aji_harness --rife-chain. The
+        // harness makes its own shared textures, so a source-res interp temp
+        // is just another make_tex (no decoder-texture-sharing problem).
+        if (r == 0) {
+            fprintf(stderr, "no chain active; nothing to do\n");
+            return 0;
+        }
+        int rn = 0, rd = 0;
+        if (!aji_rife_factor(aji, &rn, &rd) || rd == 0) {
+            fprintf(stderr, "rife-chain needs an active rife chain "
+                            "(slot 1012/1013, or a conf chain with rife=yes)\n");
+            return 1;
+        }
+        const int before = aji_rife_before_upscale(aji);
+        const double factor = (double)rn / rd;
+        printf("rife-chain: %dx%d -> %dx%d, factor %d/%d, order: %s\n",
+               w, h, ow, oh, rn, rd,
+               before ? "RIFE then upscale" : "upscale then RIFE");
+
+        const int cbpp = format == AJI_FMT_P010 ? 2 : 1;
+        const DXGI_FORMAT cdxf = format == AJI_FMT_P010 ? DXGI_FORMAT_P010
+                                                        : DXGI_FORMAT_NV12;
+        ID3D11Texture2D *s[2], *smid, *up[2], *umid, *st_in;
+        for (int i = 0; i < 2; i++) {
+            s[i] = make_tex(dev, w, h, cdxf, false, false);
+            up[i] = make_tex(dev, ow, oh, cdxf, false, false);
+        }
+        smid = make_tex(dev, w, h, cdxf, false, false);
+        umid = make_tex(dev, ow, oh, cdxf, false, false);
+        st_in = make_tex(dev, w, h, cdxf, true, true);
+        if (!s[0] || !s[1] || !smid || !up[0] || !up[1] || !umid || !st_in) {
+            fprintf(stderr, "rife-chain texture creation failed\n");
+            return 1;
+        }
+
+        aji_frame fs[2], fsmid, fup[2], fumid;
+        for (int i = 0; i < 2; i++) {
+            fs[i] = aji_frame{};
+            fs[i].width = w; fs[i].height = h; fs[i].format = format;
+            fs[i].matrix = matrix; fs[i].range = range; fs[i].siting = siting;
+            fs[i].plane[0] = s[i];
+            fup[i] = fs[i];
+            fup[i].width = ow; fup[i].height = oh; fup[i].plane[0] = up[i];
+        }
+        fsmid = fs[0]; fsmid.plane[0] = smid;
+        fumid = fup[0]; fumid.plane[0] = umid;
+
+        FILE *fi = fopen(input, "rb");
+        if (!fi) { fprintf(stderr, "cannot open %s\n", input); return 1; }
+        const size_t fb = (size_t)w * h * cbpp * 3 / 2;
+        char *raw = (char *)malloc(fb);
+
+        LARGE_INTEGER freq, t0, t1;
+        QueryPerformanceFrequency(&freq);
+        double total_ms = 0;
+        int timed = 0, warmup = 3, prev = -1, cur = 0, n = 0, interp = 0;
+        while (n < frames) {
+            if (fread(raw, 1, fb, fi) != fb) {
+                if (n == 0) {
+                    fprintf(stderr, "input shorter than one frame\n");
+                    return 1;
+                }
+                fseek(fi, 0, SEEK_SET);     // loop a short seed
+                if (fread(raw, 1, fb, fi) != fb)
+                    break;
+            }
+            D3D11_MAPPED_SUBRESOURCE map = {};
+            if (FAILED(ctx->Map(st_in, 0, D3D11_MAP_WRITE, 0, &map)))
+                return 1;
+            const char *ss = raw;
+            char *dd = (char *)map.pData;
+            for (int y = 0; y < h; y++)
+                memcpy(dd + (size_t)y * map.RowPitch,
+                       ss + (size_t)y * w * cbpp, (size_t)w * cbpp);
+            ss += (size_t)w * h * cbpp;
+            dd += (size_t)map.RowPitch * h;
+            for (int y = 0; y < h / 2; y++)
+                memcpy(dd + (size_t)y * map.RowPitch,
+                       ss + (size_t)y * w * cbpp, (size_t)w * cbpp);
+            ctx->Unmap(st_in, 0);
+            ctx->CopyResource(s[cur], st_in);
+
+            QueryPerformanceCounter(&t0);
+            int ret = AJI_OK;
+            if (before) {
+                // interpolate the source pair, then upscale every frame
+                if (prev >= 0) {
+                    ret = aji_infer_rife(aji, &fs[prev], &fs[cur], 0.5,
+                                         &fsmid, NULL);
+                    if (ret == AJI_OK) {
+                        interp++;
+                        ret = aji_infer(aji, &fsmid, &fumid, NULL);
+                    } else if (ret == AJI_SCENE) {
+                        ret = aji_infer(aji, &fs[prev], &fumid, NULL);
+                    }
+                }
+                if (ret == AJI_OK)
+                    ret = aji_infer(aji, &fs[cur], &fup[cur], NULL);
+            } else {
+                // upscale, then interpolate the upscaled pair
+                ret = aji_infer(aji, &fs[cur], &fup[cur], NULL);
+                if (ret == AJI_OK && prev >= 0) {
+                    int rr = aji_infer_rife(aji, &fup[prev], &fup[cur], 0.5,
+                                            &fumid, NULL);
+                    if (rr == AJI_OK) interp++;
+                    else if (rr != AJI_SCENE) ret = rr;
+                }
+            }
+            if (ret == AJI_OK)
+                ret = aji_wait(aji, aji_flush(aji, NULL));
+            QueryPerformanceCounter(&t1);
+            if (ret != AJI_OK) {
+                fprintf(stderr, "rife-chain infer failed (%d): %s\n", ret,
+                        aji_last_error(aji));
+                return 1;
+            }
+            if (n >= warmup) {
+                total_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 /
+                            freq.QuadPart;
+                timed++;
+            }
+            if (prev < 0) {
+                prev = cur;
+                cur = 1;
+            } else {
+                int tmp = prev;
+                prev = cur;
+                cur = tmp;
+            }
+            n++;
+        }
+        double avg = timed ? total_ms / timed : 0.0;
+        printf("rife-chain: %d source frames, %d interpolated\n", n, interp);
+        printf("device chain time: %.3f ms/source-frame avg (%d timed); "
+               "source %.2f fps, output %.2f fps\n",
+               avg, timed, avg > 0 ? 1000.0 / avg : 0.0,
+               avg > 0 ? factor * 1000.0 / avg : 0.0);
         fclose(fi);
         aji_destroy(&aji);
         return 0;
