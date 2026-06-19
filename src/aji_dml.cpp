@@ -1386,7 +1386,12 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
                  "New Video FPS: %.3f",
                  chain->rife_model, factor, fps * factor);
     }
-    c->log_steps.push_back(buf);
+    // RIFE-first runs before the whole upscale pipeline, so its step belongs
+    // at the front of the sequence; the default order appends it last.
+    if (chain->rife_before_upscale)
+        c->log_steps.insert(c->log_steps.begin(), buf);
+    else
+        c->log_steps.push_back(buf);
     R.enabled = true;
     return true;
 }
