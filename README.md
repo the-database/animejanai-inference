@@ -14,8 +14,9 @@ engine building, colorspace metadata and CUDA graphs land here in phase 1.
 
 ## Build (Linux)
 
-Needs CUDA toolkit 13.x and TensorRT 10.x (default path:
-`~/sdk/tensorrt/usr`, override with `-DAJI_TRT_ROOT=`).
+Needs CUDA toolkit 13.x and TensorRT 11.x (default path:
+`~/sdk/tensorrt/usr`, override with `-DAJI_TRT_ROOT=`; on a system TensorRT
+install from NVIDIA's apt repo, pass `-DAJI_TRT_ROOT=/usr`).
 
 ```sh
 CUDACXX=/usr/local/cuda/bin/nvcc cmake -B build -S .
