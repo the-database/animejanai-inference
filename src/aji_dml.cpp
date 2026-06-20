@@ -264,6 +264,20 @@ struct aji_ctx {
     uint32_t in_pitch = 0, out_pitch = 0;
     int stage_key[3] = {0};     // format, in dims valid for staging
 
+    // Pre-RIFE downscale (rife-first only; see aji_trt for the design): the
+    // filter downscales source -> work via aji_resize before RIFE. aji_resize
+    // keeps its OWN pre/post plans + plane staging so it doesn't disturb
+    // run_chain's per-frame state.
+    bool has_pre_resize = false;
+    int pre_src_w = 0, pre_src_h = 0;                    // aji_resize input dims
+    int work_w = 0, work_h = 0;                          // aji_resize output dims
+    std::unique_ptr<DmlPlan> pre_resize_plan;            // source -> work
+    std::unique_ptr<DmlPlan> pr_pre_plan, pr_post_plan;
+    int pr_pre_key[4] = {0}, pr_post_key[4] = {0};
+    ComPtr<ID3D12Resource> pr_in_y, pr_in_uv, pr_out_y, pr_out_uv;
+    uint32_t pr_in_pitch = 0, pr_out_pitch = 0;
+    int pr_stage_key[3] = {0};
+
     // shared-texture cache (cleared on configure)
     std::map<void *, ComPtr<ID3D12Resource>> shared;
 
@@ -341,6 +355,37 @@ void fit_box(int w, int h, double box_w, double box_h, int *ow, int *oh)
         *ow = round_even(box_h * w / h);
         *oh = round_even(box_h);
     }
+}
+
+// Compose the FIRST model's "resize before upscale" target from (w,h): factor
+// then explicit height, exactly as the configure model loop applies them.
+// Returns true + fills (ow,oh) when an explicit resize is set and changes the
+// size. Only an explicit resize is hoisted ahead of RIFE.
+bool first_resize_target(const AjiModelConf &m, int w, int h, int *ow, int *oh)
+{
+    int cw = w, ch = h;
+    double factor = m.resize_factor_before_upscale;
+    if (m.resize_height_before_upscale != 0)
+        factor = 100;
+    if (factor != 100) {
+        int nw = round_even(cw * factor / 100.0);
+        int nh = round_even(ch * factor / 100.0);
+        if (nw >= 2 && nh >= 2) {
+            cw = nw;
+            ch = nh;
+        }
+    }
+    if (m.resize_height_before_upscale != 0 &&
+        (int)m.resize_height_before_upscale != ch) {
+        int nw, nh;
+        fit_box(cw, ch, m.resize_height_before_upscale * 16.0 / 9.0,
+                m.resize_height_before_upscale, &nw, &nh);
+        cw = nw;
+        ch = nh;
+    }
+    *ow = cw;
+    *oh = ch;
+    return cw != w || ch != h;
 }
 
 std::string fmt_num(double v)
@@ -1042,6 +1087,19 @@ void chain_teardown(aji_ctx *c)
     c->out_y.Reset();
     c->out_uv.Reset();
     memset(c->stage_key, 0, sizeof(c->stage_key));
+    c->pre_resize_plan.reset();
+    c->pr_pre_plan.reset();
+    c->pr_post_plan.reset();
+    memset(c->pr_pre_key, 0, sizeof(c->pr_pre_key));
+    memset(c->pr_post_key, 0, sizeof(c->pr_post_key));
+    c->pr_in_y.Reset();
+    c->pr_in_uv.Reset();
+    c->pr_out_y.Reset();
+    c->pr_out_uv.Reset();
+    memset(c->pr_stage_key, 0, sizeof(c->pr_stage_key));
+    c->has_pre_resize = false;
+    c->pre_src_w = c->pre_src_h = 0;
+    c->work_w = c->work_h = 0;
     c->shared.clear();
     rife_teardown(c);
 }
@@ -1386,10 +1444,12 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
                  "New Video FPS: %.3f",
                  chain->rife_model, factor, fps * factor);
     }
-    // RIFE-first runs before the whole upscale pipeline, so its step belongs
-    // at the front of the sequence; the default order appends it last.
+    // RIFE-first runs after any hoisted pre-RIFE resize but before the upscale
+    // models, so its step goes right after the pre-resize line (if one was
+    // pushed at index 0); the default (rife-after) appends it last.
     if (chain->rife_before_upscale)
-        c->log_steps.insert(c->log_steps.begin(), buf);
+        c->log_steps.insert(c->log_steps.begin() + (c->has_pre_resize ? 1 : 0),
+                            buf);
     else
         c->log_steps.push_back(buf);
     R.enabled = true;
@@ -1609,11 +1669,50 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         " - " + fmt_num(chain->max_fps));
 
     int cw = w, ch = h;
+
+    // Pre-RIFE downscale: in rife-first mode, hoist the FIRST model's explicit
+    // "resize before upscale" ahead of RIFE so interpolation runs on the
+    // smaller frame (order: resize -> RIFE -> upscale). The filter applies it
+    // to source frames via aji_resize; the upscale chain then starts here at
+    // the work resolution. Rife-after and no-RIFE paths are unaffected.
+    const bool rife_first_mode = chain->rife && !c->rife_model_dir.empty() &&
+                                 chain->rife_before_upscale;
+    if (rife_first_mode && !chain->models.empty()) {
+        int ww, wh;
+        if (first_resize_target(chain->models[0], w, h, &ww, &wh)) {
+            c->pre_resize_plan = resize_plan_create(c, w, h, ww, wh);
+            if (!c->pre_resize_plan) {
+                c->set_error("pre-rife resize plan %dx%d -> %dx%d allocation "
+                             "failed", w, h, ww, wh);
+                return AJI_ERR;
+            }
+            c->has_pre_resize = true;
+            c->pre_src_w = w;
+            c->pre_src_h = h;
+            c->work_w = ww;
+            c->work_h = wh;
+            cw = ww;
+            ch = wh;
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "Applied Resize Before Upscale: %dx%d (before RIFE)",
+                     ww, wh);
+            c->log_steps.push_back(buf);
+        }
+    }
+    // RIFE-first interpolates at this resolution (work res if a pre-RIFE
+    // downscale was hoisted, else source); the model loop advances cw/ch.
+    const int rife_in_w = cw, rife_in_h = ch;
     bool any_model = false;
 
-    for (const auto &m : chain->models) {
+    for (size_t mi = 0; mi < chain->models.size(); mi++) {
+        const auto &m = chain->models[mi];
+        // model[0]'s explicit "resize before upscale" is hoisted ahead of RIFE
+        // (rife-first) and applied by the filter via aji_resize; suppress it
+        // here so it isn't re-applied as an upscale step.
+        const bool skip_resize = (mi == 0 && c->has_pre_resize);
         double factor = m.resize_factor_before_upscale;
-        if (m.resize_height_before_upscale != 0)
+        if (m.resize_height_before_upscale != 0 || skip_resize)
             factor = 100;
 
         char buf[160];
@@ -1629,7 +1728,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                 c->log_steps.push_back(buf);
             }
         }
-        if (m.resize_height_before_upscale != 0 &&
+        if (!skip_resize && m.resize_height_before_upscale != 0 &&
             (int)m.resize_height_before_upscale != ch) {
             int nw, nh;
             fit_box(cw, ch, m.resize_height_before_upscale * 16.0 / 9.0,
@@ -1641,16 +1740,11 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                      "New Video Resolution: %dx%d",
                      m.resize_height_before_upscale, cw, ch);
             c->log_steps.push_back(buf);
-        } else if (ch > 1080) {
-            int nw, nh;
-            fit_box(cw, ch, 1920, 1080, &nw, &nh);
-            if (!push_resize_step(c, &cw, &ch, nw, nh))
-                return AJI_ERR;
-            snprintf(buf, sizeof(buf),
-                     "Applied Resize to Video Larger than 1080p;    "
-                     "New Video Resolution: %dx%d", cw, ch);
-            c->log_steps.push_back(buf);
         }
+        // No automatic >1080p downscale on DirectML: the EP runs dynamic-shape
+        // ONNX directly, so there's no max build shape to clamp to. Large
+        // sources run natively (VRAM permitting); use an explicit resize in the
+        // profile for a perf cap.
 
         if (m.name.empty())
             continue;
@@ -1680,12 +1774,13 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     if (chain->rife) {
         if (!c->rife_model_dir.empty()) {
-            // RIFE-first interpolates the source frames (w, h); the upscale
-            // models then run on every frame. The default interpolates the
-            // already-upscaled frames (cw, ch). aji_infer_rife validates its
-            // inputs against these configured dims either way.
-            const int rw = chain->rife_before_upscale ? w : cw;
-            const int rh = chain->rife_before_upscale ? h : ch;
+            // RIFE-first interpolates at the work resolution (source, or the
+            // hoisted pre-RIFE downscale); the upscale models then run on every
+            // frame. The default (rife-after) interpolates the already-upscaled
+            // frames (cw, ch). aji_infer_rife validates its inputs against these
+            // configured dims either way.
+            const int rw = chain->rife_before_upscale ? rife_in_w : cw;
+            const int rh = chain->rife_before_upscale ? rife_in_h : ch;
             if (!setup_rife(c, chain, rw, rh, fps)) {
                 finalize_log(c);
                 return AJI_ERR_ENGINE;
@@ -1700,7 +1795,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     finalize_log(c);
 
-    if (!any_model && c->steps.empty()) {
+    if (!any_model && c->steps.empty() && !c->has_pre_resize) {
         if (out_w) *out_w = w;
         if (out_h) *out_h = h;
         return 0;
@@ -1774,6 +1869,11 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             return AJI_ERR_ENGINE;
     }
 
+    // In hoist mode the filter downscales source -> work via aji_resize and
+    // feeds work-res frames to the upscale chain, so the chain's input geometry
+    // is the work resolution (aji_infer validates in->w/h against c->in_w/in_h).
+    c->in_w = c->has_pre_resize ? c->work_w : w;
+    c->in_h = c->has_pre_resize ? c->work_h : h;
     c->out_w = cw;
     c->out_h = ch;
     c->active = true;
@@ -2022,6 +2122,239 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
 
     // No CPU wait: the guard queues this frame's end-of-frame marker and
     // the caller synchronizes through the ticket API.
+    return AJI_OK;
+}
+
+extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
+{
+    if (!c || !c->has_pre_resize)
+        return 0;
+    if (work_w)
+        *work_w = c->work_w;
+    if (work_h)
+        *work_h = c->work_h;
+    return 1;
+}
+
+// Downscale one source-resolution frame to the work resolution (the rife-first
+// pre-RIFE step): pre -> single resize -> post over c->buf, with aji_resize's
+// OWN plane staging + pre/post plans so it doesn't disturb run_chain's. A
+// trimmed aji_infer (no model steps; fp16 intermediate throughout).
+extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
+                                     const aji_frame *out, void *cu_stream)
+{
+    (void)cu_stream;
+    if (!c || !in || !out)
+        return AJI_ERR;
+    if (!c->has_pre_resize || !c->pre_resize_plan) {
+        c->set_error("aji_resize without a configured pre-RIFE downscale");
+        return AJI_ERR;
+    }
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
+        in->format != AJI_FMT_RGB10A2) {
+        c->set_error("unsupported input format %d", in->format);
+        return AJI_ERR_FORMAT;
+    }
+    if (out->format != in->format) {
+        c->set_error("output format must match input");
+        return AJI_ERR_FORMAT;
+    }
+    if (in->width != c->pre_src_w || in->height != c->pre_src_h ||
+        out->width != c->work_w || out->height != c->work_h) {
+        c->set_error("aji_resize dims %dx%d->%dx%d do not match configured "
+                     "%dx%d->%dx%d", in->width, in->height, out->width,
+                     out->height, c->pre_src_w, c->pre_src_h, c->work_w,
+                     c->work_h);
+        return AJI_ERR_SHAPE;
+    }
+
+    if (FAILED(c->dev->GetDeviceRemovedReason())) {
+        diagnose_device(c, "aji_resize entry");
+        return AJI_ERR;
+    }
+    DoneGuard done_guard{c};
+
+    const bool in_rgb = in->format == AJI_FMT_RGB10A2;
+    const int in_bpp = in_rgb ? 4 : (in->format == AJI_FMT_P010 ? 2 : 1);
+    const int out_bpp = in_bpp;
+    const aji_csp csp =
+        aji_resample::make_csp(in->format, in->matrix, in->range);
+
+    // staging keyed on (format, source dims); the work (output) dims are fixed
+    // for the lifetime of a configure, so this rebuilds at most once per stream
+    const int skey[3] = {in->format, in->width, in->height};
+    if (memcmp(skey, c->pr_stage_key, sizeof(skey)) != 0) {
+        c->pr_in_pitch = align256((uint32_t)(in->width * in_bpp));
+        c->pr_out_pitch = align256((uint32_t)(out->width * out_bpp));
+        c->pr_in_y = make_buffer(c->dev.Get(),
+                                 (uint64_t)c->pr_in_pitch * in->height, false);
+        c->pr_in_uv = in_rgb ? nullptr
+                             : make_buffer(c->dev.Get(),
+                                           (uint64_t)c->pr_in_pitch * (in->height / 2),
+                                           false);
+        c->pr_out_y = make_buffer(c->dev.Get(),
+                                  (uint64_t)c->pr_out_pitch * out->height, false);
+        c->pr_out_uv = in_rgb ? nullptr
+                              : make_buffer(c->dev.Get(),
+                                            (uint64_t)c->pr_out_pitch * (out->height / 2),
+                                            false);
+        if (!c->pr_in_y || !c->pr_out_y ||
+            (!in_rgb && (!c->pr_in_uv || !c->pr_out_uv))) {
+            c->set_error("pre-resize plane staging allocation failed");
+            return AJI_ERR;
+        }
+        memcpy(c->pr_stage_key, skey, sizeof(skey));
+    }
+    const int pkey[4] = {in->format, in->width, in->height, in->siting};
+    if (!c->pr_pre_plan || memcmp(pkey, c->pr_pre_key, sizeof(pkey)) != 0) {
+        c->pr_pre_plan = pre_plan_create(c, in->format, in->width, in->height,
+                                         in->siting, AJI_FILTER_SPLINE36);
+        if (!c->pr_pre_plan) {
+            c->set_error("pre-resize pre plan allocation failed");
+            return AJI_ERR;
+        }
+        memcpy(c->pr_pre_key, pkey, sizeof(pkey));
+    }
+    const int qkey[4] = {out->format, c->work_w, c->work_h, AJI_SITING_LEFT};
+    if (!c->pr_post_plan || memcmp(qkey, c->pr_post_key, sizeof(qkey)) != 0) {
+        c->pr_post_plan = post_plan_create(c, out->format, c->work_w,
+                                           c->work_h, AJI_SITING_LEFT,
+                                           AJI_FILTER_SPLINE36);
+        if (!c->pr_post_plan) {
+            c->set_error("pre-resize post plan allocation failed");
+            return AJI_ERR;
+        }
+        memcpy(c->pr_post_key, qkey, sizeof(qkey));
+    }
+
+    ID3D12Resource *in_tex = open_shared(c, in->plane[0]);
+    ID3D12Resource *out_tex = open_shared(c, out->plane[0]);
+    if (!in_tex || !out_tex)
+        return AJI_ERR;
+    const UINT in_sub = (UINT)(intptr_t)in->plane[1];
+    const UINT out_sub = (UINT)(intptr_t)out->plane[1];
+
+    c->fence_val++;
+    c->ctx11_4->Signal(c->fence11.Get(), c->fence_val);
+    c->ctx11->Flush();
+    c->queue->Wait(c->fence.Get(), c->fence_val);
+
+    Recorder r{c};
+    if (!r.begin())
+        return AJI_ERR;
+    if (in_rgb) {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = in_tex;
+        b.Transition.Subresource = in_sub;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        c->cl->ResourceBarrier(1, &b);
+        copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width,
+                   in->height, c->pr_in_y.Get(), c->pr_in_pitch);
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        c->cl->ResourceBarrier(1, &b);
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ub.Transition.pResource = c->pr_in_y.Get();
+        ub.Transition.Subresource = 0;
+        ub.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        ub.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        c->cl->ResourceBarrier(1, &ub);
+        if (!record_pre_rgb10(c, r, c->pr_pre_plan.get(), c->pr_in_y.Get(),
+                              c->pr_in_pitch, c->buf[0].Get(), 0, true))
+            return AJI_ERR;
+    } else {
+        transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_plane(c, true, in_tex, in_sub, 0, in->format, in->width,
+                   in->height, c->pr_in_y.Get(), c->pr_in_pitch);
+        copy_plane(c, true, in_tex, in_sub, 1, in->format, in->width,
+                   in->height, c->pr_in_uv.Get(), c->pr_in_pitch);
+        transition_planes(c, in_tex, in_sub, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                          D3D12_RESOURCE_STATE_COMMON);
+        {
+            D3D12_RESOURCE_BARRIER bs[2] = {};
+            for (int i = 0; i < 2; i++) {
+                bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                bs[i].Transition.Subresource = 0;
+                bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                bs[i].Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+            bs[0].Transition.pResource = c->pr_in_y.Get();
+            bs[1].Transition.pResource = c->pr_in_uv.Get();
+            c->cl->ResourceBarrier(2, bs);
+        }
+        if (!record_pre(c, r, c->pr_pre_plan.get(), csp, c->pr_in_y.Get(),
+                        c->pr_in_uv.Get(), c->pr_in_pitch, c->buf[0].Get(), 0,
+                        true))
+            return AJI_ERR;
+    }
+    if (!r.exec())
+        return AJI_ERR;
+
+    if (!r.begin() ||
+        !record_resize(c, r, c->pre_resize_plan.get(), c->buf[0].Get(),
+                       c->buf[1].Get(), true, true) ||
+        !r.exec())
+        return AJI_ERR;
+
+    if (!r.begin())
+        return AJI_ERR;
+    if (in_rgb) {
+        if (!record_post_rgb10(c, r, c->pr_post_plan.get(), c->buf[1].Get(),
+                               c->pr_out_y.Get(), c->pr_out_pitch, true))
+            return AJI_ERR;
+    } else if (!record_post(c, r, c->pr_post_plan.get(), csp, c->buf[1].Get(),
+                            c->pr_out_y.Get(), c->pr_out_uv.Get(),
+                            c->pr_out_pitch, true)) {
+        return AJI_ERR;
+    }
+    if (in_rgb) {
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ub.Transition.pResource = c->pr_out_y.Get();
+        ub.Transition.Subresource = 0;
+        ub.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ub.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        c->cl->ResourceBarrier(1, &ub);
+        D3D12_RESOURCE_BARRIER tb = {};
+        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition.pResource = out_tex;
+        tb.Transition.Subresource = out_sub;
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        c->cl->ResourceBarrier(1, &tb);
+        copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
+                   out->height, c->pr_out_y.Get(), c->pr_out_pitch);
+        tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        c->cl->ResourceBarrier(1, &tb);
+    } else {
+        D3D12_RESOURCE_BARRIER bs[2] = {};
+        for (int i = 0; i < 2; i++) {
+            bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bs[i].Transition.Subresource = 0;
+            bs[i].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            bs[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        }
+        bs[0].Transition.pResource = c->pr_out_y.Get();
+        bs[1].Transition.pResource = c->pr_out_uv.Get();
+        c->cl->ResourceBarrier(2, bs);
+        transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_plane(c, false, out_tex, out_sub, 0, out->format, out->width,
+                   out->height, c->pr_out_y.Get(), c->pr_out_pitch);
+        copy_plane(c, false, out_tex, out_sub, 1, out->format, out->width,
+                   out->height, c->pr_out_uv.Get(), c->pr_out_pitch);
+        transition_planes(c, out_tex, out_sub, D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_COMMON);
+    }
+    if (!r.exec())
+        return AJI_ERR;
     return AJI_OK;
 }
 
