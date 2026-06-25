@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <string>
@@ -48,6 +49,124 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+#ifdef _WIN32
+std::wstring widen_utf8(const std::string &s)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (n <= 0)
+        return std::wstring();
+    std::wstring w((size_t)n - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    return w;
+}
+
+std::wstring win_long_path(const std::string &path)
+{
+    std::wstring w = widen_utf8(path);
+    if (w.empty() || w.rfind(L"\\\\?\\", 0) == 0 ||
+        w.rfind(L"\\\\.\\", 0) == 0)
+        return w;
+
+    DWORD need = GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
+    if (need > 0) {
+        std::vector<wchar_t> full(need);
+        DWORD n = GetFullPathNameW(w.c_str(), need, full.data(), nullptr);
+        if (n > 0 && n < need)
+            w.assign(full.data(), n);
+    }
+
+    if (w.rfind(L"\\\\", 0) == 0)
+        return L"\\\\?\\UNC" + w.substr(1);
+    if (w.size() >= 2 && w[1] == L':')
+        return L"\\\\?\\" + w;
+    return w;
+}
+
+bool file_exists(const std::string &path)
+{
+    DWORD attrs = GetFileAttributesW(win_long_path(path).c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+void remove_file(const std::string &path)
+{
+    DeleteFileW(win_long_path(path).c_str());
+}
+
+bool read_file_bytes(const std::string &path, std::vector<char> *out)
+{
+    HANDLE h = CreateFileW(win_long_path(path).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 ||
+        size.QuadPart > SIZE_MAX) {
+        CloseHandle(h);
+        return false;
+    }
+    out->resize((size_t)size.QuadPart);
+    char *dst = out->data();
+    size_t left = out->size();
+    while (left > 0) {
+        DWORD chunk = (DWORD)std::min<size_t>(left, 1u << 30);
+        DWORD got = 0;
+        if (!ReadFile(h, dst, chunk, &got, nullptr) || got == 0) {
+            CloseHandle(h);
+            return false;
+        }
+        dst += got;
+        left -= got;
+    }
+    CloseHandle(h);
+    return true;
+}
+
+void append_file_text(const std::string &path, const std::string &text)
+{
+    HANDLE h = CreateFileW(win_long_path(path).c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    DWORD written = 0;
+    WriteFile(h, text.data(), (DWORD)text.size(), &written, nullptr);
+    CloseHandle(h);
+}
+#else
+bool file_exists(const std::string &path)
+{
+    std::error_code ec;
+    return fs::is_regular_file(path, ec);
+}
+
+void remove_file(const std::string &path)
+{
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
+bool read_file_bytes(const std::string &path, std::vector<char> *out)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return false;
+    out->assign(std::istreambuf_iterator<char>(f),
+                std::istreambuf_iterator<char>());
+    return true;
+}
+
+void append_file_text(const std::string &path, const std::string &text)
+{
+    if (FILE *f = fopen(path.c_str(), "a")) {
+        fwrite(text.data(), 1, text.size(), f);
+        fclose(f);
+    }
+}
+#endif
 
 // TRT 11: strongly-typed is the default (--stronglyTyped is a no-op), and sanitize_settings_trt11
 // strips --inputIOFormats/--outputIOFormats/--tacticSources anyway (types come from the network;
@@ -302,6 +421,18 @@ std::string engine_path_for(const std::string &model_dir,
         .string();
 }
 
+std::string short_engine_path_for(const std::string &model_dir,
+                                  const std::string &onnx_name,
+                                  const std::string &settings)
+{
+    char model_hash[9];
+    snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
+    return (fs::path(model_dir) /
+            ("aji-" + std::string(model_hash) + "." +
+             std::to_string(crc32_z(settings)) + engine_suffix()))
+        .string();
+}
+
 void clean_stale_engines(aji_ctx *c)
 {
     const std::string suffix = engine_suffix();
@@ -406,9 +537,11 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
 #ifdef _WIN32
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
-    HANDLE log = CreateFileA(spec.log_path.c_str(), GENERIC_WRITE,
+    HANDLE log = CreateFileW(win_long_path(spec.log_path).c_str(), GENERIC_WRITE,
                              FILE_SHARE_READ, &sa, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log == INVALID_HANDLE_VALUE)
+        return -1;
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
@@ -455,14 +588,13 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
     int rc = run_build_process(spec, child);
-    if (rc != 0 || !fs::exists(spec.engine_path)) {
-        std::error_code ec;
-        fs::remove(spec.engine_path, ec);
-        if (FILE *f = fopen(spec.log_path.c_str(), "a")) {
-            fprintf(f, "\n[aji] build process exit code: %d (0x%x)\n", rc,
-                    (unsigned)rc);
-            fclose(f);
-        }
+    if (rc != 0 || !file_exists(spec.engine_path)) {
+        remove_file(spec.engine_path);
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "\n[aji] build process exit code: %d (0x%x)\n", rc,
+                 (unsigned)rc);
+        append_file_text(spec.log_path, msg);
         return false;
     }
     return true;
@@ -526,7 +658,7 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
 {
     const std::string onnx_path =
         (fs::path(dir ? *dir : c->model_dir) / (onnx_name + ".onnx")).string();
-    if (!fs::exists(onnx_path)) {
+    if (!file_exists(onnx_path)) {
         c->set_error("model not found: %s", onnx_path.c_str());
         return false;
     }
@@ -578,13 +710,11 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
 bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
                  int in_w, int in_h, int in_ch = 3)
 {
-    std::ifstream f(engine_path, std::ios::binary);
-    if (!f) {
+    std::vector<char> blob;
+    if (!read_file_bytes(engine_path, &blob)) {
         c->set_error("cannot open engine: %s", engine_path.c_str());
         return false;
     }
-    std::vector<char> blob((std::istreambuf_iterator<char>(f)),
-                           std::istreambuf_iterator<char>());
     me->engine.reset(c->runtime->deserializeCudaEngine(blob.data(), blob.size()));
     if (!me->engine) {
         c->set_error("engine deserialization failed: %s", engine_path.c_str());
@@ -736,55 +866,62 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                   ModelEngine *me, int w, int h, int ch,
                   const std::string *dir = nullptr)
 {
-    bool fresh = false;
-    if (!fs::exists(epath)) {
-        if (c->async_build) {
-            if (c->failed_builds.count(epath)) {
-                // permanent (until reconfigure changes the cache key):
-                // play passthrough instead of failing the filter
-                c->log_steps.push_back(
-                    "Engine build FAILED for " + name + " for " +
-                    shapes_label(settings) + " (see " + epath +
-                    ".build.log); playing without this chain");
-                return 0;
-            }
-            if (c->build_running.load()) {
-                // one build at a time; multi-engine chains cascade through
-                // repeated poll() -> reconfigure cycles
-                c->log_steps.push_back("Building TensorRT engine for " +
-                                       name + " for " +
-                                       shapes_label(settings) +
-                                       " (first play at this resolution)");
-                return 0;
-            }
-            BuildSpec spec;
-            if (!make_build_spec(c, name, settings, epath, dir, &spec))
-                return -1;
-            start_async_build(c, spec);
+    const std::string model_dir = dir ? *dir : c->model_dir;
+    const std::string short_epath = short_engine_path_for(model_dir, name, settings);
+
+    // Backwards compatibility: 3.5.0 and earlier cached engines used the
+    // full ONNX basename in the filename. Try that legacy path first so
+    // upgraders do not rebuild engines that already exist.
+    auto try_cached = [&](const std::string &path) -> int {
+        if (!file_exists(path))
+            return 0;
+        if (load_engine(c, path, me, w, h, ch))
+            return 1;
+        c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
+        remove_file(path);
+        return -1;
+    };
+
+    int cached = try_cached(epath);
+    if (cached == 1)
+        return 1;
+    if (short_epath != epath) {
+        cached = try_cached(short_epath);
+        if (cached == 1)
+            return 1;
+    }
+
+    // New builds use a short filename. This avoids MAX_PATH failures for
+    // portable installs while keeping the model/settings/GPU/TRT cache key.
+    const std::string &build_epath = short_epath;
+    if (c->async_build) {
+        if (c->failed_builds.count(build_epath)) {
+            // permanent (until reconfigure changes the cache key):
+            // play passthrough instead of failing the filter
+            c->log_steps.push_back(
+                "Engine build FAILED for " + name + " for " +
+                shapes_label(settings) + " (see " + build_epath +
+                ".build.log); playing without this chain");
             return 0;
         }
-        if (!build_engine(c, name, settings, epath, dir))
-            return -1;
-        fresh = true;
-    }
-    if (load_engine(c, epath, me, w, h, ch))
-        return 1;
-    if (fresh)
-        return -1;
-    c->verbose("cached engine unusable, rebuilding: %s", epath.c_str());
-    std::error_code ec;
-    fs::remove(epath, ec);
-    if (c->async_build) {
+        if (c->build_running.load()) {
+            // one build at a time; multi-engine chains cascade through
+            // repeated poll() -> reconfigure cycles
+            c->log_steps.push_back("Building TensorRT engine for " +
+                                   name + " for " +
+                                   shapes_label(settings) +
+                                   " (first play at this resolution)");
+            return 0;
+        }
         BuildSpec spec;
-        if (!make_build_spec(c, name, settings, epath, dir, &spec))
+        if (!make_build_spec(c, name, settings, build_epath, dir, &spec))
             return -1;
-        if (!c->build_running.load())
-            start_async_build(c, spec);
+        start_async_build(c, spec);
         return 0;
     }
-    if (!build_engine(c, name, settings, epath, dir))
+    if (!build_engine(c, name, settings, build_epath, dir))
         return -1;
-    return load_engine(c, epath, me, w, h, ch) ? 1 : -1;
+    return load_engine(c, build_epath, me, w, h, ch) ? 1 : -1;
 }
 
 // rife model code -> file basename: 414 -> rife_v4.14, 4141 -> _lite,
