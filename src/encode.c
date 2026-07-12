@@ -419,6 +419,9 @@ fail:
 
 /* ---- libaji init --------------------------------------------------------- */
 
+static void compute_final_dims(enc_ctx *c);
+static int  resize_needed(enc_ctx *c);
+
 static int init_aji(enc_ctx *c)
 {
     aji_create_params p = {
@@ -448,14 +451,11 @@ static int init_aji(enc_ctx *c)
         return -1;
     }
     progress("build_engine", 0, 0, 0, 100);
-    loge("%s", aji_current_log(c->aji));
 
     if (act == 0) {
         c->passthrough = 1;
         c->up_w = c->src_w;
         c->up_h = c->src_h;
-        loge("no chain active for %dx%d @ %.3f fps; transcoding (passthrough)",
-             c->src_w, c->src_h, av_q2d(c->out_fps));
     } else {
         c->up_w = ow;
         c->up_h = oh;
@@ -463,6 +463,27 @@ static int init_aji(enc_ctx *c)
     /* final encode dims default to the upscale dims; --final-resize adjusts */
     c->out_w = c->up_w;
     c->out_h = c->up_h;
+
+    /* aji's log ends with "New Video Resolution: WxH"; when a final resize is
+     * active, compute the post-resize dims now and report them on the same
+     * line (matching the ";    " field separator aji already uses). */
+    int do_resize = resize_needed(c);
+    if (do_resize) compute_final_dims(c);
+    if (do_resize) {
+        /* aji's log has a trailing newline; trim it so Final Resolution lands
+         * on the same line as New Video Resolution, not the next one. */
+        const char *lg = aji_current_log(c->aji);
+        size_t n = strlen(lg);
+        while (n > 0 && (lg[n - 1] == '\n' || lg[n - 1] == '\r')) n--;
+        loge("%.*s;    Final Resolution: %dx%d",
+             (int)n, lg, c->out_w, c->out_h);
+    } else {
+        loge("%s", aji_current_log(c->aji));
+    }
+
+    if (act == 0)
+        loge("no chain active for %dx%d @ %.3f fps; transcoding (passthrough)",
+             c->src_w, c->src_h, av_q2d(c->out_fps));
 
     if (aji_rife_factor(c->aji, &c->rnum, &c->rden) && c->rnum > 0) {
         if (c->rden != 1 || c->rnum % c->rden != 0) {
@@ -1325,7 +1346,8 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    if (resize_needed(&c)) compute_final_dims(&c);
+    /* final-resize dims are computed + logged in init_aji (same line as the
+     * upscale resolution), so nothing to do here. */
     if (!c.passthrough && init_aji_pool(&c) < 0) goto out;
     if (open_decoder(&c) < 0) goto out;
     if (open_output(&c) < 0) goto out;
