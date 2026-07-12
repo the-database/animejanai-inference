@@ -86,6 +86,7 @@ typedef struct {
     const char *vcodec;
     const char *vquality;
     enum out_pixfmt pix_fmt;
+    int final_w;            /* --final-resize-width, 0 = none */
     int final_h;            /* --final-resize-height, 0 = none */
     int final_pct;          /* --final-resize-factor, 0 = none */
     int overwrite;
@@ -418,6 +419,9 @@ fail:
 
 /* ---- libaji init --------------------------------------------------------- */
 
+static void compute_final_dims(enc_ctx *c);
+static int  resize_needed(enc_ctx *c);
+
 static int init_aji(enc_ctx *c)
 {
     aji_create_params p = {
@@ -447,14 +451,11 @@ static int init_aji(enc_ctx *c)
         return -1;
     }
     progress("build_engine", 0, 0, 0, 100);
-    loge("%s", aji_current_log(c->aji));
 
     if (act == 0) {
         c->passthrough = 1;
         c->up_w = c->src_w;
         c->up_h = c->src_h;
-        loge("no chain active for %dx%d @ %.3f fps; transcoding (passthrough)",
-             c->src_w, c->src_h, av_q2d(c->out_fps));
     } else {
         c->up_w = ow;
         c->up_h = oh;
@@ -462,6 +463,27 @@ static int init_aji(enc_ctx *c)
     /* final encode dims default to the upscale dims; --final-resize adjusts */
     c->out_w = c->up_w;
     c->out_h = c->up_h;
+
+    /* aji's log ends with "New Video Resolution: WxH"; when a final resize is
+     * active, compute the post-resize dims now and report them on the same
+     * line (matching the ";    " field separator aji already uses). */
+    int do_resize = resize_needed(c);
+    if (do_resize) compute_final_dims(c);
+    if (do_resize) {
+        /* aji's log has a trailing newline; trim it so Final Resolution lands
+         * on the same line as New Video Resolution, not the next one. */
+        const char *lg = aji_current_log(c->aji);
+        size_t n = strlen(lg);
+        while (n > 0 && (lg[n - 1] == '\n' || lg[n - 1] == '\r')) n--;
+        loge("%.*s;    Final Resolution: %dx%d",
+             (int)n, lg, c->out_w, c->out_h);
+    } else {
+        loge("%s", aji_current_log(c->aji));
+    }
+
+    if (act == 0)
+        loge("no chain active for %dx%d @ %.3f fps; transcoding (passthrough)",
+             c->src_w, c->src_h, av_q2d(c->out_fps));
 
     if (aji_rife_factor(c->aji, &c->rnum, &c->rden) && c->rnum > 0) {
         if (c->rden != 1 || c->rnum % c->rden != 0) {
@@ -734,19 +756,24 @@ static int init_resize(enc_ctx *c, AVFrame *first)
         c->graph = avfilter_graph_alloc();
         if (!c->graph) return -1;
 
-        char args[512];
+        /* hw_frames_ctx must be attached BEFORE buffersrc init (ffmpeg 8
+         * rejects a HW pix_fmt without it), so alloc + parameters_set +
+         * init_str instead of graph_create_filter (which inits immediately). */
         AVStream *vst = c->ifmt->streams[c->vstream];
-        snprintf(args, sizeof args,
-                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1",
-                 first->width, first->height, AV_PIX_FMT_CUDA,
-                 vst->time_base.num, vst->time_base.den);
-        AV(avfilter_graph_create_filter(&c->buf_src,
-                avfilter_get_by_name("buffer"), "in", args, NULL, c->graph));
+        c->buf_src = avfilter_graph_alloc_filter(c->graph,
+                avfilter_get_by_name("buffer"), "in");
+        if (!c->buf_src) goto fail;
 
         AVBufferSrcParameters *bp = av_buffersrc_parameters_alloc();
+        bp->format        = AV_PIX_FMT_CUDA;
+        bp->width         = first->width;
+        bp->height        = first->height;
+        bp->time_base     = vst->time_base;
+        bp->sample_aspect_ratio = (AVRational){1, 1};
         bp->hw_frames_ctx = first->hw_frames_ctx;
         AV(av_buffersrc_parameters_set(c->buf_src, bp));
         av_free(bp);
+        AV(avfilter_init_str(c->buf_src, NULL));
 
         AV(avfilter_graph_create_filter(&c->buf_sink,
                 avfilter_get_by_name("buffersink"), "out", NULL, NULL,
@@ -770,9 +797,19 @@ fail:
 /* Compute final (post-resize) dims from the upscale output dims + opts. */
 static void compute_final_dims(enc_ctx *c)
 {
-    if (c->o.final_h > 0) {
-        int h = c->o.final_h & ~1;
-        int w = (int)((int64_t)c->out_w * h / c->out_h) & ~1;
+    if (c->o.final_w > 0 || c->o.final_h > 0) {
+        int w, h;
+        if (c->o.final_w > 0 && c->o.final_h > 0) {
+            /* both given: exact dims (anamorphic stretch, e.g. DVD 16:9) */
+            w = c->o.final_w & ~1;
+            h = c->o.final_h & ~1;
+        } else if (c->o.final_h > 0) {
+            h = c->o.final_h & ~1;
+            w = (int)((int64_t)c->out_w * h / c->out_h) & ~1;
+        } else {
+            w = c->o.final_w & ~1;
+            h = (int)((int64_t)c->out_h * w / c->out_w) & ~1;
+        }
         c->out_w = w; c->out_h = h;
     } else if (c->o.final_pct > 0 && c->o.final_pct != 100) {
         c->out_w = ((c->out_w * c->o.final_pct / 100) + 1) & ~1;
@@ -782,7 +819,8 @@ static void compute_final_dims(enc_ctx *c)
 
 static int resize_needed(enc_ctx *c)
 {
-    return c->o.final_h > 0 || (c->o.final_pct > 0 && c->o.final_pct != 100);
+    return c->o.final_w > 0 || c->o.final_h > 0 ||
+           (c->o.final_pct > 0 && c->o.final_pct != 100);
 }
 
 /* ---- emit one finished output frame: resize -> encode -> mux ------------- */
@@ -1191,7 +1229,9 @@ static void usage(void)
 " [--vquality \"<args>\"]\n"
 "           [--pix-fmt yuv420p|yuv420p10|yuv444p|yuv444p10]"
 " (default yuv420p10; 4:4:4 = software encoder)\n"
-"           [--final-resize-height H | --final-resize-factor PCT]"
+"           [--final-resize-width W and/or --final-resize-height H"
+" | --final-resize-factor PCT]\n"
+"           (width+height = exact dims; one alone keeps aspect)"
 " [--overwrite]\n"
 "           [--no-audio] [--no-subs] [--no-chapters]"
 " [--progress none|line|json]\n"
@@ -1242,6 +1282,7 @@ int main(int argc, char **argv)
             else { loge("unknown --pix-fmt '%s' (yuv420p|yuv420p10|yuv444p|"
                         "yuv444p10)", v); return 2; }
         }
+        else if (!strcmp(a, "--final-resize-width"))  c.o.final_w = atoi(argv[++i]);
         else if (!strcmp(a, "--final-resize-height")) c.o.final_h = atoi(argv[++i]);
         else if (!strcmp(a, "--final-resize-factor")) c.o.final_pct = atoi(argv[++i]);
         else if (!strcmp(a, "--progress")) {
@@ -1279,8 +1320,9 @@ int main(int argc, char **argv)
         usage(); return 2;
     }
     if (!c.o.conf && !c.o.engine) { loge("need --conf or --engine"); return 2; }
-    if (c.o.final_h > 0 && c.o.final_pct > 0) {
-        loge("--final-resize-height and --final-resize-factor are exclusive");
+    if ((c.o.final_w > 0 || c.o.final_h > 0) && c.o.final_pct > 0) {
+        loge("--final-resize-width/--final-resize-height and "
+             "--final-resize-factor are exclusive");
         return 2;
     }
     if (c.o.pix_fmt >= OUT_444P8 && is_nvenc(c.o.vcodec)) {
@@ -1304,7 +1346,8 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    if (resize_needed(&c)) compute_final_dims(&c);
+    /* final-resize dims are computed + logged in init_aji (same line as the
+     * upscale resolution), so nothing to do here. */
     if (!c.passthrough && init_aji_pool(&c) < 0) goto out;
     if (open_decoder(&c) < 0) goto out;
     if (open_output(&c) < 0) goto out;
