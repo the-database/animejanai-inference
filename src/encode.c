@@ -203,6 +203,8 @@ typedef struct {
     int             src_w, src_h;
     int             up_w, up_h;      /* libaji upscale output (pool dims) */
     int             out_w, out_h;    /* final encode dims (after resize) */
+    AVRational      src_sar;         /* source pixel aspect (1:1 if untagged) */
+    AVRational      out_sar;         /* pixel aspect tagged on the output */
     int             ten_bit;         /* OUTPUT is 10-bit (from --pix-fmt) */
     int             is_444;          /* OUTPUT is 4:4:4 (from --pix-fmt) */
     int             src_aji_fmt;     /* input aji_frame.format from source */
@@ -311,6 +313,13 @@ static int open_input(enc_ctx *c)
     AVCodecParameters *par = vst->codecpar;
     c->src_w = par->width;
     c->src_h = par->height;
+
+    /* anamorphic sources (DVD/BD 720x480 etc) carry a non-square pixel aspect;
+     * without it the upscaled output is displayed at the wrong shape */
+    c->src_sar = av_guess_sample_aspect_ratio(c->ifmt, vst, NULL);
+    if (c->src_sar.num <= 0 || c->src_sar.den <= 0)
+        c->src_sar = (AVRational){1, 1};
+    c->out_sar = c->src_sar;
 
     /* input aji_frame.format mirrors the source bit depth (NVDEC emits NV12
      * for 8-bit, P010 for 10-bit). The OUTPUT format is decoupled and set by
@@ -421,6 +430,7 @@ fail:
 
 static void compute_final_dims(enc_ctx *c);
 static int  resize_needed(enc_ctx *c);
+static void compute_out_sar(enc_ctx *c);
 
 static int init_aji(enc_ctx *c)
 {
@@ -469,6 +479,7 @@ static int init_aji(enc_ctx *c)
      * line (matching the ";    " field separator aji already uses). */
     int do_resize = resize_needed(c);
     if (do_resize) compute_final_dims(c);
+    compute_out_sar(c);
     if (do_resize) {
         /* aji's log has a trailing newline; trim it so Final Resolution lands
          * on the same line as New Video Resolution, not the next one. */
@@ -480,6 +491,11 @@ static int init_aji(enc_ctx *c)
     } else {
         loge("%s", aji_current_log(c->aji));
     }
+
+    if (c->out_sar.num != c->out_sar.den)
+        loge("anamorphic source: SAR %d:%d -> %d:%d (displays as %dx%d)",
+             c->src_sar.num, c->src_sar.den, c->out_sar.num, c->out_sar.den,
+             (int)(c->out_w * av_q2d(c->out_sar) + 0.5), c->out_h);
 
     if (act == 0)
         loge("no chain active for %dx%d @ %.3f fps; transcoding (passthrough)",
@@ -623,6 +639,7 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     c->enc->color_primaries       = c->color_pri;
     c->enc->color_trc             = c->color_trc;
     c->enc->chroma_sample_location = c->chroma_loc;
+    c->enc->sample_aspect_ratio   = c->out_sar;
 
     int hw = is_nvenc(c->o.vcodec) && first->format == AV_PIX_FMT_CUDA;
     if (hw) {
@@ -718,6 +735,9 @@ static int finalize_output(enc_ctx *c)
     AV(avcodec_parameters_from_context(vs->codecpar, c->enc));
     vs->time_base = c->enc->time_base;
     vs->avg_frame_rate = c->out_fps;
+    /* avcodec_parameters_from_context copies the encoder SAR, but the muxer
+     * writes the stream's own (matroska DisplayWidth/Height) */
+    vs->sample_aspect_ratio = c->out_sar;
 
     if (!(c->ofmt->oformat->flags & AVFMT_NOFILE)) {
         if (!c->o.overwrite) {
@@ -815,6 +835,26 @@ static void compute_final_dims(enc_ctx *c)
         c->out_w = ((c->out_w * c->o.final_pct / 100) + 1) & ~1;
         c->out_h = ((c->out_h * c->o.final_pct / 100) + 1) & ~1;
     }
+}
+
+/* Pick the pixel aspect to tag on the output so it displays at the source's
+ * aspect. Scaling W and H by different factors (upscale + any final resize)
+ * changes the pixel aspect: keeping the display aspect means
+ * SAR_out = SAR_in * (src_w/src_h) / (out_w/out_h). */
+static void compute_out_sar(enc_ctx *c)
+{
+    AVRational sar = c->src_sar;
+    if (c->src_w > 0 && c->src_h > 0 && c->out_w > 0 && c->out_h > 0) {
+        sar = av_mul_q(sar, (AVRational){c->src_w, c->src_h});
+        sar = av_div_q(sar, (AVRational){c->out_w, c->out_h});
+    }
+    av_reduce(&sar.num, &sar.den, sar.num, sar.den, 1 << 16);
+    if (sar.num <= 0 || sar.den <= 0) sar = (AVRational){1, 1};
+    /* a final resize that squares the pixels lands a hair off 1:1 because the
+     * requested dims are integers; tag those square, not as 8317:8320 */
+    double d = av_q2d(sar);
+    if (d > 0.995 && d < 1.005) sar = (AVRational){1, 1};
+    c->out_sar = sar;
 }
 
 static int resize_needed(enc_ctx *c)
