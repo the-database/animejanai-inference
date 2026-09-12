@@ -120,8 +120,14 @@ parity/run_parity.sh       # the sweep
 ```
 
 `run_parity.sh` is explicitly a **WSL** script: Linux paths for the aji tools, Windows paths for
-VSPipe. **It hardcodes absolute paths in a block of variables at the top** (`WROOT`, `LROOT`,
-`VSPIPE`, `KT`, `PY`, `CMP`) — edit those to match your layout before running it.
+VSPipe. The locations come from a block of variables at the top; the three machine-specific ones
+are environment-overridable, so set these rather than editing the script:
+
+```sh
+export AJI_PARITY_WIN='C:\path\to\parity'      # what VSPipe.exe (a Windows binary) sees
+export AJI_PARITY_WSL=/mnt/c/path/to/parity    # the same directory from WSL
+export AJI_VSPIPE=/mnt/c/<package-install>/VSPipe.exe
+```
 
 What it assumes:
 
