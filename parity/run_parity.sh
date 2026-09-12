@@ -3,8 +3,11 @@
 # kernels. WSL-side paths for aji tools, Windows paths for VSPipe.
 set -e
 
-WROOT='C:\Users\<user>\aji-win\parity'
-LROOT=/mnt/c/Users/<user>/aji-win/parity
+# The shared parity working dir, spelled both ways: WROOT is what VSPipe.exe
+# (a Windows binary) sees, LROOT is the same directory from WSL. Point
+# AJI_PARITY_WIN / AJI_PARITY_WSL at your own location.
+WROOT=${AJI_PARITY_WIN:-'C:\parity'}
+LROOT=${AJI_PARITY_WSL:-/mnt/c/parity}
 # the current shipped reference (VS R73 / vsmlrt 3.22.38 / TRT 10.16.0);
 # override with AJI_VSPIPE to golden against another package version
 VSPIPE=${AJI_VSPIPE:-/mnt/c/mpv-upscale-2x_animejanai-v3.3.0/VSPipe.exe}
