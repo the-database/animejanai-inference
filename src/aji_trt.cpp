@@ -542,14 +542,19 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
                              FILE_ATTRIBUTE_NORMAL, nullptr);
     if (log == INVALID_HANDLE_VALUE)
         return -1;
-    STARTUPINFOA si = {};
+    STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = log;
     si.hStdError = log;
     PROCESS_INFORMATION pi = {};
-    std::string cmd = spec.cmdline;  // CreateProcess may modify the buffer
-    BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+    // The command line carries UTF-8 paths (model dir, engine, timing cache).
+    // CreateProcessA reinterprets those bytes through the process ANSI code
+    // page, handing trtexec a mangled path on any install whose path is not
+    // representable there. Widen and spawn wide, so the child gets the real
+    // path whatever the system locale is.
+    std::wstring cmd = widen_utf8(spec.cmdline);  // CreateProcess may modify it
+    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     if (log != INVALID_HANDLE_VALUE)
         CloseHandle(log);

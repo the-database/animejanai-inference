@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <!-- Force the process ANSI code page to UTF-8 (Windows 10 1903+). Without this,
+  <!-- Force the process ANSI code page to UTF-8 (Windows 10 1903+). Shared by
+       aji_harness, aji_harness_dml and aji_encode. Without this,
        the CRT narrows the wide command line to char** argv using the system ANSI
        code page, mangling non-ASCII path characters to '?' before they reach
        FFmpeg/fopen/CreateProcessA. avformat_open_input() then fails with
