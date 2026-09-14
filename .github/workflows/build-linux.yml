@@ -2,8 +2,13 @@ name: Build Linux (aji)
 
 # Builds libaji.so + libaji_trt.so (TensorRT/CUDA backend) on the Ubuntu 22.04
 # baseline image and publishes aji-linux-x64.tar.zst. The mpv-upscale-2x_animejanai
-# assembler downloads this (InstallAji). Kept in lockstep with the mpv fork's
-# Linux build (same TensorRT 11 + CUDA 13.2 from the image).
+# assembler downloads this (InstallAji).
+#
+# TensorRT comes from NVIDIA's apt packages fetched here, NOT from the build
+# image, so this build pins the same TensorRT the package ships (TrtVersion in
+# the assembler) without waiting on an image rebuild that three repos share.
+# Keep TRT_VERSION/TRT_CUDA in step with that pin; CUDA itself still comes from
+# the image (minor versions are compatible within CUDA 13).
 on:
   workflow_dispatch:
     inputs:
@@ -20,6 +25,9 @@ on:
 
 env:
   DEFAULT_TAG: v0.6.0
+  # Must match TrtVersion / TrtCudaVersion in mpv-AnimeJaNai's Program.cs.
+  TRT_VERSION: 11.3.0.99
+  TRT_CUDA: '13.4'
 
 jobs:
   build-linux:
@@ -34,6 +42,34 @@ jobs:
       packages: read
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install TensorRT ${{ env.TRT_VERSION }} from NVIDIA
+      # Unpacked over the container's own /usr (it is a throwaway), replacing
+      # whatever TensorRT the image happens to carry. That keeps AJI_TRT_ROOT
+      # at /usr, so the RPATH baked into the shipped libaji_trt.so is the same
+      # system path as before rather than a CI workspace path.
+      #
+      # libnvinfer11 is ~1.9 GB because it carries every per-SM builder
+      # resource; only libnvinfer.so.11 is needed to link against (the
+      # libnvinfer.so symlink comes from -dev), so unpack just that and delete
+      # the .deb immediately to stay inside the runner's disk budget.
+      run: |
+        set -eux
+        repo=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64
+        ver="${TRT_VERSION}-1+cuda${TRT_CUDA}"
+        for pkg in libnvinfer-headers-dev libnvinfer-dev; do
+          curl -fsSL -o "$pkg.deb" "$repo/${pkg}_${ver}_amd64.deb"
+          dpkg-deb -x "$pkg.deb" /
+          rm -f "$pkg.deb"
+        done
+        curl -fsSL -o runtime.deb "$repo/libnvinfer11_${ver}_amd64.deb"
+        dpkg-deb --fsys-tarfile runtime.deb \
+          | tar -C / -x --wildcards './usr/lib/x86_64-linux-gnu/libnvinfer.so.*'
+        rm -f runtime.deb
+        # Fail loudly if the headers are not the version we asked for.
+        grep -E 'TRT_(MAJOR|MINOR|PATCH|BUILD)_ENTERPRISE' \
+          /usr/include/x86_64-linux-gnu/NvInferVersion.h
+        ls -l /usr/lib/x86_64-linux-gnu/libnvinfer.so*
 
     - name: Build aji (full per-SM kernel set)
       run: |

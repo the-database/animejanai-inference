@@ -77,9 +77,19 @@ which falls back to `env.DEFAULT_TAG` — currently `v0.6.0`, i.e. **stale**. Di
 with an explicit tag rather than relying on the push path.
 
 The job runs on `ubuntu-latest` inside `ghcr.io/the-database/animejanai-linux-build:ubuntu2204`
-(GHCR login via `github.actor` + `GITHUB_TOKEN`). **All dependencies are baked into that
-image** — there is no apt/pip/download step in the workflow. TensorRT comes from the system
-install via `-DAJI_TRT_ROOT=/usr`.
+(GHCR login via `github.actor` + `GITHUB_TOKEN`). The toolchain comes from that image, but
+**TensorRT does not**: a step fetches NVIDIA's `.deb`s (`TRT_VERSION` / `TRT_CUDA` in the
+workflow env, which must match `TrtVersion` / `TrtCudaVersion` in the assembler) and unpacks
+them over the throwaway container's `/usr`, replacing whatever TensorRT the image carries.
+
+That keeps this build pinned to the exact TensorRT the package ships without waiting on a
+rebuild of an image three repos share, and because the destination is still `/usr`,
+`-DAJI_TRT_ROOT=/usr` is unchanged — so the RPATH baked into the shipped `libaji_trt.so`
+stays a system path instead of a CI workspace path.
+
+Only `libnvinfer.so.11` is unpacked from the ~1.9 GB `libnvinfer11` package (the rest is
+per-SM builder resources, which the *package* ships but this build does not need), and each
+`.deb` is deleted immediately to stay inside the runner's disk budget.
 
 ```bash
 cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
@@ -102,12 +112,11 @@ The image is built by `build-image.yml` in `the-database/mpv-AnimeJaNai` from
 `build/Dockerfile.ubuntu2204`, and is shared with that repo's Linux release leg and the mpv
 fork's Linux bundle build — rebuilding it affects all three.
 
-> **CUDA version discrepancy.** This workflow's header comment says "same TensorRT 11 + CUDA
-> 13.2 from the image", and the mpv fork's `ci/build-linux-portable.sh` exports
-> `/usr/local/cuda-13.2/bin`. But `build/Dockerfile.ubuntu2204` installs CUDA **13.3**
-> (`cuda-nvcc-13-3`, `CUDACXX=/usr/local/cuda-13.3/bin/nvcc`) alongside TensorRT 11.1.0.106.
-> Unverified which is current; the CMake build here does not hardcode a CUDA path, so it is
-> unaffected, but check this first if a sibling build fails looking for `nvcc`.
+> **CUDA comes from the image, TensorRT does not.** The image's CUDA toolkit supplies `nvcc`;
+> the CMake build here does not hardcode a CUDA path, so it follows whatever the image has.
+> CUDA minor versions are compatible within CUDA 13, so building against the image's toolkit
+> while the package ships a `cudart` from a different CUDA 13.x minor is fine — check this
+> first only if a sibling build fails looking for `nvcc`.
 
 ## Parity harness (WSL)
 
