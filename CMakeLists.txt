@@ -64,7 +64,10 @@ if(NOT WIN32)
     target_link_options(aji_trt PRIVATE -Wl,-Bsymbolic)
 endif()
 
-add_executable(aji_harness src/harness.c)
+# The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so argv/fopen
+# carry non-ASCII paths intact; benchmark.ps1 runs this from the installed
+# package, which may live under a non-ASCII path.
+add_executable(aji_harness src/harness.c $<$<BOOL:${WIN32}>:src/utf8-argv.manifest>)
 target_link_libraries(aji_harness PRIVATE aji CUDA::cudart)
 add_dependencies(aji_harness aji_trt)
 set_target_properties(aji_harness PROPERTIES
@@ -77,9 +80,8 @@ set_target_properties(aji_harness PROPERTIES
 if(WIN32)
     set(AJI_FFMPEG_ROOT "" CACHE PATH "ffmpeg dev root (include/, lib/)")
     if(AJI_FFMPEG_ROOT)
-        # The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so the exe's
-        # argv/fopen/CreateProcessA handle Unicode (non-ASCII) file paths correctly.
-        add_executable(aji_encode src/encode.c src/aji_encode.manifest)
+        # Same UTF-8 argv manifest as aji_harness above.
+        add_executable(aji_encode src/encode.c src/utf8-argv.manifest)
         target_include_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/include")
         target_link_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/lib")
         target_link_libraries(aji_encode PRIVATE aji CUDA::cudart CUDA::cuda_driver
@@ -126,7 +128,7 @@ if(WIN32)
     target_link_libraries(aji_dml PRIVATE d3d12 d3d11 dxgi d3dcompiler)
     set_target_properties(aji_dml PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
-    add_executable(aji_harness_dml src/harness_dml.cpp)
+    add_executable(aji_harness_dml src/harness_dml.cpp src/utf8-argv.manifest)
     target_link_libraries(aji_harness_dml PRIVATE aji d3d11)
     add_dependencies(aji_harness_dml aji_dml)
 endif()

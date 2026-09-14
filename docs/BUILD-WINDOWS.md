@@ -33,13 +33,13 @@ part of the contract:
 ├── animejanai-inference\          NTFS junction -> %REPO%
 │   ├── build-win-release\         release build (all arches)   [created by the build]
 │   └── build-win-trt11\           dev build    (single arch)   [created by the build]
-├── trt111\                        TensorRT 11.1.0.106  <- the release TRT root
-│   ├── include\                   NvInfer*.h (11 headers)
-│   ├── nvinfer_11.dll  nvinfer_11.lib  nvinfer_11.def  nvinfer_11.exp
-│   ├── nvinfer_plugin_11.dll  nvonnxparser_11.dll
-│   ├── nvinfer_builder_resource_sm120_11.dll   cudart64_13.dll   trtexec.exe
-│   └── vsmlrt-windows-x64-cuda.v16.1.test1.7z.001 / .002
-├── trt11\                         TensorRT 11.0.0.114 — kept for reference only
+├── trt113\                        TensorRT 11.3.0.99  <- the release TRT root
+│   ├── include\                   NvInfer*.h + impl\
+│   ├── nvinfer_11.lib  nvonnxparser_11.lib  nvinfer_plugin_11.lib  (+ lean/dispatch/vc)
+│   ├── nvinfer_11.dll  nvinfer_plugin_11.dll  nvonnxparser_11.dll  trtexec.exe
+│   ├── nvinfer_builder_resource_{ptx,sm75,sm80,sm86,sm89,sm90,sm100,sm120}_11.dll
+│   └── Acknowledgements.txt
+├── trt111\ , trt11\               TRT 11.1.0.106 / 11.0.0.114 — reference only
 ├── ort\
 │   ├── ort-dml-1.24.4.nupkg       +  Microsoft.ML.OnnxRuntime.DirectML\   (extracted)
 │   └── directml-1.15.4.nupkg      +  Microsoft.AI.DirectML\               (extracted)
@@ -98,65 +98,66 @@ CUDA 13.3 was installed from `cuda_13.3.0_windows_network.exe`, which is still i
 
 ## Dependency setup, from scratch
 
-### 1. TensorRT 11.1 runtime + `trtexec` — from the vs-mlrt archive
+### 1. TensorRT — one zip from NVIDIA
 
-`trt111` is populated from the two-part archive in that directory:
-
-```
-vsmlrt-windows-x64-cuda.v16.1.test1.7z.001
-vsmlrt-windows-x64-cuda.v16.1.test1.7z.002
-```
-
-That filename matches, exactly, the URL the package assembler builds from its
-`VsMlrtCudaVersion = "v16.1.test1"` pin:
+`trt113` is populated wholesale from NVIDIA's public redistributable archive — no login, and no
+third-party redistributor:
 
 ```
-https://github.com/AmusementClub/vs-mlrt/releases/download/v16.1.test1/vsmlrt-windows-x64-cuda.v16.1.test1.7z.001
+https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.3.0/zip/
+  TensorRT-Enterprise-11.3.0.99-Windows-amd64-cuda-13.4-Release-external.zip
 ```
 
-so the source is `AmusementClub/vs-mlrt`, release `v16.1.test1`. Extract `.001` (7-Zip picks up
-`.002` automatically) and take `nvinfer_11.dll`, `nvinfer_plugin_11.dll`,
-`nvonnxparser_11.dll`, `nvinfer_builder_resource_sm120_11.dll`, `cudart64_13.dll`, and
-`trtexec.exe`.
+The `-external` suffix marks the publicly redistributable build. It carries everything this
+build needs in one versioned place: `include/` headers, the real `lib/*.lib` import libraries,
+the runtime DLLs, every per-SM builder resource, a prebuilt `trtexec.exe`, and
+`doc/Acknowledgements.txt`. Extract it into `trt113` **flat** — headers under `include/`, the
+`.lib` and `.dll` files at the root — which is the layout `CMakeLists.txt` expects on Windows
+(`AJI_TRT_INCLUDE = <root>/include`, `AJI_TRT_LIB = <root>`).
 
-**Keep this pin and `AjiVersion` on the same TensorRT major.minor.** The assembler's comment
-states `v16.1.x == TensorRT 11.1 / CUDA 13.3`, and flags that `v16.1.test1` is a vs-mlrt
-*pre-release*.
+**Keep this and `TrtVersion` in the package assembler on the same version.** `aji_trt` links
+`nvinfer_11` and must be built against the TensorRT it runs on.
 
-### 2. TensorRT 11.1 headers
+> **The CUDA flavour is part of the URL and is not derivable from the TensorRT version.**
+> NVIDIA's pairing wanders: 11.0 -> cuda-13.2, 11.1 -> 13.3, 11.2 -> 13.3, 11.3 -> 13.4.
+> Guessing it yields a 404.
 
-`trt111\include\` holds the 11 `NvInfer*.h` headers. Verified version:
+NVIDIA retains old versions (10.13.3.9 through 11.3.0.99 are all still live), so an older
+release stays reproducible. Two archival fallbacks exist if a URL ever 404s:
+`pypi.nvidia.com/tensorrt-cu13-libs/` (every version, sha256 in the index, but no `trtexec`)
+and the CUDA apt repo (including `trtexec` via `libnvinfer-bin`).
+
+### 2. Headers and the import library — both from that zip
+
+Previous releases assembled these by hand: headers of unrecorded provenance, and an
+`nvinfer_11.lib` synthesized from the DLL's export table by `make-trt111-implib.cmd` (a
+`dumpbin /exports` scrape with a hardcoded `skip=19` that broke silently on a toolchain
+change). Both are obsolete — the zip ships NVIDIA's own headers and import libraries, so
+`make-trt111-implib.cmd` / `make-trt11-implib.cmd` are no longer part of any build.
+
+Verify the end state:
 
 ```c
+/* trt113\include\NvInferVersion.h */
 #define TRT_MAJOR_ENTERPRISE 11
-#define TRT_MINOR_ENTERPRISE 1
+#define TRT_MINOR_ENTERPRISE 3
 #define TRT_PATCH_ENTERPRISE 0
-#define TRT_BUILD_ENTERPRISE 106
+#define TRT_BUILD_ENTERPRISE 99
 ```
 
-> **Unverified:** how these were obtained. `build-aji-release.bat`'s header says "enterprise
-> headers from NVIDIA's apt repo", but nothing in `aji-win` scripts the download, and vs-mlrt
-> ships runtime DLLs without headers. Reproduce the **end state**: `NvInferVersion.h` reporting
-> 11.1.0.106, matching the runtime DLLs' version.
+### 3. `trtexec.exe` — NVIDIA's, not a patched fork
 
-### 3. `nvinfer_11.lib` — synthesized, not shipped
+The package ships the `trtexec.exe` from this zip. Earlier packages took vs-mlrt's rebuild of
+it, which carried a patch for long paths and a `CreateFileA` -> `CreateFileW` fix in the
+timing-cache file lock. Neither is needed now:
 
-vs-mlrt ships no import library, so it is generated from the DLL's export table.
-`%AJI_WIN%\make-trt111-implib.cmd`:
-
-```bat
-call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo
-cd /d %AJI_WIN%\trt111
-echo EXPORTS > nvinfer_11.def
-for /f "skip=19 tokens=4" %%A in ('dumpbin /exports nvinfer_11.dll') do @echo %%A >> nvinfer_11.def
-lib /nologo /def:nvinfer_11.def /out:nvinfer_11.lib /machine:x64
-echo IMPLIB-OK
-```
-
-Run it once per TRT root. `make-trt11-implib.cmd` is the identical recipe for the older
-`trt11`. The `skip=19` is how many header lines `dumpbin /exports` prints before the export
-table — if a future toolchain changes that, the `.def` comes out malformed and the link fails
-with missing symbols.
+- **Long paths** — NVIDIA's stock binary already embeds a `longPathAware` manifest
+  (`<description>trtexec with long path support</description>`).
+- **Non-ASCII paths** — fixed on *our* side instead, which is where it belonged.
+  `run_build_process` used to spawn with `CreateProcessA`, so the UTF-8 paths in the command
+  line were reinterpreted through the process ANSI code page and trtexec received a mangled
+  path. It now widens the command line and calls `CreateProcessW`, so the child gets the real
+  path regardless of system locale — and regardless of which `trtexec` is in use.
 
 ### 4. ONNX Runtime DirectML + DirectML — NuGet packages
 
@@ -224,7 +225,7 @@ cmake -S %AJI_WIN%\animejanai-inference ^
       -B %AJI_WIN%\animejanai-inference\build-win-release ^
       -G Ninja -DCMAKE_BUILD_TYPE=Release ^
       "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ^
-      -DAJI_TRT_ROOT=%AJI_WIN%/trt111 ^
+      -DAJI_TRT_ROOT=%AJI_WIN%/trt113 ^
       -DAJI_NVINFER=nvinfer_11 ^
       -DAJI_ORT_ROOT=%AJI_WIN%/ort/Microsoft.ML.OnnxRuntime.DirectML ^
       -DAJI_DML_ROOT=%AJI_WIN%/ort/Microsoft.AI.DirectML ^
@@ -310,8 +311,9 @@ The contents are flat because the assembler extracts them straight into
 `trtexec.exe`, no `onnxruntime.dll` and no `DirectML.dll`, even though the backends load those
 from their own directory at runtime. The package assembler drops them into that same
 `animejanai/inference/` directory from its own independently pinned sources:
-`InstallInferenceRuntime()` lifts the TensorRT runtime, the per-SM builder resources, `cudart`
-and `trtexec.exe` out of the vs-mlrt archive (`VsMlrtCudaVersion`), and `InstallOrtDml()` pulls
+`InstallInferenceRuntime()` takes the TensorRT runtime, the per-SM builder resources and
+`trtexec.exe` from the same NVIDIA zip this build uses (`TrtVersion`) plus `cudart` from the
+CUDA redistributable, and `InstallOrtDml()` pulls
 `onnxruntime.dll` + `DirectML.dll` from the two NuGet packages (`OrtDmlVersion`,
 `DirectMLVersion`). That is why this build needs those SDKs only to **compile and link**
 against — it never ships them. `pkg-mock\animejanai\inference\` mirrors the assembled result.
