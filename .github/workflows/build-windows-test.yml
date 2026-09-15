@@ -1,5 +1,8 @@
 name: Windows inference test build
 on:
+  push:
+    branches: [integration/addon-scene-detection]
+    paths: ['src/**', 'include/**', 'CMakeLists.txt', 'tools/build-windows-test.ps1', '.github/workflows/build-windows-test.yml']
   workflow_dispatch:
 permissions:
   contents: read
