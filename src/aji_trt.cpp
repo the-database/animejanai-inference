@@ -2030,7 +2030,20 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *b, double t,
                                          const aji_frame *out, void *cu_stream)
 {
-    if (!c || !a || !b || !out)
+    return aji_infer_rife_with_scene(c, a, b, t, out, cu_stream, -1);
+}
+
+extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
+{
+    return c != nullptr;
+}
+
+extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b, double t,
+                                         const aji_frame *out, void *cu_stream,
+                                         int scene)
+{
+    if (!c || !a || !b || !out || scene < -1 || scene > 1)
         return AJI_ERR;
     auto &R = c->rife;
     if (!R.enabled) {
@@ -2049,6 +2062,9 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                      R.w, R.h);
         return AJI_ERR_SHAPE;
     }
+
+    if (scene == 1)
+        return AJI_SCENE;
 
     CtxGuard guard(c->cu_ctx);
     if (!guard.ok) {
@@ -2126,7 +2142,7 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     }
     // The reference runs SCDetect on the padded clip; the constant borders
     // contribute zero difference, so its mean divides by the padded area.
-    if (sum / ((double)R.pw * R.ph) > R.scd_threshold)
+    if (scene == -1 && sum / ((double)R.pw * R.ph) > R.scd_threshold)
         return AJI_SCENE;
 
     // stage both frames into the padded buffers (interior only)

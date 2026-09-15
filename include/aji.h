@@ -233,6 +233,18 @@ AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, double t,
                               const aji_frame *out, void *cu_stream);
 
+/* Optional additive ABI for an isolated scene detector. No existing entry
+ * point or structure changes. Query support on the configured dispatcher:
+ * older backend libraries can still be used for ordinary interpolation.
+ * scene: -1 = built-in detector, 0 = continuous pair, 1 = cut (AJI_SCENE).
+ * The caller owns pair identity, timeouts and fallback. A continuous decision
+ * explicitly replaces the built-in decision, rather than adding another veto.
+ * All normal frame validation, GPU completion and output ownership still apply. */
+AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c);
+AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
+                              const aji_frame *b, double t,
+                              const aji_frame *out, void *cu_stream, int scene);
+
 AJI_EXPORT const char *aji_last_error(aji_ctx *c);
 
 AJI_EXPORT void aji_destroy(aji_ctx **c);

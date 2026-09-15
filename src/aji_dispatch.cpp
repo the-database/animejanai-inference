@@ -48,6 +48,8 @@ struct aji_backend {
     int (*poll)(aji_ctx *);
     int (*infer_rife)(aji_ctx *, const aji_frame *, const aji_frame *,
                       double, const aji_frame *, void *);
+    int (*infer_rife_with_scene)(aji_ctx *, const aji_frame *, const aji_frame *,
+                      double, const aji_frame *, void *, int);
     const char *(*last_error)(aji_ctx *);
     void (*destroy)(aji_ctx **);
 };
@@ -168,6 +170,8 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(resize,       "aji_resize");
     SYM(poll,         "aji_poll");
     SYM(infer_rife,   "aji_infer_rife");
+    // Optional: do not make old backends unusable for existing callers.
+    *(void **)&be->infer_rife_with_scene = lib_sym(be->lib, "aji_infer_rife_with_scene");
     SYM(last_error,   "aji_last_error");
     SYM(destroy,      "aji_destroy");
 #undef SYM
@@ -297,6 +301,25 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *out, void *cu_stream)
 {
     return c->be.infer_rife(c->inner, a, b, t, out, cu_stream);
+}
+
+extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
+{
+    return c && c->be.infer_rife_with_scene;
+}
+
+extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b, double t,
+                                         const aji_frame *out, void *cu_stream,
+                                         int scene)
+{
+    if (!c || scene < -1 || scene > 1)
+        return AJI_ERR;
+    if (c->be.infer_rife_with_scene)
+        return c->be.infer_rife_with_scene(c->inner, a, b, t, out, cu_stream, scene);
+    // Default remains callable with an older backend. An explicit decision
+    // cannot silently fall back to a different scene detector.
+    return scene == -1 ? c->be.infer_rife(c->inner, a, b, t, out, cu_stream) : AJI_ERR;
 }
 
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)

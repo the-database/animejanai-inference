@@ -22,7 +22,7 @@ endif()
 if(WIN32)
     set(AJI_TRT_ROOT "" CACHE PATH "TensorRT root")
     set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include")
-    set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
+    set(AJI_TRT_LIB "${AJI_TRT_ROOT}" CACHE PATH "TensorRT import library directory")
     set(AJI_NVINFER "nvinfer_10" CACHE STRING
         "nvinfer import library name (nvinfer_10 / nvinfer_11)")
 else()
