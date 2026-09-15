@@ -1,6 +1,6 @@
 // GPU regression driver: reuse the production harness's D3D11 upload/readback
 // and call the optional dispatcher ABI for each real RIFE input pair.
-// AJN_SCENE_DECISION=-1/0/1; AJN_SCENE_EXPECT=AJI_OK(0)/AJI_SCENE(2).
+// AJN_SCENE_DECISION=-1/0/1; AJN_SCENE_EXPECT=AJI_OK(0)/AJI_SCENE(1).
 // AJN_SCENE_LEGACY=1 verifies a new dispatcher with an older backend.
 #include <stdio.h>
 #include <stdlib.h>
