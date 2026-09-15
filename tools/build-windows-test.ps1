@@ -46,7 +46,7 @@ if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
 cmake --build build --parallel 2
 if ($LASTEXITCODE -ne 0) { throw 'Inference build failed' }
 [IO.Directory]::CreateDirectory('build/Release') | Out-Null
-foreach ($name in @('aji.dll','aji_dml.dll','aji_trt.dll','aji_harness.exe','aji_harness_dml.exe','aji_kernel_test.exe')) {
+foreach ($name in @('aji.dll','aji_dml.dll','aji_trt.dll','aji_harness.exe','aji_harness_dml.exe','aji_kernel_test.exe','aji_scene_dml_test.exe')) {
     Copy-Item -LiteralPath "build/$name" -Destination 'build/Release'
 }
 [ordered]@{ commit = (git rev-parse HEAD); cuda = '13.3.0'; tensorRT = '11.1.0.106'; onnxRuntime = '1.24.4'; directML = '1.15.4';

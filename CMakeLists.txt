@@ -129,6 +129,9 @@ if(WIN32)
     add_executable(aji_harness_dml src/harness_dml.cpp)
     target_link_libraries(aji_harness_dml PRIVATE aji d3d11)
     add_dependencies(aji_harness_dml aji_dml)
+    add_executable(aji_scene_dml_test sanity/scene_dml.cpp)
+    target_link_libraries(aji_scene_dml_test PRIVATE aji d3d11)
+    add_dependencies(aji_scene_dml_test aji_dml)
 endif()
 
 # Parity test tool: compiles the kernels directly (the shared lib hides

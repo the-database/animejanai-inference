@@ -2,7 +2,7 @@ name: Windows inference test build
 on:
   push:
     branches: [integration/addon-scene-detection]
-    paths: ['src/**', 'include/**', 'CMakeLists.txt', 'tools/build-windows-test.ps1', '.github/workflows/build-windows-test.yml']
+    paths: ['src/**', 'include/**', 'sanity/scene_dml.cpp', 'CMakeLists.txt', 'tools/build-windows-test.ps1', '.github/workflows/build-windows-test.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -34,6 +34,7 @@ jobs:
             build/Release/aji_harness_dml.exe
             build/Release/aji_harness.exe
             build/Release/aji_kernel_test.exe
+            build/Release/aji_scene_dml_test.exe
             build/build-info.json
           if-no-files-found: error
           retention-days: 14
