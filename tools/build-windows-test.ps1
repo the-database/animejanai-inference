@@ -9,7 +9,7 @@ function Fetch([string]$Url, [string]$Destination, [string]$Sha256 = '') {
 }
 if (-not (Test-Path -LiteralPath "$deps/cuda/bin/nvcc.exe")) {
     $manifest = Invoke-RestMethod 'https://developer.download.nvidia.com/compute/cuda/redist/redistrib_13.3.0.json'
-    foreach ($component in @('cuda_nvcc', 'cuda_crt', 'cuda_cudart', 'cccl')) {
+    foreach ($component in @('cuda_nvcc', 'cuda_crt', 'cuda_cudart', 'cccl', 'libnvvm')) {
         $asset = $manifest.$component.'windows-x86_64'
         if (-not $asset.relative_path) { throw "Missing CUDA component: $component" }
         Fetch "https://developer.download.nvidia.com/compute/cuda/redist/$($asset.relative_path)" "$deps/$component.zip" $asset.sha256
