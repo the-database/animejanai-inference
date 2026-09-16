@@ -129,6 +129,9 @@ typedef struct aji_frame {
     ptrdiff_t stride[3];      /* bytes */
 } aji_frame;
 
+/* Additive policy capability. async_build=2 checks cached engines without
+ * starting a builder or deleting incompatible engines. Query before use. */
+AJI_EXPORT int aji_stream_policy_version(void);
 AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params);
 
 /* Select the slot used by the next aji_configure() (conf mode). */

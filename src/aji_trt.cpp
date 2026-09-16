@@ -284,6 +284,7 @@ struct aji_ctx {
     // caller thread owns build_epath/failed_builds (written only while no
     // worker is running / in aji_poll).
     bool async_build = false;
+    bool check_engines_only = false;
     std::thread build_thread;
     std::atomic<bool> build_running{false};
     std::atomic<int> build_done_flag{0};
@@ -877,16 +878,24 @@ int ensure_engine(aji_ctx *c, const std::string &name,
             return 0;
         if (load_engine(c, path, me, w, h, ch))
             return 1;
+        if (c->check_engines_only) {
+            c->set_error("AJN_ENGINE_INCOMPATIBLE");
+            return -1;
+        }
         c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
         remove_file(path);
         return -1;
     };
 
     int cached = try_cached(epath);
+    if (cached < 0 && c->check_engines_only)
+        return -1;
     if (cached == 1)
         return 1;
     if (short_epath != epath) {
         cached = try_cached(short_epath);
+        if (cached < 0 && c->check_engines_only)
+            return -1;
         if (cached == 1)
             return 1;
     }
@@ -894,6 +903,10 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     // New builds use a short filename. This avoids MAX_PATH failures for
     // portable installs while keeping the model/settings/GPU/TRT cache key.
     const std::string &build_epath = short_epath;
+    if (c->check_engines_only) {
+        c->set_error("AJN_ENGINE_MISSING");
+        return -1;
+    }
     if (c->async_build) {
         if (c->failed_builds.count(build_epath)) {
             // permanent (until reconfigure changes the cache key):
@@ -1117,6 +1130,7 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         c->rife_model_dir =
             params->rife_model_dir ? params->rife_model_dir : "";
         c->async_build = params->async_build != 0;
+        c->check_engines_only = params->async_build == 2;
         return c.release();
     }
 
@@ -2310,4 +2324,9 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
     }
     delete c;
     *pc = nullptr;
+}
+
+extern "C" AJI_EXPORT int aji_stream_policy_version(void)
+{
+    return 1;
 }

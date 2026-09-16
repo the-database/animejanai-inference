@@ -2734,3 +2734,8 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
     delete c;
     *pc = nullptr;
 }
+
+extern "C" AJI_EXPORT int aji_stream_policy_version(void)
+{
+    return 1;
+}

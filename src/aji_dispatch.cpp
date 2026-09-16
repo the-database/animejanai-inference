@@ -219,6 +219,14 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     logf_to(params->log, params->log_opaque, 3,
             "backend: %s (%s)", backend.c_str(), stem);
 
+    if (params->async_build == 2) {
+        auto version = (int (*)(void))lib_sym(be.lib, "aji_stream_policy_version");
+        if (!version || version() != 1) {
+            logf_to(params->log, params->log_opaque, 0, "AJN_STREAM_POLICY_UNAVAILABLE");
+            lib_close(be.lib);
+            return nullptr;
+        }
+    }
     aji_ctx *inner = be.create(params);
     if (!inner) {
         lib_close(be.lib);
@@ -336,4 +344,9 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **c)
     lib_close(ctx->be.lib);
     delete ctx;
     *c = nullptr;
+}
+
+extern "C" AJI_EXPORT int aji_stream_policy_version(void)
+{
+    return 1;
 }
