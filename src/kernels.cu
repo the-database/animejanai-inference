@@ -234,6 +234,7 @@ __global__ void k_uv_v_store(const float *src, int cw, pass py, aji_csp csp,
 /* -------- 4:4:4 16-bit planar: pure matrix, no resampling -------- */
 
 __global__ void k_post444(const __half *src, int w, int h, aji_csp csp,
+                          float qdiv, float qmax,
                           uint8_t *yp, ptrdiff_t ys,
                           uint8_t *cbp, ptrdiff_t cbs,
                           uint8_t *crp, ptrdiff_t crs)
@@ -253,23 +254,27 @@ __global__ void k_post444(const __half *src, int w, int h, aji_csp csp,
     const float V = (r - Y) / (2.0f * (1.0f - csp.kr));
 
     ((uint16_t *)(yp  + (size_t)y * ys))[x]  =
-        (uint16_t)quant(Y * csp.yscale + csp.yoff, 1.0f, 65535.0f);
+        (uint16_t)quant(Y * csp.yscale + csp.yoff, qdiv, qmax);
     ((uint16_t *)(cbp + (size_t)y * cbs))[x] =
-        (uint16_t)quant(U * csp.cscale + csp.coff, 1.0f, 65535.0f);
+        (uint16_t)quant(U * csp.cscale + csp.coff, qdiv, qmax);
     ((uint16_t *)(crp + (size_t)y * crs))[x] =
-        (uint16_t)quant(V * csp.cscale + csp.coff, 1.0f, 65535.0f);
+        (uint16_t)quant(V * csp.cscale + csp.coff, qdiv, qmax);
 }
 
-extern "C" int aji_run_post444(int w, int h, const void *src_f16,
+extern "C" int aji_run_post444(int format, int w, int h, const void *src_f16,
                                const aji_csp *csp,
                                void *y_plane, ptrdiff_t y_stride,
                                void *cb_plane, ptrdiff_t cb_stride,
                                void *cr_plane, ptrdiff_t cr_stride,
                                void *stream)
 {
+    const float qdiv = format == AJI_FMT_YUV444P10MSB ? 64.0f :
+                       format == AJI_FMT_YUV444P12MSB ? 16.0f : 1.0f;
+    const float qmax = format == AJI_FMT_YUV444P10MSB ? 1023.0f :
+                       format == AJI_FMT_YUV444P12MSB ? 4095.0f : 65535.0f;
     k_post444<<<dim3((w + 31) / 32, (h + 7) / 8), dim3(32, 8), 0,
                 (cudaStream_t)stream>>>(
-        (const __half *)src_f16, w, h, *csp,
+        (const __half *)src_f16, w, h, *csp, qdiv, qmax,
         (uint8_t *)y_plane, y_stride, (uint8_t *)cb_plane, cb_stride,
         (uint8_t *)cr_plane, cr_stride);
     return (int)cudaGetLastError();
@@ -614,10 +619,8 @@ extern "C" int aji_scd_diff(int format, const void *ya, ptrdiff_t stride_a,
             (const uint8_t *)ya, stride_a, (const uint8_t *)yb, stride_b,
             w, h, 1.0f / 255.0f, accum_dev);
     } else {
-        // P010 raw values are MSB-aligned 10-bit; YUV444P16 uses the
-        // full 16-bit container
-        const float peak = format == AJI_FMT_YUV444P16 ? 65535.0f
-                                                       : 65472.0f;
+        const float peak = aji_make_csp(format, AJI_MATRIX_BT709,
+                                        AJI_RANGE_FULL).yscale;
         k_scd_diff<uint16_t><<<GRID(w, h, 1), 0, s>>>(
             (const uint8_t *)ya, stride_a, (const uint8_t *)yb, stride_b,
             w, h, 1.0f / peak, accum_dev);
