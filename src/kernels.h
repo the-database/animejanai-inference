@@ -57,9 +57,9 @@ int aji_run_post(aji_plan *p, const void *src_f16, const aji_csp *csp,
                  void *y_plane, ptrdiff_t y_stride,
                  void *uv_plane, ptrdiff_t uv_stride, void *stream);
 
-/* fp16 NCHW RGB -> 16-bit 4:4:4 planar YUV (full-resolution chroma; pure
- * matrix + quantize, no resampling, so no plan is involved). */
-int aji_run_post444(int w, int h, const void *src_f16, const aji_csp *csp,
+/* fp16 NCHW RGB -> 4:4:4 planar YUV in 16-bit containers. Quantizes to
+ * format's depth/alignment; no resampling, so no plan is involved. */
+int aji_run_post444(int format, int w, int h, const void *src_f16, const aji_csp *csp,
                     void *y_plane, ptrdiff_t y_stride,
                     void *cb_plane, ptrdiff_t cb_stride,
                     void *cr_plane, ptrdiff_t cr_stride, void *stream);

@@ -138,3 +138,7 @@ endif()
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
+
+add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
+target_include_directories(aji_msb444_test PRIVATE include src)
+target_link_libraries(aji_msb444_test PRIVATE CUDA::cudart)

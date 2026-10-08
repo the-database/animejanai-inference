@@ -54,7 +54,16 @@ enum aji_format {
                               only — what mpv hwuploads a 4:4:4 source to on
                               D3D11. Already RGB, so the backend skips the
                               YUV->RGB matrix; output is 4:2:0. */
+    AJI_FMT_YUV444P10MSB = 5, /* 10-bit-in-16 (MSB) planar 4:4:4, CUDA */
+    AJI_FMT_YUV444P12MSB = 6, /* 12-bit-in-16 (MSB) planar 4:4:4, CUDA */
 };
+
+static inline int aji_format_is_444(int format)
+{
+    return format == AJI_FMT_YUV444P16 ||
+           format == AJI_FMT_YUV444P10MSB ||
+           format == AJI_FMT_YUV444P12MSB;
+}
 
 enum aji_matrix {
     AJI_MATRIX_BT601  = 1,

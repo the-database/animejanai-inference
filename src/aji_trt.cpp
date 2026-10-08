@@ -1504,8 +1504,8 @@ static bool infer_via_graph(aji_ctx *c, const aji_frame *in,
                             const aji_frame *out, cudaStream_t stream,
                             int *ret)
 {
-    const bool out444 = out->format == AJI_FMT_YUV444P16;
-    const bool in444 = in->format == AJI_FMT_YUV444P16;
+    const bool out444 = aji_format_is_444(out->format);
+    const bool in444 = aji_format_is_444(in->format);
     const int bpp = (in->format == AJI_FMT_P010 || in444) ? 2 : 1;
     // output bytes/sample is the OUTPUT format's (NV12 is the only 8-bit one);
     // input bpp must not leak in here, or NV12->P010 staging is half-sized.
@@ -1624,16 +1624,16 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         return AJI_ERR;
     }
     if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
-        in->format != AJI_FMT_YUV444P16) {
+        !aji_format_is_444(in->format)) {
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
     // Output is independent of input: any 4:2:0 (NV12/P010) or 4:4:4
-    // (YUV444P16). The post-kernel quantizes to the output format's depth,
+    // (planar 4:4:4). The post-kernel quantizes to the output format's depth,
     // so NV12->P010 (8-bit source, 10-bit output) and P010->NV12 are on-GPU.
     if (out->format != AJI_FMT_NV12 && out->format != AJI_FMT_P010 &&
-        out->format != AJI_FMT_YUV444P16) {
-        c->set_error("unsupported output format %d (nv12/p010/yuv444p16)",
+        !aji_format_is_444(out->format)) {
+        c->set_error("unsupported output format %d (nv12/p010/planar 444)",
                      out->format);
         return AJI_ERR_FORMAT;
     }
@@ -1674,7 +1674,7 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
     // 4:4:4 input is already full-resolution: pure matrix convert, no chroma
     // upsample and no plan (aji_pre_plan_create hardcodes w>>1/h>>1 chroma and
     // would silently corrupt 444). Mirrors the RIFE f444 branch.
-    const bool in444 = in->format == AJI_FMT_YUV444P16;
+    const bool in444 = aji_format_is_444(in->format);
     if (!in444) {
         const int pkey[4] = {in->format, in->width, in->height, in->siting};
         if (!c->pre_plan || memcmp(pkey, c->pre_key, sizeof(pkey)) != 0) {
@@ -1743,13 +1743,13 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
         }
     }
 
-    if (out->format == AJI_FMT_YUV444P16) {
-        // full-resolution chroma: pure matrix + 16-bit quantize, no
+    if (aji_format_is_444(out->format)) {
+        // full-resolution chroma: pure matrix + output-depth quantize, no
         // resampling and no plan (this exceeds the reference pipeline,
         // which always subsampled back to 4:2:0)
-        const aji_csp ocsp = aji_make_csp(AJI_FMT_YUV444P16, in->matrix,
+        const aji_csp ocsp = aji_make_csp(out->format, in->matrix,
                                           in->range);
-        int err4 = aji_run_post444(cw, ch, c->buf[cur], &ocsp,
+        int err4 = aji_run_post444(out->format, cw, ch, c->buf[cur], &ocsp,
                                    out->plane[0], out->stride[0],
                                    out->plane[1], out->stride[1],
                                    out->plane[2], out->stride[2], stream);
@@ -1818,7 +1818,7 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
         return AJI_ERR;
     }
     if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
-        in->format != AJI_FMT_YUV444P16) {
+        !aji_format_is_444(in->format)) {
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
@@ -1843,7 +1843,7 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
     cudaStream_t stream = (cudaStream_t)cu_stream;
 
     const aji_csp csp = make_csp(in);
-    const bool in444 = in->format == AJI_FMT_YUV444P16;
+    const bool in444 = aji_format_is_444(in->format);
     if (!in444) {
         const int pkey[4] = {in->format, in->width, in->height, in->siting};
         if (!c->pr_pre_plan || memcmp(pkey, c->pr_pre_key, sizeof(pkey)) != 0) {
@@ -1878,10 +1878,10 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
         return AJI_ERR_CUDA;
     }
 
-    if (out->format == AJI_FMT_YUV444P16) {
-        const aji_csp ocsp = aji_make_csp(AJI_FMT_YUV444P16, in->matrix,
+    if (aji_format_is_444(out->format)) {
+        const aji_csp ocsp = aji_make_csp(out->format, in->matrix,
                                           in->range);
-        int err4 = aji_run_post444(c->work_w, c->work_h, c->buf[1], &ocsp,
+        int err4 = aji_run_post444(out->format, c->work_w, c->work_h, c->buf[1], &ocsp,
                                    out->plane[0], out->stride[0],
                                    out->plane[1], out->stride[1],
                                    out->plane[2], out->stride[2], stream);
@@ -2044,8 +2044,8 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     }
     if (a->format != b->format || a->format != out->format ||
         (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010 &&
-         a->format != AJI_FMT_YUV444P16)) {
-        c->set_error("rife frame formats must match (nv12/p010/yuv444p16)");
+         !aji_format_is_444(a->format))) {
+        c->set_error("rife frame formats must match (nv12/p010/planar 444)");
         return AJI_ERR_FORMAT;
     }
     if (a->width != R.w || a->height != R.h || b->width != R.w ||
@@ -2062,7 +2062,7 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     }
     cudaStream_t stream = (cudaStream_t)cu_stream;
     const int fmt = a->format;
-    const bool f444 = fmt == AJI_FMT_YUV444P16;
+    const bool f444 = aji_format_is_444(fmt);
     const int bpp = fmt == AJI_FMT_NV12 ? 1 : 2;
     const size_t prow = (size_t)R.pw * bpp;
     const size_t py = prow * R.ph;
@@ -2206,7 +2206,7 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
 
     // RGB -> padded YUV, then crop the window out
     if (f444) {
-        err = aji_run_post444(R.pw, R.ph, R.out_tensor, &csp,
+        err = aji_run_post444(fmt, R.pw, R.ph, R.out_tensor, &csp,
                               R.pad_o, prow,
                               (char *)R.pad_o + py, prow,
                               (char *)R.pad_o + 2 * py, prow, stream);
