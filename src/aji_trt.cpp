@@ -384,6 +384,7 @@ struct aji_ctx {
         int frames = 1;
         bool rank5 = false;
         int elem_type = 0;
+        bool dynamic_input = false;
     };
     std::map<std::string, OnnxFrames> onnx_frames;
     cudaEvent_t tick_ev[TICK_RING] = {};
@@ -1138,6 +1139,8 @@ aji_ctx::OnnxFrames onnx_frames(aji_ctx *c, const std::string &name)
         f.frames = aji_onnx_temporal_frames(in);
         f.rank5 = in.dims.size() == 5;
         f.elem_type = in.elem_type;
+        f.dynamic_input = std::any_of(in.dims.begin(), in.dims.end(),
+                                     [](int64_t d) { return d < 0; });
     }
     c->onnx_frames[path] = f;
     return f;
@@ -1413,6 +1416,21 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         if (m.frames > 0)
             model_frames[mi].frames = m.frames;
         const int t = model_frames[mi].frames;
+        // Without a shape profile trtexec replaces dynamic dimensions with
+        // 1, creating an unusable engine that gets rebuilt on every retry.
+        // Temporal models get an explicit shape below regardless of preset.
+        if (t <= 1 && model_frames[mi].dynamic_input &&
+            settings_tpl.find("--minShapes=") == std::string::npos &&
+            settings_tpl.find("--optShapes=") == std::string::npos &&
+            settings_tpl.find("--maxShapes=") == std::string::npos) {
+            c->set_error("%s: Static ONNX requires a model with fixed input "
+                         "dimensions. This model has dynamic dimensions; "
+                         "select Static or Dynamic in the TensorRT engine "
+                         "settings (or set --optShapes=input:%%video_resolution%%).",
+                         m.name.c_str());
+            finalize_log(c);
+            return AJI_ERR_CONF;
+        }
         if (t <= 1)
             continue;
         if (t % 2 == 0 || t > AJI_TEMPORAL_MAX) {
