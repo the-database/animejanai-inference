@@ -335,7 +335,8 @@ void cs_scd_partial(uint3 id : SV_DispatchThreadID,
 }
 
 // ---- cs_scd_final: one group sums all partials ----
-// di.x = partial count. d0 = partials, d1 = result (one float).
+// di.x = partial count, dj.x = result float index. d0 = partials,
+// d1 = result.
 [numthreads(256, 1, 1)]
 void cs_scd_final(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
@@ -351,7 +352,108 @@ void cs_scd_final(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         GroupMemoryBarrierWithGroupSync();
     }
     if (gi == 0)
-        d1.Store(0u, asuint(scd_gs[0]));
+        d1.Store((uint)dj.x * 4u, asuint(scd_gs[0]));
+}
+
+// ---- cs_rgb_diff_partial: per-group sum of the mean |a - b| over the
+// three tensor planes (temporal scene detection; cs_scd_final reduces).
+// di = {w, h, groups_x}, dj = {a element offset, b element offset}.
+// d0 = frames (both in one buffer), d2 = partials.
+[numthreads(32, 8, 1)]
+void cs_rgb_diff_partial(uint3 id : SV_DispatchThreadID,
+                         uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    float d = 0.0f;
+    if (id.x < (uint)di.x && id.y < (uint)di.y) {
+        uint plane = (uint)di.x * (uint)di.y;
+        uint i = id.y * (uint)di.x + id.x;
+        [unroll]
+        for (uint ch = 0; ch < 3; ch++)
+            d += abs(TLOAD(d0, (uint)dj.x + ch * plane + i) -
+                     TLOAD(d0, (uint)dj.y + ch * plane + i));
+        d *= 1.0f / 3.0f;
+    }
+    scd_gs[gi] = d;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint n = 128; n > 0; n >>= 1) {
+        if (gi < n)
+            scd_gs[gi] += scd_gs[gi + n];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0)
+        d2.Store((gid.y * (uint)di.z + gid.x) * 4u, asuint(scd_gs[0]));
+}
+
+// ---- cs_temporal_gather: window frames -> [3T, ph, pw] model input ----
+// Window position z reads the nearest frame on the center's side of the
+// first scene cut between it and the center (see k_temporal_gather), and
+// w x h frames are edge-replicated to pw x ph. di = {w, h, pw, ph},
+// dj = {T, slots 0-5, slots 6-11, slots 12-14} (5 bits per window
+// position: the frame's ring slot), asuint(qdiv) = bit k set when the cut
+// metric between positions k and k+1 is valid, kr = threshold (<= 0
+// disables), kb = 1 / (w * h). d0 = ring (slot s at s * 3*w*h elements),
+// d1 = per-slot cut metrics (float sums), d2 = model input.
+// IO16: 2 px per thread (pw is a multiple of 32).
+uint gather_slot(uint k)
+{
+    uint word = k < 6u ? (uint)dj.y : (k < 12u ? (uint)dj.z : (uint)dj.w);
+    return (word >> ((k % 6u) * 5u)) & 31u;
+}
+
+bool gather_cut(uint k)
+{
+    if (!((asuint(qdiv) >> k) & 1u))
+        return false;
+    return asfloat(d1.Load(gather_slot(k + 1u) * 4u)) * kb > kr;
+}
+
+[numthreads(32, 8, 1)]
+void cs_temporal_gather(uint3 id : SV_DispatchThreadID)
+{
+    uint t = (uint)dj.x, z = id.z, center = (t - 1u) / 2u;
+    uint w = (uint)di.x, h = (uint)di.y, pw = (uint)di.z, ph = (uint)di.w;
+#if IO16
+    uint x0 = id.x * 2u;
+#else
+    uint x0 = id.x;
+#endif
+    if (x0 >= pw || id.y >= ph || z >= t)
+        return;
+
+    uint e = z;
+    if (kr > 0.0f) {
+        e = center;
+        if (z > center) {
+            for (uint k = center; k < z; k++) {
+                if (gather_cut(k))
+                    break;
+                e = k + 1u;
+            }
+        } else {
+            for (uint k = center; k > z; k--) {
+                if (gather_cut(k - 1u))
+                    break;
+                e = k - 1u;
+            }
+        }
+    }
+
+    uint plane = w * h, dplane = pw * ph;
+    uint src = gather_slot(e) * 3u * plane;
+    uint sy = min(id.y, h - 1u);
+    uint dst = z * 3u * dplane + id.y * pw + x0;
+    [unroll]
+    for (uint ch = 0; ch < 3; ch++) {
+        uint row = src + ch * plane + sy * w;
+#if IO16
+        float a = TLOAD(d0, row + min(x0, w - 1u));
+        float b = TLOAD(d0, row + min(x0 + 1u, w - 1u));
+        d2.Store((dst + ch * dplane) * 2u, f32tof16(a) | (f32tof16(b) << 16u));
+#else
+        d2.Store((dst + ch * dplane) * 4u, asuint(TLOAD(d0, row + min(x0, w - 1u))));
+#endif
+    }
 }
 
 // ---- cs_post_matrix: RGB tensor -> quantized Y raw + chroma f32 ----

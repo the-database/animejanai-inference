@@ -36,6 +36,7 @@
 #include <onnxruntime_c_api.h>
 #include <dml_provider_factory.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -149,13 +150,14 @@ enum Kern {
     K_UV_H = 0, K_V_F32, K_PRE_COMBINE, K_POST_MATRIX,
     K_H_F32, K_UV_V_STORE, K_RS_H, K_RS_V,
     K_FILL, K_WINDOW, K_RIFE_CONSTS, K_SCD_PARTIAL, K_SCD_FINAL,
-    K_PRE_RGB10, K_POST_RGB10,
+    K_PRE_RGB10, K_POST_RGB10, K_RGB_DIFF_PARTIAL, K_TEMPORAL_GATHER,
 };
 const char *const KERN_ENTRY[] = {
     "cs_uv_h", "cs_v_f32", "cs_pre_combine", "cs_post_matrix",
     "cs_h_f32", "cs_uv_v_store", "cs_rs_h", "cs_rs_v",
     "cs_fill", "cs_window", "cs_rife_consts", "cs_scd_partial",
-    "cs_scd_final", "cs_pre_rgb10", "cs_post_rgb10",
+    "cs_scd_final", "cs_pre_rgb10", "cs_post_rgb10", "cs_rgb_diff_partial",
+    "cs_temporal_gather",
 };
 
 struct DmlPass {
@@ -182,9 +184,9 @@ struct DmlModel {
 };
 
 struct Step {
-    enum Kind { RESIZE, MODEL } kind;
+    enum Kind { RESIZE, MODEL, TEMPORAL } kind;
     int out_w, out_h;
-    int model_idx = -1;                  // MODEL
+    int model_idx = -1;                  // MODEL, TEMPORAL
     std::unique_ptr<DmlPlan> plan;       // RESIZE
     int in_buf = 0;                      // chain buffer ping-pong index
     bool elem16_in = true, elem16_out = true;
@@ -309,6 +311,31 @@ struct aji_ctx {
         ComPtr<ID3D12Resource> scd_part, scd_sum, scd_read;
         int scd_groups = 0;
     } rife;
+
+    // Temporal (multi-frame) model step, mirroring aji_trt: frames enter a
+    // ring at the step's input resolution (aji_ingest runs the steps before
+    // it once per source frame); aji_infer_seq gathers the 2r+1 window into
+    // the padded model input, runs the model, crops, and runs the rest.
+    struct {
+        bool enabled = false;
+        int t = 1, r = 0;
+        size_t step_idx = 0;         // index of the TEMPORAL step in steps[]
+        int w = 0, h = 0;            // ring frame dims (step input)
+        int pw = 0, ph = 0;          // model input dims, padded
+        int ow = 0, oh = 0;          // step output dims, cropped
+        int pow = 0, poh = 0;        // model output dims
+        bool fp16 = true;            // ring/tensor element type (the model's)
+        float threshold = 0.0f;
+        int nslots = 0;
+        ComPtr<ID3D12Resource> ring;     // nslots * 3*w*h elements
+        ComPtr<ID3D12Resource> diff;     // per slot: diff sum vs seq-1
+        ComPtr<ID3D12Resource> part;     // diff reduction partials
+        int part_groups = 0;
+        ComPtr<ID3D12Resource> in_tensor, out_tensor;
+        void *in_alloc = nullptr, *out_alloc = nullptr;
+        std::vector<int64_t> seq;    // per slot, -1 = empty
+        std::vector<int> format, matrix, range;
+    } temporal;
 
     void set_error(const char *fmt, ...) {
         va_list ap;
@@ -1057,6 +1084,7 @@ void model_release(DmlModel *m)
 }
 
 void rife_teardown(aji_ctx *c);
+void temporal_teardown(aji_ctx *c);
 
 void chain_teardown(aji_ctx *c)
 {
@@ -1103,6 +1131,7 @@ void chain_teardown(aji_ctx *c)
     c->work_w = c->work_h = 0;
     c->shared.clear();
     rife_teardown(c);
+    temporal_teardown(c);
 }
 
 // Create an ORT tensor over `bytes` of a D3D12 buffer (DML allocation).
@@ -1339,7 +1368,7 @@ void rife_teardown(aji_ctx *c)
 // input channels. Format-dependent staging builds lazily in
 // aji_infer_rife. Mirrors aji_trt's setup_rife (and its stats text).
 bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
-                double fps)
+                double fps, bool before_upscale)
 {
     auto &R = c->rife;
     R.w = w;
@@ -1448,7 +1477,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     // RIFE-first runs after any hoisted pre-RIFE resize but before the upscale
     // models, so its step goes right after the pre-resize line (if one was
     // pushed at index 0); the default (rife-after) appends it last.
-    if (chain->rife_before_upscale)
+    if (before_upscale)
         c->log_steps.insert(c->log_steps.begin() + (c->has_pre_resize ? 1 : 0),
                             buf);
     else
@@ -1457,35 +1486,94 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     return true;
 }
 
-// First model of the chain whose onnx input takes several frames (or that
-// the conf marks as temporal), else "".
-std::string chain_temporal_model(aji_ctx *c, const AjiChainConf &chain)
+// Input shape of <model_dir>/<name>.onnx (false if unreadable).
+bool read_onnx_input(aji_ctx *c, const std::string &name, AjiOnnxInput *in)
 {
-    for (const auto &m : chain.models) {
-        if (m.name.empty())
-            continue;
-        if (m.frames > 1)
-            return m.name;
-        const std::string path = c->model_dir + "\\" + m.name + ".onnx";
-        FILE *f = _wfopen(widen(path).c_str(), L"rb");
-        if (!f)
-            continue;
-        std::vector<char> blob;
-        if (_fseeki64(f, 0, SEEK_END) == 0) {
-            const long long n = _ftelli64(f);
-            if (n > 0 && _fseeki64(f, 0, SEEK_SET) == 0) {
-                blob.resize((size_t)n);
-                if (fread(blob.data(), 1, blob.size(), f) != blob.size())
-                    blob.clear();
-            }
+    const std::string path = c->model_dir + "\\" + name + ".onnx";
+    FILE *f = _wfopen(widen(path).c_str(), L"rb");
+    if (!f)
+        return false;
+    std::vector<char> blob;
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        const long long n = _ftelli64(f);
+        if (n > 0 && _fseeki64(f, 0, SEEK_SET) == 0) {
+            blob.resize((size_t)n);
+            if (fread(blob.data(), 1, blob.size(), f) != blob.size())
+                blob.clear();
         }
-        fclose(f);
-        AjiOnnxInput in;
-        if (!blob.empty() && aji_onnx_input(blob.data(), blob.size(), &in) &&
-            aji_onnx_temporal_frames(in) > 1)
-            return m.name;
     }
-    return std::string();
+    fclose(f);
+    return !blob.empty() && aji_onnx_input(blob.data(), blob.size(), in);
+}
+
+void temporal_teardown(aji_ctx *c)
+{
+    auto &T = c->temporal;
+    if (T.in_alloc)
+        g_dml_api->FreeGPUAllocation(T.in_alloc);
+    if (T.out_alloc)
+        g_dml_api->FreeGPUAllocation(T.out_alloc);
+    T = {};
+}
+
+// Allocate the ring, cut metrics and model tensors for the configured
+// temporal step and bind the model to them (its input/output are not chain
+// buffers). Requires the step's model at c->models[steps[step_idx]].
+bool setup_temporal(aji_ctx *c)
+{
+    auto &T = c->temporal;
+    DmlModel &m = c->models[c->steps[T.step_idx].model_idx];
+    const size_t elem = T.fp16 ? 2 : 4;
+    T.nslots = T.t + 4;
+    const size_t in_bytes = (size_t)3 * T.t * T.pw * T.ph * elem;
+    const size_t out_bytes = (size_t)3 * T.pow * T.poh * elem;
+    T.part_groups = ((T.w + 31) / 32) * ((T.h + 7) / 8);
+    T.ring = make_buffer(c->dev.Get(),
+                         (uint64_t)T.nslots * 3 * T.w * T.h * elem, false);
+    T.diff = make_buffer(c->dev.Get(), (uint64_t)T.nslots * 4, false);
+    T.part = make_buffer(c->dev.Get(), (uint64_t)T.part_groups * 4, false);
+    T.in_tensor = make_buffer(c->dev.Get(), in_bytes, false);
+    T.out_tensor = make_buffer(c->dev.Get(), out_bytes, false);
+    if (!T.ring || !T.diff || !T.part || !T.in_tensor || !T.out_tensor) {
+        c->set_error("temporal buffer allocation failed");
+        return false;
+    }
+    if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
+                       T.in_tensor.Get(), &T.in_alloc), "temporal in alloc") ||
+        !c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
+                       T.out_tensor.Get(), &T.out_alloc), "temporal out alloc"))
+        return false;
+    m.in_val = make_tensor(c, T.in_alloc, in_bytes, 1, 3 * T.t, T.ph, T.pw,
+                           T.fp16);
+    m.out_val = make_tensor(c, T.out_alloc, out_bytes, 1, 3, T.poh, T.pow,
+                            T.fp16);
+    if (!m.in_val || !m.out_val)
+        return false;
+    if (!c->ort_ck(g_ort->BindInput(m.binding, m.in_name.c_str(), m.in_val),
+                   "temporal BindInput") ||
+        !c->ort_ck(g_ort->BindOutput(m.binding, m.out_name.c_str(),
+                                     m.out_val), "temporal BindOutput"))
+        return false;
+    // warm the rebound command list (discovery used a temporary binding)
+    // and zero the cut metrics, then drain so later segments can recycle
+    // the command allocators
+    if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
+                   "temporal warmup"))
+        return false;
+    {
+        Recorder r{c};
+        if (!r.begin() || !record_fill(c, r, T.diff.Get(), 0,
+                                       (uint32_t)T.nslots, 0) ||
+            !r.exec())
+            return false;
+    }
+    drain_queue(c, 30000);
+    T.seq.assign(T.nslots, -1);
+    T.format.assign(T.nslots, AJI_FMT_NV12);
+    T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
+    T.range.assign(T.nslots, AJI_RANGE_LIMITED);
+    T.enabled = true;
+    return true;
 }
 
 } // namespace
@@ -1681,14 +1769,6 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                         " skipped: model not found: " + missing + ".onnx");
                     continue;
                 }
-                std::string temporal = chain_temporal_model(c, ch);
-                if (!temporal.empty()) {
-                    c->log_info.push_back(
-                        "Chain " + std::to_string(ch.index) + " skipped: " +
-                        temporal + " is a temporal (multi-frame) model, "
-                        "which needs the TensorRT backend");
-                    continue;
-                }
                 chain = &ch;
                 break;
             }
@@ -1710,13 +1790,57 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     int cw = w, ch = h;
 
+    // Temporal models: frame counts per model step (conf override, else the
+    // onnx input shape). One temporal step per chain.
+    std::vector<int> model_frames(chain->models.size(), 1);
+    int n_temporal = 0;
+    for (size_t mi = 0; mi < chain->models.size(); mi++) {
+        const auto &m = chain->models[mi];
+        if (m.name.empty())
+            continue;
+        AjiOnnxInput oin;
+        const bool have = read_onnx_input(c, m.name, &oin);
+        int t = have ? aji_onnx_temporal_frames(oin) : 1;
+        if (m.frames > 0)
+            t = m.frames;
+        model_frames[mi] = t;
+        if (t <= 1)
+            continue;
+        if (t % 2 == 0 || t > AJI_TEMPORAL_MAX) {
+            c->set_error("%s: temporal models need an odd frame count up to "
+                         "%d (got %d)", m.name.c_str(), AJI_TEMPORAL_MAX, t);
+            finalize_log(c);
+            return AJI_ERR_CONF;
+        }
+        if (have && oin.dims.size() == 5) {
+            c->set_error("%s: the DirectML backend needs a 4-D [1, T*3, H, W] "
+                         "temporal model input (export with wrap_5d_to_4d)",
+                         m.name.c_str());
+            finalize_log(c);
+            return AJI_ERR_CONF;
+        }
+        n_temporal++;
+    }
+    if (n_temporal > 1) {
+        c->set_error("chain %d has %d temporal models; at most one is "
+                     "supported", chain->index, n_temporal);
+        finalize_log(c);
+        return AJI_ERR_CONF;
+    }
+    // RIFE-first would feed interpolated frames into the temporal model's
+    // window; interpolate the upscaled frames instead.
+    const bool rife_before = chain->rife_before_upscale && n_temporal == 0;
+    if (chain->rife && chain->rife_before_upscale && n_temporal)
+        c->log_steps.push_back("RIFE before upscale is not supported with a "
+                               "temporal model; interpolating after upscale");
+
     // Pre-RIFE downscale: in rife-first mode, hoist the FIRST model's explicit
     // "resize before upscale" ahead of RIFE so interpolation runs on the
     // smaller frame (order: resize -> RIFE -> upscale). The filter applies it
     // to source frames via aji_resize; the upscale chain then starts here at
     // the work resolution. Rife-after and no-RIFE paths are unaffected.
     const bool rife_first_mode = chain->rife && !c->rife_model_dir.empty() &&
-                                 chain->rife_before_upscale;
+                                 rife_before;
     if (rife_first_mode && !chain->models.empty()) {
         int ww, wh;
         if (first_resize_target(chain->models[0], w, h, &ww, &wh)) {
@@ -1789,26 +1913,68 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         if (m.name.empty())
             continue;
 
+        // Temporal models open at the input padded to mod 32: the exported
+        // graphs only accept their alignment (TFDAT: 8-32 by scale), and the
+        // output is cropped back.
+        const int t = model_frames[mi];
+        const int bw = t > 1 ? (cw + 31) / 32 * 32 : cw;
+        const int bh = t > 1 ? (ch + 31) / 32 * 32 : ch;
         DmlModel dm;
         const std::string onnx = c->model_dir + "\\" + m.name + ".onnx";
-        if (!model_open(c, &dm, onnx, cw, ch, 3)) {
+        if (!model_open(c, &dm, onnx, bw, bh, 3 * t)) {
             model_release(&dm);
             finalize_log(c);
             return AJI_ERR_ENGINE;
         }
-        cw = dm.out_w;
-        ch = dm.out_h;
-        c->models.push_back(std::move(dm));
         Step st;
-        st.kind = Step::MODEL;
+        st.model_idx = (int)c->models.size();
+        if (t > 1) {
+            auto &T = c->temporal;
+            const int sx = dm.out_w / bw, sy = dm.out_h / bh;
+            if (sx < 1 || sy < 1 || dm.out_w != sx * bw ||
+                dm.out_h != sy * bh) {
+                c->set_error("%s: output %dx%d is not an integer scale of the "
+                             "input %dx%d", m.name.c_str(), dm.out_w,
+                             dm.out_h, bw, bh);
+                model_release(&dm);
+                finalize_log(c);
+                return AJI_ERR_ENGINE;
+            }
+            T.t = t;
+            T.r = (t - 1) / 2;
+            T.w = cw; T.h = ch;
+            T.pw = bw; T.ph = bh;
+            T.pow = dm.out_w; T.poh = dm.out_h;
+            T.ow = cw * sx; T.oh = ch * sy;
+            T.fp16 = dm.fp16;
+            T.threshold = (float)m.temporal_scene_threshold;
+            T.step_idx = c->steps.size();
+            st.kind = Step::TEMPORAL;
+            cw = T.ow;
+            ch = T.oh;
+            if (T.threshold > 0)
+                snprintf(buf, sizeof(buf),
+                         "Applied Temporal Model: %s (%d frames, scene "
+                         "threshold %g);    New Video Resolution: %dx%d",
+                         m.name.c_str(), t, T.threshold, cw, ch);
+            else
+                snprintf(buf, sizeof(buf),
+                         "Applied Temporal Model: %s (%d frames);    "
+                         "New Video Resolution: %dx%d",
+                         m.name.c_str(), t, cw, ch);
+        } else {
+            st.kind = Step::MODEL;
+            cw = dm.out_w;
+            ch = dm.out_h;
+            snprintf(buf, sizeof(buf),
+                     "Applied Model: %s;    New Video Resolution: %dx%d",
+                     m.name.c_str(), cw, ch);
+        }
+        c->models.push_back(std::move(dm));
         st.out_w = cw;
         st.out_h = ch;
-        st.model_idx = (int)c->models.size() - 1;
         c->steps.push_back(std::move(st));
         any_model = true;
-        snprintf(buf, sizeof(buf),
-                 "Applied Model: %s;    New Video Resolution: %dx%d",
-                 m.name.c_str(), cw, ch);
         c->log_steps.push_back(buf);
     }
 
@@ -1819,13 +1985,13 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             // frame. The default (rife-after) interpolates the already-upscaled
             // frames (cw, ch). aji_infer_rife validates its inputs against these
             // configured dims either way.
-            const int rw = chain->rife_before_upscale ? rife_in_w : cw;
-            const int rh = chain->rife_before_upscale ? rife_in_h : ch;
-            if (!setup_rife(c, chain, rw, rh, fps)) {
+            const int rw = rife_before ? rife_in_w : cw;
+            const int rh = rife_before ? rife_in_h : ch;
+            if (!setup_rife(c, chain, rw, rh, fps, rife_before)) {
                 finalize_log(c);
                 return AJI_ERR_ENGINE;
             }
-            c->rife.before_upscale = chain->rife_before_upscale;
+            c->rife.before_upscale = rife_before;
         } else {
             c->log_steps.push_back(
                 "RIFE requested by the chain but no rife model dir is "
@@ -1854,7 +2020,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             Step &st = c->steps[i];
             st.in_buf = cur;
             st.elem16_in = elem16;
-            if (st.kind == Step::MODEL) {
+            if (st.kind != Step::RESIZE) {
                 DmlModel &m = c->models[st.model_idx];
                 if (m.fp16 != elem16) {
                     c->set_error("mixed fp16/fp32 models in one chain are "
@@ -1866,7 +2032,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                 // a resize feeding a model adopts that model's IO type
                 bool next16 = elem16;
                 for (size_t j = i + 1; j < c->steps.size(); j++) {
-                    if (c->steps[j].kind == Step::MODEL) {
+                    if (c->steps[j].kind != Step::RESIZE) {
                         next16 = c->models[c->steps[j].model_idx].fp16;
                         break;
                     }
@@ -1908,6 +2074,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         if (!model_bind(c, &c->models[st.model_idx], st.in_buf))
             return AJI_ERR_ENGINE;
     }
+    if (c->temporal.t > 1 && !setup_temporal(c))
+        return AJI_ERR_ENGINE;
 
     // In hoist mode the filter downscales source -> work via aji_resize and
     // feeds work-res frames to the upscale chain, so the chain's input geometry
@@ -1922,57 +2090,55 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     return 1;
 }
 
-extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
-                                    const aji_frame *out, void *cu_stream)
+// Frame format checks shared by aji_infer and the temporal calls. RGB10 (a
+// hwuploaded 4:4:4 source) round-trips as full-res RGB; 4:2:0 stays 4:2:0.
+static int check_in_frame(aji_ctx *c, const aji_frame *in)
 {
-    (void)cu_stream;
-    if (!c || !in || !out)
-        return AJI_ERR;
-    if (!c->active) {
-        c->set_error("aji_infer without an active configuration");
-        return AJI_ERR;
-    }
     if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
         in->format != AJI_FMT_RGB10A2) {
         c->set_error("unsupported input format %d", in->format);
         return AJI_ERR_FORMAT;
     }
-    // RGB10 (a hwuploaded 4:4:4 source) round-trips as full-res RGB; 4:2:0
-    // stays 4:2:0. Either way the post path assumes in == out.
-    if (out->format != in->format) {
+    if (in->width != c->in_w || in->height != c->in_h) {
+        c->set_error("input dims %dx%d do not match configured %dx%d",
+                     in->width, in->height, c->in_w, c->in_h);
+        return AJI_ERR_SHAPE;
+    }
+    return AJI_OK;
+}
+
+static int check_out_frame(aji_ctx *c, const aji_frame *out, int in_format)
+{
+    // the post path assumes out format == in format
+    if (out->format != in_format) {
         c->set_error("output format must match input");
         return AJI_ERR_FORMAT;
     }
-    if (in->width != c->in_w || in->height != c->in_h ||
-        out->width != c->out_w || out->height != c->out_h) {
-        c->set_error("frame dims %dx%d->%dx%d do not match configured "
-                     "%dx%d->%dx%d", in->width, in->height, out->width,
-                     out->height, c->in_w, c->in_h, c->out_w, c->out_h);
+    if (out->width != c->out_w || out->height != c->out_h) {
+        c->set_error("output dims %dx%d do not match configured %dx%d",
+                     out->width, out->height, c->out_w, c->out_h);
         return AJI_ERR_SHAPE;
     }
+    return AJI_OK;
+}
 
-    if (FAILED(c->dev->GetDeviceRemovedReason())) {
-        diagnose_device(c, "aji_infer entry");
-        return AJI_ERR;
-    }
-    // Pipelined: everything below only submits; the end-of-frame marker
-    // (queued by the guard on every exit) is what callers gate on via
-    // aji_flush/aji_done/aji_wait before consuming the output texture.
-    DoneGuard done_guard{c};
-
+// Source frame -> RGB tensor in buf[0]: plane staging + pre/post plans
+// (built lazily per format/dims), the D3D11 -> D3D12 input handoff, the
+// texture copies and the pre kernels. Submits.
+static int run_pre(aji_ctx *c, const aji_frame *in)
+{
     // RGB10 round-trips as a single 4-byte packed plane (no chroma, no
-    // matrix); NV12 luma is 1 byte, P010 2. out == in (checked above).
+    // matrix); NV12 luma is 1 byte, P010 2. out == in format.
     const bool in_rgb = in->format == AJI_FMT_RGB10A2;
-    const int in_bpp = in_rgb ? 4 : (in->format == AJI_FMT_P010 ? 2 : 1);
-    const int out_bpp = in_bpp;
+    const int bpp = in_rgb ? 4 : (in->format == AJI_FMT_P010 ? 2 : 1);
     const aji_csp csp =
         aji_resample::make_csp(in->format, in->matrix, in->range);
 
     // (re)build staging + plans on format/dim changes
     const int skey[3] = {in->format, in->width, in->height};
     if (memcmp(skey, c->stage_key, sizeof(skey)) != 0) {
-        c->in_pitch = align256((uint32_t)(in->width * in_bpp));
-        c->out_pitch = align256((uint32_t)(out->width * out_bpp));
+        c->in_pitch = align256((uint32_t)(in->width * bpp));
+        c->out_pitch = align256((uint32_t)(c->out_w * bpp));
         c->in_y = make_buffer(c->dev.Get(),
                               (uint64_t)c->in_pitch * in->height, false);
         // RGB input is a single packed plane; no chroma plane buffer.
@@ -1981,10 +2147,10 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
                                         (uint64_t)c->in_pitch * (in->height / 2),
                                         false);
         c->out_y = make_buffer(c->dev.Get(),
-                               (uint64_t)c->out_pitch * out->height, false);
+                               (uint64_t)c->out_pitch * c->out_h, false);
         c->out_uv = in_rgb ? nullptr
                            : make_buffer(c->dev.Get(),
-                                         (uint64_t)c->out_pitch * (out->height / 2),
+                                         (uint64_t)c->out_pitch * (c->out_h / 2),
                                          false);
         if (!c->in_y || !c->out_y || (!in_rgb && (!c->in_uv || !c->out_uv))) {
             c->set_error("plane staging allocation failed");
@@ -2003,9 +2169,9 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         memcpy(c->pre_key, pkey, sizeof(pkey));
     }
     // the reference pipeline's final 4:2:0 subsample is always LEFT-sited
-    const int qkey[4] = {out->format, c->out_w, c->out_h, AJI_SITING_LEFT};
+    const int qkey[4] = {in->format, c->out_w, c->out_h, AJI_SITING_LEFT};
     if (!c->post_plan || memcmp(qkey, c->post_key, sizeof(qkey)) != 0) {
-        c->post_plan = post_plan_create(c, out->format, c->out_w, c->out_h,
+        c->post_plan = post_plan_create(c, in->format, c->out_w, c->out_h,
                                         AJI_SITING_LEFT, AJI_FILTER_SPLINE36);
         if (!c->post_plan) {
             c->set_error("post plan allocation failed");
@@ -2015,11 +2181,9 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     }
 
     ID3D12Resource *in_tex = open_shared(c, in->plane[0]);
-    ID3D12Resource *out_tex = open_shared(c, out->plane[0]);
-    if (!in_tex || !out_tex)
+    if (!in_tex)
         return AJI_ERR;
     const UINT in_sub = (UINT)(intptr_t)in->plane[1];
-    const UINT out_sub = (UINT)(intptr_t)out->plane[1];
 
     // input-ready handoff: D3D11's queued work (the caller's copy into
     // the input texture) must land before our queue reads it
@@ -2085,9 +2249,16 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     }
     if (!r.exec())
         return AJI_ERR;
+    return AJI_OK;
+}
 
-    int cur = 0;
-    for (Step &st : c->steps) {
+// Run steps [first, last) over the ping-pong buffers; *cur tracks the
+// buffer holding the current tensor.
+static int run_steps(aji_ctx *c, size_t first, size_t last, int *cur)
+{
+    Recorder r{c};
+    for (size_t i = first; i < last; i++) {
+        Step &st = c->steps[i];
         if (st.kind == Step::MODEL) {
             DmlModel &m = c->models[st.model_idx];
             if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
@@ -2095,15 +2266,30 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
                 return AJI_ERR_ENGINE;
         } else {
             if (!r.begin() ||
-                !record_resize(c, r, st.plan.get(), c->buf[cur].Get(),
-                               c->buf[cur ^ 1].Get(), st.elem16_in,
+                !record_resize(c, r, st.plan.get(), c->buf[*cur].Get(),
+                               c->buf[*cur ^ 1].Get(), st.elem16_in,
                                st.elem16_out) ||
                 !r.exec())
                 return AJI_ERR;
         }
-        cur ^= 1;
+        *cur ^= 1;
     }
+    return AJI_OK;
+}
 
+// RGB tensor in buf[cur] -> the output texture, in the source's colorimetry
+// (format/matrix/range). Submits.
+static int run_post(aji_ctx *c, int format, int matrix, int range, int cur,
+                    const aji_frame *out)
+{
+    const bool in_rgb = format == AJI_FMT_RGB10A2;
+    const aji_csp csp = aji_resample::make_csp(format, matrix, range);
+    ID3D12Resource *out_tex = open_shared(c, out->plane[0]);
+    if (!out_tex)
+        return AJI_ERR;
+    const UINT out_sub = (UINT)(intptr_t)out->plane[1];
+
+    Recorder r{c};
     if (!r.begin())
         return AJI_ERR;
     if (in_rgb) {
@@ -2159,10 +2345,251 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     }
     if (!r.exec())
         return AJI_ERR;
+    return AJI_OK;
+}
 
+extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
+                                    const aji_frame *out, void *cu_stream)
+{
+    (void)cu_stream;
+    if (!c || !in || !out)
+        return AJI_ERR;
+    if (!c->active) {
+        c->set_error("aji_infer without an active configuration");
+        return AJI_ERR;
+    }
+    if (c->temporal.enabled) {
+        c->set_error("the active chain has a temporal model: use "
+                     "aji_ingest + aji_infer_seq");
+        return AJI_ERR;
+    }
+    int err = check_in_frame(c, in);
+    if (err == AJI_OK)
+        err = check_out_frame(c, out, in->format);
+    if (err != AJI_OK)
+        return err;
+
+    if (FAILED(c->dev->GetDeviceRemovedReason())) {
+        diagnose_device(c, "aji_infer entry");
+        return AJI_ERR;
+    }
+    // Pipelined: everything below only submits; the end-of-frame marker
+    // (queued by the guard on every exit) is what callers gate on via
+    // aji_flush/aji_done/aji_wait before consuming the output texture.
+    DoneGuard done_guard{c};
+
+    int cur = 0;
+    err = run_pre(c, in);
+    if (err == AJI_OK)
+        err = run_steps(c, 0, c->steps.size(), &cur);
+    if (err == AJI_OK)
+        err = run_post(c, in->format, in->matrix, in->range, cur, out);
     // No CPU wait: the guard queues this frame's end-of-frame marker and
     // the caller synchronizes through the ticket API.
+    return err;
+}
+
+/* ---------------- temporal (multi-frame) models ---------------- */
+
+extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
+{
+    return (c && c->active && c->temporal.enabled) ? c->temporal.r : 0;
+}
+
+extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
+{
+    if (c && c->temporal.enabled)
+        std::fill(c->temporal.seq.begin(), c->temporal.seq.end(), -1);
+}
+
+static int temporal_slot(aji_ctx *c, int64_t seq)
+{
+    auto &T = c->temporal;
+    if (seq < 0)
+        return -1;
+    const int slot = (int)(seq % T.nslots);
+    return T.seq[slot] == seq ? slot : -1;
+}
+
+extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
+                                     uint64_t seq, void *cu_stream)
+{
+    (void)cu_stream;
+    if (!c || !in)
+        return AJI_ERR;
+    auto &T = c->temporal;
+    if (!c->active || !T.enabled) {
+        c->set_error("aji_ingest without an active temporal configuration");
+        return AJI_ERR;
+    }
+    if (seq > (uint64_t)INT64_MAX)
+        return AJI_ERR;
+    int err = check_in_frame(c, in);
+    if (err != AJI_OK)
+        return err;
+    if (temporal_slot(c, (int64_t)seq) >= 0)
+        return AJI_OK;  // already held
+    if (FAILED(c->dev->GetDeviceRemovedReason())) {
+        diagnose_device(c, "aji_ingest entry");
+        return AJI_ERR;
+    }
+    DoneGuard done_guard{c};
+
+    // the steps before the temporal model, once per source frame
+    int cur = 0;
+    err = run_pre(c, in);
+    if (err == AJI_OK)
+        err = run_steps(c, 0, T.step_idx, &cur);
+    if (err != AJI_OK)
+        return err;
+
+    const int slot = (int)(seq % (uint64_t)T.nslots);
+    const uint32_t elem = T.fp16 ? 2u : 4u;
+    const uint32_t row = (uint32_t)T.w * elem;
+    const uint32_t frame_elems = 3u * (uint32_t)T.w * (uint32_t)T.h;
+    Recorder r{c};
+    if (!r.begin() ||
+        !record_window(c, r, c->buf[cur].Get(), 0, row, T.ring.Get(),
+                       (uint32_t)slot * frame_elems * elem, row, row,
+                       3u * (uint32_t)T.h))
+        return AJI_ERR;
+    r.uav_barrier();
+    // scene-change metric against the previous frame, if held
+    const int prev = temporal_slot(c, (int64_t)seq - 1);
+    if (prev >= 0) {
+        KernArgs a = {};
+        a.di[0] = T.w;
+        a.di[1] = T.h;
+        a.di[2] = (T.w + 31) / 32;
+        a.dj[0] = (int)((uint32_t)prev * frame_elems);
+        a.dj[1] = (int)((uint32_t)slot * frame_elems);
+        if (!r.dispatch(K_RGB_DIFF_PARTIAL, false, T.fp16, a, NULL, NULL,
+                        T.ring.Get(), NULL, T.part.Get(), T.w, T.h, 1))
+            return AJI_ERR;
+        r.uav_barrier();
+        KernArgs f = {};
+        f.di[0] = T.part_groups;
+        f.dj[0] = slot;
+        if (!r.dispatch(K_SCD_FINAL, false, false, f, NULL, NULL,
+                        T.part.Get(), T.diff.Get(), NULL, 32, 1, 1))
+            return AJI_ERR;
+    } else if (!record_fill(c, r, T.diff.Get(), (uint32_t)slot, 1, 0)) {
+        return AJI_ERR;
+    }
+    r.uav_barrier();
+    if (!r.exec())
+        return AJI_ERR;
+
+    T.seq[slot] = (int64_t)seq;
+    T.format[slot] = in->format;
+    T.matrix[slot] = in->matrix;
+    T.range[slot] = in->range;
     return AJI_OK;
+}
+
+extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
+                                        const aji_frame *out, void *cu_stream)
+{
+    (void)cu_stream;
+    if (!c || !out)
+        return AJI_ERR;
+    auto &T = c->temporal;
+    if (!c->active || !T.enabled) {
+        c->set_error("aji_infer_seq without an active temporal configuration");
+        return AJI_ERR;
+    }
+    const int64_t center = (int64_t)seq;
+    const int cslot = seq > (uint64_t)INT64_MAX ? -1 : temporal_slot(c, center);
+    if (cslot < 0) {
+        c->set_error("aji_infer_seq: frame %llu was not ingested",
+                     (unsigned long long)seq);
+        return AJI_ERR;
+    }
+    int err = check_out_frame(c, out, T.format[cslot]);
+    if (err != AJI_OK)
+        return err;
+    if (FAILED(c->dev->GetDeviceRemovedReason())) {
+        diagnose_device(c, "aji_infer_seq entry");
+        return AJI_ERR;
+    }
+    DoneGuard done_guard{c};
+
+    // Window: frames that are not held take the nearest held one toward the
+    // center; a cut metric is valid only between two consecutive held
+    // frames (same rules as the TensorRT backend).
+    int slots[AJI_TEMPORAL_MAX];
+    bool held[AJI_TEMPORAL_MAX];
+    slots[T.r] = cslot;
+    held[T.r] = true;
+    for (int dir = -1; dir <= 1; dir += 2) {
+        bool clamped = false;
+        for (int k = 1; k <= T.r; k++) {
+            const int j = T.r + dir * k;
+            const int s = clamped ? -1 : temporal_slot(c, center + dir * k);
+            clamped = s < 0;
+            slots[j] = clamped ? slots[j - dir] : s;
+            held[j] = !clamped;
+        }
+    }
+    KernArgs a = {};
+    a.di[0] = T.w;
+    a.di[1] = T.h;
+    a.di[2] = T.pw;
+    a.di[3] = T.ph;
+    a.dj[0] = T.t;
+    uint32_t packed[3] = {0, 0, 0};
+    uint32_t cut_mask = 0;
+    for (int j = 0; j < T.t; j++) {
+        packed[j / 6] |= (uint32_t)slots[j] << ((j % 6) * 5);
+        if (j + 1 < T.t && held[j] && held[j + 1])
+            cut_mask |= 1u << j;
+    }
+    a.dj[1] = (int)packed[0];
+    a.dj[2] = (int)packed[1];
+    a.dj[3] = (int)packed[2];
+    a.kr = T.threshold;
+    a.kb = 1.0f / ((float)T.w * (float)T.h);
+    memcpy(&a.qdiv, &cut_mask, sizeof(cut_mask));
+
+    Recorder r{c};
+    if (!r.begin() ||
+        !r.dispatch(K_TEMPORAL_GATHER, false, T.fp16, a, NULL, NULL,
+                    T.ring.Get(), T.diff.Get(), T.in_tensor.Get(),
+                    T.fp16 ? T.pw / 2 : T.pw, T.ph, T.t))
+        return AJI_ERR;
+    r.uav_barrier();
+    if (!r.exec())
+        return AJI_ERR;
+
+    const Step &st = c->steps[T.step_idx];
+    DmlModel &m = c->models[st.model_idx];
+    if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
+                   "RunWithBinding (temporal)"))
+        return AJI_ERR_ENGINE;
+
+    // crop the padded model output into the step's output chain buffer
+    int cur = st.in_buf ^ 1;
+    const uint32_t elem = T.fp16 ? 2u : 4u;
+    const uint32_t splane = (uint32_t)T.pow * (uint32_t)T.poh * elem;
+    const uint32_t dplane = (uint32_t)T.ow * (uint32_t)T.oh * elem;
+    if (!r.begin())
+        return AJI_ERR;
+    for (uint32_t pl = 0; pl < 3; pl++) {
+        if (!record_window(c, r, T.out_tensor.Get(), pl * splane,
+                           (uint32_t)T.pow * elem, c->buf[cur].Get(),
+                           pl * dplane, (uint32_t)T.ow * elem,
+                           (uint32_t)T.ow * elem, (uint32_t)T.oh))
+            return AJI_ERR;
+    }
+    r.uav_barrier();
+    if (!r.exec())
+        return AJI_ERR;
+
+    err = run_steps(c, T.step_idx + 1, c->steps.size(), &cur);
+    if (err == AJI_OK)
+        err = run_post(c, T.format[cslot], T.matrix[cslot], T.range[cslot],
+                       cur, out);
+    return err;
 }
 
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
@@ -2736,36 +3163,6 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         return AJI_ERR;
     }
     return AJI_OK;
-}
-
-// Temporal models are TensorRT-only (aji_configure skips their chains).
-extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
-{
-    (void)c;
-    return 0;
-}
-
-extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
-                                     uint64_t seq, void *cu_stream)
-{
-    (void)in; (void)seq; (void)cu_stream;
-    if (c)
-        c->set_error("temporal models need the TensorRT backend");
-    return AJI_ERR;
-}
-
-extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
-                                        const aji_frame *out, void *cu_stream)
-{
-    (void)seq; (void)out; (void)cu_stream;
-    if (c)
-        c->set_error("temporal models need the TensorRT backend");
-    return AJI_ERR;
-}
-
-extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
-{
-    (void)c;
 }
 
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)

@@ -248,8 +248,8 @@ AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
  * is driven through aji_ingest + aji_infer_seq instead of aji_infer.
  *
  * Returns r after aji_configure(): 0 when the active chain has no temporal
- * step (use aji_infer as before). TensorRT backend only; DirectML skips
- * chains with temporal models. */
+ * step (use aji_infer as before). Both backends; DirectML needs a 4-D
+ * [1, T*3, H, W] model input. */
 AJI_EXPORT int aji_temporal_radius(aji_ctx *c);
 
 /* Add one source frame to the frame history under a caller-assigned
