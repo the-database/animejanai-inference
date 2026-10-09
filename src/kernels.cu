@@ -627,3 +627,101 @@ extern "C" int aji_scd_diff(int format, const void *ya, ptrdiff_t stride_a,
     }
     return (int)cudaGetLastError();
 }
+
+/* ---------------- temporal (multi-frame) models ---------------- */
+
+// Block-reduced sum of |a - b| over the 3 fp16 RGB planes, averaged per
+// pixel; one atomicAdd per block.
+__global__ void k_rgb_diff(const __half *a, const __half *b, int w, int h,
+                           float *accum)
+{
+    __shared__ float partial[BLOCK_X * BLOCK_Y];
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    float d = 0.0f;
+    if (x < w && y < h) {
+        const size_t plane = (size_t)w * h;
+        const size_t i = (size_t)y * w + x;
+        for (int c = 0; c < 3; c++)
+            d += fabsf(__half2float(a[c * plane + i]) -
+                       __half2float(b[c * plane + i]));
+        d *= 1.0f / 3.0f;
+    }
+    partial[tid] = d;
+    __syncthreads();
+    for (int n = BLOCK_X * BLOCK_Y / 2; n > 0; n >>= 1) {
+        if (tid < n)
+            partial[tid] += partial[tid + n];
+        __syncthreads();
+    }
+    if (tid == 0)
+        atomicAdd(accum, partial[0]);
+}
+
+extern "C" int aji_rgb_diff(const void *a_f16, const void *b_f16, int w,
+                            int h, float *accum_dev, void *stream)
+{
+    k_rgb_diff<<<GRID(w, h, 1), 0, (cudaStream_t)stream>>>(
+        (const __half *)a_f16, (const __half *)b_f16, w, h, accum_dev);
+    return (int)cudaGetLastError();
+}
+
+// Window position z reads the nearest frame on the center's side of the
+// first scene cut between it and the center, so no frame from another
+// scene reaches the model (edge replication, like a clip boundary).
+__global__ void k_temporal_gather(aji_gather_args args, int t, float thresh,
+                                  float inv_area, int w, int h, int pw,
+                                  int ph, __half *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z;
+    if (x >= pw || y >= ph)
+        return;
+
+    const int center = (t - 1) / 2;
+    int e = center;
+    if (thresh > 0.0f) {
+        if (z > center) {
+            for (int k = center; k < z; k++) {
+                const float *cut = args.cut[k];
+                if (cut && *cut * inv_area > thresh)
+                    break;
+                e = k + 1;
+            }
+        } else {
+            for (int k = center - 1; k >= z; k--) {
+                const float *cut = args.cut[k];
+                if (cut && *cut * inv_area > thresh)
+                    break;
+                e = k;
+            }
+        }
+    } else {
+        e = z;
+    }
+
+    const __half *src = (const __half *)args.src[e];
+    const int sx = min(x, w - 1);
+    const int sy = min(y, h - 1);
+    const size_t splane = (size_t)w * h;
+    const size_t dplane = (size_t)pw * ph;
+    const size_t si = (size_t)sy * w + sx;
+    const size_t di = (size_t)y * pw + x;
+    for (int c = 0; c < 3; c++)
+        dst[(size_t)(z * 3 + c) * dplane + di] = src[c * splane + si];
+}
+
+extern "C" int aji_temporal_gather(const aji_gather_args *args, int t,
+                                   float thresh, int w, int h, int pw, int ph,
+                                   void *dst_f16, void *stream)
+{
+    if (t < 1 || t > AJI_TEMPORAL_MAX || pw < w || ph < h)
+        return (int)cudaErrorInvalidValue;
+    k_temporal_gather<<<GRID(pw, ph, t), 0, (cudaStream_t)stream>>>(
+        *args, t, thresh, 1.0f / ((float)w * h), w, h, pw, ph,
+        (__half *)dst_f16);
+    return (int)cudaGetLastError();
+}

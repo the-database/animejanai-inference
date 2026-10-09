@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -45,6 +46,7 @@
 #include "aji.h"
 #include "aji_conf.h"
 #include "kernels.h"
+#include "onnx_shape.h"
 
 namespace fs = std::filesystem;
 
@@ -243,9 +245,9 @@ struct ModelEngine {
 };
 
 struct Step {
-    enum Kind { RESIZE, MODEL } kind;
+    enum Kind { RESIZE, MODEL, TEMPORAL } kind;
     int out_w, out_h;
-    int engine_idx;             // MODEL
+    int engine_idx;             // MODEL, TEMPORAL
     aji_plan *plan = nullptr;   // RESIZE
 };
 
@@ -352,6 +354,38 @@ struct aji_ctx {
     // synchronizes its previous recording first, which never blocks in
     // practice (callers queue 2-4 frames, the ring holds 8).
     static constexpr int TICK_RING = 8;
+
+    // Temporal (multi-frame) model step. Frames enter a history ring at the
+    // step's input resolution (aji_ingest runs the steps before it once per
+    // source frame); aji_infer_seq gathers the 2r+1 window into the padded
+    // model input, runs the model, crops, and runs the steps after it.
+    struct {
+        bool enabled = false;
+        int t = 1, r = 0;
+        size_t step_idx = 0;         // index of the TEMPORAL step in steps[]
+        int w = 0, h = 0;            // ring frame dims (step input)
+        int pw = 0, ph = 0;          // model input dims, padded
+        int ow = 0, oh = 0;          // step output dims, cropped
+        int pow = 0, poh = 0;        // model output dims
+        float threshold = 0.0f;
+        int nslots = 0;
+        void *ring = nullptr;        // nslots * 3*w*h fp16
+        float *diff = nullptr;       // per slot: rgb diff vs seq-1
+        std::vector<int64_t> seq;    // per slot, -1 = empty
+        std::vector<int> matrix, range;
+        void *in_tensor = nullptr;   // 3t * pw*ph fp16
+        void *out_tensor = nullptr;  // 3 * pow*poh fp16
+    } temporal;
+
+    // ONNX input frame counts, keyed by path, valid while size/mtime match
+    struct OnnxFrames {
+        uintmax_t size = 0;
+        int64_t mtime = 0;
+        int frames = 1;
+        bool rank5 = false;
+        int elem_type = 0;
+    };
+    std::map<std::string, OnnxFrames> onnx_frames;
     cudaEvent_t tick_ev[TICK_RING] = {};
     uint64_t tick_next = 1;
     uint64_t tick_completed = 0;
@@ -712,8 +746,9 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
     return true;
 }
 
+// rank5_t > 0: the input is [1, rank5_t, 3, H, W] (in_ch is then ignored).
 bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
-                 int in_w, int in_h, int in_ch = 3)
+                 int in_w, int in_h, int in_ch = 3, int rank5_t = 0)
 {
     std::vector<char> blob;
     if (!read_file_bytes(engine_path, &blob)) {
@@ -741,8 +776,16 @@ bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
         c->set_error("createExecutionContext failed");
         return false;
     }
-    if (!me->exec->setInputShape(me->in_name,
-                                 nvinfer1::Dims4{1, in_ch, in_h, in_w})) {
+    nvinfer1::Dims in_dims = nvinfer1::Dims4{1, in_ch, in_h, in_w};
+    if (rank5_t > 0) {
+        in_dims.nbDims = 5;
+        in_dims.d[0] = 1;
+        in_dims.d[1] = rank5_t;
+        in_dims.d[2] = 3;
+        in_dims.d[3] = in_h;
+        in_dims.d[4] = in_w;
+    }
+    if (!me->exec->setInputShape(me->in_name, in_dims)) {
         c->set_error("engine rejects input %dx%d (%s)", in_w, in_h,
                      engine_path.c_str());
         return false;
@@ -869,7 +912,7 @@ void start_async_build(aji_ctx *c, const BuildSpec &spec)
 int ensure_engine(aji_ctx *c, const std::string &name,
                   const std::string &settings, const std::string &epath,
                   ModelEngine *me, int w, int h, int ch,
-                  const std::string *dir = nullptr)
+                  const std::string *dir = nullptr, int rank5_t = 0)
 {
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath = short_engine_path_for(model_dir, name, settings);
@@ -880,7 +923,7 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     auto try_cached = [&](const std::string &path) -> int {
         if (!file_exists(path))
             return 0;
-        if (load_engine(c, path, me, w, h, ch))
+        if (load_engine(c, path, me, w, h, ch, rank5_t))
             return 1;
         c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
         remove_file(path);
@@ -926,7 +969,7 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     }
     if (!build_engine(c, name, settings, build_epath, dir))
         return -1;
-    return load_engine(c, build_epath, me, w, h, ch) ? 1 : -1;
+    return load_engine(c, build_epath, me, w, h, ch, rank5_t) ? 1 : -1;
 }
 
 // rife model code -> file basename: 414 -> rife_v4.14, 4141 -> _lite,
@@ -965,7 +1008,7 @@ void rife_teardown(aji_ctx *c)
 // constant input planes. Format-dependent staging builds lazily in
 // aji_infer_rife. Requires the CUDA context to be current.
 bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
-                double fps)
+                double fps, bool before_upscale)
 {
     auto &R = c->rife;
     R.w = w;
@@ -1032,7 +1075,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     // RIFE-first runs after any hoisted pre-RIFE resize but before the upscale
     // models, so its step goes right after the pre-resize line (if one was
     // pushed at index 0); the default (rife-after) appends it last.
-    if (chain->rife_before_upscale)
+    if (before_upscale)
         c->log_steps.insert(c->log_steps.begin() + (c->has_pre_resize ? 1 : 0),
                             buf);
     else
@@ -1067,6 +1110,71 @@ void finalize_log(aji_ctx *c)
     for (size_t i = 0; i < c->log_steps.size(); i++)
         out += std::to_string(i + 1) + ". " + c->log_steps[i] + "\n";
     c->current_log = out;
+}
+
+// Input frame count of <model_dir>/<name>.onnx (1 = single-frame model),
+// cached while the file's size/mtime are unchanged.
+aji_ctx::OnnxFrames onnx_frames(aji_ctx *c, const std::string &name)
+{
+    const std::string path =
+        (fs::path(c->model_dir) / (name + ".onnx")).string();
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(path, ec);
+    const int64_t mtime =
+        ec ? 0
+           : (int64_t)fs::last_write_time(path, ec).time_since_epoch().count();
+    auto it = c->onnx_frames.find(path);
+    if (it != c->onnx_frames.end() && it->second.size == size &&
+        it->second.mtime == mtime)
+        return it->second;
+
+    aji_ctx::OnnxFrames f;
+    f.size = size;
+    f.mtime = mtime;
+    std::vector<char> blob;
+    AjiOnnxInput in;
+    if (read_file_bytes(path, &blob) &&
+        aji_onnx_input(blob.data(), blob.size(), &in)) {
+        f.frames = aji_onnx_temporal_frames(in);
+        f.rank5 = in.dims.size() == 5;
+        f.elem_type = in.elem_type;
+    }
+    c->onnx_frames[path] = f;
+    return f;
+}
+
+void temporal_teardown(aji_ctx *c)
+{
+    auto &T = c->temporal;
+    cudaFree(T.ring);
+    cudaFree(T.diff);
+    cudaFree(T.in_tensor);
+    cudaFree(T.out_tensor);
+    T = {};
+}
+
+// Allocate the history ring and model tensors for the configured temporal
+// step. Requires the CUDA context to be current.
+bool setup_temporal(aji_ctx *c)
+{
+    auto &T = c->temporal;
+    T.nslots = T.t + 4;
+    const size_t frame = (size_t)3 * T.w * T.h * 2;
+    if (cudaMalloc(&T.ring, frame * T.nslots) != cudaSuccess ||
+        cudaMalloc((void **)&T.diff, sizeof(float) * T.nslots) != cudaSuccess ||
+        cudaMalloc(&T.in_tensor, (size_t)3 * T.t * T.pw * T.ph * 2) !=
+            cudaSuccess ||
+        cudaMalloc(&T.out_tensor, (size_t)3 * T.pow * T.poh * 2) !=
+            cudaSuccess) {
+        c->set_error("temporal buffer allocation failed");
+        return false;
+    }
+    cudaMemset(T.diff, 0, sizeof(float) * T.nslots);
+    T.seq.assign(T.nslots, -1);
+    T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
+    T.range.assign(T.nslots, AJI_RANGE_LIMITED);
+    T.enabled = true;
+    return true;
 }
 
 std::string fmt_num(double v)
@@ -1220,6 +1328,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     c->pre_src_w = c->pre_src_h = 0;
     c->work_w = c->work_h = 0;
     rife_teardown(c);
+    temporal_teardown(c);
     if (c->graph_exec) {
         cudaGraphExecDestroy(c->graph_exec);
         c->graph_exec = nullptr;
@@ -1292,13 +1401,55 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     int cw = w, ch = h;
 
+    // Temporal models: frame counts per model step (conf override, else the
+    // onnx input shape). One temporal step per chain.
+    std::vector<aji_ctx::OnnxFrames> model_frames(chain->models.size());
+    int n_temporal = 0;
+    for (size_t mi = 0; mi < chain->models.size(); mi++) {
+        const auto &m = chain->models[mi];
+        if (m.name.empty())
+            continue;
+        model_frames[mi] = onnx_frames(c, m.name);
+        if (m.frames > 0)
+            model_frames[mi].frames = m.frames;
+        const int t = model_frames[mi].frames;
+        if (t <= 1)
+            continue;
+        if (t % 2 == 0 || t > AJI_TEMPORAL_MAX) {
+            c->set_error("%s: temporal models need an odd frame count up to "
+                         "%d (got %d)", m.name.c_str(), AJI_TEMPORAL_MAX, t);
+            finalize_log(c);
+            return AJI_ERR_CONF;
+        }
+        if (model_frames[mi].elem_type == 1 /* FLOAT */) {
+            c->set_error("%s: model input is fp32; temporal models need fp16 "
+                         "I/O (traiNNer-redux convert_to_onnx: io_dtype: fp16)",
+                         m.name.c_str());
+            finalize_log(c);
+            return AJI_ERR_CONF;
+        }
+        n_temporal++;
+    }
+    if (n_temporal > 1) {
+        c->set_error("chain %d has %d temporal models; at most one is "
+                     "supported", chain->index, n_temporal);
+        finalize_log(c);
+        return AJI_ERR_CONF;
+    }
+    // RIFE-first would feed interpolated frames into the temporal model's
+    // window; interpolate the upscaled frames instead.
+    const bool rife_before = chain->rife_before_upscale && n_temporal == 0;
+    if (chain->rife && chain->rife_before_upscale && n_temporal)
+        c->log_steps.push_back("RIFE before upscale is not supported with a "
+                               "temporal model; interpolating after upscale");
+
     // Pre-RIFE downscale: in rife-first mode, hoist the FIRST model's explicit
     // "resize before upscale" ahead of RIFE so interpolation runs on the
     // smaller frame (order: resize -> RIFE -> upscale). The filter applies it
     // to source frames via aji_resize; the upscale chain then starts here at
     // the work resolution. Rife-after and no-RIFE paths are unaffected.
     const bool rife_first_mode = chain->rife && !c->rife_model_dir.empty() &&
-                                 chain->rife_before_upscale;
+                                 rife_before;
     if (rife_first_mode && !chain->models.empty()) {
         int ww, wh;
         if (first_resize_target(chain->models[0], w, h, &ww, &wh)) {
@@ -1394,16 +1545,29 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         if (m.name.empty())
             continue;
 
-        char dims[48];
-        snprintf(dims, sizeof(dims), "1x3x%dx%d", ch, cw);
+        // Temporal models are built static at the input padded to mod 32:
+        // the exported graphs only accept their alignment (TFDAT: 8-32 by
+        // scale), and the output is cropped back.
+        const int t = model_frames[mi].frames;
+        const bool rank5 = t > 1 && model_frames[mi].rank5;
+        const int bw = t > 1 ? (cw + 31) / 32 * 32 : cw;
+        const int bh = t > 1 ? (ch + 31) / 32 * 32 : ch;
+        char dims[64];
+        if (rank5)
+            snprintf(dims, sizeof(dims), "1x%dx3x%dx%d", t, bh, bw);
+        else
+            snprintf(dims, sizeof(dims), "1x%dx%dx%d", 3 * t, bh, bw);
         std::string settings = settings_tpl;
+        if (t > 1 && settings.find("%video_resolution%") == std::string::npos)
+            settings = DEFAULT_TRT_ENGINE_SETTINGS;  // custom 1x3 shapes
         size_t pos;
         while ((pos = settings.find("%video_resolution%")) != std::string::npos)
             settings.replace(pos, strlen("%video_resolution%"), dims);
 
         const std::string epath = engine_path_for(c->model_dir, m.name, settings);
         ModelEngine me;
-        int er = ensure_engine(c, m.name, settings, epath, &me, cw, ch, 3);
+        int er = ensure_engine(c, m.name, settings, epath, &me, bw, bh, 3 * t,
+                               nullptr, rank5 ? t : 0);
         if (er < 0) {
             finalize_log(c);
             return AJI_ERR_ENGINE;
@@ -1416,13 +1580,50 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             if (out_h) *out_h = h;
             return 0;
         }
-        cw = me.out_w; ch = me.out_h;
-        c->engines.push_back(std::move(me));
-        c->steps.push_back({Step::MODEL, cw, ch, (int)c->engines.size() - 1});
+        if (t > 1) {
+            auto &T = c->temporal;
+            const int sx = me.out_w / bw, sy = me.out_h / bh;
+            if (sx < 1 || sy < 1 || me.out_w != sx * bw ||
+                me.out_h != sy * bh) {
+                c->set_error("%s: output %dx%d is not an integer scale of the "
+                             "input %dx%d", m.name.c_str(), me.out_w,
+                             me.out_h, bw, bh);
+                finalize_log(c);
+                return AJI_ERR_ENGINE;
+            }
+            T.t = t;
+            T.r = (t - 1) / 2;
+            T.w = cw; T.h = ch;
+            T.pw = bw; T.ph = bh;
+            T.pow = me.out_w; T.poh = me.out_h;
+            T.ow = cw * sx; T.oh = ch * sy;
+            T.threshold = (float)m.temporal_scene_threshold;
+            T.step_idx = c->steps.size();
+            c->engines.push_back(std::move(me));
+            c->steps.push_back({Step::TEMPORAL, T.ow, T.oh,
+                                (int)c->engines.size() - 1});
+            max_bytes = std::max(max_bytes, (size_t)3 * T.ow * T.oh * 2);
+            cw = T.ow; ch = T.oh;
+            if (T.threshold > 0)
+                snprintf(buf, sizeof(buf),
+                         "Applied Temporal Model: %s (%d frames, scene "
+                         "threshold %g);    New Video Resolution: %dx%d",
+                         m.name.c_str(), t, T.threshold, cw, ch);
+            else
+                snprintf(buf, sizeof(buf),
+                         "Applied Temporal Model: %s (%d frames);    "
+                         "New Video Resolution: %dx%d",
+                         m.name.c_str(), t, cw, ch);
+        } else {
+            cw = me.out_w; ch = me.out_h;
+            c->engines.push_back(std::move(me));
+            c->steps.push_back({Step::MODEL, cw, ch,
+                                (int)c->engines.size() - 1});
+            snprintf(buf, sizeof(buf),
+                     "Applied Model: %s;    New Video Resolution: %dx%d",
+                     m.name.c_str(), cw, ch);
+        }
         any_model = true;
-        snprintf(buf, sizeof(buf),
-                 "Applied Model: %s;    New Video Resolution: %dx%d",
-                 m.name.c_str(), cw, ch);
         c->log_steps.push_back(buf);
         max_bytes = std::max(max_bytes, (size_t)3 * cw * ch * 2);
     }
@@ -1434,13 +1635,13 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             // frame. The default (rife-after) interpolates the already-upscaled
             // frames (cw, ch). aji_infer_rife validates its inputs against these
             // configured dims either way.
-            const int rw = chain->rife_before_upscale ? rife_in_w : cw;
-            const int rh = chain->rife_before_upscale ? rife_in_h : ch;
-            if (!setup_rife(c, chain, rw, rh, fps)) {
+            const int rw = rife_before ? rife_in_w : cw;
+            const int rh = rife_before ? rife_in_h : ch;
+            if (!setup_rife(c, chain, rw, rh, fps, rife_before)) {
                 finalize_log(c);
                 return AJI_ERR_ENGINE;
             }
-            c->rife.before_upscale = chain->rife_before_upscale;
+            c->rife.before_upscale = rife_before;
         } else {
             c->log_steps.push_back(
                 "RIFE requested by the chain but no rife model dir is "
@@ -1459,6 +1660,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     }
 
     if (!ensure_buffers(c, max_bytes))
+        return AJI_ERR_CUDA;
+    if (c->temporal.t > 1 && !setup_temporal(c))
         return AJI_ERR_CUDA;
 
     // In hoist mode the filter downscales source -> work via aji_resize and
@@ -1623,6 +1826,11 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         c->set_error("aji_infer without an active configuration");
         return AJI_ERR;
     }
+    if (c->temporal.enabled) {
+        c->set_error("the active chain has a temporal model: use "
+                     "aji_ingest + aji_infer_seq");
+        return AJI_ERR;
+    }
     if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
         !aji_format_is_444(in->format)) {
         c->set_error("unsupported input format %d", in->format);
@@ -1661,13 +1869,9 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
     return run_chain(c, in, out, stream);
 }
 
-// The chain body: pre -> (model/resize steps) -> post, launched on `stream`
-// against whatever plane pointers the frame descriptors carry (real frames
-// on the plain path, stable staging buffers on the graph path). Everything
-// in here must be capture-safe once warm: allocations only happen on plan
-// key changes, which a warmup run performs before any capture.
-static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
-                     cudaStream_t stream)
+// Source frame -> fp16 NCHW RGB in dst (the chain's first buffer).
+static int run_pre(aji_ctx *c, const aji_frame *in, void *dst,
+                   cudaStream_t stream)
 {
     const aji_csp csp = make_csp(in);
 
@@ -1689,67 +1893,64 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
         }
     }
 
-    int cur = 0;
     int err = in444
         ? aji_run_pre444(in->width, in->height, in->plane[0], in->stride[0],
                          in->plane[1], in->stride[1], in->plane[2],
-                         in->stride[2], &csp, c->buf[cur], stream)
+                         in->stride[2], &csp, dst, stream)
         : aji_run_pre(c->pre_plan, in->plane[0], in->stride[0],
-                      in->plane[1], in->stride[1], &csp, c->buf[cur], stream);
+                      in->plane[1], in->stride[1], &csp, dst, stream);
     if (err) {
         c->set_error("pre-kernel failed: %s", cudaGetErrorString((cudaError_t)err));
         return AJI_ERR_CUDA;
     }
+    return AJI_OK;
+}
 
-    int cw = in->width, ch = in->height;
-
-    if (!c->conf_mode) {
-        ModelEngine &me = c->direct;
-        if (!me.exec->setTensorAddress(me.in_name, c->buf[cur]) ||
-            !me.exec->setTensorAddress(me.out_name, c->buf[cur ^ 1])) {
-            c->set_error("setTensorAddress failed");
-            return AJI_ERR_ENGINE;
-        }
-        if (!me.exec->enqueueV3(stream)) {
-            c->set_error("enqueueV3 failed");
-            return AJI_ERR_ENGINE;
-        }
-        cur ^= 1;
-        cw = c->out_w; ch = c->out_h;
-    } else {
-        for (const Step &st : c->steps) {
-            if (st.kind == Step::RESIZE) {
-                err = aji_run_resize(st.plan, c->buf[cur], c->buf[cur ^ 1],
+// Run steps [first, last) over the ping-pong buffers, starting in buf[*cur];
+// *cur/*cw/*ch track the current buffer and dims.
+static int run_steps(aji_ctx *c, size_t first, size_t last, int *cur,
+                     int *cw, int *ch, cudaStream_t stream)
+{
+    for (size_t i = first; i < last; i++) {
+        const Step &st = c->steps[i];
+        if (st.kind == Step::RESIZE) {
+            int err = aji_run_resize(st.plan, c->buf[*cur], c->buf[*cur ^ 1],
                                      stream);
-                if (err) {
-                    c->set_error("resize kernel failed: %s",
-                                 cudaGetErrorString((cudaError_t)err));
-                    return AJI_ERR_CUDA;
-                }
-            } else {
-                ModelEngine &me = c->engines[st.engine_idx];
-                if (!me.exec->setTensorAddress(me.in_name, c->buf[cur]) ||
-                    !me.exec->setTensorAddress(me.out_name, c->buf[cur ^ 1])) {
-                    c->set_error("setTensorAddress failed");
-                    return AJI_ERR_ENGINE;
-                }
-                if (!me.exec->enqueueV3(stream)) {
-                    c->set_error("enqueueV3 failed");
-                    return AJI_ERR_ENGINE;
-                }
+            if (err) {
+                c->set_error("resize kernel failed: %s",
+                             cudaGetErrorString((cudaError_t)err));
+                return AJI_ERR_CUDA;
             }
-            cur ^= 1;
-            cw = st.out_w; ch = st.out_h;
+        } else {
+            ModelEngine &me = c->engines[st.engine_idx];
+            if (!me.exec->setTensorAddress(me.in_name, c->buf[*cur]) ||
+                !me.exec->setTensorAddress(me.out_name, c->buf[*cur ^ 1])) {
+                c->set_error("setTensorAddress failed");
+                return AJI_ERR_ENGINE;
+            }
+            if (!me.exec->enqueueV3(stream)) {
+                c->set_error("enqueueV3 failed");
+                return AJI_ERR_ENGINE;
+            }
         }
+        *cur ^= 1;
+        *cw = st.out_w;
+        *ch = st.out_h;
     }
+    return AJI_OK;
+}
 
+// fp16 NCHW RGB (cw x ch) in src -> the output frame, in the source's
+// matrix/range.
+static int run_post(aji_ctx *c, int matrix, int range, const void *src,
+                    int cw, int ch, const aji_frame *out, cudaStream_t stream)
+{
     if (aji_format_is_444(out->format)) {
         // full-resolution chroma: pure matrix + output-depth quantize, no
         // resampling and no plan (this exceeds the reference pipeline,
         // which always subsampled back to 4:2:0)
-        const aji_csp ocsp = aji_make_csp(out->format, in->matrix,
-                                          in->range);
-        int err4 = aji_run_post444(out->format, cw, ch, c->buf[cur], &ocsp,
+        const aji_csp ocsp = aji_make_csp(out->format, matrix, range);
+        int err4 = aji_run_post444(out->format, cw, ch, src, &ocsp,
                                    out->plane[0], out->stride[0],
                                    out->plane[1], out->stride[1],
                                    out->plane[2], out->stride[2], stream);
@@ -1780,17 +1981,252 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
     }
 
     // Quantize to the OUTPUT format's depth/range (NV12 8-bit vs P010 10-bit),
-    // not the input's — `csp` above is the input format's, used by the pre
-    // kernel. Same matrix/range as the input (the model preserves them).
-    const aji_csp ocsp = aji_make_csp(out->format, in->matrix, in->range);
-    err = aji_run_post(c->post_plan, c->buf[cur], &ocsp,
-                       out->plane[0], out->stride[0], out->plane[1],
-                       out->stride[1], stream);
+    // not the input's. Same matrix/range as the input (the model preserves
+    // them).
+    const aji_csp ocsp = aji_make_csp(out->format, matrix, range);
+    int err = aji_run_post(c->post_plan, src, &ocsp,
+                           out->plane[0], out->stride[0], out->plane[1],
+                           out->stride[1], stream);
     if (err) {
         c->set_error("post-kernel failed: %s", cudaGetErrorString((cudaError_t)err));
         return AJI_ERR_CUDA;
     }
     return AJI_OK;
+}
+
+// The chain body: pre -> (model/resize steps) -> post, launched on `stream`
+// against whatever plane pointers the frame descriptors carry (real frames
+// on the plain path, stable staging buffers on the graph path). Everything
+// in here must be capture-safe once warm: allocations only happen on plan
+// key changes, which a warmup run performs before any capture.
+static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
+                     cudaStream_t stream)
+{
+    int cur = 0;
+    int err = run_pre(c, in, c->buf[cur], stream);
+    if (err != AJI_OK)
+        return err;
+
+    int cw = in->width, ch = in->height;
+
+    if (!c->conf_mode) {
+        ModelEngine &me = c->direct;
+        if (!me.exec->setTensorAddress(me.in_name, c->buf[cur]) ||
+            !me.exec->setTensorAddress(me.out_name, c->buf[cur ^ 1])) {
+            c->set_error("setTensorAddress failed");
+            return AJI_ERR_ENGINE;
+        }
+        if (!me.exec->enqueueV3(stream)) {
+            c->set_error("enqueueV3 failed");
+            return AJI_ERR_ENGINE;
+        }
+        cur ^= 1;
+        cw = c->out_w; ch = c->out_h;
+    } else {
+        err = run_steps(c, 0, c->steps.size(), &cur, &cw, &ch, stream);
+        if (err != AJI_OK)
+            return err;
+    }
+    return run_post(c, in->matrix, in->range, c->buf[cur], cw, ch, out,
+                    stream);
+}
+
+// Frame format/dims checks for the temporal calls (aji_infer's rules).
+static int check_frame(aji_ctx *c, const aji_frame *f, bool input)
+{
+    if (f->format != AJI_FMT_NV12 && f->format != AJI_FMT_P010 &&
+        !aji_format_is_444(f->format)) {
+        c->set_error("unsupported %s format %d (nv12/p010/planar 444)",
+                     input ? "input" : "output", f->format);
+        return AJI_ERR_FORMAT;
+    }
+    const int w = input ? c->in_w : c->out_w;
+    const int h = input ? c->in_h : c->out_h;
+    if (f->width != w || f->height != h) {
+        c->set_error("%s dims %dx%d do not match configured %dx%d",
+                     input ? "input" : "output", f->width, f->height, w, h);
+        return AJI_ERR_SHAPE;
+    }
+    return AJI_OK;
+}
+
+extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
+{
+    return (c && c->active && c->temporal.enabled) ? c->temporal.r : 0;
+}
+
+extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
+{
+    if (c && c->temporal.enabled)
+        std::fill(c->temporal.seq.begin(), c->temporal.seq.end(), -1);
+}
+
+static int temporal_slot(aji_ctx *c, int64_t seq)
+{
+    auto &T = c->temporal;
+    if (seq < 0)
+        return -1;
+    const int slot = (int)(seq % T.nslots);
+    return T.seq[slot] == seq ? slot : -1;
+}
+
+static void *temporal_frame(aji_ctx *c, int slot)
+{
+    auto &T = c->temporal;
+    return (char *)T.ring + (size_t)slot * 3 * T.w * T.h * 2;
+}
+
+extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
+                                     uint64_t seq, void *cu_stream)
+{
+    if (!c || !in)
+        return AJI_ERR;
+    auto &T = c->temporal;
+    if (!c->active || !T.enabled) {
+        c->set_error("aji_ingest without an active temporal configuration");
+        return AJI_ERR;
+    }
+    if (seq > (uint64_t)INT64_MAX)
+        return AJI_ERR;
+    int err = check_frame(c, in, true);
+    if (err != AJI_OK)
+        return err;
+    if (temporal_slot(c, (int64_t)seq) >= 0)
+        return AJI_OK;  // already held
+
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return AJI_ERR_CUDA;
+    }
+    cudaStream_t stream = (cudaStream_t)cu_stream;
+
+    // the steps before the temporal model, once per source frame
+    int cur = 0, cw = in->width, ch = in->height;
+    err = run_pre(c, in, c->buf[cur], stream);
+    if (err == AJI_OK)
+        err = run_steps(c, 0, T.step_idx, &cur, &cw, &ch, stream);
+    if (err != AJI_OK)
+        return err;
+
+    const int slot = (int)(seq % (uint64_t)T.nslots);
+    void *dst = temporal_frame(c, slot);
+    if (cudaMemcpyAsync(dst, c->buf[cur], (size_t)3 * T.w * T.h * 2,
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+        c->set_error("temporal ingest copy failed");
+        return AJI_ERR_CUDA;
+    }
+    // scene-change metric against the previous frame, if held
+    cudaMemsetAsync(&T.diff[slot], 0, sizeof(float), stream);
+    const int prev = temporal_slot(c, (int64_t)seq - 1);
+    if (prev >= 0) {
+        err = aji_rgb_diff(temporal_frame(c, prev), dst, T.w, T.h,
+                           &T.diff[slot], stream);
+        if (err) {
+            c->set_error("temporal diff kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+    }
+    T.seq[slot] = (int64_t)seq;
+    T.matrix[slot] = in->matrix;
+    T.range[slot] = in->range;
+    return AJI_OK;
+}
+
+extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
+                                        const aji_frame *out, void *cu_stream)
+{
+    if (!c || !out)
+        return AJI_ERR;
+    auto &T = c->temporal;
+    if (!c->active || !T.enabled) {
+        c->set_error("aji_infer_seq without an active temporal configuration");
+        return AJI_ERR;
+    }
+    int err = check_frame(c, out, false);
+    if (err != AJI_OK)
+        return err;
+    const int64_t center = (int64_t)seq;
+    const int cslot = seq > (uint64_t)INT64_MAX ? -1 : temporal_slot(c, center);
+    if (cslot < 0) {
+        c->set_error("aji_infer_seq: frame %llu was not ingested",
+                     (unsigned long long)seq);
+        return AJI_ERR;
+    }
+
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return AJI_ERR_CUDA;
+    }
+    cudaStream_t stream = (cudaStream_t)cu_stream;
+
+    // Window: frames that are not held take the nearest held one toward the
+    // center; a cut pointer exists only between two consecutive held frames.
+    aji_gather_args args = {};
+    int slots[AJI_TEMPORAL_MAX];
+    bool held[AJI_TEMPORAL_MAX];
+    slots[T.r] = cslot;
+    held[T.r] = true;
+    for (int dir = -1; dir <= 1; dir += 2) {
+        bool clamped = false;
+        for (int k = 1; k <= T.r; k++) {
+            const int j = T.r + dir * k;
+            const int s = clamped ? -1 : temporal_slot(c, center + dir * k);
+            clamped = s < 0;
+            slots[j] = clamped ? slots[j - dir] : s;
+            held[j] = !clamped;
+        }
+    }
+    for (int j = 0; j < T.t; j++) {
+        args.src[j] = temporal_frame(c, slots[j]);
+        if (j + 1 < T.t && held[j] && held[j + 1])
+            args.cut[j] = &T.diff[slots[j + 1]];
+    }
+    err = aji_temporal_gather(&args, T.t, T.threshold, T.w, T.h, T.pw, T.ph,
+                              T.in_tensor, stream);
+    if (err) {
+        c->set_error("temporal gather kernel failed: %s",
+                     cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+
+    const Step &st = c->steps[T.step_idx];
+    ModelEngine &me = c->engines[st.engine_idx];
+    if (!me.exec->setTensorAddress(me.in_name, T.in_tensor) ||
+        !me.exec->setTensorAddress(me.out_name, T.out_tensor)) {
+        c->set_error("setTensorAddress failed");
+        return AJI_ERR_ENGINE;
+    }
+    if (!me.exec->enqueueV3(stream)) {
+        c->set_error("enqueueV3 failed");
+        return AJI_ERR_ENGINE;
+    }
+
+    // crop the padded model output into the chain buffer
+    int cur = 0;
+    const size_t splane = (size_t)T.pow * T.poh * 2;
+    const size_t dplane = (size_t)T.ow * T.oh * 2;
+    for (int pl = 0; pl < 3; pl++) {
+        if (cudaMemcpy2DAsync((char *)c->buf[cur] + pl * dplane,
+                              (size_t)T.ow * 2,
+                              (char *)T.out_tensor + pl * splane,
+                              (size_t)T.pow * 2, (size_t)T.ow * 2, T.oh,
+                              cudaMemcpyDeviceToDevice, stream) !=
+            cudaSuccess) {
+            c->set_error("temporal crop copy failed");
+            return AJI_ERR_CUDA;
+        }
+    }
+
+    int cw = T.ow, ch = T.oh;
+    err = run_steps(c, T.step_idx + 1, c->steps.size(), &cur, &cw, &ch,
+                    stream);
+    if (err != AJI_OK)
+        return err;
+    return run_post(c, T.matrix[cslot], T.range[cslot], c->buf[cur], cw, ch,
+                    out, stream);
 }
 
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
@@ -2283,6 +2719,7 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         aji_plan_destroy(c->pr_pre_plan);
         aji_plan_destroy(c->pr_post_plan);
         rife_teardown(c);
+        temporal_teardown(c);
         if (c->graph_exec)
             cudaGraphExecDestroy(c->graph_exec);
         cudaFree(c->stage_in);

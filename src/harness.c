@@ -420,6 +420,79 @@ int main(int argc, char **argv)
     double total_ms = 0;
     int timed = 0;
 
+    const int radius = aji_temporal_radius(aji);
+    if (radius > 0) {
+        // Temporal chain: frames are ingested in order and frame k is
+        // emitted once k+radius is in (the input is not looped: a wrap
+        // would be a scene cut). The last radius frames drain at EOF with
+        // a clamped window.
+        printf("temporal: %d-frame window\n", 2 * radius + 1);
+        int nread = 0;
+        for (;;) {
+            const int have = nread < max_frames &&
+                             fread(h_in, 1, frame_sz, fin) == frame_sz;
+            const int center = have ? nread - radius : n;
+            if (!have && center >= nread)
+                break;
+            CK(cudaEventRecord(ev0, stream));
+            if (have) {
+                CK(cudaMemcpyAsync(in.plane[0], h_in, y_sz,
+                                   cudaMemcpyHostToDevice, stream));
+                CK(cudaMemcpyAsync(in.plane[1], (char *)h_in + y_sz, uv_sz,
+                                   cudaMemcpyHostToDevice, stream));
+                int ret = aji_ingest(aji, &in, (uint64_t)nread, stream);
+                if (ret != AJI_OK) {
+                    fprintf(stderr, "aji_ingest: %d: %s\n", ret,
+                            aji_last_error(aji));
+                    return 1;
+                }
+                nread++;
+            }
+            if (center < 0) {
+                // h_in is reused by the next fread: let the upload finish
+                CK(cudaStreamSynchronize(stream));
+                continue;
+            }
+            int ret = aji_infer_seq(aji, (uint64_t)center, &out, stream);
+            if (ret != AJI_OK) {
+                fprintf(stderr, "aji_infer_seq: %d: %s\n", ret,
+                        aji_last_error(aji));
+                return 1;
+            }
+            CK(cudaEventRecord(ev1, stream));
+            if (fout) {
+                CK(cudaMemcpyAsync(h_out, out.plane[0], oy_sz,
+                                   cudaMemcpyDeviceToHost, stream));
+                CK(cudaMemcpyAsync((char *)h_out + oy_sz, out.plane[1],
+                                   out444 ? oy_sz : ouv_sz,
+                                   cudaMemcpyDeviceToHost, stream));
+                if (out444)
+                    CK(cudaMemcpyAsync((char *)h_out + 2 * oy_sz,
+                                       out.plane[2], oy_sz,
+                                       cudaMemcpyDeviceToHost, stream));
+            }
+            CK(cudaStreamSynchronize(stream));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, ev0, ev1));
+            if (n >= warmup && have) {
+                total_ms += ms;
+                timed++;
+            }
+            if (fout &&
+                fwrite(h_out, 1, oy_sz + ouv_sz, fout) != oy_sz + ouv_sz) {
+                perror("fwrite");
+                return 1;
+            }
+            n++;
+        }
+        printf("frames: %d, device chain time: %.3f ms/frame avg (%d timed)\n",
+               n, timed ? total_ms / timed : 0.0, timed);
+        if (fout) fclose(fout);
+        fclose(fin);
+        aji_destroy(&aji);
+        return 0;
+    }
+
     while (n < max_frames) {
         if (fread(h_in, 1, frame_sz, fin) != frame_sz) {
             if (n == 0) {

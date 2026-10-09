@@ -1,5 +1,5 @@
 /*
- * aji.h — AnimeJaNai inference shim, C ABI (version 8).
+ * aji.h — AnimeJaNai inference shim, C ABI (version 9).
  *
  * Boundary between the mpv filter (mingw/gcc world) and the inference
  * backends (MSVC world on Windows). Only C types and opaque handles
@@ -39,7 +39,7 @@ extern "C" {
 #  define AJI_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define AJI_API_VERSION 8
+#define AJI_API_VERSION 9
 
 typedef struct aji_ctx aji_ctx;
 
@@ -241,6 +241,36 @@ AJI_EXPORT int aji_poll(aji_ctx *c);
 AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, double t,
                               const aji_frame *out, void *cu_stream);
+
+/* Temporal (multi-frame) models. A chain model whose input takes T = 2r+1
+ * frames (oldest first, the frame to upscale in the middle) is a temporal
+ * step: it needs the neighboring source frames, so a chain containing one
+ * is driven through aji_ingest + aji_infer_seq instead of aji_infer.
+ *
+ * Returns r after aji_configure(): 0 when the active chain has no temporal
+ * step (use aji_infer as before). TensorRT backend only; DirectML skips
+ * chains with temporal models. */
+AJI_EXPORT int aji_temporal_radius(aji_ctx *c);
+
+/* Add one source frame to the frame history under a caller-assigned
+ * sequence number: consecutive source frames take consecutive numbers (a
+ * gap is a missing frame). Ingesting a number already held is a no-op, so
+ * callers may ingest ahead freely. The history keeps the last 2r+5 numbers
+ * ingested: ingest at most r+4 frames past the next aji_infer_seq center.
+ * Input rules are aji_infer's. Enqueues on cu_stream like aji_infer. */
+AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in, uint64_t seq,
+                          void *cu_stream);
+
+/* Upscale frame `seq` (which must be ingested) from the window
+ * seq-r .. seq+r. Window frames that are not held (stream start, after a
+ * reset, end of stream) or lie across a scene cut from the center are
+ * replaced by the nearest frame on the center's side. Enqueue/ticket
+ * semantics and output rules are aji_infer's. */
+AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq, const aji_frame *out,
+                             void *cu_stream);
+
+/* Forget the frame history (seek / discontinuity). */
+AJI_EXPORT void aji_temporal_reset(aji_ctx *c);
 
 AJI_EXPORT const char *aji_last_error(aji_ctx *c);
 

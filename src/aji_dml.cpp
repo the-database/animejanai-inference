@@ -48,6 +48,7 @@
 #include "aji.h"
 #include "aji_conf.h"
 #include "dml_shaders.h"
+#include "onnx_shape.h"
 #include "resample.h"
 
 using Microsoft::WRL::ComPtr;
@@ -1456,6 +1457,37 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     return true;
 }
 
+// First model of the chain whose onnx input takes several frames (or that
+// the conf marks as temporal), else "".
+std::string chain_temporal_model(aji_ctx *c, const AjiChainConf &chain)
+{
+    for (const auto &m : chain.models) {
+        if (m.name.empty())
+            continue;
+        if (m.frames > 1)
+            return m.name;
+        const std::string path = c->model_dir + "\\" + m.name + ".onnx";
+        FILE *f = _wfopen(widen(path).c_str(), L"rb");
+        if (!f)
+            continue;
+        std::vector<char> blob;
+        if (_fseeki64(f, 0, SEEK_END) == 0) {
+            const long long n = _ftelli64(f);
+            if (n > 0 && _fseeki64(f, 0, SEEK_SET) == 0) {
+                blob.resize((size_t)n);
+                if (fread(blob.data(), 1, blob.size(), f) != blob.size())
+                    blob.clear();
+            }
+        }
+        fclose(f);
+        AjiOnnxInput in;
+        if (!blob.empty() && aji_onnx_input(blob.data(), blob.size(), &in) &&
+            aji_onnx_temporal_frames(in) > 1)
+            return m.name;
+    }
+    return std::string();
+}
+
 } // namespace
 
 /* ---------------- C ABI ---------------- */
@@ -1647,6 +1679,14 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                     c->log_info.push_back(
                         "Chain " + std::to_string(ch.index) +
                         " skipped: model not found: " + missing + ".onnx");
+                    continue;
+                }
+                std::string temporal = chain_temporal_model(c, ch);
+                if (!temporal.empty()) {
+                    c->log_info.push_back(
+                        "Chain " + std::to_string(ch.index) + " skipped: " +
+                        temporal + " is a temporal (multi-frame) model, "
+                        "which needs the TensorRT backend");
                     continue;
                 }
                 chain = &ch;
@@ -2696,6 +2736,36 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         return AJI_ERR;
     }
     return AJI_OK;
+}
+
+// Temporal models are TensorRT-only (aji_configure skips their chains).
+extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
+{
+    (void)c;
+    return 0;
+}
+
+extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
+                                     uint64_t seq, void *cu_stream)
+{
+    (void)in; (void)seq; (void)cu_stream;
+    if (c)
+        c->set_error("temporal models need the TensorRT backend");
+    return AJI_ERR;
+}
+
+extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
+                                        const aji_frame *out, void *cu_stream)
+{
+    (void)seq; (void)out; (void)cu_stream;
+    if (c)
+        c->set_error("temporal models need the TensorRT backend");
+    return AJI_ERR;
+}
+
+extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
+{
+    (void)c;
 }
 
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)
