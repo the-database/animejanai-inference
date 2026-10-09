@@ -306,7 +306,10 @@ void cs_rife_consts(uint3 id : SV_DispatchThreadID)
 #endif
 }
 
-// ---- cs_scd_partial: per-group sum of |Ya - Yb| * norm ----
+)hlsl"
+// MSVC caps a single string literal at 16380 bytes (C2026); adjacent
+// literals concatenate into one array, so split the source here.
+R"hlsl(// ---- cs_scd_partial: per-group sum of |Ya - Yb| * norm ----
 // (misc.SCDetect's metric; HLSL has no float atomics, so this is a
 // two-pass reduction.) di = {w, h, groups_x}, dj = {pitch_a, pitch_b},
 // kr = norm. d0 = plane a, d1 = plane b, d2 = partials (one float per
