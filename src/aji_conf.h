@@ -9,6 +9,13 @@ struct AjiModelConf {
     std::string name;                          // onnx base name; empty = none
     double resize_factor_before_upscale = 100.0;
     double resize_height_before_upscale = 0.0;
+    int frames = 0;                            // temporal window size;
+                                               // 0 = from the onnx input
+    double temporal_scene_threshold = 0.150;   // temporal models: neighbors
+                                               // across a cut (mean RGB diff
+                                               // above this) are replaced by
+                                               // the nearest same-scene
+                                               // frame; 0 disables
 };
 
 struct AjiChainConf {

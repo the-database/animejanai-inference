@@ -45,7 +45,8 @@ set_target_properties(aji PROPERTIES
     CXX_VISIBILITY_PRESET hidden)
 
 # aji_trt: TensorRT/CUDA backend (the former aji.dll).
-add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/kernels.cu)
+add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/onnx_shape.cpp
+    src/kernels.cu)
 target_include_directories(aji_trt
     PUBLIC include
     PRIVATE ${AJI_TRT_INCLUDE})
@@ -120,7 +121,7 @@ if(WIN32)
         "Microsoft.ML.OnnxRuntime.DirectML package root")
     set(AJI_DML_ROOT "" CACHE PATH
         "Microsoft.AI.DirectML package root")
-    add_library(aji_dml SHARED src/aji_dml.cpp src/aji_conf.cpp)
+    add_library(aji_dml SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp)
     target_include_directories(aji_dml
         PUBLIC include
         PRIVATE "${AJI_ORT_ROOT}/build/native/include"

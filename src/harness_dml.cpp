@@ -465,8 +465,22 @@ int main(int argc, char **argv)
     double total_ms = 0;
     int timed = 0;
 
-    for (int f = 0; f < frames; f++) {
-        if (fread(raw, 1, in_frame_bytes, fi) != in_frame_bytes) {
+    // Temporal chain: frames are ingested in order and frame k is emitted
+    // once k+radius is in (the input is not looped: a wrap would be a scene
+    // cut). The last radius frames drain at EOF with a clamped window.
+    const int radius = aji_temporal_radius(aji);
+    if (radius > 0)
+        printf("temporal: %d-frame window\n", 2 * radius + 1);
+    int nread = 0, nout = 0;
+
+    for (int f = 0; radius > 0 || f < frames; f++) {
+        bool have = true;
+        if (radius > 0) {
+            have = nread < frames &&
+                   fread(raw, 1, in_frame_bytes, fi) == in_frame_bytes;
+            if (!have && nout >= nread)
+                break;
+        } else if (fread(raw, 1, in_frame_bytes, fi) != in_frame_bytes) {
             if (f == 0) {
                 fprintf(stderr, "input shorter than one frame\n");
                 return 1;
@@ -477,6 +491,70 @@ int main(int argc, char **argv)
         }
 
         D3D11_MAPPED_SUBRESOURCE map = {};
+        if (radius > 0) {
+            int tr = AJI_OK;
+            QueryPerformanceCounter(&t0);
+            if (have) {
+                if (FAILED(ctx->Map(in_st, 0, D3D11_MAP_WRITE, 0, &map))) {
+                    fprintf(stderr, "map in staging failed\n");
+                    return 1;
+                }
+                const char *src = raw;
+                char *dst = (char *)map.pData;
+                for (int y = 0; y < h; y++)
+                    memcpy(dst + (size_t)y * map.RowPitch,
+                           src + (size_t)y * w * bpp, (size_t)w * bpp);
+                src += (size_t)w * h * bpp;
+                dst += (size_t)map.RowPitch * h;
+                for (int y = 0; y < h / 2; y++)
+                    memcpy(dst + (size_t)y * map.RowPitch,
+                           src + (size_t)y * w * bpp, (size_t)w * bpp);
+                ctx->Unmap(in_st, 0);
+                ctx->CopyResource(in_tex, in_st);
+                tr = aji_ingest(aji, &fin, (uint64_t)nread, NULL);
+                nread++;
+            }
+            const int center = have ? nread - 1 - radius : nout;
+            if (tr == AJI_OK && center >= 0)
+                tr = aji_infer_seq(aji, (uint64_t)center, &fout, NULL);
+            // in_tex is rewritten next iteration: let the queue finish
+            if (tr == AJI_OK)
+                tr = aji_wait(aji, aji_flush(aji, NULL));
+            QueryPerformanceCounter(&t1);
+            if (tr != AJI_OK) {
+                fprintf(stderr, "temporal call failed (%d): %s\n", tr,
+                        aji_last_error(aji));
+                return 1;
+            }
+            if (center < 0)
+                continue;
+            if (nout >= 2 && have) {
+                total_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 /
+                            freq.QuadPart;
+                timed++;
+            }
+            nout++;
+            if (fo) {
+                ctx->CopyResource(out_st, out_tex);
+                if (FAILED(ctx->Map(out_st, 0, D3D11_MAP_READ, 0, &map))) {
+                    fprintf(stderr, "map out staging failed\n");
+                    return 1;
+                }
+                const char *s = (const char *)map.pData;
+                char *d = raw_out;
+                for (int y = 0; y < oh; y++)
+                    memcpy(d + (size_t)y * ow * bpp,
+                           s + (size_t)y * map.RowPitch, (size_t)ow * bpp);
+                s += (size_t)map.RowPitch * oh;
+                d += (size_t)ow * oh * bpp;
+                for (int y = 0; y < oh / 2; y++)
+                    memcpy(d + (size_t)y * ow * bpp,
+                           s + (size_t)y * map.RowPitch, (size_t)ow * bpp);
+                ctx->Unmap(out_st, 0);
+                fwrite(raw_out, 1, out_frame_bytes, fo);
+            }
+            continue;
+        }
         if (FAILED(ctx->Map(in_st, 0, D3D11_MAP_WRITE, 0, &map))) {
             fprintf(stderr, "map in staging failed\n");
             return 1;
@@ -533,8 +611,8 @@ int main(int argc, char **argv)
         }
     }
 
-    printf("frames: %d, infer time: %.3f ms/frame avg (%d timed)\n", frames,
-           timed ? total_ms / timed : 0.0, timed);
+    printf("frames: %d, infer time: %.3f ms/frame avg (%d timed)\n",
+           radius > 0 ? nout : frames, timed ? total_ms / timed : 0.0, timed);
 
     if (fo)
         fclose(fo);

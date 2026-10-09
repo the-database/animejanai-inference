@@ -48,6 +48,10 @@ struct aji_backend {
     int (*poll)(aji_ctx *);
     int (*infer_rife)(aji_ctx *, const aji_frame *, const aji_frame *,
                       double, const aji_frame *, void *);
+    int (*temporal_radius)(aji_ctx *);
+    int (*ingest)(aji_ctx *, const aji_frame *, uint64_t, void *);
+    int (*infer_seq)(aji_ctx *, uint64_t, const aji_frame *, void *);
+    void (*temporal_reset)(aji_ctx *);
     const char *(*last_error)(aji_ctx *);
     void (*destroy)(aji_ctx **);
 };
@@ -168,6 +172,10 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(resize,       "aji_resize");
     SYM(poll,         "aji_poll");
     SYM(infer_rife,   "aji_infer_rife");
+    SYM(temporal_radius, "aji_temporal_radius");
+    SYM(ingest,       "aji_ingest");
+    SYM(infer_seq,    "aji_infer_seq");
+    SYM(temporal_reset, "aji_temporal_reset");
     SYM(last_error,   "aji_last_error");
     SYM(destroy,      "aji_destroy");
 #undef SYM
@@ -297,6 +305,28 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *out, void *cu_stream)
 {
     return c->be.infer_rife(c->inner, a, b, t, out, cu_stream);
+}
+
+extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
+{
+    return c->be.temporal_radius(c->inner);
+}
+
+extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
+                                     uint64_t seq, void *cu_stream)
+{
+    return c->be.ingest(c->inner, in, seq, cu_stream);
+}
+
+extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
+                                        const aji_frame *out, void *cu_stream)
+{
+    return c->be.infer_seq(c->inner, seq, out, cu_stream);
+}
+
+extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
+{
+    c->be.temporal_reset(c->inner);
 }
 
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)

@@ -139,7 +139,7 @@ RIFE model weights ship from this repo too, under a separate tag
 2. rebuild and release both the engine and the mpv builds,
 3. bump `AjiVersion` **and** `MpvForkVersion`/`MpvForkLinuxVersion` in the assembler.
 
-The filter lives on the mpv fork's `master` (aji ABI v8). The old standalone `vf-animejanai`
+The filter lives on the mpv fork's `master` (aji ABI v9). The old standalone `vf-animejanai`
 branch is stale (ABI v4) and must not be used.
 
 ## Conventions
