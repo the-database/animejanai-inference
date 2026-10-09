@@ -60,6 +60,8 @@ def main():
         (root / f"case-{i}.log").write_text(proc.stdout, encoding="utf-8")
         if valid:
             assert proc.returncode == 0, proc.stdout
+            assert "configured: 16x16 nv12 -> 16x16" in proc.stdout, proc.stdout
+            assert "frames: 1," in proc.stdout, proc.stdout
         else:
             assert proc.returncode != 0, proc.stdout
             assert "Static ONNX requires a model with fixed input dimensions" in proc.stdout
