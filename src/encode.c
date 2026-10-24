@@ -9,14 +9,20 @@
  *   input file -> decode -> libaji (upscale + optional RIFE)
  *               -> [final resize] -> encode -> mux -> output file
  *
- * v1: TensorRT backend only; single input -> single output; copies audio,
- * subtitles, chapters and attachments from the source. DirectML deferred.
+ * Single input -> single output; copies audio, subtitles, chapters and
+ * attachments from the source.
  * Temporal (multi-frame) chains are driven through aji_ingest +
  * aji_infer_seq, each output inferred once its window has been ingested.
  *
  * Decode prefers NVDEC (frames stay GPU-resident, zero-copy into libaji and
  * out to NVENC, all sharing libav's CUDA context). --decoder cpu decodes to
  * host and uploads. See the companion spec for the full contract.
+ *
+ * --backend directml (Windows; the conf must say backend=DirectML too):
+ * frames are shared D3D11 textures from libav D3D11 pools, decoded on the
+ * CPU and uploaded, read back for encoding, 4:2:0 output only. No CUDA call
+ * is made, and nvcuda/cudart are delay-loaded, so it runs on GPUs without
+ * the NVIDIA driver.
  */
 
 #include <stdarg.h>
@@ -32,8 +38,12 @@
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
+#include <libavutil/avstring.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
+#ifdef _WIN32
+#include <libavutil/hwcontext_d3d11va.h>
+#endif
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
@@ -197,6 +207,10 @@ typedef struct {
     CUcontext        cuctx;          /* shared context (from libav) */
     int              ctx_pushed;
     int              nvdec;          /* decoding on the GPU */
+    int              dml;            /* DirectML backend: frames are shared D3D11
+                                        textures (libav D3D11 frames), and no
+                                        CUDA call is ever made */
+    void            *d3d11_dev;      /* ID3D11Device* of the D3D11VA hwdevice */
 
     /* libaji */
     aji_ctx        *aji;
@@ -320,6 +334,29 @@ static int setup_cuda(enc_ctx *c)
     return 0;
 }
 
+/* DirectML: a D3D11 device for libaji (aji_dml opens the shared frame
+ * textures on a D3D12 device on the same adapter) and for libav's D3D11
+ * frame pools, uploads and readbacks. Decoding stays on the CPU: hardware
+ * decoder textures can't be shared to D3D12. */
+static int setup_d3d11(enc_ctx *c)
+{
+#ifdef _WIN32
+    if (av_hwdevice_ctx_create(&c->hw_device, AV_HWDEVICE_TYPE_D3D11VA,
+                               NULL, NULL, 0) < 0) {
+        loge("av_hwdevice_ctx_create(D3D11VA) failed");
+        return -1;
+    }
+    AVHWDeviceContext      *dc = (AVHWDeviceContext *)c->hw_device->data;
+    AVD3D11VADeviceContext *dx = (AVD3D11VADeviceContext *)dc->hwctx;
+    c->d3d11_dev = dx->device;
+    return 0;
+#else
+    (void)c;
+    loge("the DirectML backend is Windows-only");
+    return -1;
+#endif
+}
+
 /* ---- input + decoder ----------------------------------------------------- */
 
 static int open_input(enc_ctx *c)
@@ -410,6 +447,12 @@ static void resolve_pixfmt(enc_ctx *c)
     case OUT_444P10:
         c->out_aji_fmt = AJI_FMT_YUV444P16; c->sw_fmt = AV_PIX_FMT_YUV444P16LE; break;
     }
+    /* DirectML writes the output in the input's format (4:2:0 only), so the
+     * host repack before upload produces the output format directly: an
+     * 8-bit source for a 10-bit file is widened there, and 4:2:2 / 4:4:4
+     * sources are subsampled. */
+    if (c->dml)
+        c->src_aji_fmt = c->out_aji_fmt;
 }
 
 static int open_decoder(enc_ctx *c)
@@ -423,7 +466,7 @@ static int open_decoder(enc_ctx *c)
     AV(avcodec_parameters_to_context(c->dec, vst->codecpar));
     c->dec->pkt_timebase = vst->time_base;
 
-    int want_hw = (c->o.decoder != DEC_CPU) && !c->o.no_zerocopy;
+    int want_hw = (c->o.decoder != DEC_CPU) && !c->o.no_zerocopy && !c->dml;
     if (want_hw) {
         c->dec->hw_device_ctx = av_buffer_ref(c->hw_device);
         c->dec->get_format = get_hw_format;
@@ -455,6 +498,7 @@ static int init_aji(enc_ctx *c)
     aji_create_params p = {
         .api_version    = AJI_API_VERSION,
         .cuda_context   = (void *)c->cuctx,
+        .d3d11_device   = c->d3d11_dev,
         .conf_path      = c->o.conf,
         .model_dir      = c->o.model_dir,
         .trtexec        = c->o.trtexec,
@@ -525,27 +569,50 @@ static int init_aji(enc_ctx *c)
     return 0;
 }
 
-/* Allocate the CUDA frame pool that libaji writes its upscaled output into.
- * Frames come from a libav CUDA hw_frames_ctx so the device pointers are
+/* A frame pool on the active backend's device: CUDA frames, or (DirectML)
+ * D3D11 textures created SHARED | SHARED_NTHANDLE so aji_dml can open them
+ * on its D3D12 device. libav's D3D11 frame data[0]/data[1] (texture,
+ * subresource index) is exactly aji_frame.plane[0]/plane[1] for DirectML,
+ * so the rest of the pipeline handles both alike. CUDA pools are fixed-size
+ * (n); D3D11 ones grow on demand, one texture per frame like mpv's. */
+static AVBufferRef *make_pool(enc_ctx *c, enum AVPixelFormat sw, int w, int h,
+                              int n)
+{
+    AVBufferRef *ref = av_hwframe_ctx_alloc(c->hw_device);
+    if (!ref) { loge("av_hwframe_ctx_alloc failed"); return NULL; }
+    AVHWFramesContext *fc = (AVHWFramesContext *)ref->data;
+    fc->sw_format         = sw;
+    fc->width             = w;
+    fc->height            = h;
+    if (c->dml) {
+#ifdef _WIN32
+        fc->format = AV_PIX_FMT_D3D11;
+        AVD3D11VAFramesContext *dx = (AVD3D11VAFramesContext *)fc->hwctx;
+        dx->BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        dx->MiscFlags = D3D11_RESOURCE_MISC_SHARED |
+                        D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+#endif
+    } else {
+        fc->format            = AV_PIX_FMT_CUDA;
+        fc->initial_pool_size = n;
+    }
+    if (av_hwframe_ctx_init(ref) < 0) {
+        loge("%s frame pool init failed for %dx%d %s", c->dml ? "D3D11" : "CUDA",
+             w, h, av_get_pix_fmt_name(sw));
+        av_buffer_unref(&ref);
+    }
+    return ref;
+}
+
+/* Allocate the frame pool that libaji writes its upscaled output into.
+ * CUDA frames come from a libav hw_frames_ctx so the device pointers are
  * valid for NVENC (zero-copy) and carry a hw_frames_ctx for scale_cuda. */
 static int init_aji_pool(enc_ctx *c)
 {
-    c->aji_pool = av_hwframe_ctx_alloc(c->hw_device);
-    if (!c->aji_pool) { loge("av_hwframe_ctx_alloc failed"); return -1; }
-    AVHWFramesContext *fc = (AVHWFramesContext *)c->aji_pool->data;
-    fc->format            = AV_PIX_FMT_CUDA;
-    fc->sw_format         = c->sw_fmt;
-    fc->width             = c->up_w;     /* aji writes at the upscale dims */
-    fc->height            = c->up_h;
     /* cover in-flight ring/RIFE frames plus those the encoder holds
-     * (NVENC async depth + B-frames) — the pool is fixed-size */
-    fc->initial_pool_size = c->ring_depth + 48;
-    if (av_hwframe_ctx_init(c->aji_pool) < 0) {
-        loge("CUDA frame pool init failed for sw_format=%s",
-             av_get_pix_fmt_name(c->sw_fmt));
-        return -1;
-    }
-    return 0;
+     * (NVENC async depth + B-frames) — the CUDA pool is fixed-size */
+    c->aji_pool = make_pool(c, c->sw_fmt, c->up_w, c->up_h, c->ring_depth + 48);
+    return c->aji_pool ? 0 : -1;
 }
 
 /* ---- map a decoded AVFrame into an aji_frame ----------------------------- */
@@ -567,7 +634,7 @@ static void fill_aji_frame(enc_ctx *c, aji_frame *f, AVFrame *av, int output)
     f->stride[2] = av->linesize[2];
 }
 
-/* CUDA pool sw_format for frames in the libaji input format */
+/* device pool sw_format for frames in the libaji input format */
 static enum AVPixelFormat src_sw_fmt(const enc_ctx *c)
 {
     return c->src_aji_fmt == AJI_FMT_YUV444P16 ? AV_PIX_FMT_YUV444P16LE
@@ -575,28 +642,10 @@ static enum AVPixelFormat src_sw_fmt(const enc_ctx *c)
                                                 : AV_PIX_FMT_NV12;
 }
 
-static AVBufferRef *make_pool(enc_ctx *c, enum AVPixelFormat sw, int w, int h,
-                              int n)
-{
-    AVBufferRef *ref = av_hwframe_ctx_alloc(c->hw_device);
-    if (!ref) { loge("av_hwframe_ctx_alloc failed"); return NULL; }
-    AVHWFramesContext *fc = (AVHWFramesContext *)ref->data;
-    fc->format            = AV_PIX_FMT_CUDA;
-    fc->sw_format         = sw;
-    fc->width             = w;
-    fc->height            = h;
-    fc->initial_pool_size = n;
-    if (av_hwframe_ctx_init(ref) < 0) {
-        loge("CUDA frame pool init failed for %dx%d %s", w, h,
-             av_get_pix_fmt_name(sw));
-        av_buffer_unref(&ref);
-    }
-    return ref;
-}
-
-/* Hand libaji a CUDA frame in its input format. NVDEC frames already are
- * one (zero-copy); CPU-decoded frames, and NVDEC frames in a layout libaji
- * does not read, are repacked on the host and uploaded. Takes ownership. */
+/* Hand libaji a device frame in its input format. NVDEC frames already are
+ * one (zero-copy); CPU-decoded frames (always, on DirectML), and NVDEC
+ * frames in a layout libaji does not read, are repacked on the host and
+ * uploaded. Takes ownership. */
 static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
 {
     const enum AVPixelFormat sw = src_sw_fmt(c);
@@ -739,9 +788,11 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     c->enc->color_trc             = c->color_trc;
     c->enc->chroma_sample_location = c->chroma_loc;
 
-    int hw = is_nvenc(c->o.vcodec) && first->format == AV_PIX_FMT_CUDA;
+    int hw = is_nvenc(c->o.vcodec) && first->hw_frames_ctx &&
+             (first->format == AV_PIX_FMT_CUDA ||
+              first->format == AV_PIX_FMT_D3D11);
     if (hw) {
-        c->enc->pix_fmt = AV_PIX_FMT_CUDA;
+        c->enc->pix_fmt = first->format;
         c->enc->hw_frames_ctx = av_buffer_ref(first->hw_frames_ctx);
         if (!c->enc->hw_frames_ctx) { loge("no hw_frames_ctx"); return -1; }
     } else {
@@ -938,9 +989,13 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
      * can read directly. Anything routed through the YUV444P16 intermediate
      * (bit-depth/chroma change or 4:4:4) is downloaded and converted with
      * swscale, then handed to the encoder (NVENC uploads host frames itself;
-     * software encoders consume them directly). */
+     * software encoders consume them directly). DirectML's D3D11 output goes
+     * to NVENC zero-copy too (NVENC takes D3D11 textures), except with a
+     * final resize (scale_cuda is CUDA-only); every other encoder reads it
+     * back. */
     int zerocopy = is_nvenc(c->o.vcodec) &&
-                   c->out_aji_fmt != AJI_FMT_YUV444P16;
+                   c->out_aji_fmt != AJI_FMT_YUV444P16 &&
+                   (!c->dml || !resize_needed(c));
 
     if (zerocopy && resize_needed(c)) {
         if (init_resize(c, cuda_out) < 0) goto done;
@@ -957,10 +1012,18 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
          * pixfmt/dims from the context, not from c->enc. */
         AVFrame *host = cuda_out;
         AVFrame *dl = NULL;
-        if (cuda_out->format == AV_PIX_FMT_CUDA) {
+        if (cuda_out->hw_frames_ctx) {     /* CUDA, or DirectML's D3D11 */
             dl = av_frame_alloc();
             AV(av_hwframe_transfer_data(dl, cuda_out, 0));
             host = dl;
+        }
+        if (host->format == c->out_pixfmt && host->width == c->out_w &&
+            host->height == c->out_h) {
+            /* already what the encoder takes (e.g. DirectML NV12/P010 into
+             * NVENC): skip a full-frame swscale copy */
+            to_encode = host;
+            resized = dl;              /* freed below; NULL = caller's frame */
+            goto encode;
         }
         AVFrame *sw = av_frame_alloc();
         sw->format = c->out_pixfmt;
@@ -979,6 +1042,7 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
         resized = sw;                  /* freed below */
     }
 
+encode:
     if (!c->opened) {
         if (open_encoder(c, to_encode) < 0) goto done;
         if (finalize_output(c) < 0) goto done;
@@ -1530,7 +1594,7 @@ static void usage(void)
     fprintf(stderr,
 "aji_encode --input <f> --output <f> --conf <c> --slot <N> "
 "--model-dir <d> [--rife-model-dir <d>] [--trtexec <p>]\n"
-"           [--vcodec hevc_nvenc|h264_nvenc|libx265|libx264|ffv1]"
+"           [--vcodec hevc_nvenc|h264_nvenc|hevc_amf|hevc_qsv|libx265|libx264|ffv1]"
 " [--vquality \"<args>\"]\n"
 "           [--pix-fmt yuv420p|yuv420p10|yuv444p|yuv444p10]"
 " (default yuv420p10; 4:4:4 = software encoder)\n"
@@ -1539,7 +1603,7 @@ static void usage(void)
 "           [--no-audio] [--no-subs] [--no-chapters]"
 " [--progress none|line|json]\n"
 "           [--build-only] [--log <f>] [--decoder auto|nvdec|cpu]"
-" [--backend tensorrt]\n"
+" [--backend tensorrt|directml]\n"
 "           (direct mode: --engine <e> --max-width W --max-height H)\n");
 }
 
@@ -1613,9 +1677,21 @@ int main(int argc, char **argv)
     av_log_set_callback(av_log_cb);
     av_log_set_level(AV_LOG_WARNING);
 
-    if (strcmp(c.o.backend, "tensorrt") != 0) {
-        loge("backend '%s' not yet supported in offline encode "
-             "(v1 is TensorRT-only)", c.o.backend);
+    /* Must agree with the conf's [global] backend, which is what libaji's
+     * dispatcher loads; this only picks the device the frames live on. */
+    if (!av_strcasecmp(c.o.backend, "directml")) {
+        c.dml = 1;
+    } else if (av_strcasecmp(c.o.backend, "tensorrt")) {
+        loge("unknown --backend '%s' (tensorrt|directml)", c.o.backend);
+        return 2;
+    }
+    if (c.dml && c.o.pix_fmt >= OUT_444P8) {
+        loge("the DirectML backend outputs 4:2:0 only (--pix-fmt yuv420p or "
+             "yuv420p10)");
+        return 2;
+    }
+    if (c.dml && c.o.engine) {
+        loge("direct mode (--engine) is TensorRT-only");
         return 2;
     }
     if (!c.o.input || (!c.o.build_only && !c.o.output)) {
@@ -1638,7 +1714,7 @@ int main(int argc, char **argv)
     int rc = 1;
     if (open_input(&c) < 0) goto out;
     resolve_pixfmt(&c);    /* needs src_aji_fmt from open_input */
-    if (setup_cuda(&c) < 0) goto out;
+    if ((c.dml ? setup_d3d11(&c) : setup_cuda(&c)) < 0) goto out;
     if (init_aji(&c) < 0) goto out;
 
     if (c.o.build_only) {
