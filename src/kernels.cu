@@ -556,6 +556,40 @@ extern "C" int aji_fill_f16(void *dst_f16, size_t count, float value,
     return (int)cudaGetLastError();
 }
 
+__global__ void k_f16_to_f32(const __half *src, float *dst, size_t count)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        dst[i] = __half2float(src[i]);
+}
+
+__global__ void k_f32_to_f16(const float *src, __half *dst, size_t count)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        dst[i] = __float2half(src[i]);
+}
+
+extern "C" int aji_f16_to_f32(const void *src_f16, void *dst_f32, size_t count,
+                              void *stream)
+{
+    const int block = 256;
+    const size_t grid = (count + block - 1) / block;
+    k_f16_to_f32<<<(unsigned)grid, block, 0, (cudaStream_t)stream>>>(
+        (const __half *)src_f16, (float *)dst_f32, count);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int aji_f32_to_f16(const void *src_f32, void *dst_f16, size_t count,
+                              void *stream)
+{
+    const int block = 256;
+    const size_t grid = (count + block - 1) / block;
+    k_f32_to_f16<<<(unsigned)grid, block, 0, (cudaStream_t)stream>>>(
+        (const float *)src_f32, (__half *)dst_f16, count);
+    return (int)cudaGetLastError();
+}
+
 template <typename T>
 __global__ void k_fill_plane(uint8_t *plane, ptrdiff_t stride, int w, int h,
                              unsigned value)
