@@ -119,7 +119,7 @@ compile — the release list builds eight architectures.
 
 | Platform | Built by | Asset |
 |---|---|---|
-| Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst` |
+| Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
 | Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip` |
 
 Both are attached to the **same release tag**, because the consumer derives both URLs from one

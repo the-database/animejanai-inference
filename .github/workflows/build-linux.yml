@@ -98,7 +98,8 @@ jobs:
     - name: Build aji (full per-SM kernel set)
       run: |
         cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
-          -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"           -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/opt/ffmpeg/lib"
+          -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" \
+          -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/opt/ffmpeg/lib"
         cmake --build build -j"$(nproc)"
         test -x build/aji_encode || { echo "aji_encode was not built (ffmpeg not found)"; exit 1; }
 
