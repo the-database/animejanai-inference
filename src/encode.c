@@ -228,6 +228,8 @@ typedef struct {
     int             rnum, rden;
     int             temporal_r;      /* temporal chain window radius, 0 = none */
     uint64_t        in_seq, out_seq; /* temporal: next frame to ingest / infer */
+    int             rife_only;       /* RIFE with no scaling chain (aji_configure
+                                        returned passthrough) */
     int             rife_first;      /* RIFE interpolates source frames, then
                                         each emitted frame is upscaled */
     int             pre_resize;      /* RIFE-first: downscale to work dims first */
@@ -551,6 +553,16 @@ static int init_aji(enc_ctx *c)
         }
         c->rife = 1;
         c->out_fps = av_mul_q(c->out_fps, (AVRational){c->rnum, c->rden});
+        if (c->passthrough) {
+            /* RIFE-only chain (no scaling): the engine interpolates the
+             * passthrough frames, so they go to the device like any input -
+             * already in the output format, which RIFE keeps - and no upscale
+             * runs, whatever the order setting says */
+            c->rife_only = 1;
+            c->src_aji_fmt = c->out_aji_fmt;
+            loge("RIFE-only chain: interpolating at %dx%d", c->src_w, c->src_h);
+            return 0;
+        }
         /* the order must agree with what the engine configured RIFE for */
         c->rife_first = aji_rife_before_upscale(c->aji) == 1;
         c->work_w = c->src_w;
@@ -1466,8 +1478,10 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
 /* one decoded frame into the active pipeline (NULL flushes it) */
 static int push_frame(enc_ctx *c, AVFrame *fr)
 {
-    if (fr && !c->passthrough && !(fr = to_device(c, fr))) return -1;
+    if (fr && (!c->passthrough || c->rife_only) && !(fr = to_device(c, fr)))
+        return -1;
     if (!c->rife) return push_upscale(c, fr);
+    if (c->rife_only) return rife_step(c, fr);   /* interpolate the frames as-is */
     return c->rife_first ? push_rife_first(c, fr) : push_rife(c, fr);
 }
 
@@ -1724,7 +1738,8 @@ int main(int argc, char **argv)
     }
 
     if (resize_needed(&c)) compute_final_dims(&c);
-    if (!c.passthrough && init_aji_pool(&c) < 0) goto out;
+    /* RIFE-only chains interpolate into this pool too (at the source dims) */
+    if ((!c.passthrough || c.rife_only) && init_aji_pool(&c) < 0) goto out;
     if (open_decoder(&c) < 0) goto out;
     if (open_output(&c) < 0) goto out;
     if (run(&c) < 0) goto out;
