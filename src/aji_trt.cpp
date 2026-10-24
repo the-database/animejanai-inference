@@ -236,12 +236,23 @@ std::string sanitize_token(std::string s)
     return out.empty() ? "device0" : out;
 }
 
+struct CudaFree {
+    void operator()(void *p) const { cudaFree(p); }
+};
+using CudaPtr = std::unique_ptr<void, CudaFree>;
+
 struct ModelEngine {
     std::unique_ptr<nvinfer1::ICudaEngine> engine;
     std::unique_ptr<nvinfer1::IExecutionContext> exec;
     const char *in_name = nullptr;
     const char *out_name = nullptr;
     int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    // The chain's tensors are fp16. A model exported with fp32 I/O (strongly
+    // typed, so the engine keeps it) runs through these fp32 staging buffers,
+    // cast on the way in and out (enqueue_model).
+    bool in_fp32 = false, out_fp32 = false;
+    CudaPtr in32, out32;
+    size_t in32_elems = 0, out32_elems = 0;
 };
 
 struct Step {
@@ -772,6 +783,13 @@ bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
         c->set_error("engine I/O tensors not found");
         return false;
     }
+    me->in_fp32 = me->engine->getTensorDataType(me->in_name) ==
+                  nvinfer1::DataType::kFLOAT;
+    me->out_fp32 = me->engine->getTensorDataType(me->out_name) ==
+                   nvinfer1::DataType::kFLOAT;
+    if (me->in_fp32 || me->out_fp32)
+        c->verbose("%s: fp32 model I/O, cast to/from the fp16 chain",
+                   engine_path.c_str());
     me->exec.reset(me->engine->createExecutionContext());
     if (!me->exec) {
         c->set_error("createExecutionContext failed");
@@ -1924,6 +1942,77 @@ static int run_pre(aji_ctx *c, const aji_frame *in, void *dst,
     return AJI_OK;
 }
 
+static size_t tensor_elems(const nvinfer1::Dims &d)
+{
+    size_t n = 1;
+    for (int i = 0; i < d.nbDims; i++)
+        n *= (size_t)(d.d[i] > 0 ? d.d[i] : 0);
+    return n;
+}
+
+// Grow an fp32 staging buffer to hold n elements.
+static bool ensure_f32(aji_ctx *c, CudaPtr *buf, size_t *have, size_t n)
+{
+    if (*buf && *have >= n)
+        return true;
+    void *p = nullptr;
+    if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) {
+        c->set_error("cudaMalloc(%zu) failed for fp32 model I/O",
+                     n * sizeof(float));
+        return false;
+    }
+    buf->reset(p);
+    *have = n;
+    return true;
+}
+
+// Run one model from the fp16 tensor `in` into the fp16 tensor `out`. Models
+// with fp32 inputs/outputs are bound to fp32 staging buffers and cast around
+// the enqueue; binding the fp16 tensors to them directly is what turned their
+// output into noise.
+static int enqueue_model(aji_ctx *c, ModelEngine &me, void *in, void *out,
+                         cudaStream_t stream)
+{
+    void *bind_in = in, *bind_out = out;
+    size_t n_in = 0, n_out = 0;
+    if (me.in_fp32) {
+        n_in = tensor_elems(me.exec->getTensorShape(me.in_name));
+        if (!ensure_f32(c, &me.in32, &me.in32_elems, n_in))
+            return AJI_ERR_CUDA;
+        int err = aji_f16_to_f32(in, me.in32.get(), n_in, stream);
+        if (err) {
+            c->set_error("fp32 input cast failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+        bind_in = me.in32.get();
+    }
+    if (me.out_fp32) {
+        n_out = tensor_elems(me.exec->getTensorShape(me.out_name));
+        if (!ensure_f32(c, &me.out32, &me.out32_elems, n_out))
+            return AJI_ERR_CUDA;
+        bind_out = me.out32.get();
+    }
+    if (!me.exec->setTensorAddress(me.in_name, bind_in) ||
+        !me.exec->setTensorAddress(me.out_name, bind_out)) {
+        c->set_error("setTensorAddress failed");
+        return AJI_ERR_ENGINE;
+    }
+    if (!me.exec->enqueueV3(stream)) {
+        c->set_error("enqueueV3 failed");
+        return AJI_ERR_ENGINE;
+    }
+    if (me.out_fp32) {
+        int err = aji_f32_to_f16(me.out32.get(), out, n_out, stream);
+        if (err) {
+            c->set_error("fp32 output cast failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+    }
+    return AJI_OK;
+}
+
 // Run steps [first, last) over the ping-pong buffers, starting in buf[*cur];
 // *cur/*cw/*ch track the current buffer and dims.
 static int run_steps(aji_ctx *c, size_t first, size_t last, int *cur,
@@ -1940,16 +2029,10 @@ static int run_steps(aji_ctx *c, size_t first, size_t last, int *cur,
                 return AJI_ERR_CUDA;
             }
         } else {
-            ModelEngine &me = c->engines[st.engine_idx];
-            if (!me.exec->setTensorAddress(me.in_name, c->buf[*cur]) ||
-                !me.exec->setTensorAddress(me.out_name, c->buf[*cur ^ 1])) {
-                c->set_error("setTensorAddress failed");
-                return AJI_ERR_ENGINE;
-            }
-            if (!me.exec->enqueueV3(stream)) {
-                c->set_error("enqueueV3 failed");
-                return AJI_ERR_ENGINE;
-            }
+            int err = enqueue_model(c, c->engines[st.engine_idx],
+                                    c->buf[*cur], c->buf[*cur ^ 1], stream);
+            if (err != AJI_OK)
+                return err;
         }
         *cur ^= 1;
         *cw = st.out_w;
@@ -2028,16 +2111,9 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
     int cw = in->width, ch = in->height;
 
     if (!c->conf_mode) {
-        ModelEngine &me = c->direct;
-        if (!me.exec->setTensorAddress(me.in_name, c->buf[cur]) ||
-            !me.exec->setTensorAddress(me.out_name, c->buf[cur ^ 1])) {
-            c->set_error("setTensorAddress failed");
-            return AJI_ERR_ENGINE;
-        }
-        if (!me.exec->enqueueV3(stream)) {
-            c->set_error("enqueueV3 failed");
-            return AJI_ERR_ENGINE;
-        }
+        err = enqueue_model(c, c->direct, c->buf[cur], c->buf[cur ^ 1], stream);
+        if (err != AJI_OK)
+            return err;
         cur ^= 1;
         cw = c->out_w; ch = c->out_h;
     } else {

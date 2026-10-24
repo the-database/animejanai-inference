@@ -86,6 +86,13 @@ int aji_rife_fill_consts(void *meshx_f16, void *meshy_f16, void *mulw_f16,
 /* Fill count fp16 elements with value (the per-call timestep plane). */
 int aji_fill_f16(void *dst_f16, size_t count, float value, void *stream);
 
+/* Element-wise casts between the chain's fp16 tensors and the I/O of a model
+ * exported with fp32 inputs/outputs. */
+int aji_f16_to_f32(const void *src_f16, void *dst_f32, size_t count,
+                   void *stream);
+int aji_f32_to_f16(const void *src_f32, void *dst_f16, size_t count,
+                   void *stream);
+
 /* Fill a (strided) u8/u16 plane with a constant (pad border init). */
 int aji_fill_plane(int format, void *plane, ptrdiff_t stride, int w, int h,
                    unsigned value, void *stream);

@@ -4,6 +4,14 @@ name: Build Linux (aji)
 # baseline image and publishes aji-linux-x64.tar.zst. The mpv-upscale-2x_animejanai
 # assembler downloads this (InstallAji).
 #
+# Also publishes aji-encode-linux-x64.tar.zst: aji_encode plus the FFmpeg shared
+# libraries it links, for VideoJaNai. It is a separate asset so the player
+# package does not carry ~100 MB of libav it never loads. FFmpeg is BtbN's
+# gpl-shared build (libx264/libx265 built in, glibc-only deps) - the Linux
+# counterpart of the gyan.dev shared build the Windows aji_encode links. BtbN
+# prunes old autobuilds: when FFMPEG_URL 404s, move to a current 9.0 build and
+# update FFMPEG_SHA256.
+#
 # TensorRT comes from NVIDIA's apt packages fetched here, NOT from the build
 # image, so this build pins the same TensorRT the package ships (TrtVersion in
 # the assembler) without waiting on an image rebuild that three repos share.
@@ -24,10 +32,12 @@ on:
       - 'include/**'
 
 env:
-  DEFAULT_TAG: v0.6.0
+  DEFAULT_TAG: v0.12.0
   # Must match TrtVersion / TrtCudaVersion in mpv-AnimeJaNai's Program.cs.
   TRT_VERSION: 11.4.0.106
   TRT_CUDA: '13.4'
+  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-24-13-02/ffmpeg-n9.0.2-35-g9a9b70bb8c-linux64-gpl-shared-9.0.tar.xz
+  FFMPEG_SHA256: 29e6cb3967225c13804bf76649672cd7ace7df6e7ccdd8ca755d366fc3258ea6
 
 jobs:
   build-linux:
@@ -71,11 +81,27 @@ jobs:
           /usr/include/x86_64-linux-gnu/NvInferVersion.h
         ls -l /usr/lib/x86_64-linux-gnu/libnvinfer.so*
 
+    - name: Fetch FFmpeg 9.0 (shared, for aji_encode)
+      shell: bash
+      run: |
+        set -euxo pipefail
+        curl -fsSL -o ffmpeg.tar.xz "$FFMPEG_URL"
+        echo "$FFMPEG_SHA256  ffmpeg.tar.xz" | sha256sum -c -
+        mkdir -p /opt/ffmpeg
+        tar -xf ffmpeg.tar.xz -C /opt/ffmpeg --strip-components=1
+        rm -f ffmpeg.tar.xz
+        # the .pc files are ${pcfiledir}-relative, so the path is all CMake
+        # needs to find them; the libs' own sonames (libswresample, ...) are
+        # resolved at link time through -rpath-link in the configure below
+        echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
     - name: Build aji (full per-SM kernel set)
       run: |
         cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
-          -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+          -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" \
+          -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/opt/ffmpeg/lib"
         cmake --build build -j"$(nproc)"
+        test -x build/aji_encode || { echo "aji_encode was not built (ffmpeg not found)"; exit 1; }
 
     - name: Stage + tar (flat, extracts into animejanai/inference)
       run: |
@@ -83,6 +109,23 @@ jobs:
         cp build/libaji.so build/libaji_trt.so build/aji_harness build/aji_kernel_test stage/
         chmod +x stage/*
         tar --zstd -C stage -cf aji-linux-x64.tar.zst .
+
+    - name: Stage + tar aji_encode (flat, extracts into animejanai/inference)
+      shell: bash
+      run: |
+        set -euxo pipefail
+        mkdir -p stage-encode
+        cp build/aji_encode stage-encode/
+        # the libav sonames aji_encode needs, dereferenced (libavcodec.so.63 ...)
+        for f in /opt/ffmpeg/lib/lib*.so.*; do
+          if [[ "$f" =~ \.so\.[0-9]+$ ]]; then cp -L "$f" stage-encode/; fi
+        done
+        cp /opt/ffmpeg/LICENSE.txt stage-encode/ffmpeg_LICENSE.txt
+        # libaji.so, libaji_trt.so, cudart and the libav libs all sit beside it
+        patchelf --set-rpath '$ORIGIN' stage-encode/aji_encode stage-encode/lib*.so.*
+        chmod +x stage-encode/aji_encode
+        ldd stage-encode/aji_encode | grep -E 'libav|libsw|not found' || true
+        tar --zstd -C stage-encode -cf aji-encode-linux-x64.tar.zst .
 
     - name: Publish release
       uses: ncipollo/release-action@v1
@@ -92,5 +135,5 @@ jobs:
         draft: false
         prerelease: false
         allowUpdates: true
-        artifacts: aji-linux-x64.tar.zst
+        artifacts: aji-linux-x64.tar.zst,aji-encode-linux-x64.tar.zst
         token: ${{ secrets.GITHUB_TOKEN }}
