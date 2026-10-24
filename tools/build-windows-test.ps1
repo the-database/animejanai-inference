@@ -8,7 +8,7 @@ function Fetch([string]$Url, [string]$Destination, [string]$Sha256 = '') {
     if ($Sha256 -and (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ne $Sha256) { throw "SDK checksum mismatch: $Destination" }
 }
 if (-not (Test-Path -LiteralPath "$deps/cuda/bin/nvcc.exe")) {
-    $manifest = Invoke-RestMethod 'https://developer.download.nvidia.com/compute/cuda/redist/redistrib_13.3.0.json'
+    $manifest = Invoke-RestMethod 'https://developer.download.nvidia.com/compute/cuda/redist/redistrib_13.4.0.json'
     foreach ($component in @('cuda_nvcc', 'cuda_crt', 'cuda_cudart', 'cccl', 'libnvvm')) {
         $asset = $manifest.$component.'windows-x86_64'
         if (-not $asset.relative_path) { throw "Missing CUDA component: $component" }
@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath "$deps/cuda/bin/nvcc.exe")) {
     }
 }
 if (-not (Test-Path -LiteralPath "$deps/trt/include/NvInfer.h")) {
-    Fetch 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.1.0/zip/TensorRT-Enterprise-11.1.0.106-Windows-amd64-cuda-13.3-Release-external.zip' "$deps/trt.zip"
+    Fetch 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.4.0/zip/TensorRT-Enterprise-11.4.0.106-Windows-amd64-cuda-13.4-Release-external.zip' "$deps/trt.zip" 'b6fd86301ad803492adf7a06de29ce45e3968d29637a1437d0fb0994f412c980'
     # Extract only headers/import libraries from NVIDIA's full SDK.
     $zip = [IO.Compression.ZipFile]::OpenRead("$deps/trt.zip")
     try {
@@ -41,7 +41,7 @@ foreach ($package in @(@('Microsoft.ML.OnnxRuntime.DirectML','1.24.4','ort'), @(
 }
 $env:CUDA_PATH = "$deps/cuda"
 $env:PATH = "$env:CUDA_PATH/bin;$env:PATH"
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_COMPILER=$deps/cuda/bin/nvcc.exe" "-DAJI_TRT_ROOT=$deps/trt" "-DAJI_TRT_LIB=$deps/trt/lib" -DAJI_NVINFER=nvinfer_11 "-DAJI_ORT_ROOT=$deps/ort" "-DAJI_DML_ROOT=$deps/dml"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" "-DCMAKE_CUDA_COMPILER=$deps/cuda/bin/nvcc.exe" "-DAJI_TRT_ROOT=$deps/trt" "-DAJI_TRT_LIB=$deps/trt/lib" -DAJI_NVINFER=nvinfer_11 "-DAJI_ORT_ROOT=$deps/ort" "-DAJI_DML_ROOT=$deps/dml"
 if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
 cmake --build build --parallel 2
 if ($LASTEXITCODE -ne 0) { throw 'Inference build failed' }
@@ -49,6 +49,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Inference build failed' }
 foreach ($name in @('aji.dll','aji_dml.dll','aji_trt.dll','aji_harness.exe','aji_harness_dml.exe','aji_kernel_test.exe','aji_scene_dml_test.exe')) {
     Copy-Item -LiteralPath "build/$name" -Destination 'build/Release'
 }
-[ordered]@{ commit = (git rev-parse HEAD); cuda = '13.3.0'; tensorRT = '11.1.0.106'; onnxRuntime = '1.24.4'; directML = '1.15.4';
+[ordered]@{ commit = (git rev-parse HEAD); cuda = '13.4.0'; tensorRT = '11.4.0.106'; onnxRuntime = '1.24.4'; directML = '1.15.4';
     tensorRTSdkSha256 = (Get-FileHash -LiteralPath "$deps/trt.zip" -Algorithm SHA256).Hash.ToLowerInvariant();
     validation = 'Compiled on Windows; GPU playback is tested separately.' } | ConvertTo-Json | Set-Content -LiteralPath 'build/build-info.json'

@@ -234,6 +234,7 @@ __global__ void k_uv_v_store(const float *src, int cw, pass py, aji_csp csp,
 /* -------- 4:4:4 16-bit planar: pure matrix, no resampling -------- */
 
 __global__ void k_post444(const __half *src, int w, int h, aji_csp csp,
+                          float qdiv, float qmax,
                           uint8_t *yp, ptrdiff_t ys,
                           uint8_t *cbp, ptrdiff_t cbs,
                           uint8_t *crp, ptrdiff_t crs)
@@ -253,23 +254,27 @@ __global__ void k_post444(const __half *src, int w, int h, aji_csp csp,
     const float V = (r - Y) / (2.0f * (1.0f - csp.kr));
 
     ((uint16_t *)(yp  + (size_t)y * ys))[x]  =
-        (uint16_t)quant(Y * csp.yscale + csp.yoff, 1.0f, 65535.0f);
+        (uint16_t)quant(Y * csp.yscale + csp.yoff, qdiv, qmax);
     ((uint16_t *)(cbp + (size_t)y * cbs))[x] =
-        (uint16_t)quant(U * csp.cscale + csp.coff, 1.0f, 65535.0f);
+        (uint16_t)quant(U * csp.cscale + csp.coff, qdiv, qmax);
     ((uint16_t *)(crp + (size_t)y * crs))[x] =
-        (uint16_t)quant(V * csp.cscale + csp.coff, 1.0f, 65535.0f);
+        (uint16_t)quant(V * csp.cscale + csp.coff, qdiv, qmax);
 }
 
-extern "C" int aji_run_post444(int w, int h, const void *src_f16,
+extern "C" int aji_run_post444(int format, int w, int h, const void *src_f16,
                                const aji_csp *csp,
                                void *y_plane, ptrdiff_t y_stride,
                                void *cb_plane, ptrdiff_t cb_stride,
                                void *cr_plane, ptrdiff_t cr_stride,
                                void *stream)
 {
+    const float qdiv = format == AJI_FMT_YUV444P10MSB ? 64.0f :
+                       format == AJI_FMT_YUV444P12MSB ? 16.0f : 1.0f;
+    const float qmax = format == AJI_FMT_YUV444P10MSB ? 1023.0f :
+                       format == AJI_FMT_YUV444P12MSB ? 4095.0f : 65535.0f;
     k_post444<<<dim3((w + 31) / 32, (h + 7) / 8), dim3(32, 8), 0,
                 (cudaStream_t)stream>>>(
-        (const __half *)src_f16, w, h, *csp,
+        (const __half *)src_f16, w, h, *csp, qdiv, qmax,
         (uint8_t *)y_plane, y_stride, (uint8_t *)cb_plane, cb_stride,
         (uint8_t *)cr_plane, cr_stride);
     return (int)cudaGetLastError();
@@ -614,13 +619,109 @@ extern "C" int aji_scd_diff(int format, const void *ya, ptrdiff_t stride_a,
             (const uint8_t *)ya, stride_a, (const uint8_t *)yb, stride_b,
             w, h, 1.0f / 255.0f, accum_dev);
     } else {
-        // P010 raw values are MSB-aligned 10-bit; YUV444P16 uses the
-        // full 16-bit container
-        const float peak = format == AJI_FMT_YUV444P16 ? 65535.0f
-                                                       : 65472.0f;
+        const float peak = aji_make_csp(format, AJI_MATRIX_BT709,
+                                        AJI_RANGE_FULL).yscale;
         k_scd_diff<uint16_t><<<GRID(w, h, 1), 0, s>>>(
             (const uint8_t *)ya, stride_a, (const uint8_t *)yb, stride_b,
             w, h, 1.0f / peak, accum_dev);
     }
+    return (int)cudaGetLastError();
+}
+
+/* ---------------- temporal (multi-frame) models ---------------- */
+
+// Block-reduced sum of |a - b| over the 3 fp16 RGB planes, averaged per
+// pixel; one atomicAdd per block.
+__global__ void k_rgb_diff(const __half *a, const __half *b, int w, int h,
+                           float *accum)
+{
+    __shared__ float partial[BLOCK_X * BLOCK_Y];
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    float d = 0.0f;
+    if (x < w && y < h) {
+        const size_t plane = (size_t)w * h;
+        const size_t i = (size_t)y * w + x;
+        for (int c = 0; c < 3; c++)
+            d += fabsf(__half2float(a[c * plane + i]) -
+                       __half2float(b[c * plane + i]));
+        d *= 1.0f / 3.0f;
+    }
+    partial[tid] = d;
+    __syncthreads();
+    for (int n = BLOCK_X * BLOCK_Y / 2; n > 0; n >>= 1) {
+        if (tid < n)
+            partial[tid] += partial[tid + n];
+        __syncthreads();
+    }
+    if (tid == 0)
+        atomicAdd(accum, partial[0]);
+}
+
+extern "C" int aji_rgb_diff(const void *a_f16, const void *b_f16, int w,
+                            int h, float *accum_dev, void *stream)
+{
+    k_rgb_diff<<<GRID(w, h, 1), 0, (cudaStream_t)stream>>>(
+        (const __half *)a_f16, (const __half *)b_f16, w, h, accum_dev);
+    return (int)cudaGetLastError();
+}
+
+// Window position z reads the nearest frame on the center's side of the
+// first scene cut between it and the center, so no frame from another
+// scene reaches the model (edge replication, like a clip boundary).
+__global__ void k_temporal_gather(aji_gather_args args, int t, float thresh,
+                                  float inv_area, int w, int h, int pw,
+                                  int ph, __half *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z;
+    if (x >= pw || y >= ph)
+        return;
+
+    const int center = (t - 1) / 2;
+    int e = center;
+    if (thresh > 0.0f) {
+        if (z > center) {
+            for (int k = center; k < z; k++) {
+                const float *cut = args.cut[k];
+                if (cut && *cut * inv_area > thresh)
+                    break;
+                e = k + 1;
+            }
+        } else {
+            for (int k = center - 1; k >= z; k--) {
+                const float *cut = args.cut[k];
+                if (cut && *cut * inv_area > thresh)
+                    break;
+                e = k;
+            }
+        }
+    } else {
+        e = z;
+    }
+
+    const __half *src = (const __half *)args.src[e];
+    const int sx = min(x, w - 1);
+    const int sy = min(y, h - 1);
+    const size_t splane = (size_t)w * h;
+    const size_t dplane = (size_t)pw * ph;
+    const size_t si = (size_t)sy * w + sx;
+    const size_t di = (size_t)y * pw + x;
+    for (int c = 0; c < 3; c++)
+        dst[(size_t)(z * 3 + c) * dplane + di] = src[c * splane + si];
+}
+
+extern "C" int aji_temporal_gather(const aji_gather_args *args, int t,
+                                   float thresh, int w, int h, int pw, int ph,
+                                   void *dst_f16, void *stream)
+{
+    if (t < 1 || t > AJI_TEMPORAL_MAX || pw < w || ph < h)
+        return (int)cudaErrorInvalidValue;
+    k_temporal_gather<<<GRID(pw, ph, t), 0, (cudaStream_t)stream>>>(
+        *args, t, thresh, 1.0f / ((float)w * h), w, h, pw, ph,
+        (__half *)dst_f16);
     return (int)cudaGetLastError();
 }

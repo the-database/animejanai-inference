@@ -20,7 +20,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: build-deps
-          key: aji-windows-cuda133-trt111-ort1244-dml1154-v1
+          key: aji-windows-cuda134-trt114-ort1244-dml1154-v1
       - name: Build dispatcher and both inference backends
         shell: pwsh
         run: ./tools/build-windows-test.ps1

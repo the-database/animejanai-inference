@@ -165,6 +165,9 @@ AjiChainConf parse_chain(const Section &sec, int chain)
             to_double(mget("resize_factor_before_upscale", "100"), 100);
         mc.resize_height_before_upscale =
             to_double(mget("resize_height_before_upscale", "0"), 0);
+        mc.frames = (int)to_double(mget("frames", "0"), 0);
+        mc.temporal_scene_threshold =
+            to_double(mget("temporal_scene_threshold", "0.150"), 0.150);
         c.models.push_back(std::move(mc));
     }
 

@@ -57,9 +57,9 @@ int aji_run_post(aji_plan *p, const void *src_f16, const aji_csp *csp,
                  void *y_plane, ptrdiff_t y_stride,
                  void *uv_plane, ptrdiff_t uv_stride, void *stream);
 
-/* fp16 NCHW RGB -> 16-bit 4:4:4 planar YUV (full-resolution chroma; pure
- * matrix + quantize, no resampling, so no plan is involved). */
-int aji_run_post444(int w, int h, const void *src_f16, const aji_csp *csp,
+/* fp16 NCHW RGB -> 4:4:4 planar YUV in 16-bit containers. Quantizes to
+ * format's depth/alignment; no resampling, so no plan is involved. */
+int aji_run_post444(int format, int w, int h, const void *src_f16, const aji_csp *csp,
                     void *y_plane, ptrdiff_t y_stride,
                     void *cb_plane, ptrdiff_t cb_stride,
                     void *cr_plane, ptrdiff_t cr_stride, void *stream);
@@ -96,6 +96,33 @@ int aji_fill_plane(int format, void *plane, ptrdiff_t stride, int w, int h,
 int aji_scd_diff(int format, const void *ya, ptrdiff_t stride_a,
                  const void *yb, ptrdiff_t stride_b, int w, int h,
                  float *accum_dev, void *stream);
+
+/* Temporal (multi-frame) models. */
+
+#define AJI_TEMPORAL_MAX 15
+
+/* Mean absolute RGB difference of two fp16 NCHW frames: accumulates the
+ * per-pixel sum into *accum_dev (caller zeroes it); divide by w*h for the
+ * mean, on the same [0,1] scale as aji_scd_diff. */
+int aji_rgb_diff(const void *a_f16, const void *b_f16, int w, int h,
+                 float *accum_dev, void *stream);
+
+/* src[j]: the fp16 NCHW frame at window position j (0..t-1, oldest first;
+ * missing frames already replaced by the nearest present one). cut[j]: the
+ * aji_rgb_diff accumulator between positions j and j+1, or NULL when
+ * unknown (no cut). */
+typedef struct aji_gather_args {
+    const void *src[AJI_TEMPORAL_MAX];
+    const float *cut[AJI_TEMPORAL_MAX];
+} aji_gather_args;
+
+/* Build the [1, 3t, ph, pw] model input from a t-frame window: positions
+ * across a scene cut (mean diff > thresh; thresh <= 0 disables) replicate
+ * the nearest frame on the center's side, and the w x h frames are padded to
+ * pw x ph by edge replication. */
+int aji_temporal_gather(const aji_gather_args *args, int t, float thresh,
+                        int w, int h, int pw, int ph, void *dst_f16,
+                        void *stream);
 
 #ifdef __cplusplus
 }

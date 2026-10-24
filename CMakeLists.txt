@@ -45,7 +45,8 @@ set_target_properties(aji PROPERTIES
     CXX_VISIBILITY_PRESET hidden)
 
 # aji_trt: TensorRT/CUDA backend (the former aji.dll).
-add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/kernels.cu)
+add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/onnx_shape.cpp
+    src/kernels.cu)
 target_include_directories(aji_trt
     PUBLIC include
     PRIVATE ${AJI_TRT_INCLUDE})
@@ -64,7 +65,10 @@ if(NOT WIN32)
     target_link_options(aji_trt PRIVATE -Wl,-Bsymbolic)
 endif()
 
-add_executable(aji_harness src/harness.c)
+# The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so argv/fopen
+# carry non-ASCII paths intact; benchmark.ps1 runs this from the installed
+# package, which may live under a non-ASCII path.
+add_executable(aji_harness src/harness.c $<$<BOOL:${WIN32}>:src/utf8-argv.manifest>)
 target_link_libraries(aji_harness PRIVATE aji CUDA::cudart)
 add_dependencies(aji_harness aji_trt)
 set_target_properties(aji_harness PROPERTIES
@@ -77,9 +81,8 @@ set_target_properties(aji_harness PROPERTIES
 if(WIN32)
     set(AJI_FFMPEG_ROOT "" CACHE PATH "ffmpeg dev root (include/, lib/)")
     if(AJI_FFMPEG_ROOT)
-        # The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so the exe's
-        # argv/fopen/CreateProcessA handle Unicode (non-ASCII) file paths correctly.
-        add_executable(aji_encode src/encode.c src/aji_encode.manifest)
+        # Same UTF-8 argv manifest as aji_harness above.
+        add_executable(aji_encode src/encode.c src/utf8-argv.manifest)
         target_include_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/include")
         target_link_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/lib")
         target_link_libraries(aji_encode PRIVATE aji CUDA::cudart CUDA::cuda_driver
@@ -118,7 +121,7 @@ if(WIN32)
         "Microsoft.ML.OnnxRuntime.DirectML package root")
     set(AJI_DML_ROOT "" CACHE PATH
         "Microsoft.AI.DirectML package root")
-    add_library(aji_dml SHARED src/aji_dml.cpp src/aji_conf.cpp)
+    add_library(aji_dml SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp)
     target_include_directories(aji_dml
         PUBLIC include
         PRIVATE "${AJI_ORT_ROOT}/build/native/include"
@@ -126,7 +129,7 @@ if(WIN32)
     target_link_libraries(aji_dml PRIVATE d3d12 d3d11 dxgi d3dcompiler)
     set_target_properties(aji_dml PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
-    add_executable(aji_harness_dml src/harness_dml.cpp)
+    add_executable(aji_harness_dml src/harness_dml.cpp src/utf8-argv.manifest)
     target_link_libraries(aji_harness_dml PRIVATE aji d3d11)
     add_dependencies(aji_harness_dml aji_dml)
     add_executable(aji_scene_dml_test sanity/scene_dml.cpp)
@@ -139,3 +142,7 @@ endif()
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
+
+add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
+target_include_directories(aji_msb444_test PRIVATE include src)
+target_link_libraries(aji_msb444_test PRIVATE CUDA::cudart)
