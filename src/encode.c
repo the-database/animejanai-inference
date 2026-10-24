@@ -276,6 +276,8 @@ typedef struct {
     int64_t  src_frames_est;
     int64_t  scene_dupes;
     int      color_space, color_range, color_pri, color_trc, chroma_loc;
+    int      src_rgb;                /* RGB source, converted to YUV on upload */
+    AVRational src_sar;              /* source sample aspect ratio, kept */
 } enc_ctx;
 
 /* forward decls */
@@ -392,6 +394,19 @@ static int open_input(enc_ctx *c)
     c->color_pri   = par->color_primaries;
     c->color_trc   = par->color_trc;
     c->chroma_loc  = par->chroma_location;
+    /* RGB sources (gbrp, bgr0, ... lossless intermediates) are converted to
+     * YUV on upload; make that BT.709 limited explicitly and tag the stream to
+     * match, so libaji, the output tags and the conversion agree (swscale's
+     * BT.601 default against BT.709-assuming tags shifted the colors) */
+    c->src_rgb = d && (d->flags & AV_PIX_FMT_FLAG_RGB);
+    if (c->src_rgb) {
+        c->color_space = AVCOL_SPC_BT709;
+        c->color_range = AVCOL_RANGE_MPEG;
+        c->chroma_loc  = AVCHROMA_LOC_LEFT;
+    }
+
+    /* upscaling scales both axes alike, so the pixel aspect carries over */
+    c->src_sar = av_guess_sample_aspect_ratio(c->ifmt, vst, NULL);
 
     c->out_fps = av_guess_frame_rate(c->ifmt, vst, NULL);
     if (c->out_fps.num == 0) c->out_fps = (AVRational){24000, 1001};
@@ -685,6 +700,12 @@ static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
                                          sw, SWS_BICUBIC, NULL, NULL, NULL);
         packed = av_frame_alloc();
         if (!c->in_sws || !packed) goto fail;
+        if (c->src_rgb) {
+            /* full-range RGB -> BT.709 limited YUV, as tagged in open_input */
+            const int *bt709 = sws_getCoefficients(SWS_CS_ITU709);
+            sws_setColorspaceDetails(c->in_sws, bt709, 1, bt709, 0,
+                                     0, 1 << 16, 1 << 16);
+        }
         packed->format = sw;
         packed->width  = src->width;
         packed->height = src->height;
@@ -799,6 +820,8 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     c->enc->color_primaries       = c->color_pri;
     c->enc->color_trc             = c->color_trc;
     c->enc->chroma_sample_location = c->chroma_loc;
+    if (c->src_sar.num > 0 && c->src_sar.den > 0)
+        c->enc->sample_aspect_ratio = c->src_sar;
 
     int hw = is_nvenc(c->o.vcodec) && first->hw_frames_ctx &&
              (first->format == AV_PIX_FMT_CUDA ||
@@ -896,6 +919,7 @@ static int finalize_output(enc_ctx *c)
     AV(avcodec_parameters_from_context(vs->codecpar, c->enc));
     vs->time_base = c->enc->time_base;
     vs->avg_frame_rate = c->out_fps;
+    vs->sample_aspect_ratio = c->enc->sample_aspect_ratio;
 
     if (!(c->ofmt->oformat->flags & AVFMT_NOFILE)) {
         if (!c->o.overwrite) {
