@@ -2,148 +2,157 @@
 
 **There is no Windows CI for this repo.** `.github/workflows/` contains exactly one workflow,
 `build-linux.yml`. The `aji-windows-x64.zip` release asset that
-`the-database/mpv-AnimeJaNai` downloads is built and uploaded **by hand from this
-workstation**, so this document is the only record of how to reproduce it.
+`the-database/mpv-AnimeJaNai` downloads is built and uploaded **by hand**, with the two scripts
+in [`ci/windows/`](../ci/windows/):
 
-Everything below is driven from a working area **outside** the repo that holds the
-hand-assembled SDKs, the build scripts, and the test rigs. Linux build:
+| Script | Does |
+|---|---|
+| `ci\windows\build-aji-release.bat` | the release build of this checkout (all architectures, clean) |
+| `ci\windows\package-aji-release.ps1` | zips the seven release artifacts into `aji-windows-x64.zip` |
+
+The SDKs they build against live **outside** the repo, in a working area. Linux build:
 [`BUILD-LINUX.md`](BUILD-LINUX.md). Engine overview: [`../CLAUDE.md`](../CLAUDE.md).
 
 ### Paths in this document
 
-Two placeholders stand in for machine-specific locations. Substitute your own, or set them as
-real environment variables and the commands below work as written:
-
 | Placeholder | Means |
 |---|---|
-| `%AJI_WIN%` | the working area holding the SDK roots, build scripts and test rigs (conventionally a directory named `aji-win`) |
+| `%AJI_WIN%` | the SDK working area. The scripts read the `AJI_WIN` environment variable and default to `%USERPROFILE%\aji-win`. |
 | `%REPO%` | your checkout of this repository |
-
-**The scripts under `%AJI_WIN%` hardcode absolute paths.** They are reproduced here with the
-placeholders substituted in, so they are faithful in structure but not byte-identical — adapt
-the paths when adopting them on another machine.
 
 ## Target layout
 
-The build scripts pass every dependency path **explicitly and absolutely**, so the layout is
+The build script passes every dependency path **explicitly and absolutely**, so the layout is
 part of the contract:
 
 ```
 %AJI_WIN%\
-├── animejanai-inference\          NTFS junction -> %REPO%
-│   ├── build-win-release\         release build (all arches)   [created by the build]
-│   └── build-win-trt11\           dev build    (single arch)   [created by the build]
-├── trt113\                        TensorRT 11.3.0.99  <- the release TRT root
+├── cuda134\                       CUDA 13.4 from NVIDIA's redistributable archives (see 1.)
+│   ├── bin\                       nvcc.exe, ptxas.exe, ...
+│   ├── include\  lib\x64\  nvvm\
+├── trt114\                        TensorRT 11.4.0.106  <- the release TRT root (see 2.)
 │   ├── include\                   NvInfer*.h + impl\
 │   ├── nvinfer_11.lib  nvonnxparser_11.lib  nvinfer_plugin_11.lib  (+ lean/dispatch/vc)
 │   ├── nvinfer_11.dll  nvinfer_plugin_11.dll  nvonnxparser_11.dll  trtexec.exe
 │   ├── nvinfer_builder_resource_{ptx,sm75,sm80,sm86,sm89,sm90,sm100,sm120}_11.dll
 │   └── Acknowledgements.txt
-├── trt111\ , trt11\               TRT 11.1.0.106 / 11.0.0.114 — reference only
 ├── ort\
 │   ├── ort-dml-1.24.4.nupkg       +  Microsoft.ML.OnnxRuntime.DirectML\   (extracted)
 │   └── directml-1.15.4.nupkg      +  Microsoft.AI.DirectML\               (extracted)
-├── ffmpeg-shared\ffmpeg-8.1.1-full_build-shared\{include,lib,bin}
+├── ffmpeg-shared\ffmpeg-9.0.2-full_build-shared\{include,lib,bin}
 └── dist\<tag>\aji-windows-x64.zip      packaging output
+%REPO%\build-win-release\               release build directory  [created by the build]
 ```
 
-The **junction** matters. Both `CMakeCache.txt` files record
-`CMAKE_HOME_DIRECTORY=%AJI_WIN%/animejanai-inference`, and the repo's
-`.git/info/exclude` says: "local build dirs (out-of-repo build env in ~/aji-win uses these via
-junction)". Create it with:
+The release build directory sits in the checkout. It is not in `.gitignore`, so exclude it
+locally: add `build-win-*/` to `.git/info/exclude`.
 
-```bat
-mklink /J %AJI_WIN%\animejanai-inference %REPO%
-```
-
-(`Get-Item` on that path reports `LinkType: Junction` with the repo as its `Target`.)
-
-Because it is a junction, `%REPO%\build-win-release` and `%AJI_WIN%\animejanai-inference\build-win-release`
-are the same directory — which is why `build-aji-release.bat` and `package-aji-release.ps1`
-spell the path differently and still agree.
+> Earlier releases were built from a junction, `%AJI_WIN%\animejanai-inference -> %REPO%`, with
+> the scripts living only in `%AJI_WIN%`. Since the scripts moved into `ci/windows/`, they build
+> the checkout they sit in, and the junction is not needed.
 
 ## Toolchain
 
 | Tool | Version in use | Where |
 |---|---|---|
-| Visual Studio | 18 Community | `C:\Program Files\Microsoft Visual Studio\18\Community` |
-| MSVC toolset | 14.51.36231 | `.../VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe` |
+| Visual Studio | 2026 (18.11) Build Tools, C++ workload | found with `vswhere` — Build Tools and Community both work |
+| MSVC toolset | 14.51.36231 (`cl` 19.51.36260) | `.../VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe` |
 | CMake | 4.3.1 | **bundled with VS**: `.../Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe` |
-| Ninja | bundled with VS | `.../CommonExtensions/Microsoft/CMake/Ninja/ninja.exe` |
-| CUDA Toolkit | 13.3 | `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3` |
+| Ninja | 1.13.2, bundled with VS | `.../CommonExtensions/Microsoft/CMake/Ninja/ninja.exe` |
+| CUDA | 13.4 (nvcc 13.4.59) | `%AJI_WIN%\cuda134` — not a system install (see 1.) |
 | PowerShell 7 (`pwsh`) | — | only needed for `package-aji-release.ps1`; must be on `PATH` |
 
-CMake and Ninja come from the Visual Studio install — there is no standalone CMake on `PATH`
-here. Every build script starts by sourcing the VS environment. This is `build-aji-release.bat`'s
-prologue — you do **not** run it yourself, the script does:
+Install Visual Studio with:
 
-```bat
-setlocal
-call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo || exit /b 1
-set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
-set "PATH=%CUDA_PATH%\bin;%PATH%"
-set "SRC=%AJI_WIN%\animejanai-inference"
-set "BLD=%SRC%\build-win-release"
+```
+winget install --id Microsoft.VisualStudio.BuildTools -e --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
-CUDA 13.3 was installed from `cuda_13.3.0_windows_network.exe`, which is still in `aji-win`.
+`--includeRecommended` brings the Windows SDK (`aji_dml` links `d3d12`, `d3d11`, `dxgi`,
+`d3dcompiler`) and the CMake/Ninja component. CMake and Ninja come from the Visual Studio
+install — there is no standalone CMake on `PATH`. The build script locates VS 18 with
+`vswhere`, sources `VsDevCmd.bat`, and puts `%AJI_WIN%\cuda134\bin` first on `PATH`.
 
 > `VsDevCmd.bat` prints `'vswhere.exe' is not recognized as an internal or external command`
-> in this environment. It is **harmless noise** — it appears at the top of every successful
-> release build log. Do not chase it.
+> because the VS installer directory is not on `PATH`. It is **harmless noise** — it appears at
+> the top of every successful release build log. Do not chase it.
 
-> `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler` is required: CUDA 13.3's `nvcc` does not
-> recognise MSVC 14.51 as a supported host compiler. `nvcc-test.cmd` in `aji-win` is the
-> minimal reproducer — it compiles a trivial kernel with and without the flag.
+> `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler` stays in the configure line for older
+> toolkits: CUDA 13.3's `nvcc` did not recognise MSVC 14.51. CUDA 13.4's does — a trivial
+> kernel compiles without the flag.
 
 ## Dependency setup, from scratch
 
-### 1. TensorRT — one zip from NVIDIA
+### 1. CUDA 13.4 — from NVIDIA's redistributable archives
 
-`trt113` is populated wholesale from NVIDIA's public redistributable archive — no login, and no
+The build needs only the compiler and the runtime, so instead of running the CUDA installer
+(which needs admin rights and installs a display driver by default), `cuda134` is assembled from
+five archives listed in NVIDIA's public manifest, which publishes a SHA-256 for every file:
+
+```
+https://developer.download.nvidia.com/compute/cuda/redist/redistrib_13.4.1.json
+  cuda_nvcc    13.4.59    nvcc, ptxas, fatbinary, nvlink, ...
+  cuda_crt     13.4.59    nvcc's crt headers
+  libnvvm      13.4.59    nvvm\ (cicc, libdevice)
+  cuda_cudart  13.4.49    cuda_runtime.h, cuda_fp16.h, cudart.lib, cuda.lib
+  cccl         13.3.4.2.1 include\cccl (FindCUDAToolkit adds it to the include path)
+```
+
+Download each `windows-x86_64` `relative_path` from `.../compute/cuda/redist/`, check it
+against the manifest's `sha256`, and extract all five into `cuda134\`, merging their top-level
+`bin\`, `include\`, `lib\` and `nvvm\` directories. `nvcc --version` should then report
+`release 13.4, V13.4.59`. The build points CMake at it with `CMAKE_CUDA_COMPILER` and
+`CUDAToolkit_ROOT`. This is the same manifest the package assembler pins `cudart` from
+(`CudartVersion` in `the-database/mpv-AnimeJaNai`).
+
+TensorRT 11.x requires CUDA 13.2 Update 2 or later; keep this on the CUDA flavour of the
+TensorRT zip below.
+
+### 2. TensorRT — one zip from NVIDIA
+
+`trt114` is populated wholesale from NVIDIA's public redistributable archive — no login, and no
 third-party redistributor:
 
 ```
-https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.3.0/zip/
-  TensorRT-Enterprise-11.3.0.99-Windows-amd64-cuda-13.4-Release-external.zip
+https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.4.0/zip/
+  TensorRT-Enterprise-11.4.0.106-Windows-amd64-cuda-13.4-Release-external.zip
+  (sha256 b6fd86301ad803492adf7a06de29ce45e3968d29637a1437d0fb0994f412c980)
 ```
 
 The `-external` suffix marks the publicly redistributable build. It carries everything this
 build needs in one versioned place: `include/` headers, the real `lib/*.lib` import libraries,
 the runtime DLLs, every per-SM builder resource, a prebuilt `trtexec.exe`, and
-`doc/Acknowledgements.txt`. Extract it into `trt113` **flat** — headers under `include/`, the
-`.lib` and `.dll` files at the root — which is the layout `CMakeLists.txt` expects on Windows
+`doc/Acknowledgements.txt`. Extract it into `trt114` **flat** — `include/` as is, the contents
+of `lib/` and `bin/` at the root — which is the layout `CMakeLists.txt` expects on Windows
 (`AJI_TRT_INCLUDE = <root>/include`, `AJI_TRT_LIB = <root>`).
 
-**Keep this and `TrtVersion` in the package assembler on the same version.** `aji_trt` links
-`nvinfer_11` and must be built against the TensorRT it runs on.
+**Keep this, the Linux workflow's `TRT_VERSION`, and `TrtVersion` in the package assembler on
+the same version.** `aji_trt` links `nvinfer_11`, which every TensorRT 11.x release ships under
+the same name — so an engine built against an older 11.x also loads on a newer 11.x runtime —
+but release builds are made against the TensorRT they ship with.
 
 > **The CUDA flavour is part of the URL and is not derivable from the TensorRT version.**
-> NVIDIA's pairing wanders: 11.0 -> cuda-13.2, 11.1 -> 13.3, 11.2 -> 13.3, 11.3 -> 13.4.
-> Guessing it yields a 404.
+> NVIDIA's pairing wanders: 11.0 -> cuda-13.2, 11.1 -> 13.3, 11.2 -> 13.3, 11.3 -> 13.4,
+> 11.4 -> 13.4. Guessing it yields a 404.
 
-NVIDIA retains old versions (10.13.3.9 through 11.3.0.99 are all still live), so an older
+NVIDIA retains old versions (10.13.3.9 through 11.4.0.106 are all still live), so an older
 release stays reproducible. Two archival fallbacks exist if a URL ever 404s:
 `pypi.nvidia.com/tensorrt-cu13-libs/` (every version, sha256 in the index, but no `trtexec`)
 and the CUDA apt repo (including `trtexec` via `libnvinfer-bin`).
 
-### 2. Headers and the import library — both from that zip
-
-Previous releases assembled these by hand: headers of unrecorded provenance, and an
-`nvinfer_11.lib` synthesized from the DLL's export table by `make-trt111-implib.cmd` (a
-`dumpbin /exports` scrape with a hardcoded `skip=19` that broke silently on a toolchain
-change). Both are obsolete — the zip ships NVIDIA's own headers and import libraries, so
-`make-trt111-implib.cmd` / `make-trt11-implib.cmd` are no longer part of any build.
-
 Verify the end state:
 
 ```c
-/* trt113\include\NvInferVersion.h */
+/* trt114\include\NvInferVersion.h */
 #define TRT_MAJOR_ENTERPRISE 11
-#define TRT_MINOR_ENTERPRISE 3
+#define TRT_MINOR_ENTERPRISE 4
 #define TRT_PATCH_ENTERPRISE 0
-#define TRT_BUILD_ENTERPRISE 99
+#define TRT_BUILD_ENTERPRISE 106
 ```
+
+Previous releases assembled the headers and an `nvinfer_11.lib` (synthesized from the DLL's
+export table) by hand. Both are obsolete — the zip ships NVIDIA's own headers and import
+libraries.
 
 ### 3. `trtexec.exe` — NVIDIA's, not a patched fork
 
@@ -187,51 +196,37 @@ ort\Microsoft.AI.DirectML\bin\x64-win\                           (DirectML.dll/.
 
 ### 5. ffmpeg dev libraries — for `aji_encode` only
 
-`AJI_FFMPEG_ROOT` needs a root containing `include/` and `lib/`. In use:
-`ffmpeg-shared\ffmpeg-8.1.1-full_build-shared\` — a shared "full build" of **ffmpeg 8.1.1**,
-carrying `avcodec-62`, `avformat-62`, `avutil-60`, `avfilter-11`, `swscale-9`, `swresample-6`
-plus the matching `.lib` import libraries.
+`AJI_FFMPEG_ROOT` needs a root containing `include/` and `lib/`. Only `aji_encode`, the offline
+CLI encoder, links ffmpeg; the player path does not (mpv brings its own). In use:
+`ffmpeg-shared\ffmpeg-9.0.2-full_build-shared\` — gyan.dev's shared "full build" of
+**ffmpeg 9.0.2**, the same ffmpeg release the Linux mpv bundle builds against, carrying
+`avcodec-63`, `avformat-63`, `avutil-61`, `swscale-10` plus the matching `.lib` import
+libraries. gyan.dev publishes its release builds on GitHub:
 
-> **Unverified:** where `ffmpeg-shared.7z` was downloaded from — no script in `aji-win`
-> references it. The naming matches the common `*-full_build-shared` Windows builds. Any
-> shared ffmpeg dev tree with `include/` + `lib/` for those libraries satisfies the build;
-> without it, `aji_encode` is silently skipped.
-
-### 6. Inno Setup (only for installer testing)
-
-`install-inno.cmd` installs it silently from the bundled `is-setup.exe`:
-
-```bat
-%AJI_WIN%\is-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /CURRENTUSER /NORESTART /DIR="%LOCALAPPDATA%\Programs\Inno Setup 6"
+```
+gh release download 9.0.2 -R GyanD/codexffmpeg -p ffmpeg-9.0.2-full_build-shared.7z
 ```
 
-Not needed to build libaji — only for `build-installer.cmd` and the install/upgrade rigs.
+Without `AJI_FFMPEG_ROOT`, `aji_encode` is silently skipped.
 
 ## The release build
 
-One script, `%AJI_WIN%\build-aji-release.bat`. Its own header calls it "the single
-canonical release build of the aji engine". Just run it:
-
 ```bat
-%AJI_WIN%\build-aji-release.bat
+%REPO%\ci\windows\build-aji-release.bat
 ```
 
-The configure line it runs. **This is the script's single `cmake` line re-wrapped with `^`
-continuations for readability, not a byte-exact quote** — `build-aji-release.bat` itself is
-the source of truth if you need exact spelling:
+It configures and builds this checkout into `%REPO%\build-win-release` with:
 
 ```
-cmake -S %AJI_WIN%\animejanai-inference ^
-      -B %AJI_WIN%\animejanai-inference\build-win-release ^
-      -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+cmake -S %REPO% -B %REPO%\build-win-release -G Ninja -DCMAKE_BUILD_TYPE=Release ^
       "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ^
-      -DAJI_TRT_ROOT=%AJI_WIN%/trt113 ^
-      -DAJI_NVINFER=nvinfer_11 ^
+      "-DCMAKE_CUDA_COMPILER=%AJI_WIN%/cuda134/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%AJI_WIN%/cuda134" ^
+      -DAJI_TRT_ROOT=%AJI_WIN%/trt114 -DAJI_NVINFER=nvinfer_11 ^
       -DAJI_ORT_ROOT=%AJI_WIN%/ort/Microsoft.ML.OnnxRuntime.DirectML ^
       -DAJI_DML_ROOT=%AJI_WIN%/ort/Microsoft.AI.DirectML ^
-      -DAJI_FFMPEG_ROOT=%AJI_WIN%/ffmpeg-shared/ffmpeg-8.1.1-full_build-shared ^
+      -DAJI_FFMPEG_ROOT=%AJI_WIN%/ffmpeg-shared/ffmpeg-9.0.2-full_build-shared ^
       "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
-cmake --build %AJI_WIN%\animejanai-inference\build-win-release --clean-first
+cmake --build %REPO%\build-win-release --clean-first
 ```
 
 Three things in there are deliberate and easy to lose:
@@ -239,49 +234,42 @@ Three things in there are deliberate and easy to lose:
 - **Every dependency is passed explicitly**, so the build never silently reuses a stale cache
   value.
 - **`--clean-first`**, because this is a release.
-- **Its own build directory**, `build-win-release`, separate from the dev build's
-  `build-win-trt11`, so a single-arch dev build can never pollute the release cache.
+- **The full architecture list** — see "The CUDA-architecture trap" in `CLAUDE.md`.
 
 ### Expected output
 
 ```
 'vswhere.exe' is not recognized as an internal or external command,
 operable program or batch file.
--- Configuring done (1.6s)
--- Generating done (0.1s)
--- Build files have been written to: %AJI_WIN%/animejanai-inference/build-win-release
-[1/1] Cleaning all built files...
-Cleaning... 22 files.
-[1/19] Building C object CMakeFiles\aji_kernel_test.dir\src\kernel_test.c.obj
+-- The CUDA compiler identification is NVIDIA 13.4.59 with host compiler MSVC 19.51.36260.0
+-- Found CUDAToolkit: %AJI_WIN%/cuda134/include;%AJI_WIN%/cuda134/include/cccl (found version "13.4.59")
+-- Configuring done
 ...
-[19/19] Linking C executable aji_encode.exe
+[24/24] Linking C executable aji_encode.exe
 AJI-RELEASE-BUILD-OK
 ```
 
-**19 build edges and all seven artifacts.** If the edge count is lower, a target was skipped —
-check the configure output for the `skipping aji_encode target` message. `AJI-RELEASE-BUILD-OK`
-on the last line is the success marker; a MSVC warning C4819 about code page 932 is expected
-noise on a Japanese ANSI code page.
+**24 build edges, and all seven release artifacts plus `aji_msb444_test.exe`.** If the edge
+count is lower, a target was skipped — check the configure output for the
+`skipping aji_encode target` message. `AJI-RELEASE-BUILD-OK` on the last line is the success
+marker; a MSVC warning C4819 about code page 932 is expected noise on a Japanese ANSI code page.
 
-Reference logs from real releases: `%AJI_WIN%\aji-release-v080.log` and `aji-release-v070.log`.
+Quick GPU self-check after a build (TensorRT and CUDA on `PATH`):
+
+```bat
+set PATH=%AJI_WIN%\cuda134\bin;%AJI_WIN%\trt114;%PATH%
+%REPO%\build-win-release\aji_msb444_test.exe
+```
+
+prints `MSB 4:4:4 GPU normalization and quantization passed`.
 
 ### Dev build (much faster)
 
-For iterating, build one architecture into a separate directory:
-
-```bat
-%AJI_WIN%\build-shim-trt111.cmd      REM TRT 11.1 root, -DCMAKE_CUDA_ARCHITECTURES=120
-%AJI_WIN%\build-shim-trt11.cmd       REM TRT 11.0 root, same arch
-```
-
-Both set `-DCMAKE_CUDA_ARCHITECTURES=120` (sm120 / RTX 50-series) and omit `AJI_FFMPEG_ROOT`,
-so **`aji_encode.exe` is not built** by a dev build — consistent with `build-win-trt11`'s
-`CMakeCache.txt` recording `AJI_FFMPEG_ROOT:PATH=` empty. They print `SHIM-TRT111-BUILD-OK` /
-`SHIM-TRT11-BUILD-OK`.
-
-> `build-shim-trt111.cmd` targets `build-win-trt111`, which does not currently exist on disk —
-> the dev builds that were actually done used `build-win-trt11` (TensorRT 11.0). Either is fine;
-> just be clear which TRT root a dev artifact was built against before comparing it to a release.
+For iterating on one machine, configure a separate directory with
+`-DCMAKE_CUDA_ARCHITECTURES=native` (or `120` for RTX 50-series) and without
+`AJI_FFMPEG_ROOT`, so `aji_encode.exe` is skipped. Keep it out of `build-win-release`, so a
+single-arch build can never pollute the release cache, and be clear which TRT root a dev
+artifact was built against before comparing it to a release.
 
 ## Packaging and release
 
@@ -289,10 +277,11 @@ so **`aji_encode.exe` is not built** by a dev build — consistent with `build-w
 (`BuildMpvUpscale2xAnimeJaNai/Program.cs` in `the-database/mpv-AnimeJaNai`) — that one constant
 builds *both* asset URLs. In practice the Linux CI job runs first and creates the release, so
 use the tag you passed to its `release_tag` input; this step then only attaches a second asset
-to the release that already exists.
+to the release that already exists. Build the Windows asset from the same commit the Linux job
+built.
 
 ```powershell
-pwsh %AJI_WIN%\package-aji-release.ps1 -Tag v0.8.0
+pwsh %REPO%\ci\windows\package-aji-release.ps1 -Tag v0.11.2
 ```
 
 It stages exactly seven files — `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_encode.exe`,
@@ -316,16 +305,14 @@ from their own directory at runtime. The package assembler drops them into that 
 CUDA redistributable, and `InstallOrtDml()` pulls
 `onnxruntime.dll` + `DirectML.dll` from the two NuGet packages (`OrtDmlVersion`,
 `DirectMLVersion`). That is why this build needs those SDKs only to **compile and link**
-against — it never ships them. `pkg-mock\animejanai\inference\` mirrors the assembled result.
+against — it never ships them.
 
-Parameters `-BuildDir` and `-OutDir` are overridable; the default
-`-BuildDir` defaults to the repo-side spelling of the build directory while the build script
-writes through the junction — the same directory either way.
+`-BuildDir` and `-OutDir` are overridable.
 
 Then attach it to the release that the Linux CI job created for the same tag:
 
 ```bash
-gh release upload v0.8.0 %AJI_WIN%/dist/v0.8.0/aji-windows-x64.zip \
+gh release upload v0.11.2 %AJI_WIN%/dist/v0.11.2/aji-windows-x64.zip \
   -R the-database/animejanai-inference
 ```
 
@@ -335,53 +322,16 @@ from one `AjiVersion`.
 To test the zip in a package build before releasing it, point the assembler at it with
 `AJI_LOCAL_ZIP` instead of uploading.
 
-## Testing rigs in `aji-win`
+## Testing
 
-None of these are needed to build; they are how a build gets validated. **Nothing automates
-them and no rig gates a release** — picking which to run after a change is a judgement call,
-so the table below says what each one actually proves.
+Nothing automates validation and nothing gates a release. The practical check is to play
+content through an installed package with the new engine dropped in: copy `aji.dll`,
+`aji_trt.dll` and `aji_dml.dll` into a copy of an install's `animejanai\inference\`, run its
+`mpv.exe --config-dir=<copy>\portable_config`, and confirm in the log (`--msg-level=all=v`)
+that `[animejanai] Configured slot ...` reports the upscaled size. First play of each model and
+resolution builds a TensorRT engine, which takes a few seconds to a minute.
 
-**Prebuild TensorRT engines** (first-play engine builds are slow, so do them up front):
-
-```bat
-prebuild-bench.cmd        REM bench models, slots 1010/1011, all five benchmark resolutions
-prebuild-display.cmd      REM slots 1..5 at 1920x1080 against test-animejanai.conf
-prebuild-rife16.cmd       REM slots 4,5 against models\rife-fp16
-```
-
-All shell out to `aji_harness.exe --input <raw> --width W --height H --frames 1 --fps 23.976
---conf <conf> --model-dir <dir> --trtexec <trtexec.exe> --slot N`.
-
-**Playback:**
-
-| Script | What it proves |
-|---|---|
-| `aji-play.cmd` | drag-and-drop playback through `%AJI_WIN%\mpv\build\mpv.exe` + `portable_config` |
-| `run-mpv.cmd` | staging launcher with the shim build dir on `PATH` |
-| `run-mock.cmd` | the **DLL-resolution test** — deliberately keeps the build dir off `PATH` and uses a neutral cwd, so `aji.dll` must resolve its TensorRT deps via `LOAD_WITH_ALTERED_SEARCH_PATH` alone. This is what catches "works on my machine, broken once installed". |
-
-**Benchmarks:** `bench-native.cmd` (TensorRT, five resolutions × slots 1010/1011),
-`bench-native-dml.cmd` (DirectML via `--hwdec=d3d11va --gpu-api=d3d11`),
-`bench-native-pipe.cmd` / `bench-dml-pipe.cmd` (queue-depth sweeps, 3 repeats),
-`bench-one.cmd` / `bench-dbg.cmd` (single cells).
-
-**Output correctness:** `shot-interop.cmd`, `shot-bisect.cmd`, `shot-regress.cmd`,
-`shot-fixtest.cmd`, `shot-charts.cmd` capture PNG screenshots into `shots-*` dirs for A/B
-comparison; `dml-md5.cmd` writes `framemd5` output for bit-exactness checks across queue depths;
-`verify-rife.cmd` checks RIFE slots 4/5.
-
-**Installer / updater simulation:** `run-installer.cmd`, `test-install-silent.cmd`,
-`test-uninstall.cmd`, `clean-reinstall.cmd`, `test-recommend.cmd`, `sim*.cmd`. These set
-`ANIMEJANAI_PACKS_DIR=%AJI_WIN%\draft-packs` so the updater resolves components
-from a local directory — necessary while a release is still a draft, because draft assets 404
-for the unauthenticated releases API.
-
-**Runtime layout these rigs assume:** `pkg-mock\animejanai\inference\` holds `aji.dll` +
-backends + the TRT runtime DLLs + `trtexec.exe`, with `animejanai.conf` at
-`pkg-mock\animejanai\`, and models in `bench-models\` / `models\`. That mirrors an installed
-package, which is the point.
-
-> **These scripts are not version-controlled.** They live only in `%AJI_WIN%`, with
-> no backup. `build-aji-release.bat` and `package-aji-release.ps1` in particular are the sole
-> definition of how the Windows asset is produced — worth copying into this repo under
-> `ci/windows/` so the release process survives the machine.
+> The previous build workstation also carried a set of unversioned test rigs in its working
+> area (engine prebuild, benchmark, screenshot A/B, installer simulation, and `run-mock.cmd`,
+> which kept the build dir off `PATH` to catch DLL-resolution failures). They were never
+> committed and are not available on the current workstation.

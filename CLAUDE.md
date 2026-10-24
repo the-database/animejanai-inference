@@ -20,7 +20,7 @@ ABI.
 
 - **[`docs/BUILD-WINDOWS.md`](docs/BUILD-WINDOWS.md)** — the Windows dependency setup and
   release build. **There is no Windows CI**: `aji-windows-x64.zip` is built and uploaded by hand
-  from this workstation, so this doc is the only record of how.
+  with the scripts in `ci/windows/`, against SDKs in an out-of-repo working area.
 - **[`docs/BUILD-LINUX.md`](docs/BUILD-LINUX.md)** — the Linux/WSL build, the CI workflow, and
   the parity harness.
 
@@ -146,9 +146,8 @@ branch is stale (ABI v4) and must not be used.
 
 - Commits: author `the-database`, short imperative subject, no co-author trailers.
 - `.gitignore` covers `build/`, `models/`, `*.engine`, and fixture binaries. The out-of-repo
-  Windows build dirs are excluded locally via `.git/info/exclude`
-  (`build-win/`, `build-win-trt11/`, `aji-build*/`) — note `build-win-release/` is in **neither**,
-  so it shows up as untracked.
+  Windows build dirs (`build-win-release/` from `ci/windows/build-aji-release.bat`) are not in
+  `.gitignore`; exclude them locally with `build-win-*/` in `.git/info/exclude`.
 - ONNX models for the DirectML backend must be **opset ≤ 21**: the bundled ORT DirectML EP only
   registers `Conv`/`PReLU` kernels through opset 21, and a model exported at opset ≥ 22 silently
   falls back to the CPU EP (roughly 2000× slower per frame, which looks like a hang). Verify
