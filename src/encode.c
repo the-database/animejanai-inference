@@ -42,6 +42,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #ifdef _WIN32
+#include <windows.h>
 #include <libavutil/hwcontext_d3d11va.h>
 #endif
 #include <libavutil/imgutils.h>
@@ -248,8 +249,18 @@ typedef struct {
     AVCodecContext  *enc;
     int              vout;           /* output video stream index */
     int             *smap;           /* input stream idx -> output idx (-1) */
-    AVRational       out_tb;         /* video stream time_base */
-    AVRational       out_fps;
+    AVRational       out_tb;         /* video encoder time_base: the source
+                                        stream's, divided by the RIFE factor so
+                                        interpolated frames land on whole ticks */
+    AVRational       out_fps;        /* nominal (encoder rate control, tags) */
+    AVRational       src_tb;         /* video stream time_base */
+    AVRational       src_fps;        /* source frame rate (guessed) */
+    int64_t          start_us;       /* input start, subtracted from every
+                                        stream's timestamps (AV_TIME_BASE) */
+    int64_t          last_pts;       /* last frame timestamp (out_tb) */
+    int64_t          frame_dur;      /* nominal frame duration (out_tb) */
+    int64_t          seq_pts[64];    /* temporal: timestamp by sequence number */
+    int             *aux_src;        /* input stream of each buffered aux packet */
     int              opened;         /* header written */
     AVPacket       **aux_buf;        /* aux packets seen before header */
     int              aux_n, aux_cap;
@@ -277,11 +288,15 @@ typedef struct {
     int64_t  scene_dupes;
     int      color_space, color_range, color_pri, color_trc, chroma_loc;
     int      src_rgb;                /* RGB source, converted to YUV on upload */
+    int      pad_r, pad_b;           /* odd source: padded by one column/row
+                                        for the engine (src_w/h are padded) */
+    int      crop_w, crop_h;         /* upscaled size cropped back to the
+                                        source's true geometry */
     AVRational src_sar;              /* source sample aspect ratio, kept */
 } enc_ctx;
 
 /* forward decls */
-static int emit_output(enc_ctx *c, AVFrame *cuda_out);
+static int emit_output(enc_ctx *c, AVFrame *cuda_out, int64_t pts);
 static int drain_encoder(enc_ctx *c, int flush);
 
 /* ---- decoder: force NVDEC's CUDA output format --------------------------- */
@@ -378,6 +393,17 @@ static int open_input(enc_ctx *c)
     AVCodecParameters *par = vst->codecpar;
     c->src_w = par->width;
     c->src_h = par->height;
+    /* libaji needs even frame dims (4:2:0 chroma, and its kernels); odd
+     * sources (853x480, ...) are padded with a replicated edge column/row
+     * and the result cropped back */
+    c->pad_r = c->src_w & 1;
+    c->pad_b = c->src_h & 1;
+    if (c->pad_r || c->pad_b) {
+        loge("odd frame size %dx%d: padding to %dx%d for the engine",
+             c->src_w, c->src_h, c->src_w + c->pad_r, c->src_h + c->pad_b);
+        c->src_w += c->pad_r;
+        c->src_h += c->pad_b;
+    }
 
     /* input aji_frame.format mirrors the source bit depth (NVDEC emits NV12
      * for 8-bit, P010 for 10-bit). The OUTPUT format is decoupled and set by
@@ -410,6 +436,14 @@ static int open_input(enc_ctx *c)
 
     c->out_fps = av_guess_frame_rate(c->ifmt, vst, NULL);
     if (c->out_fps.num == 0) c->out_fps = (AVRational){24000, 1001};
+    /* Output frames keep the source frames' own timestamps (variable frame
+     * rate sources stay in sync with their audio), all streams shifted by the
+     * input's start time so the output starts at 0 */
+    c->src_tb = vst->time_base;
+    c->src_fps = c->out_fps;
+    c->start_us = c->ifmt->start_time != AV_NOPTS_VALUE ? c->ifmt->start_time
+                                                         : 0;
+    c->last_pts = AV_NOPTS_VALUE;
 
     /* frame-count estimate for progress */
     if (vst->nb_frames > 0)
@@ -512,6 +546,7 @@ fail:
 
 static int init_aji(enc_ctx *c)
 {
+    c->out_tb = c->src_tb;     /* RIFE refines it below */
     aji_create_params p = {
         .api_version    = AJI_API_VERSION,
         .cuda_context   = (void *)c->cuctx,
@@ -556,9 +591,17 @@ static int init_aji(enc_ctx *c)
         if (c->temporal_r > 0)
             loge("temporal chain: %d-frame window", 2 * c->temporal_r + 1);
     }
-    /* final encode dims default to the upscale dims; --final-resize adjusts */
-    c->out_w = c->up_w;
-    c->out_h = c->up_h;
+    /* the source's true geometry at the upscale ratio (crops the padding of
+     * an odd source; encoders need even dims) */
+    c->crop_w = c->up_w;
+    c->crop_h = c->up_h;
+    if (c->pad_r)
+        c->crop_w = (int)((int64_t)c->up_w * (c->src_w - 1) / c->src_w) & ~1;
+    if (c->pad_b)
+        c->crop_h = (int)((int64_t)c->up_h * (c->src_h - 1) / c->src_h) & ~1;
+    /* final encode dims default to those; --final-resize adjusts */
+    c->out_w = c->crop_w;
+    c->out_h = c->crop_h;
 
     if (aji_rife_factor(c->aji, &c->rnum, &c->rden) && c->rnum > 0) {
         if (c->rden != 1 || c->rnum % c->rden != 0) {
@@ -568,6 +611,7 @@ static int init_aji(enc_ctx *c)
         }
         c->rife = 1;
         c->out_fps = av_mul_q(c->out_fps, (AVRational){c->rnum, c->rden});
+        c->out_tb = av_div_q(c->src_tb, (AVRational){c->rnum, 1});
         if (c->passthrough) {
             /* RIFE-only chain (no scaling): the engine interpolates the
              * passthrough frames, so they go to the device like any input -
@@ -669,6 +713,40 @@ static enum AVPixelFormat src_sw_fmt(const enc_ctx *c)
                                                 : AV_PIX_FMT_NV12;
 }
 
+/* Fill the padding of an odd-size source (f is the padded frame, w x h the
+ * source size) by replicating the last column and row, per plane. */
+static void pad_edges(AVFrame *f, int w, int h)
+{
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f->format);
+    for (int p = 0; p < 4 && f->data[p]; p++) {
+        int step = 0, chroma = 0;
+        for (int i = 0; i < d->nb_components; i++) {
+            if (d->comp[i].plane == p) {
+                step = d->comp[i].step;
+                chroma = i == 1 || i == 2;
+                break;
+            }
+        }
+        if (!step)
+            continue;
+        const int sw = chroma ? AV_CEIL_RSHIFT(w, d->log2_chroma_w) : w;
+        const int sh = chroma ? AV_CEIL_RSHIFT(h, d->log2_chroma_h) : h;
+        const int dw = chroma ? AV_CEIL_RSHIFT(f->width, d->log2_chroma_w)
+                              : f->width;
+        const int dh = chroma ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h)
+                              : f->height;
+        uint8_t *base = f->data[p];
+        const int ls = f->linesize[p];
+        for (int y = 0; y < sh; y++)
+            for (int x = sw; x < dw; x++)
+                memcpy(base + (size_t)y * ls + (size_t)x * step,
+                       base + (size_t)y * ls + (size_t)(sw - 1) * step, step);
+        for (int y = sh; y < dh; y++)
+            memcpy(base + (size_t)y * ls, base + (size_t)(sh - 1) * ls,
+                   (size_t)dw * step);
+    }
+}
+
 /* Hand libaji a device frame in its input format. NVDEC frames already are
  * one (zero-copy); CPU-decoded frames (always, on DirectML), and NVDEC
  * frames in a layout libaji does not read, are repacked on the host and
@@ -676,11 +754,12 @@ static enum AVPixelFormat src_sw_fmt(const enc_ctx *c)
 static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
 {
     const enum AVPixelFormat sw = src_sw_fmt(c);
-    if (fr->format == AV_PIX_FMT_CUDA && fr->hw_frames_ctx &&
+    const int pad = c->pad_r || c->pad_b;
+    if (!pad && fr->format == AV_PIX_FMT_CUDA && fr->hw_frames_ctx &&
         ((AVHWFramesContext *)fr->hw_frames_ctx->data)->sw_format == sw)
         return fr;
 
-    AVFrame *host = NULL, *packed = NULL, *dev = NULL;
+    AVFrame *host = NULL, *packed = NULL, *padded = NULL, *dev = NULL;
     if (!c->src_pool &&
         !(c->src_pool = make_pool(c, sw, c->src_w, c->src_h,
                                   c->ring_depth + 8)))
@@ -694,6 +773,23 @@ static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
         }
     }
     const AVFrame *src = host ? host : fr;
+    if (pad) {
+        /* pad in the source's own format first (replicating the last column
+         * and row), so the conversion below runs even -> even: converting
+         * first would resample an odd-width chroma plane at a ratio just off
+         * 2:1 and shift the colors of the whole frame */
+        padded = av_frame_alloc();
+        if (!padded) goto fail;
+        padded->format = src->format;
+        padded->width  = c->src_w;
+        padded->height = c->src_h;
+        if (av_frame_get_buffer(padded, 0) < 0) goto fail;
+        av_image_copy(padded->data, padded->linesize,
+                      (const uint8_t **)src->data, src->linesize,
+                      src->format, src->width, src->height);
+        pad_edges(padded, src->width, src->height);
+        src = padded;
+    }
     if (src->format != sw) {
         c->in_sws = sws_getCachedContext(c->in_sws, src->width, src->height,
                                          src->format, src->width, src->height,
@@ -725,12 +821,14 @@ static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
     }
     av_frame_copy_props(dev, fr);
     av_frame_free(&packed);
+    av_frame_free(&padded);
     av_frame_free(&host);
     av_frame_free(&fr);
     return dev;
 fail:
     av_frame_free(&dev);
     av_frame_free(&packed);
+    av_frame_free(&padded);
     av_frame_free(&host);
     av_frame_free(&fr);
     return NULL;
@@ -812,7 +910,6 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     int w = first->width, h = first->height;
     c->enc->width  = w;
     c->enc->height = h;
-    c->out_tb = av_inv_q(c->out_fps);
     c->enc->time_base = c->out_tb;
     c->enc->framerate = c->out_fps;
     c->enc->colorspace            = c->color_space;
@@ -853,6 +950,29 @@ fail:
 }
 
 /* Add the output muxer, the video stream, and stream-copy aux streams. */
+/* Whether the output container can carry a stream-copied input stream.
+ * Copying everything made whole files fail before the first frame: a DVD
+ * VOB's nav packets and a MOV's timecode track (data streams, never copied
+ * now: they mean nothing outside their container) and MP4 mov_text
+ * subtitles are all rejected by Matroska. Attachments (fonts) only exist in
+ * Matroska. Everything else is asked of the muxer; an unknown answer keeps
+ * the stream, as before - except audio into Matroska, which is always kept:
+ * its query only knows Matroska's native codec IDs and says no to audio it
+ * stores fine through the ACM compatibility mode (WMA, ...). */
+static int can_copy_stream(enc_ctx *c, const AVStream *in)
+{
+    const AVCodecParameters *p = in->codecpar;
+    const int mkv = !strcmp(c->ofmt->oformat->name, "matroska");
+    if (p->codec_type == AVMEDIA_TYPE_ATTACHMENT)
+        return mkv;
+    if (p->codec_id == AV_CODEC_ID_NONE)
+        return 0;
+    if (p->codec_type == AVMEDIA_TYPE_AUDIO && mkv)
+        return 1;
+    return avformat_query_codec(c->ofmt->oformat, p->codec_id,
+                                FF_COMPLIANCE_NORMAL) != 0;
+}
+
 static int open_output(enc_ctx *c)
 {
     AV(avformat_alloc_output_context2(&c->ofmt, NULL, NULL, c->o.output));
@@ -876,8 +996,14 @@ static int open_output(enc_ctx *c)
         if (t == AVMEDIA_TYPE_AUDIO && c->o.no_audio) continue;
         if (t == AVMEDIA_TYPE_SUBTITLE && c->o.no_subs) continue;
         if (t != AVMEDIA_TYPE_AUDIO && t != AVMEDIA_TYPE_SUBTITLE &&
-            t != AVMEDIA_TYPE_ATTACHMENT && t != AVMEDIA_TYPE_DATA)
+            t != AVMEDIA_TYPE_ATTACHMENT)
             continue;
+        if (!can_copy_stream(c, in)) {
+            loge("dropping stream #%u (%s %s): the output container can't "
+                 "hold it", i, av_get_media_type_string(t),
+                 avcodec_get_name(in->codecpar->codec_id));
+            continue;
+        }
         AVStream *out = avformat_new_stream(c->ofmt, NULL);
         if (!out) { loge("new aux stream failed"); return -1; }
         AV(avcodec_parameters_copy(out->codecpar, in->codecpar));
@@ -910,6 +1036,23 @@ fail:
     return -1;
 }
 
+/* Write one stream-copied packet (in its input stream's time base), shifted
+ * by the input start like the video, then rescaled to its output stream.
+ * Takes ownership. */
+static void write_aux(enc_ctx *c, AVPacket *pkt, int in_idx)
+{
+    const AVStream *in = c->ifmt->streams[in_idx];
+    const int oidx = c->smap[in_idx];
+    const int64_t off = av_rescale_q(c->start_us, AV_TIME_BASE_Q,
+                                     in->time_base);
+    if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= off;
+    if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= off;
+    pkt->stream_index = oidx;
+    av_packet_rescale_ts(pkt, in->time_base, c->ofmt->streams[oidx]->time_base);
+    av_interleaved_write_frame(c->ofmt, pkt);
+    av_packet_free(&pkt);
+}
+
 /* Finish output setup once the first encoded video frame is known: copy the
  * encoder params onto the video stream, open the file, write the header, and
  * flush any aux packets buffered before this point. */
@@ -937,8 +1080,8 @@ static int finalize_output(enc_ctx *c)
     c->opened = 1;
 
     for (int i = 0; i < c->aux_n; i++) {
-        av_interleaved_write_frame(c->ofmt, c->aux_buf[i]);
-        av_packet_free(&c->aux_buf[i]);
+        write_aux(c, c->aux_buf[i], c->aux_src[i]);
+        c->aux_buf[i] = NULL;
     }
     c->aux_n = 0;
     return 0;
@@ -1011,12 +1154,11 @@ static int resize_needed(enc_ctx *c)
 
 /* ---- emit one finished output frame: resize -> encode -> mux ------------- */
 
-/* Emit one finished output frame. Frames arrive in display order (the
- * non-RIFE ring drains FIFO; RIFE emits base then phases in order), so we
- * assign the monotonic CFR PTS here and own the emitted-frame count. */
-static int emit_output(enc_ctx *c, AVFrame *cuda_out)
+/* Emit one finished output frame at pts (out_tb). Frames arrive in display
+ * order (the non-RIFE ring drains FIFO; RIFE emits base then phases in
+ * order); the timestamps come from the source frames (frame_pts). */
+static int emit_output(enc_ctx *c, AVFrame *cuda_out, int64_t pts)
 {
-    int64_t pts = c->out_frames;
     AVFrame *to_encode = NULL;
     AVFrame *resized = NULL;
     int rc = -1;
@@ -1031,7 +1173,8 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
      * back. */
     int zerocopy = is_nvenc(c->o.vcodec) &&
                    c->out_aji_fmt != AJI_FMT_YUV444P16 &&
-                   (!c->dml || !resize_needed(c));
+                   (!c->dml || !resize_needed(c)) &&
+                   !c->pad_r && !c->pad_b;     /* cropped in the sws path */
 
     if (zerocopy && resize_needed(c)) {
         if (init_resize(c, cuda_out) < 0) goto done;
@@ -1066,13 +1209,17 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
         sw->width  = c->out_w;
         sw->height = c->out_h;
         AV(av_frame_get_buffer(sw, 0));
-        c->sws = sws_getCachedContext(c->sws, host->width, host->height,
+        /* an odd source's padding is cropped here: read only the top-left
+         * crop_w x crop_h (the engine output keeps the padded size) */
+        const int in_w = (c->pad_r || c->pad_b) ? c->crop_w : host->width;
+        const int in_h = (c->pad_r || c->pad_b) ? c->crop_h : host->height;
+        c->sws = sws_getCachedContext(c->sws, in_w, in_h,
                     host->format, sw->width, sw->height, sw->format,
                     SWS_BICUBIC, NULL, NULL, NULL);
         if (!c->sws) { loge("sws_getContext failed"); av_frame_free(&sw);
                        av_frame_free(&dl); goto done; }
         sws_scale(c->sws, (const uint8_t *const *)host->data, host->linesize,
-                  0, host->height, sw->data, sw->linesize);
+                  0, in_h, sw->data, sw->linesize);
         av_frame_free(&dl);
         to_encode = sw;
         resized = sw;                  /* freed below */
@@ -1148,7 +1295,7 @@ static int ring_reclaim(enc_ctx *c, slot *s)
             return -1;
         }
     }
-    int r = emit_output(c, s->out);
+    int r = emit_output(c, s->out, s->out->pts);
     av_frame_free(&s->out);
     av_frame_free(&s->in_ref);
     s->ticket = 0;
@@ -1224,6 +1371,8 @@ static int ingest(enc_ctx *c, AVFrame *dec)
         loge("aji_ingest: %d: %s", ret, aji_last_error(c->aji));
         return -1;
     }
+    /* the output for this frame is inferred later; keep its timestamp */
+    c->seq_pts[c->in_seq % FF_ARRAY_ELEMS(c->seq_pts)] = dec->pts;
     c->in_seq++;
     return 0;
 }
@@ -1241,6 +1390,7 @@ static AVFrame *infer_next_seq(enc_ctx *c)
         av_frame_free(&out);
         return NULL;
     }
+    out->pts = c->seq_pts[c->out_seq % FF_ARRAY_ELEMS(c->seq_pts)];
     c->out_seq++;
     return out;
 }
@@ -1299,6 +1449,7 @@ static int push_upscale(enc_ctx *c, AVFrame *dec)
         av_frame_free(&out);
         return -1;
     }
+    out->pts = dec->pts;
     ring_commit(c, dec, out, aji_flush(c->aji, c->stream));
     return 0;
 }
@@ -1319,7 +1470,14 @@ static AVFrame *upscale_one(enc_ctx *c, AVFrame *dec)
         return NULL;
     }
     if (sync_aji(c) < 0) { av_frame_free(&out); return NULL; }
+    out->pts = dec->pts;
     return out;
+}
+
+/* timestamp of interpolation phase k of n between frames a and b */
+static int64_t interp_pts(const AVFrame *a, const AVFrame *b, int k, int n)
+{
+    return a->pts + (b->pts - a->pts) * k / n;
 }
 
 /* take one upscaled frame (up==NULL flushes): emit the previous one and the
@@ -1329,7 +1487,7 @@ static int rife_step(enc_ctx *c, AVFrame *up)
     if (!up) {
         /* emit the final upscaled frame, no successor to interpolate with */
         if (c->have_prev) {
-            if (emit_output(c, c->up_prev) < 0) return -1;
+            if (emit_output(c, c->up_prev, c->up_prev->pts) < 0) return -1;
         }
         return 0;
     }
@@ -1342,7 +1500,7 @@ static int rife_step(enc_ctx *c, AVFrame *up)
     c->up_cur = up;
 
     /* emit base frame N (= up_prev) */
-    if (emit_output(c, c->up_prev) < 0) return -1;
+    if (emit_output(c, c->up_prev, c->up_prev->pts) < 0) return -1;
 
     /* interpolation phases between N and N+1 */
     double factor = (double)c->rnum / c->rden;
@@ -1368,7 +1526,8 @@ static int rife_step(enc_ctx *c, AVFrame *up)
                 loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
                 av_frame_free(&interp); return -1;
             }
-            int er = emit_output(c, emit);
+            int er = emit_output(c, emit,
+                                 interp_pts(c->up_prev, c->up_cur, k, phases));
             av_frame_free(&interp);
             if (er < 0) return -1;
         }
@@ -1444,7 +1603,7 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
     if (!dec) {
         if (!c->src_prev) return 0;
         AVFrame *up = upscale_one(c, c->src_prev);
-        int r = up ? emit_output(c, up) : -1;
+        int r = up ? emit_output(c, up, up->pts) : -1;
         av_frame_free(&up);
         return r;
     }
@@ -1460,6 +1619,7 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
         if (ret != AJI_OK)
             loge("aji_resize: %d: %s", ret, aji_last_error(c->aji));
         int r = ret == AJI_OK ? sync_aji(c) : -1;
+        cur->pts = dec->pts;
         av_frame_free(&dec);
         if (r < 0) { av_frame_free(&cur); return -1; }
     }
@@ -1469,11 +1629,12 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
     }
 
     AVFrame *base = upscale_one(c, c->src_prev);
-    int rc = base ? emit_output(c, base) : -1;
+    int rc = base ? emit_output(c, base, base->pts) : -1;
     int phases = c->rnum / c->rden;        /* integer factor: F-1 phases */
     for (int k = 1; rc == 0 && k < phases; k++) {
         AVFrame *interp = alloc_work(c);
         if (!interp) { rc = -1; break; }
+        interp->pts = interp_pts(c->src_prev, cur, k, phases);
         aji_frame a, b, o;
         fill_aji_frame(c, &a, c->src_prev, 0);
         fill_aji_frame(c, &b, cur, 0);
@@ -1482,13 +1643,13 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
                                  c->stream);
         if (ret == AJI_SCENE) {
             c->scene_dupes++;
-            rc = emit_output(c, base);
+            rc = emit_output(c, base, interp->pts);
         } else if (ret != AJI_OK) {
             loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
             rc = -1;
         } else {
             AVFrame *up = upscale_one(c, interp);
-            rc = up ? emit_output(c, up) : -1;
+            rc = up ? emit_output(c, up, up->pts) : -1;
             av_frame_free(&up);
         }
         av_frame_free(&interp);
@@ -1499,9 +1660,36 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
     return rc;
 }
 
+/* A decoded frame's timestamp in out_tb, from the input's start: the
+ * decoder's best-effort timestamp (variable frame rate sources keep their
+ * timing), filled in where missing and kept strictly increasing, by a whole
+ * source frame so RIFE's in-between timestamps stay distinct. */
+static int64_t frame_pts(enc_ctx *c, const AVFrame *fr)
+{
+    if (!c->frame_dur)
+        c->frame_dur = FFMAX(1, av_rescale_q(1, av_inv_q(c->src_fps), c->out_tb));
+    int64_t pts = fr->best_effort_timestamp;
+    if (pts != AV_NOPTS_VALUE)
+        pts = av_rescale_q(pts, c->src_tb, c->out_tb) -
+              av_rescale_q(c->start_us, AV_TIME_BASE_Q, c->out_tb);
+    if (c->last_pts != AV_NOPTS_VALUE) {
+        const int64_t min_step = c->rife ? c->rnum : 1;
+        if (pts == AV_NOPTS_VALUE)
+            pts = c->last_pts + c->frame_dur;
+        else if (pts < c->last_pts + min_step)
+            pts = c->last_pts + min_step;
+    } else if (pts == AV_NOPTS_VALUE) {
+        pts = 0;
+    }
+    c->last_pts = pts;
+    return pts;
+}
+
 /* one decoded frame into the active pipeline (NULL flushes it) */
 static int push_frame(enc_ctx *c, AVFrame *fr)
 {
+    if (fr)
+        fr->pts = frame_pts(c, fr);
     if (fr && (!c->passthrough || c->rife_only) && !(fr = to_device(c, fr)))
         return -1;
     if (!c->rife) return push_upscale(c, fr);
@@ -1531,23 +1719,20 @@ static int run(enc_ctx *c)
                 if (push_frame(c, fr) < 0) goto done;
             }
         } else if (c->smap && c->smap[pkt->stream_index] >= 0) {
-            AVStream *in = c->ifmt->streams[pkt->stream_index];
-            int oidx = c->smap[pkt->stream_index];
             AVPacket *out = av_packet_clone(pkt);
-            out->stream_index = oidx;
-            av_packet_rescale_ts(out, in->time_base,
-                                 c->opened ? c->ofmt->streams[oidx]->time_base
-                                           : in->time_base);
             if (c->opened) {
-                av_interleaved_write_frame(c->ofmt, out);
-                av_packet_free(&out);
+                write_aux(c, out, pkt->stream_index);
             } else {
-                /* header not written yet: buffer */
+                /* header not written yet: buffer (in the input time base;
+                 * the output stream's is only final after the header) */
                 if (c->aux_n == c->aux_cap) {
                     c->aux_cap = c->aux_cap ? c->aux_cap * 2 : 16;
                     c->aux_buf = av_realloc_f(c->aux_buf, c->aux_cap,
                                               sizeof(*c->aux_buf));
+                    c->aux_src = av_realloc_f(c->aux_src, c->aux_cap,
+                                              sizeof(*c->aux_src));
                 }
+                c->aux_src[c->aux_n] = pkt->stream_index;
                 c->aux_buf[c->aux_n++] = out;
             }
         }
@@ -1607,6 +1792,7 @@ static void cleanup(enc_ctx *c)
     if (c->sws) sws_freeContext(c->sws);
     for (int i = 0; i < c->aux_n; i++) av_packet_free(&c->aux_buf[i]);
     av_free(c->aux_buf);
+    av_free(c->aux_src);
     av_free(c->smap);
     if (c->aji) aji_destroy(&c->aji);
     if (c->stream) cudaStreamDestroy(c->stream);
@@ -1645,8 +1831,26 @@ static void usage(void)
 "           (direct mode: --engine <e> --max-width W --max-height H)\n");
 }
 
+/* Windows 11 power-throttles (EcoQoS) windowless processes whose parent
+ * isn't in the foreground, and coarsens their timer resolution: an encode
+ * launched by a GUI slows to a crawl once that GUI loses focus or is
+ * minimized. Opt this process out of both. */
+static void disable_power_throttling(void)
+{
+#ifdef _WIN32
+    PROCESS_POWER_THROTTLING_STATE s = {0};
+    s.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    s.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    s.StateMask   = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &s, sizeof s);
+#endif
+}
+
 int main(int argc, char **argv)
 {
+    disable_power_throttling();
     enc_ctx c = {0};
     c.o.slot = 1;
     c.o.vcodec = "hevc_nvenc";

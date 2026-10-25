@@ -97,6 +97,23 @@ void remove_file(const std::string &path)
     DeleteFileW(win_long_path(path).c_str());
 }
 
+// Size in bytes, or -1 if the file can't be stat'ed.
+long long file_size(const std::string &path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a = {};
+    if (!GetFileAttributesExW(win_long_path(path).c_str(), GetFileExInfoStandard,
+                              &a))
+        return -1;
+    return ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+}
+
+// Rename over an existing file.
+bool move_file(const std::string &from, const std::string &to)
+{
+    return MoveFileExW(win_long_path(from).c_str(), win_long_path(to).c_str(),
+                       MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
 bool read_file_bytes(const std::string &path, std::vector<char> *out)
 {
     HANDLE h = CreateFileW(win_long_path(path).c_str(), GENERIC_READ,
@@ -149,6 +166,20 @@ void remove_file(const std::string &path)
 {
     std::error_code ec;
     fs::remove(path, ec);
+}
+
+long long file_size(const std::string &path)
+{
+    std::error_code ec;
+    auto n = fs::file_size(path, ec);
+    return ec ? -1 : (long long)n;
+}
+
+bool move_file(const std::string &from, const std::string &to)
+{
+    std::error_code ec;
+    fs::rename(from, to, ec);
+    return !ec;
 }
 
 bool read_file_bytes(const std::string &path, std::vector<char> *out)
@@ -571,6 +602,8 @@ struct BuildSpec {
     std::string cmdline;      // "trtexec" --onnx=... --saveEngine=...
     std::string env_prefix;   // POSIX only, e.g. "LD_LIBRARY_PATH=..."
     std::string engine_path;
+    std::string tmp_path;     // what trtexec writes; renamed to engine_path
+                              // only once the build has succeeded
     std::string log_path;     // trtexec output, kept for diagnostics
     std::string name;
     std::string res;          // shapes_label() of the build settings
@@ -636,10 +669,19 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 // Run a build to completion; on failure remove the half-written engine and
 // append the exit code to the build log (crash/kill diagnosis). Thread-safe
 // (touches no ctx state).
+//
+// trtexec creates its --saveEngine file empty when it starts and only fills
+// it at the end, so a build that is killed (the app's Cancel, closing the
+// player, a crash) used to leave an empty engine under the real cache name.
+// It builds into tmp_path instead, renamed into place only after a successful
+// build, so the cache only ever holds complete engines.
 bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
+    remove_file(spec.tmp_path);  // a previous build's leftover
     int rc = run_build_process(spec, child);
-    if (rc != 0 || !file_exists(spec.engine_path)) {
+    if (rc != 0 || file_size(spec.tmp_path) <= 0 ||
+        !move_file(spec.tmp_path, spec.engine_path)) {
+        remove_file(spec.tmp_path);
         remove_file(spec.engine_path);
         char msg[96];
         snprintf(msg, sizeof(msg),
@@ -728,11 +770,12 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
     const std::string &cmd_settings = settings;
 #endif
     spec->cmdline = "\"" + c->trtexec + "\" --onnx=\"" + onnx_path +
-                    "\" --saveEngine=\"" + engine_path + "\" " +
+                    "\" --saveEngine=\"" + engine_path + ".tmp\" " +
                     cmd_settings +
                     " --timingCacheFile=\"" + tcache + "\"";
     spec->env_prefix = c->trtexec_env;
     spec->engine_path = engine_path;
+    spec->tmp_path = engine_path + ".tmp";
     spec->log_path = engine_path + ".build.log";
     spec->name = onnx_name;
     spec->res = shapes_label(settings);
@@ -942,6 +985,14 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     auto try_cached = [&](const std::string &path) -> int {
         if (!file_exists(path))
             return 0;
+        if (file_size(path) <= 0) {
+            // an interrupted build from before builds went through a temp
+            // file: not an error, just rebuild (deserializing it would only
+            // print a TensorRT API error first)
+            c->verbose("removing incomplete cached engine: %s", path.c_str());
+            remove_file(path);
+            return -1;
+        }
         if (load_engine(c, path, me, w, h, ch, rank5_t))
             return 1;
         c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
