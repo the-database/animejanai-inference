@@ -147,8 +147,14 @@ static void aji_log_cb(void *opaque, int level, const char *msg)
 
 static void av_log_cb(void *p, int level, const char *fmt, va_list ap)
 {
-    (void)p;
     if (level > av_log_get_level())
+        return;
+    /* --deinterlace ivtc: fieldmatch warns about every frame it leaves combed
+     * (bwdif then deinterlaces it, as intended), which would flood the log of
+     * a whole DVD */
+    const AVClass *cls = p ? *(const AVClass **)p : NULL;
+    if (cls && level >= AV_LOG_WARNING && cls->item_name &&
+        strstr(cls->item_name(p), "fieldmatch"))
         return;
     vfprintf(g_log ? g_log : stderr, fmt, ap);
 }
