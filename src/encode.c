@@ -277,6 +277,10 @@ typedef struct {
     int64_t  scene_dupes;
     int      color_space, color_range, color_pri, color_trc, chroma_loc;
     int      src_rgb;                /* RGB source, converted to YUV on upload */
+    int      pad_r, pad_b;           /* odd source: padded by one column/row
+                                        for the engine (src_w/h are padded) */
+    int      crop_w, crop_h;         /* upscaled size cropped back to the
+                                        source's true geometry */
     AVRational src_sar;              /* source sample aspect ratio, kept */
 } enc_ctx;
 
@@ -378,6 +382,17 @@ static int open_input(enc_ctx *c)
     AVCodecParameters *par = vst->codecpar;
     c->src_w = par->width;
     c->src_h = par->height;
+    /* libaji needs even frame dims (4:2:0 chroma, and its kernels); odd
+     * sources (853x480, ...) are padded with a replicated edge column/row
+     * and the result cropped back */
+    c->pad_r = c->src_w & 1;
+    c->pad_b = c->src_h & 1;
+    if (c->pad_r || c->pad_b) {
+        loge("odd frame size %dx%d: padding to %dx%d for the engine",
+             c->src_w, c->src_h, c->src_w + c->pad_r, c->src_h + c->pad_b);
+        c->src_w += c->pad_r;
+        c->src_h += c->pad_b;
+    }
 
     /* input aji_frame.format mirrors the source bit depth (NVDEC emits NV12
      * for 8-bit, P010 for 10-bit). The OUTPUT format is decoupled and set by
@@ -556,9 +571,17 @@ static int init_aji(enc_ctx *c)
         if (c->temporal_r > 0)
             loge("temporal chain: %d-frame window", 2 * c->temporal_r + 1);
     }
-    /* final encode dims default to the upscale dims; --final-resize adjusts */
-    c->out_w = c->up_w;
-    c->out_h = c->up_h;
+    /* the source's true geometry at the upscale ratio (crops the padding of
+     * an odd source; encoders need even dims) */
+    c->crop_w = c->up_w;
+    c->crop_h = c->up_h;
+    if (c->pad_r)
+        c->crop_w = (int)((int64_t)c->up_w * (c->src_w - 1) / c->src_w) & ~1;
+    if (c->pad_b)
+        c->crop_h = (int)((int64_t)c->up_h * (c->src_h - 1) / c->src_h) & ~1;
+    /* final encode dims default to those; --final-resize adjusts */
+    c->out_w = c->crop_w;
+    c->out_h = c->crop_h;
 
     if (aji_rife_factor(c->aji, &c->rnum, &c->rden) && c->rnum > 0) {
         if (c->rden != 1 || c->rnum % c->rden != 0) {
@@ -669,6 +692,40 @@ static enum AVPixelFormat src_sw_fmt(const enc_ctx *c)
                                                 : AV_PIX_FMT_NV12;
 }
 
+/* Fill the padding of an odd-size source (f is the padded frame, w x h the
+ * source size) by replicating the last column and row, per plane. */
+static void pad_edges(AVFrame *f, int w, int h)
+{
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f->format);
+    for (int p = 0; p < 4 && f->data[p]; p++) {
+        int step = 0, chroma = 0;
+        for (int i = 0; i < d->nb_components; i++) {
+            if (d->comp[i].plane == p) {
+                step = d->comp[i].step;
+                chroma = i == 1 || i == 2;
+                break;
+            }
+        }
+        if (!step)
+            continue;
+        const int sw = chroma ? AV_CEIL_RSHIFT(w, d->log2_chroma_w) : w;
+        const int sh = chroma ? AV_CEIL_RSHIFT(h, d->log2_chroma_h) : h;
+        const int dw = chroma ? AV_CEIL_RSHIFT(f->width, d->log2_chroma_w)
+                              : f->width;
+        const int dh = chroma ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h)
+                              : f->height;
+        uint8_t *base = f->data[p];
+        const int ls = f->linesize[p];
+        for (int y = 0; y < sh; y++)
+            for (int x = sw; x < dw; x++)
+                memcpy(base + (size_t)y * ls + (size_t)x * step,
+                       base + (size_t)y * ls + (size_t)(sw - 1) * step, step);
+        for (int y = sh; y < dh; y++)
+            memcpy(base + (size_t)y * ls, base + (size_t)(sh - 1) * ls,
+                   (size_t)dw * step);
+    }
+}
+
 /* Hand libaji a device frame in its input format. NVDEC frames already are
  * one (zero-copy); CPU-decoded frames (always, on DirectML), and NVDEC
  * frames in a layout libaji does not read, are repacked on the host and
@@ -676,11 +733,12 @@ static enum AVPixelFormat src_sw_fmt(const enc_ctx *c)
 static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
 {
     const enum AVPixelFormat sw = src_sw_fmt(c);
-    if (fr->format == AV_PIX_FMT_CUDA && fr->hw_frames_ctx &&
+    const int pad = c->pad_r || c->pad_b;
+    if (!pad && fr->format == AV_PIX_FMT_CUDA && fr->hw_frames_ctx &&
         ((AVHWFramesContext *)fr->hw_frames_ctx->data)->sw_format == sw)
         return fr;
 
-    AVFrame *host = NULL, *packed = NULL, *dev = NULL;
+    AVFrame *host = NULL, *packed = NULL, *padded = NULL, *dev = NULL;
     if (!c->src_pool &&
         !(c->src_pool = make_pool(c, sw, c->src_w, c->src_h,
                                   c->ring_depth + 8)))
@@ -694,6 +752,23 @@ static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
         }
     }
     const AVFrame *src = host ? host : fr;
+    if (pad) {
+        /* pad in the source's own format first (replicating the last column
+         * and row), so the conversion below runs even -> even: converting
+         * first would resample an odd-width chroma plane at a ratio just off
+         * 2:1 and shift the colors of the whole frame */
+        padded = av_frame_alloc();
+        if (!padded) goto fail;
+        padded->format = src->format;
+        padded->width  = c->src_w;
+        padded->height = c->src_h;
+        if (av_frame_get_buffer(padded, 0) < 0) goto fail;
+        av_image_copy(padded->data, padded->linesize,
+                      (const uint8_t **)src->data, src->linesize,
+                      src->format, src->width, src->height);
+        pad_edges(padded, src->width, src->height);
+        src = padded;
+    }
     if (src->format != sw) {
         c->in_sws = sws_getCachedContext(c->in_sws, src->width, src->height,
                                          src->format, src->width, src->height,
@@ -725,12 +800,14 @@ static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
     }
     av_frame_copy_props(dev, fr);
     av_frame_free(&packed);
+    av_frame_free(&padded);
     av_frame_free(&host);
     av_frame_free(&fr);
     return dev;
 fail:
     av_frame_free(&dev);
     av_frame_free(&packed);
+    av_frame_free(&padded);
     av_frame_free(&host);
     av_frame_free(&fr);
     return NULL;
@@ -853,6 +930,29 @@ fail:
 }
 
 /* Add the output muxer, the video stream, and stream-copy aux streams. */
+/* Whether the output container can carry a stream-copied input stream.
+ * Copying everything made whole files fail before the first frame: a DVD
+ * VOB's nav packets and a MOV's timecode track (data streams, never copied
+ * now: they mean nothing outside their container) and MP4 mov_text
+ * subtitles are all rejected by Matroska. Attachments (fonts) only exist in
+ * Matroska. Everything else is asked of the muxer; an unknown answer keeps
+ * the stream, as before - except audio into Matroska, which is always kept:
+ * its query only knows Matroska's native codec IDs and says no to audio it
+ * stores fine through the ACM compatibility mode (WMA, ...). */
+static int can_copy_stream(enc_ctx *c, const AVStream *in)
+{
+    const AVCodecParameters *p = in->codecpar;
+    const int mkv = !strcmp(c->ofmt->oformat->name, "matroska");
+    if (p->codec_type == AVMEDIA_TYPE_ATTACHMENT)
+        return mkv;
+    if (p->codec_id == AV_CODEC_ID_NONE)
+        return 0;
+    if (p->codec_type == AVMEDIA_TYPE_AUDIO && mkv)
+        return 1;
+    return avformat_query_codec(c->ofmt->oformat, p->codec_id,
+                                FF_COMPLIANCE_NORMAL) != 0;
+}
+
 static int open_output(enc_ctx *c)
 {
     AV(avformat_alloc_output_context2(&c->ofmt, NULL, NULL, c->o.output));
@@ -876,8 +976,14 @@ static int open_output(enc_ctx *c)
         if (t == AVMEDIA_TYPE_AUDIO && c->o.no_audio) continue;
         if (t == AVMEDIA_TYPE_SUBTITLE && c->o.no_subs) continue;
         if (t != AVMEDIA_TYPE_AUDIO && t != AVMEDIA_TYPE_SUBTITLE &&
-            t != AVMEDIA_TYPE_ATTACHMENT && t != AVMEDIA_TYPE_DATA)
+            t != AVMEDIA_TYPE_ATTACHMENT)
             continue;
+        if (!can_copy_stream(c, in)) {
+            loge("dropping stream #%u (%s %s): the output container can't "
+                 "hold it", i, av_get_media_type_string(t),
+                 avcodec_get_name(in->codecpar->codec_id));
+            continue;
+        }
         AVStream *out = avformat_new_stream(c->ofmt, NULL);
         if (!out) { loge("new aux stream failed"); return -1; }
         AV(avcodec_parameters_copy(out->codecpar, in->codecpar));
@@ -1031,7 +1137,8 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
      * back. */
     int zerocopy = is_nvenc(c->o.vcodec) &&
                    c->out_aji_fmt != AJI_FMT_YUV444P16 &&
-                   (!c->dml || !resize_needed(c));
+                   (!c->dml || !resize_needed(c)) &&
+                   !c->pad_r && !c->pad_b;     /* cropped in the sws path */
 
     if (zerocopy && resize_needed(c)) {
         if (init_resize(c, cuda_out) < 0) goto done;
@@ -1066,13 +1173,17 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out)
         sw->width  = c->out_w;
         sw->height = c->out_h;
         AV(av_frame_get_buffer(sw, 0));
-        c->sws = sws_getCachedContext(c->sws, host->width, host->height,
+        /* an odd source's padding is cropped here: read only the top-left
+         * crop_w x crop_h (the engine output keeps the padded size) */
+        const int in_w = (c->pad_r || c->pad_b) ? c->crop_w : host->width;
+        const int in_h = (c->pad_r || c->pad_b) ? c->crop_h : host->height;
+        c->sws = sws_getCachedContext(c->sws, in_w, in_h,
                     host->format, sw->width, sw->height, sw->format,
                     SWS_BICUBIC, NULL, NULL, NULL);
         if (!c->sws) { loge("sws_getContext failed"); av_frame_free(&sw);
                        av_frame_free(&dl); goto done; }
         sws_scale(c->sws, (const uint8_t *const *)host->data, host->linesize,
-                  0, host->height, sw->data, sw->linesize);
+                  0, in_h, sw->data, sw->linesize);
         av_frame_free(&dl);
         to_encode = sw;
         resized = sw;                  /* freed below */
