@@ -53,6 +53,7 @@
 #else
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 #endif
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
@@ -1535,15 +1536,33 @@ static void *cmd_reader(void *arg)
 #endif
 {
     (void)arg;
-    char buf[sizeof g_cmd.line];
-    while (fgets(buf, sizeof buf, stdin)) {
-        buf[strcspn(buf, "\r\n")] = 0;
-        if (!buf[0]) continue;
-        CMD_LOCK();
-        memcpy(g_cmd.line, buf, sizeof buf);
-        g_cmd.n++;
-        CMD_WAKE();
-        CMD_UNLOCK();
+    /* read(), not stdio: glibc's exit() locks every FILE, stdin's included,
+     * and this thread would hold that lock while blocked in fgets(), so the
+     * process could never exit */
+    char buf[sizeof g_cmd.line], in[512];
+    size_t len = 0;
+    for (;;) {
+#ifdef _WIN32
+        const int n = _read(0, in, sizeof in);
+#else
+        const ssize_t n = read(0, in, sizeof in);
+#endif
+        if (n <= 0) break;
+        for (int i = 0; i < (int)n; i++) {
+            if (in[i] != '\n') {
+                if (len < sizeof buf - 1) buf[len++] = in[i];
+                continue;
+            }
+            buf[len] = 0;
+            buf[strcspn(buf, "\r")] = 0;
+            len = 0;
+            if (!buf[0]) continue;
+            CMD_LOCK();
+            memcpy(g_cmd.line, buf, sizeof buf);
+            g_cmd.n++;
+            CMD_WAKE();
+            CMD_UNLOCK();
+        }
     }
     CMD_LOCK();
     g_cmd.eof = 1;             /* the GUI went away */
