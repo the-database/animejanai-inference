@@ -97,6 +97,7 @@
 enum decoder_mode { DEC_AUTO, DEC_NVDEC, DEC_CPU };
 enum progress_mode { PROG_NONE, PROG_LINE, PROG_JSON };
 enum deint_mode { DEINT_OFF, DEINT_IVTC, DEINT_BWDIF };
+enum square_mode { SQUARE_OFF, SQUARE_BEFORE, SQUARE_AFTER };
 
 /* output chroma subsampling + bit depth, chosen via --pix-fmt and decoupled
  * from the source. 16-bit 4:4:4 is libaji's intermediate, never the file. */
@@ -122,6 +123,7 @@ typedef struct {
     int no_zerocopy;
     int pipeline_depth;
     enum deint_mode deint;
+    enum square_mode square; /* --square-pixels */
     const char *preview;    /* --preview: JPEG of the latest output frame */
     int preview_w;
     int session;            /* --preview-session: serve a player, no encode */
@@ -329,7 +331,13 @@ typedef struct {
                                         for the engine (src_w/h are padded) */
     int      crop_w, crop_h;         /* upscaled size cropped back to the
                                         source's true geometry */
-    AVRational src_sar;              /* source sample aspect ratio, kept */
+    AVRational src_sar;              /* source sample aspect ratio */
+    AVRational out_sar;              /* output's: the source's, or 1:1 once
+                                        --square-pixels has stretched it */
+    int      sq_before;              /* --square-pixels before: frames are
+                                        stretched to src_w x src_h on upload */
+    int      sq_after;               /* --square-pixels after: the final
+                                        resize stretches them */
 
     /* --deinterlace: decoded (host) frames -> filter graph -> pipeline */
     AVFilterGraph   *dgraph;
@@ -498,6 +506,35 @@ static int open_input(enc_ctx *c)
 
     /* upscaling scales both axes alike, so the pixel aspect carries over */
     c->src_sar = av_guess_sample_aspect_ratio(c->ifmt, vst, NULL);
+    c->out_sar = c->src_sar;
+
+    /* --square-pixels: non-square pixels (DVD, DV) are stretched to square,
+     * along the narrow axis so no source detail is dropped (16:9 720x480 ->
+     * 854x480, 4:3 -> 720x540). Before processing, the stretched size is
+     * the size everything downstream sees (chain selection, engines); after,
+     * the final resize does it. */
+    if (c->o.square && c->src_sar.num > 0 && c->src_sar.den > 0 &&
+        c->src_sar.num != c->src_sar.den) {
+        int qw = par->width, qh = par->height;
+        if (c->src_sar.num > c->src_sar.den)
+            qw = (int)av_rescale(qw, c->src_sar.num, c->src_sar.den);
+        else
+            qh = (int)av_rescale(qh, c->src_sar.den, c->src_sar.num);
+        qw = (qw + 1) & ~1;
+        qh = (qh + 1) & ~1;
+        c->out_sar = (AVRational){1, 1};
+        if (c->o.square == SQUARE_BEFORE) {
+            c->sq_before = 1;
+            c->src_w = qw;              /* even: no padding needed */
+            c->src_h = qh;
+            c->pad_r = c->pad_b = 0;
+        } else {
+            c->sq_after = 1;
+        }
+        loge("square pixels (%s processing): %dx%d SAR %d:%d -> %dx%d",
+             c->sq_before ? "before" : "after", par->width, par->height,
+             c->src_sar.num, c->src_sar.den, qw, qh);
+    }
 
     c->out_fps = av_guess_frame_rate(c->ifmt, vst, NULL);
     if (c->out_fps.num == 0) c->out_fps = (AVRational){24000, 1001};
@@ -803,6 +840,15 @@ static int init_aji(enc_ctx *c)
     /* final encode dims default to those; --final-resize adjusts */
     c->out_w = c->crop_w;
     c->out_h = c->crop_h;
+    if (c->sq_after) {
+        /* --square-pixels after: the final resize stretches the narrow axis */
+        if (c->src_sar.num > c->src_sar.den)
+            c->out_w = ((int)av_rescale(c->out_w, c->src_sar.num,
+                                        c->src_sar.den) + 1) & ~1;
+        else
+            c->out_h = ((int)av_rescale(c->out_h, c->src_sar.den,
+                                        c->src_sar.num) + 1) & ~1;
+    }
 
     if (aji_rife_factor(c->aji, &c->rnum, &c->rden) && c->rnum > 0) {
         if (c->rden != 1 || c->rnum % c->rden != 0) {
@@ -951,12 +997,14 @@ static void pad_edges(AVFrame *f, int w, int h)
 /* Hand libaji a device frame in its input format. NVDEC frames already are
  * one (zero-copy); CPU-decoded frames (always, on DirectML), and NVDEC
  * frames in a layout libaji does not read, are repacked on the host and
- * uploaded. Takes ownership. */
+ * uploaded - stretched to square pixels there too with --square-pixels
+ * before (DVD-sized frames, so the host is cheap). Takes ownership. */
 static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
 {
     const enum AVPixelFormat sw = src_sw_fmt(c);
     const int pad = c->pad_r || c->pad_b;
-    if (!pad && fr->format == AV_PIX_FMT_CUDA && fr->hw_frames_ctx &&
+    if (!pad && !c->sq_before && fr->format == AV_PIX_FMT_CUDA &&
+        fr->hw_frames_ctx &&
         ((AVHWFramesContext *)fr->hw_frames_ctx->data)->sw_format == sw)
         return fr;
 
@@ -991,10 +1039,13 @@ static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
         pad_edges(padded, src->width, src->height);
         src = padded;
     }
-    if (src->format != sw) {
+    if (src->format != sw || c->sq_before) {
+        const int dw = c->sq_before ? c->src_w : src->width;
+        const int dh = c->sq_before ? c->src_h : src->height;
         c->in_sws = sws_getCachedContext(c->in_sws, src->width, src->height,
-                                         src->format, src->width, src->height,
-                                         sw, SWS_BICUBIC, NULL, NULL, NULL);
+                                         src->format, dw, dh, sw,
+                                         c->sq_before ? SWS_SPLINE : SWS_BICUBIC,
+                                         NULL, NULL, NULL);
         packed = av_frame_alloc();
         if (!c->in_sws || !packed) goto fail;
         if (c->src_rgb) {
@@ -1004,8 +1055,8 @@ static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
                                      0, 1 << 16, 1 << 16);
         }
         packed->format = sw;
-        packed->width  = src->width;
-        packed->height = src->height;
+        packed->width  = dw;
+        packed->height = dh;
         if (av_frame_get_buffer(packed, 0) < 0 ||
             sws_scale_frame(c->in_sws, packed, src) < 0) {
             loge("source repack %s -> %s failed",
@@ -1120,8 +1171,8 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     c->enc->color_primaries       = c->color_pri;
     c->enc->color_trc             = c->color_trc;
     c->enc->chroma_sample_location = c->chroma_loc;
-    if (c->src_sar.num > 0 && c->src_sar.den > 0)
-        c->enc->sample_aspect_ratio = c->src_sar;
+    if (c->out_sar.num > 0 && c->out_sar.den > 0)
+        c->enc->sample_aspect_ratio = c->out_sar;
 
     int hw = is_nvenc(c->o.vcodec) && first->hw_frames_ctx &&
              (first->format == AV_PIX_FMT_CUDA ||
@@ -1310,13 +1361,18 @@ static int init_resize(enc_ctx *c, AVFrame *first)
                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1",
                  first->width, first->height, AV_PIX_FMT_CUDA,
                  vst->time_base.num, vst->time_base.den);
-        AV(avfilter_graph_create_filter(&c->buf_src,
-                avfilter_get_by_name("buffer"), "in", args, NULL, c->graph));
-
+        /* the hw frames context has to be set before the buffer source is
+         * initialized: libavfilter 12 rejects a CUDA pix_fmt without one */
+        c->buf_src = avfilter_graph_alloc_filter(c->graph,
+                avfilter_get_by_name("buffer"), "in");
+        if (!c->buf_src) { loge("buffer source alloc failed"); goto fail; }
         AVBufferSrcParameters *bp = av_buffersrc_parameters_alloc();
+        if (!bp) goto fail;
         bp->hw_frames_ctx = first->hw_frames_ctx;
-        AV(av_buffersrc_parameters_set(c->buf_src, bp));
+        int pr = av_buffersrc_parameters_set(c->buf_src, bp);
         av_free(bp);
+        AV(pr);
+        AV(avfilter_init_str(c->buf_src, args));
 
         AV(avfilter_graph_create_filter(&c->buf_sink,
                 avfilter_get_by_name("buffersink"), "out", NULL, NULL,
@@ -1352,7 +1408,8 @@ static void compute_final_dims(enc_ctx *c)
 
 static int resize_needed(enc_ctx *c)
 {
-    return c->o.final_h > 0 || (c->o.final_pct > 0 && c->o.final_pct != 100);
+    return c->o.final_h > 0 || (c->o.final_pct > 0 && c->o.final_pct != 100) ||
+           c->sq_after;
 }
 
 /* ---- --preview / --preview-session: still images for a GUI --------------- */
@@ -1365,10 +1422,12 @@ static int ends_with_ci(const char *s, const char *suffix)
 
 /* Encode f (device or host, any format) as an image: PNG (full quality, for
  * judging an upscale) or JPEG (4:4:4 when full, else 4:2:0). width > 0
- * scales it to that width, height following the display aspect; 0 keeps its
- * size, or takes full_w x full_h when those are set. */
+ * scales it to that width, height following the display aspect (sar is
+ * the frame's pixel aspect); 0 keeps its size, or takes full_w x full_h when
+ * those are set. */
 static AVPacket *encode_image(enc_ctx *c, img_enc *ie, const AVFrame *f,
-                              int png, int width, int full_w, int full_h)
+                              AVRational sar, int png, int width, int full_w,
+                              int full_h)
 {
     AVFrame *dl = NULL, *pv = NULL;
     AVPacket *pkt = NULL;
@@ -1387,8 +1446,8 @@ static AVPacket *encode_image(enc_ctx *c, img_enc *ie, const AVFrame *f,
                                  : full ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
     /* anamorphic sources (DVDs) are shown at their display aspect: a full
      * size image is stretched (never squeezed) to it */
-    const AVRational sar = c->src_sar.num > 0 && c->src_sar.den > 0
-                         ? c->src_sar : (AVRational){1, 1};
+    if (sar.num <= 0 || sar.den <= 0)
+        sar = (AVRational){1, 1};
     int pw = full_w > 0 ? full_w : sw;
     int ph = full_h > 0 ? full_h : sh;
     if (!full) {
@@ -1465,7 +1524,7 @@ done:
  * never sees a partial file. */
 static int write_image(enc_ctx *c, const AVFrame *f, const char *path, int width)
 {
-    AVPacket *pkt = encode_image(c, &c->preview_img, f,
+    AVPacket *pkt = encode_image(c, &c->preview_img, f, c->out_sar,
                                  ends_with_ci(path, ".png"), width, 0, 0);
     FILE *fp = NULL;
     char tmp[4096];
@@ -1671,8 +1730,8 @@ static void sess_free_sources(enc_ctx *c)
  * upscale */
 static int sess_add_source(enc_ctx *c, const AVFrame *fr)
 {
-    AVPacket *pkt = encode_image(c, &c->sess_src_img, fr, 0, c->sess_w,
-                                 0, 0);
+    AVPacket *pkt = encode_image(c, &c->sess_src_img, fr, c->src_sar, 0,
+                                 c->sess_w, 0, 0);
     if (!pkt) { loge("preview session: source image failed"); return -1; }
     if (c->sess_src_n == FF_ARRAY_ELEMS(c->sess_src)) {
         av_packet_free(&c->sess_src[0].pkt);
@@ -1715,8 +1774,8 @@ static int sess_emit(enc_ctx *c, AVFrame *f, int64_t pts)
                 (c->sess_src_n - 1) * sizeof *c->sess_src);
         c->sess_src_n--;
     }
-    AVPacket *out = encode_image(c, &c->preview_img, f, 0, c->sess_w,
-                                 c->out_w, c->out_h);
+    AVPacket *out = encode_image(c, &c->preview_img, f, c->out_sar, 0,
+                                 c->sess_w, c->out_w, c->out_h);
     if (!out) { loge("preview session: output image failed"); return -1; }
     int r = sess_send_frame(c, pts, c->sess_src_n ? c->sess_src[0].pkt : NULL,
                             out);
@@ -2295,7 +2354,8 @@ static int push_frame(enc_ctx *c, AVFrame *fr)
             c->sess_after++;
         }
     }
-    if (fr && (!c->passthrough || c->rife_only) && !(fr = to_device(c, fr)))
+    if (fr && (!c->passthrough || c->rife_only || c->sq_before) &&
+        !(fr = to_device(c, fr)))
         return -1;
     if (!c->rife) return push_upscale(c, fr);
     if (c->rife_only) return rife_step(c, fr);   /* interpolate the frames as-is */
@@ -2597,8 +2657,8 @@ static void usage(void)
 " [--progress none|line|json]\n"
 "           [--build-only] [--log <f>] [--decoder auto|nvdec|cpu]"
 " [--backend tensorrt|directml]\n"
-"           [--deinterlace off|ivtc|bwdif]"
-" [--preview <f.jpg> [--preview-width W]]\n"
+"           [--deinterlace off|ivtc|bwdif] [--square-pixels off|before|after]\n"
+"           [--preview <f.jpg> [--preview-width W]]\n"
 "           [--preview-session] (no --output: frames for a GUI's player)\n"
 "           (direct mode: --engine <e> --max-width W --max-height H)\n");
 }
@@ -2687,6 +2747,14 @@ int main(int argc, char **argv)
             else if (!strcmp(v, "ivtc"))  c.o.deint = DEINT_IVTC;
             else if (!strcmp(v, "bwdif")) c.o.deint = DEINT_BWDIF;
             else { loge("unknown --deinterlace '%s' (off|ivtc|bwdif)", v); return 2; }
+        }
+        else if (!strcmp(a, "--square-pixels")) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "off"))         c.o.square = SQUARE_OFF;
+            else if (!strcmp(v, "before")) c.o.square = SQUARE_BEFORE;
+            else if (!strcmp(v, "after"))  c.o.square = SQUARE_AFTER;
+            else { loge("unknown --square-pixels '%s' (off|before|after)", v);
+                   return 2; }
         }
         else if (!strcmp(a, "--preview")) c.o.preview = argv[++i];
         else if (!strcmp(a, "--preview-width")) c.o.preview_w = atoi(argv[++i]);
