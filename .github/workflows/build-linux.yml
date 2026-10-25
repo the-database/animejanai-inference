@@ -32,7 +32,7 @@ on:
       - 'include/**'
 
 env:
-  DEFAULT_TAG: v0.12.0
+  DEFAULT_TAG: v0.13.0
   # Must match TrtVersion / TrtCudaVersion in mpv-AnimeJaNai's Program.cs.
   TRT_VERSION: 11.4.0.106
   TRT_CUDA: '13.4'
