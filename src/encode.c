@@ -11,6 +11,9 @@
  *
  * Single input -> single output; copies audio, subtitles, chapters and
  * attachments from the source.
+ * --deinterlace runs the decoded frames through a libavfilter graph first
+ * (IVTC, or bwdif at field rate); --preview keeps a JPEG of the latest
+ * output frame up to date for a GUI.
  * Temporal (multi-frame) chains are driven through aji_ingest +
  * aji_infer_seq, each output inferred once its window has been ingested.
  *
@@ -48,6 +51,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/time.h>
 #include <libswscale/swscale.h>
 
 #include "aji.h"
@@ -85,6 +89,7 @@
 
 enum decoder_mode { DEC_AUTO, DEC_NVDEC, DEC_CPU };
 enum progress_mode { PROG_NONE, PROG_LINE, PROG_JSON };
+enum deint_mode { DEINT_OFF, DEINT_IVTC, DEINT_BWDIF };
 
 /* output chroma subsampling + bit depth, chosen via --pix-fmt and decoupled
  * from the source. 16-bit 4:4:4 is libaji's intermediate, never the file. */
@@ -109,6 +114,9 @@ typedef struct {
     enum decoder_mode decoder;
     int no_zerocopy;
     int pipeline_depth;
+    enum deint_mode deint;
+    const char *preview;    /* --preview: JPEG of the latest output frame */
+    int preview_w;
 
     /* direct mode (testing) */
     const char *engine;
@@ -253,7 +261,10 @@ typedef struct {
                                         stream's, divided by the RIFE factor so
                                         interpolated frames land on whole ticks */
     AVRational       out_fps;        /* nominal (encoder rate control, tags) */
-    AVRational       src_tb;         /* video stream time_base */
+    AVRational       src_tb;         /* video stream time_base (out_tb's base) */
+    AVRational       in_tb;          /* time base of the frames entering the
+                                        pipeline (= src_tb, or the
+                                        deinterlacer's output) */
     AVRational       src_fps;        /* source frame rate (guessed) */
     int64_t          start_us;       /* input start, subtracted from every
                                         stream's timestamps (AV_TIME_BASE) */
@@ -293,6 +304,19 @@ typedef struct {
     int      crop_w, crop_h;         /* upscaled size cropped back to the
                                         source's true geometry */
     AVRational src_sar;              /* source sample aspect ratio, kept */
+
+    /* --deinterlace: decoded (host) frames -> filter graph -> pipeline */
+    AVFilterGraph   *dgraph;
+    AVFilterContext *dsrc, *dsink;
+    AVRational       dec_tb;         /* decoded frames' time base (stream's) */
+    AVRational       dec_fps;
+    int              dg_fmt, dg_spc, dg_range;  /* what the graph was built for */
+    int              dg_fed;         /* a frame went in (no rebuilding after) */
+
+    /* --preview */
+    int64_t          preview_at;     /* av_gettime_relative() of the last write */
+    struct SwsContext *preview_sws;
+    AVCodecContext  *preview_enc;
 } enc_ctx;
 
 /* forward decls */
@@ -440,6 +464,7 @@ static int open_input(enc_ctx *c)
      * rate sources stay in sync with their audio), all streams shifted by the
      * input's start time so the output starts at 0 */
     c->src_tb = vst->time_base;
+    c->in_tb = c->src_tb;
     c->src_fps = c->out_fps;
     c->start_us = c->ifmt->start_time != AV_NOPTS_VALUE ? c->ifmt->start_time
                                                          : 0;
@@ -517,7 +542,9 @@ static int open_decoder(enc_ctx *c)
     AV(avcodec_parameters_to_context(c->dec, vst->codecpar));
     c->dec->pkt_timebase = vst->time_base;
 
-    int want_hw = (c->o.decoder != DEC_CPU) && !c->o.no_zerocopy && !c->dml;
+    /* deinterlacing filters run on the CPU: decode there too */
+    int want_hw = (c->o.decoder != DEC_CPU) && !c->o.no_zerocopy && !c->dml &&
+                  !c->dgraph;
     if (want_hw) {
         c->dec->hw_device_ctx = av_buffer_ref(c->hw_device);
         c->dec->get_format = get_hw_format;
@@ -538,6 +565,139 @@ static int open_decoder(enc_ctx *c)
     if (r < 0) { AV(r); }
     c->nvdec = want_hw;
     return 0;
+fail:
+    return -1;
+}
+
+/* ---- --deinterlace: libavfilter graph on the decoded frames -------------- */
+
+/* Build the deinterlace graph for decoded frames of format fmt. IVTC is the
+ * usual film-on-video recipe: repeatfields turns soft telecine (MPEG-2
+ * repeat-field flags) into hard telecine, fieldmatch rebuilds the film
+ * frames, bwdif cleans the frames left combed, and on 30 fps sources
+ * decimate drops the duplicate of each 3:2 cycle (PAL sources have no
+ * pulldown to remove). Deinterlace is bwdif at field rate: one frame per
+ * field, so 29.97i becomes 59.94p. */
+static int build_deint(enc_ctx *c, int fmt, int spc, int range)
+{
+    avfilter_graph_free(&c->dgraph);
+    c->dgraph = avfilter_graph_alloc();
+    if (!c->dgraph) return -1;
+    const AVCodecParameters *par = c->ifmt->streams[c->vstream]->codecpar;
+    char args[256];
+    snprintf(args, sizeof args,
+             "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:frame_rate=%d/%d:"
+             "pixel_aspect=%d/%d:colorspace=%d:range=%d",
+             par->width, par->height, fmt,
+             c->dec_tb.num, c->dec_tb.den, c->dec_fps.num, c->dec_fps.den,
+             c->src_sar.num > 0 ? c->src_sar.num : 1,
+             c->src_sar.num > 0 ? c->src_sar.den : 1, spc, range);
+    AV(avfilter_graph_create_filter(&c->dsrc, avfilter_get_by_name("buffer"),
+                                    "in", args, NULL, c->dgraph));
+    AV(avfilter_graph_create_filter(&c->dsink,
+                                    avfilter_get_by_name("buffersink"), "out",
+                                    NULL, NULL, c->dgraph));
+    const double fps = av_q2d(c->dec_fps);
+    const char *chain;
+    if (c->o.deint == DEINT_BWDIF)
+        chain = "bwdif=mode=send_field:parity=auto:deint=all";
+    else if (fps > 29 && fps < 31)
+        chain = "repeatfields,fieldmatch=order=auto:combmatch=full,"
+                "bwdif=mode=send_frame:parity=auto:deint=interlaced,decimate";
+    else
+        chain = "repeatfields,fieldmatch=order=auto:combmatch=full,"
+                "bwdif=mode=send_frame:parity=auto:deint=interlaced";
+    AVFilterInOut *outs = avfilter_inout_alloc(), *ins = avfilter_inout_alloc();
+    if (!outs || !ins) {
+        avfilter_inout_free(&outs); avfilter_inout_free(&ins);
+        return -1;
+    }
+    outs->name = av_strdup("in");  outs->filter_ctx = c->dsrc;  outs->pad_idx = 0;
+    ins->name  = av_strdup("out"); ins->filter_ctx  = c->dsink; ins->pad_idx  = 0;
+    int r = avfilter_graph_parse_ptr(c->dgraph, chain, &ins, &outs, NULL);
+    avfilter_inout_free(&outs);
+    avfilter_inout_free(&ins);
+    AV(r);
+    AV(avfilter_graph_config(c->dgraph, NULL));
+    c->dg_fmt = fmt;
+    c->dg_spc = spc;
+    c->dg_range = range;
+    return 0;
+fail:
+    loge("deinterlace filter setup failed");
+    return -1;
+}
+
+/* Set up --deinterlace before libaji is configured: the graph's output
+ * rate (field rate, or film rate after IVTC) is the rate everything
+ * downstream sees, chain selection included. */
+static int setup_deint(enc_ctx *c)
+{
+    AVStream *vst = c->ifmt->streams[c->vstream];
+    c->dec_tb  = vst->time_base;
+    c->dec_fps = c->out_fps;
+    if (build_deint(c, vst->codecpar->format, vst->codecpar->color_space,
+                    vst->codecpar->color_range) < 0)
+        return -1;
+    const AVRational tb  = av_buffersink_get_time_base(c->dsink);
+    const AVRational fps = av_buffersink_get_frame_rate(c->dsink);
+    /* frames arrive in the graph's time base; the output keeps the finer of
+     * it and the stream's: decimate's is one film frame, which would round
+     * the source's start offset (audio sync) away */
+    c->in_tb = tb;
+    if (av_cmp_q(tb, c->src_tb) < 0)
+        c->src_tb = tb;
+    if (fps.num > 0 && fps.den > 0) {
+        c->src_frames_est = av_rescale(c->src_frames_est, (int64_t)fps.num *
+                                       c->dec_fps.den,
+                                       (int64_t)fps.den * c->dec_fps.num);
+        c->src_fps = c->out_fps = fps;
+    }
+    loge("%s: %.3f fps -> %.3f fps",
+         c->o.deint == DEINT_IVTC ? "inverse telecine" : "deinterlace (bwdif)",
+         av_q2d(c->dec_fps), av_q2d(c->out_fps));
+    return 0;
+}
+
+static int push_frame(enc_ctx *c, AVFrame *fr);
+
+/* one decoded frame through the deinterlace graph (NULL flushes it); the
+ * frames it puts out go on into the pipeline */
+static int push_decoded(enc_ctx *c, AVFrame *fr)
+{
+    if (!c->dgraph)
+        return fr ? push_frame(c, fr) : 0;
+    if (fr) {
+        /* the container's description can differ from the decoded frames:
+         * rebuild for the first frame's (the output rate stays the same);
+         * later the graph's is kept, as the filters can't change mid-stream */
+        if (!c->dg_fed && (fr->format != c->dg_fmt ||
+                           fr->colorspace != c->dg_spc ||
+                           fr->color_range != c->dg_range) &&
+            build_deint(c, fr->format, fr->colorspace, fr->color_range) < 0) {
+            av_frame_free(&fr);
+            return -1;
+        }
+        c->dg_fed = 1;
+        fr->colorspace = c->dg_spc;
+        fr->color_range = c->dg_range;
+        fr->pts = fr->best_effort_timestamp;
+    }
+    int r = av_buffersrc_add_frame(c->dsrc, fr);
+    av_frame_free(&fr);
+    if (r < 0) { AV(r); }
+    for (;;) {
+        AVFrame *out = av_frame_alloc();
+        if (!out) return -1;
+        r = av_buffersink_get_frame(c->dsink, out);
+        if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
+            av_frame_free(&out);
+            return 0;
+        }
+        if (r < 0) { av_frame_free(&out); AV(r); }
+        out->best_effort_timestamp = out->pts;   /* in the graph's time base */
+        if (push_frame(c, out) < 0) return -1;
+    }
 fail:
     return -1;
 }
@@ -1154,6 +1314,94 @@ static int resize_needed(enc_ctx *c)
     return c->o.final_h > 0 || (c->o.final_pct > 0 && c->o.final_pct != 100);
 }
 
+/* ---- --preview: a JPEG of the latest output frame, for a GUI ------------- */
+
+/* Scale f (device or host, any output format) down to the preview width and
+ * write it as a JPEG: to <path>.tmp, then renamed over <path> so a reader
+ * never sees a partial file. A PREVIEW line on stdout says it's there.
+ * Failures only cost the preview. */
+static void write_preview(enc_ctx *c, const AVFrame *f)
+{
+    AVFrame *dl = NULL, *pv = NULL;
+    AVPacket *pkt = NULL;
+    FILE *fp = NULL;
+    char tmp[4096];
+    if (f->hw_frames_ctx) {
+        dl = av_frame_alloc();
+        if (!dl || av_hwframe_transfer_data(dl, f, 0) < 0) goto done;
+        f = dl;
+    }
+    const int pw = (c->o.preview_w > 0 ? c->o.preview_w : 640) & ~1;
+    const int ph = FFMAX(2, (int)((int64_t)pw * f->height / f->width) & ~1);
+    if (!c->preview_enc) {
+        const AVCodec *mj = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+        if (!mj || !(c->preview_enc = avcodec_alloc_context3(mj))) goto done;
+        c->preview_enc->width       = pw;
+        c->preview_enc->height      = ph;
+        c->preview_enc->pix_fmt     = AV_PIX_FMT_YUV420P;
+        c->preview_enc->color_range = AVCOL_RANGE_JPEG;
+        c->preview_enc->time_base   = (AVRational){1, 1};
+        c->preview_enc->flags      |= AV_CODEC_FLAG_QSCALE;
+        c->preview_enc->global_quality = FF_QP2LAMBDA * 3;
+        if (avcodec_open2(c->preview_enc, mj, NULL) < 0) {
+            avcodec_free_context(&c->preview_enc);
+            c->o.preview = NULL;           /* no MJPEG encoder: give up */
+            loge("preview disabled: MJPEG encoder unavailable");
+            goto done;
+        }
+    }
+    /* odd sources: the frame still carries the padding, crop it off */
+    const int sw = (c->pad_r && f->width == c->up_w) ? c->crop_w : f->width;
+    const int sh = (c->pad_b && f->height == c->up_h) ? c->crop_h : f->height;
+    c->preview_sws = sws_getCachedContext(c->preview_sws, sw, sh, f->format,
+                                          pw, ph, AV_PIX_FMT_YUV420P,
+                                          SWS_BILINEAR, NULL, NULL, NULL);
+    if (!c->preview_sws) goto done;
+    /* the stream's matrix and range in, JPEG's (BT.601 full range) out */
+    const int spc = c->color_space == AVCOL_SPC_BT470BG ||
+                    c->color_space == AVCOL_SPC_SMPTE170M ? SWS_CS_ITU601
+                  : c->color_space == AVCOL_SPC_BT2020_NCL ||
+                    c->color_space == AVCOL_SPC_BT2020_CL ? SWS_CS_BT2020
+                  : SWS_CS_ITU709;
+    sws_setColorspaceDetails(c->preview_sws, sws_getCoefficients(spc),
+                             c->color_range == AVCOL_RANGE_JPEG,
+                             sws_getCoefficients(SWS_CS_ITU601), 1,
+                             0, 1 << 16, 1 << 16);
+    pv = av_frame_alloc();
+    pkt = av_packet_alloc();
+    if (!pv || !pkt) goto done;
+    pv->format = AV_PIX_FMT_YUV420P;
+    pv->width = pw;
+    pv->height = ph;
+    pv->color_range = AVCOL_RANGE_JPEG;
+    if (av_frame_get_buffer(pv, 0) < 0) goto done;
+    sws_scale(c->preview_sws, (const uint8_t *const *)f->data, f->linesize,
+              0, sh, pv->data, pv->linesize);
+    if (avcodec_send_frame(c->preview_enc, pv) < 0 ||
+        avcodec_receive_packet(c->preview_enc, pkt) < 0)
+        goto done;
+    snprintf(tmp, sizeof tmp, "%s.tmp", c->o.preview);
+    if (!(fp = fopen(tmp, "wb"))) goto done;
+    int ok = fwrite(pkt->data, 1, pkt->size, fp) == (size_t)pkt->size;
+    ok &= fclose(fp) == 0;
+    fp = NULL;
+#ifdef _WIN32
+    /* the UTF-8 manifest makes the A functions take UTF-8, like fopen */
+    ok = ok && MoveFileExA(tmp, c->o.preview, MOVEFILE_REPLACE_EXISTING);
+#else
+    ok = ok && rename(tmp, c->o.preview) == 0;
+#endif
+    if (ok && g_progress != PROG_NONE) {
+        printf("PREVIEW frame=%lld\n", (long long)c->out_frames);
+        fflush(stdout);
+    }
+done:
+    if (fp) fclose(fp);
+    av_packet_free(&pkt);
+    av_frame_free(&pv);
+    av_frame_free(&dl);
+}
+
 /* ---- emit one finished output frame: resize -> encode -> mux ------------- */
 
 /* Emit one finished output frame at pts (out_tb). Frames arrive in display
@@ -1231,6 +1479,13 @@ encode:
     if (!c->opened) {
         if (open_encoder(c, to_encode) < 0) goto done;
         if (finalize_output(c) < 0) goto done;
+    }
+    if (c->o.preview) {
+        const int64_t now = av_gettime_relative();
+        if (!c->preview_at || now - c->preview_at >= 1000000) {
+            c->preview_at = now;
+            write_preview(c, to_encode);
+        }
     }
 
     /* Clone before sending so the queued frame owns its own pts (callers
@@ -1672,7 +1927,7 @@ static int64_t frame_pts(enc_ctx *c, const AVFrame *fr)
         c->frame_dur = FFMAX(1, av_rescale_q(1, av_inv_q(c->src_fps), c->out_tb));
     int64_t pts = fr->best_effort_timestamp;
     if (pts != AV_NOPTS_VALUE)
-        pts = av_rescale_q(pts, c->src_tb, c->out_tb) -
+        pts = av_rescale_q(pts, c->in_tb, c->out_tb) -
               av_rescale_q(c->start_us, AV_TIME_BASE_Q, c->out_tb);
     if (c->last_pts != AV_NOPTS_VALUE) {
         const int64_t min_step = c->rife ? c->rnum : 1;
@@ -1718,7 +1973,7 @@ static int run(enc_ctx *c)
                 }
                 if (r < 0) { av_frame_free(&fr); AV(r); }
                 /* fr is owned by the pipeline now */
-                if (push_frame(c, fr) < 0) goto done;
+                if (push_decoded(c, fr) < 0) goto done;
             }
         } else if (c->smap && c->smap[pkt->stream_index] >= 0) {
             AVPacket *out = av_packet_clone(pkt);
@@ -1748,8 +2003,9 @@ static int run(enc_ctx *c)
         int r = avcodec_receive_frame(c->dec, fr);
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) { av_frame_free(&fr); break; }
         if (r < 0) { av_frame_free(&fr); AV(r); }
-        if (push_frame(c, fr) < 0) goto done;
+        if (push_decoded(c, fr) < 0) goto done;
     }
+    if (push_decoded(c, NULL) < 0) goto done;   /* flush the deinterlacer */
 
     /* flush pipeline */
     if (push_frame(c, NULL) < 0) goto done;
@@ -1791,6 +2047,9 @@ static void cleanup(enc_ctx *c)
     if (c->in_sws) sws_freeContext(c->in_sws);
     av_frame_free(&c->host_frame);
     if (c->graph) avfilter_graph_free(&c->graph);
+    avfilter_graph_free(&c->dgraph);
+    if (c->preview_sws) sws_freeContext(c->preview_sws);
+    avcodec_free_context(&c->preview_enc);
     if (c->sws) sws_freeContext(c->sws);
     for (int i = 0; i < c->aux_n; i++) av_packet_free(&c->aux_buf[i]);
     av_free(c->aux_buf);
@@ -1830,6 +2089,8 @@ static void usage(void)
 " [--progress none|line|json]\n"
 "           [--build-only] [--log <f>] [--decoder auto|nvdec|cpu]"
 " [--backend tensorrt|directml]\n"
+"           [--deinterlace off|ivtc|bwdif]"
+" [--preview <f.jpg> [--preview-width W]]\n"
 "           (direct mode: --engine <e> --max-width W --max-height H)\n");
 }
 
@@ -1910,6 +2171,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--max-width")) c.o.max_w = atoi(argv[++i]);
         else if (!strcmp(a, "--max-height")) c.o.max_h = atoi(argv[++i]);
         else if (!strcmp(a, "--pipeline-depth")) c.o.pipeline_depth = atoi(argv[++i]);
+        else if (!strcmp(a, "--deinterlace")) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "off"))        c.o.deint = DEINT_OFF;
+            else if (!strcmp(v, "ivtc"))  c.o.deint = DEINT_IVTC;
+            else if (!strcmp(v, "bwdif")) c.o.deint = DEINT_BWDIF;
+            else { loge("unknown --deinterlace '%s' (off|ivtc|bwdif)", v); return 2; }
+        }
+        else if (!strcmp(a, "--preview")) c.o.preview = argv[++i];
+        else if (!strcmp(a, "--preview-width")) c.o.preview_w = atoi(argv[++i]);
         else { loge("unknown arg: %s", a); usage(); return 2; }
     }
 
@@ -1957,6 +2227,7 @@ int main(int argc, char **argv)
 
     int rc = 1;
     if (open_input(&c) < 0) goto out;
+    if (c.o.deint && setup_deint(&c) < 0) goto out;
     resolve_pixfmt(&c);    /* needs src_aji_fmt from open_input */
     if ((c.dml ? setup_d3d11(&c) : setup_cuda(&c)) < 0) goto out;
     if (init_aji(&c) < 0) goto out;
