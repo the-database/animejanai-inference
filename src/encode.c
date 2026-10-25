@@ -892,9 +892,11 @@ static void inject_profile(const char *vcodec, enum out_pixfmt pf,
     } else if (!strcmp(vcodec, "libx264")) {
         p = pf == OUT_420P10 ? "high10" :
             (pf == OUT_444P8 || pf == OUT_444P10) ? "high444" : NULL;
-    } else if (strstr(vcodec, "nvenc")) {
+    } else if (!strcmp(vcodec, "hevc_nvenc")) {
         p = pf == OUT_420P10 ? "main10" : NULL;   /* nvenc is 4:2:0 only here */
-    }
+    } else if (!strcmp(vcodec, "h264_nvenc")) {
+        p = pf == OUT_420P10 ? "high10" : NULL;
+    }   /* av1_nvenc: its "main" profile covers 10-bit */
     if (p)
         av_dict_set(opts, "profile", p, 0);
 }
