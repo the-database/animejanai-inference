@@ -42,6 +42,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #ifdef _WIN32
+#include <windows.h>
 #include <libavutil/hwcontext_d3d11va.h>
 #endif
 #include <libavutil/imgutils.h>
@@ -1830,8 +1831,26 @@ static void usage(void)
 "           (direct mode: --engine <e> --max-width W --max-height H)\n");
 }
 
+/* Windows 11 power-throttles (EcoQoS) windowless processes whose parent
+ * isn't in the foreground, and coarsens their timer resolution: an encode
+ * launched by a GUI slows to a crawl once that GUI loses focus or is
+ * minimized. Opt this process out of both. */
+static void disable_power_throttling(void)
+{
+#ifdef _WIN32
+    PROCESS_POWER_THROTTLING_STATE s = {0};
+    s.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    s.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    s.StateMask   = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &s, sizeof s);
+#endif
+}
+
 int main(int argc, char **argv)
 {
+    disable_power_throttling();
     enc_ctx c = {0};
     c.o.slot = 1;
     c.o.vcodec = "hevc_nvenc";
