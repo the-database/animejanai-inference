@@ -13,7 +13,8 @@
  * attachments from the source.
  * --deinterlace runs the decoded frames through a libavfilter graph first
  * (IVTC, or bwdif at field rate); --preview keeps a JPEG of the latest
- * output frame up to date for a GUI.
+ * output frame up to date for a GUI, and --preview-session serves a GUI's
+ * player instead of encoding (frames at any position, or played from it).
  * Temporal (multi-frame) chains are driven through aji_ingest +
  * aji_infer_seq, each output inferred once its window has been ingested.
  *
@@ -46,7 +47,13 @@
 #include <libavutil/hwcontext_cuda.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <fcntl.h>
+#include <io.h>
 #include <libavutil/hwcontext_d3d11va.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
@@ -117,6 +124,7 @@ typedef struct {
     enum deint_mode deint;
     const char *preview;    /* --preview: JPEG of the latest output frame */
     int preview_w;
+    int session;            /* --preview-session: serve a player, no encode */
 
     /* direct mode (testing) */
     const char *engine;
@@ -210,6 +218,18 @@ typedef struct {
     uint64_t  ticket;
     int64_t   pts;       /* output PTS in the video stream time_base */
 } slot;
+
+/* a still-image encoder (scaler + PNG/MJPEG), kept across frames */
+typedef struct {
+    struct SwsContext *sws;
+    AVCodecContext    *enc;
+} img_enc;
+
+/* --preview-session: an encoded source frame, sent with its output */
+typedef struct {
+    int64_t   pts;
+    AVPacket *pkt;
+} src_image;
 
 typedef struct {
     options o;
@@ -321,8 +341,23 @@ typedef struct {
 
     /* --preview */
     int64_t          preview_at;     /* av_gettime_relative() of the last write */
-    struct SwsContext *preview_sws;
-    AVCodecContext  *preview_enc;
+    img_enc          preview_img;
+
+    /* --preview-session: the request being served */
+    uint64_t         sess_cmd;       /* its command number (cmd_wait) */
+    long long        sess_id;        /* the GUI's id for it, echoed back */
+    int              sess_play;      /* play from the position, else one frame */
+    int              sess_w;         /* image width, 0 = full size */
+    int64_t          sess_at;        /* the position (out_tb) */
+    int64_t          sess_target;    /* first frame at or after it, or NOPTS */
+    int              sess_after;     /* frames pushed since the target */
+    int              sess_done;      /* one frame: sent */
+    int              sess_abort;     /* a newer command came in */
+    int64_t          sess_clock;     /* play: wall clock (us) of sess_pts0 */
+    int64_t          sess_pts0;
+    img_enc          sess_src_img;
+    src_image        sess_src[16];   /* source images awaiting their output */
+    int              sess_src_n;
 } enc_ctx;
 
 /* forward decls */
@@ -1320,92 +1355,374 @@ static int resize_needed(enc_ctx *c)
     return c->o.final_h > 0 || (c->o.final_pct > 0 && c->o.final_pct != 100);
 }
 
-/* ---- --preview: a JPEG of the latest output frame, for a GUI ------------- */
+/* ---- --preview / --preview-session: still images for a GUI --------------- */
 
-/* Scale f (device or host, any output format) down to the preview width and
- * write it as a JPEG: to <path>.tmp, then renamed over <path> so a reader
- * never sees a partial file. A PREVIEW line on stdout says it's there.
- * Failures only cost the preview. */
-static void write_preview(enc_ctx *c, const AVFrame *f)
+static int ends_with_ci(const char *s, const char *suffix)
+{
+    const size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && !av_strcasecmp(s + n - m, suffix);
+}
+
+/* Encode f (device or host, any format) as an image: PNG (full quality, for
+ * judging an upscale) or JPEG (4:4:4 when full, else 4:2:0). width > 0
+ * scales it to that width, height following the display aspect; 0 keeps its
+ * size, or takes full_w x full_h when those are set. */
+static AVPacket *encode_image(enc_ctx *c, img_enc *ie, const AVFrame *f,
+                              int png, int width, int full_w, int full_h)
 {
     AVFrame *dl = NULL, *pv = NULL;
     AVPacket *pkt = NULL;
-    FILE *fp = NULL;
-    char tmp[4096];
+    int ok = 0;
     if (f->hw_frames_ctx) {
         dl = av_frame_alloc();
         if (!dl || av_hwframe_transfer_data(dl, f, 0) < 0) goto done;
         f = dl;
     }
-    const int pw = (c->o.preview_w > 0 ? c->o.preview_w : 640) & ~1;
-    const int ph = FFMAX(2, (int)((int64_t)pw * f->height / f->width) & ~1);
-    if (!c->preview_enc) {
-        const AVCodec *mj = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
-        if (!mj || !(c->preview_enc = avcodec_alloc_context3(mj))) goto done;
-        c->preview_enc->width       = pw;
-        c->preview_enc->height      = ph;
-        c->preview_enc->pix_fmt     = AV_PIX_FMT_YUV420P;
-        c->preview_enc->color_range = AVCOL_RANGE_JPEG;
-        c->preview_enc->time_base   = (AVRational){1, 1};
-        c->preview_enc->flags      |= AV_CODEC_FLAG_QSCALE;
-        c->preview_enc->global_quality = FF_QP2LAMBDA * 3;
-        if (avcodec_open2(c->preview_enc, mj, NULL) < 0) {
-            avcodec_free_context(&c->preview_enc);
-            c->o.preview = NULL;           /* no MJPEG encoder: give up */
-            loge("preview disabled: MJPEG encoder unavailable");
+    /* odd sources: an upscaled frame still carries the padding, crop it off */
+    const int sw = (c->pad_r && f->width == c->up_w) ? c->crop_w : f->width;
+    const int sh = (c->pad_b && f->height == c->up_h) ? c->crop_h : f->height;
+    const enum AVCodecID id = png ? AV_CODEC_ID_PNG : AV_CODEC_ID_MJPEG;
+    const int full = width <= 0;
+    const enum AVPixelFormat fmt = png ? AV_PIX_FMT_RGB24
+                                 : full ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
+    /* anamorphic sources (DVDs) are shown at their display aspect: a full
+     * size image is stretched (never squeezed) to it */
+    const AVRational sar = c->src_sar.num > 0 && c->src_sar.den > 0
+                         ? c->src_sar : (AVRational){1, 1};
+    int pw = full_w > 0 ? full_w : sw;
+    int ph = full_h > 0 ? full_h : sh;
+    if (!full) {
+        ph = (int)av_rescale((int64_t)width * ph, sar.den, (int64_t)pw * sar.num);
+        pw = width;
+    } else if (sar.num > sar.den) {
+        pw = (int)av_rescale(pw, sar.num, sar.den);
+    } else if (sar.num < sar.den) {
+        ph = (int)av_rescale(ph, sar.den, sar.num);
+    }
+    if (fmt == AV_PIX_FMT_YUV420P) {   /* 4:2:0 JPEG: even dims */
+        pw = FFMAX(2, pw & ~1);
+        ph = FFMAX(2, ph & ~1);
+    }
+    pw = FFMAX(1, pw);
+    ph = FFMAX(1, ph);
+    if (ie->enc && (ie->enc->codec_id != id || ie->enc->pix_fmt != fmt ||
+                    ie->enc->width != pw || ie->enc->height != ph))
+        avcodec_free_context(&ie->enc);
+    if (!ie->enc) {
+        const AVCodec *codec = avcodec_find_encoder(id);
+        if (!codec || !(ie->enc = avcodec_alloc_context3(codec))) goto done;
+        ie->enc->width       = pw;
+        ie->enc->height      = ph;
+        ie->enc->pix_fmt     = fmt;
+        ie->enc->color_range = AVCOL_RANGE_JPEG;
+        ie->enc->time_base   = (AVRational){1, 1};
+        if (!png) {
+            ie->enc->flags |= AV_CODEC_FLAG_QSCALE;
+            ie->enc->global_quality = FF_QP2LAMBDA * (full ? 2 : 3);
+        }
+        if (avcodec_open2(ie->enc, codec, NULL) < 0) {
+            avcodec_free_context(&ie->enc);
+            loge("preview: %s encoder unavailable", png ? "PNG" : "MJPEG");
             goto done;
         }
     }
-    /* odd sources: the frame still carries the padding, crop it off */
-    const int sw = (c->pad_r && f->width == c->up_w) ? c->crop_w : f->width;
-    const int sh = (c->pad_b && f->height == c->up_h) ? c->crop_h : f->height;
-    c->preview_sws = sws_getCachedContext(c->preview_sws, sw, sh, f->format,
-                                          pw, ph, AV_PIX_FMT_YUV420P,
-                                          SWS_BILINEAR, NULL, NULL, NULL);
-    if (!c->preview_sws) goto done;
-    /* the stream's matrix and range in, JPEG's (BT.601 full range) out */
+    ie->sws = sws_getCachedContext(ie->sws, sw, sh, f->format, pw, ph, fmt,
+                                   full ? SWS_BICUBIC : SWS_BILINEAR,
+                                   NULL, NULL, NULL);
+    if (!ie->sws) goto done;
+    /* the stream's matrix and range in; full range out (RGB, or JPEG's
+     * BT.601 full-range YUV) */
     const int spc = c->color_space == AVCOL_SPC_BT470BG ||
                     c->color_space == AVCOL_SPC_SMPTE170M ? SWS_CS_ITU601
                   : c->color_space == AVCOL_SPC_BT2020_NCL ||
                     c->color_space == AVCOL_SPC_BT2020_CL ? SWS_CS_BT2020
                   : SWS_CS_ITU709;
-    sws_setColorspaceDetails(c->preview_sws, sws_getCoefficients(spc),
+    sws_setColorspaceDetails(ie->sws, sws_getCoefficients(spc),
                              c->color_range == AVCOL_RANGE_JPEG,
                              sws_getCoefficients(SWS_CS_ITU601), 1,
                              0, 1 << 16, 1 << 16);
     pv = av_frame_alloc();
     pkt = av_packet_alloc();
     if (!pv || !pkt) goto done;
-    pv->format = AV_PIX_FMT_YUV420P;
+    pv->format = fmt;
     pv->width = pw;
     pv->height = ph;
     pv->color_range = AVCOL_RANGE_JPEG;
     if (av_frame_get_buffer(pv, 0) < 0) goto done;
-    sws_scale(c->preview_sws, (const uint8_t *const *)f->data, f->linesize,
+    sws_scale(ie->sws, (const uint8_t *const *)f->data, f->linesize,
               0, sh, pv->data, pv->linesize);
-    if (avcodec_send_frame(c->preview_enc, pv) < 0 ||
-        avcodec_receive_packet(c->preview_enc, pkt) < 0)
-        goto done;
-    snprintf(tmp, sizeof tmp, "%s.tmp", c->o.preview);
+    ok = avcodec_send_frame(ie->enc, pv) >= 0 &&
+         avcodec_receive_packet(ie->enc, pkt) >= 0;
+done:
+    av_frame_free(&pv);
+    av_frame_free(&dl);
+    if (!ok) av_packet_free(&pkt);
+    return pkt;
+}
+
+/* Write f as an image file (PNG when path ends in .png, else JPEG) of the
+ * given width. Written to <path>.tmp, then renamed over <path>, so a reader
+ * never sees a partial file. */
+static int write_image(enc_ctx *c, const AVFrame *f, const char *path, int width)
+{
+    AVPacket *pkt = encode_image(c, &c->preview_img, f,
+                                 ends_with_ci(path, ".png"), width, 0, 0);
+    FILE *fp = NULL;
+    char tmp[4096];
+    int ok = 0;
+    if (!pkt) goto done;
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
     if (!(fp = fopen(tmp, "wb"))) goto done;
-    int ok = fwrite(pkt->data, 1, pkt->size, fp) == (size_t)pkt->size;
+    ok = fwrite(pkt->data, 1, pkt->size, fp) == (size_t)pkt->size;
     ok &= fclose(fp) == 0;
     fp = NULL;
 #ifdef _WIN32
     /* the UTF-8 manifest makes the A functions take UTF-8, like fopen */
-    ok = ok && MoveFileExA(tmp, c->o.preview, MOVEFILE_REPLACE_EXISTING);
+    ok = ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
 #else
-    ok = ok && rename(tmp, c->o.preview) == 0;
+    ok = ok && rename(tmp, path) == 0;
 #endif
-    if (ok && g_progress != PROG_NONE) {
-        printf("PREVIEW frame=%lld\n", (long long)c->out_frames);
-        fflush(stdout);
-    }
 done:
     if (fp) fclose(fp);
     av_packet_free(&pkt);
-    av_frame_free(&pv);
-    av_frame_free(&dl);
+    return ok ? 0 : -1;
+}
+
+/* --preview during an encode: the latest output frame, downscaled, as a
+ * JPEG; a PREVIEW line on stdout says a new one is there. Failures only
+ * cost the preview. */
+static void write_preview(enc_ctx *c, const AVFrame *f)
+{
+    const int w = c->o.preview_w > 0 ? c->o.preview_w : 640;
+    if (write_image(c, f, c->o.preview, w) == 0 && g_progress != PROG_NONE) {
+        printf("PREVIEW frame=%lld\n", (long long)c->out_frames);
+        fflush(stdout);
+    }
+}
+
+/* ---- --preview-session: commands on stdin -------------------------------- *
+ *
+ * A thread reads command lines; only the latest is kept (a GUI dragging a
+ * slider sends many, and only where it stopped matters), numbered so the
+ * pipeline can tell a newer one came in and drop what it is doing. */
+
+static struct {
+    char     line[256];
+    uint64_t n;                /* commands read so far */
+    int      eof;
+#ifdef _WIN32
+    CRITICAL_SECTION   lock;
+    CONDITION_VARIABLE cv;
+#else
+    pthread_mutex_t    lock;
+    pthread_cond_t     cv;
+#endif
+} g_cmd;
+
+#ifdef _WIN32
+#define CMD_LOCK()   EnterCriticalSection(&g_cmd.lock)
+#define CMD_UNLOCK() LeaveCriticalSection(&g_cmd.lock)
+#define CMD_WAKE()   WakeAllConditionVariable(&g_cmd.cv)
+#else
+#define CMD_LOCK()   pthread_mutex_lock(&g_cmd.lock)
+#define CMD_UNLOCK() pthread_mutex_unlock(&g_cmd.lock)
+#define CMD_WAKE()   pthread_cond_broadcast(&g_cmd.cv)
+#endif
+
+#ifdef _WIN32
+static DWORD WINAPI cmd_reader(void *arg)
+#else
+static void *cmd_reader(void *arg)
+#endif
+{
+    (void)arg;
+    /* read(), not stdio: glibc's exit() locks every FILE, stdin's included,
+     * and this thread would hold that lock while blocked in fgets(), so the
+     * process could never exit */
+    char buf[sizeof g_cmd.line], in[512];
+    size_t len = 0;
+    for (;;) {
+#ifdef _WIN32
+        const int n = _read(0, in, sizeof in);
+#else
+        const ssize_t n = read(0, in, sizeof in);
+#endif
+        if (n <= 0) break;
+        for (int i = 0; i < (int)n; i++) {
+            if (in[i] != '\n') {
+                if (len < sizeof buf - 1) buf[len++] = in[i];
+                continue;
+            }
+            buf[len] = 0;
+            buf[strcspn(buf, "\r")] = 0;
+            len = 0;
+            if (!buf[0]) continue;
+            CMD_LOCK();
+            memcpy(g_cmd.line, buf, sizeof buf);
+            g_cmd.n++;
+            CMD_WAKE();
+            CMD_UNLOCK();
+        }
+    }
+    CMD_LOCK();
+    g_cmd.eof = 1;             /* the GUI went away */
+    g_cmd.n++;
+    CMD_WAKE();
+    CMD_UNLOCK();
+    return 0;
+}
+
+static int cmd_start(void)
+{
+#ifdef _WIN32
+    InitializeCriticalSection(&g_cmd.lock);
+    InitializeConditionVariable(&g_cmd.cv);
+    HANDLE t = CreateThread(NULL, 0, cmd_reader, NULL, 0, NULL);
+    if (!t) return -1;
+    CloseHandle(t);
+#else
+    pthread_t t;
+    pthread_mutex_init(&g_cmd.lock, NULL);
+    pthread_cond_init(&g_cmd.cv, NULL);
+    if (pthread_create(&t, NULL, cmd_reader, NULL)) return -1;
+    pthread_detach(t);
+#endif
+    return 0;
+}
+
+/* Wait until a command newer than `seen` is in, or until wall clock `until`
+ * (av_gettime_relative() us; < 0 = no limit). Returns the newest command's
+ * number (== seen on timeout) and copies it to line (NULL = don't). */
+static uint64_t cmd_wait(uint64_t seen, char *line, int64_t until)
+{
+    CMD_LOCK();
+    while (g_cmd.n == seen) {
+        if (until < 0) {
+#ifdef _WIN32
+            SleepConditionVariableCS(&g_cmd.cv, &g_cmd.lock, INFINITE);
+#else
+            pthread_cond_wait(&g_cmd.cv, &g_cmd.lock);
+#endif
+            continue;
+        }
+        const int64_t left = until - av_gettime_relative();
+        if (left <= 0) break;
+#ifdef _WIN32
+        SleepConditionVariableCS(&g_cmd.cv, &g_cmd.lock,
+                                 (DWORD)((left + 999) / 1000));
+#else
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        const int64_t ns = ts.tv_nsec + left * 1000;
+        ts.tv_sec += ns / 1000000000;
+        ts.tv_nsec = ns % 1000000000;
+        pthread_cond_timedwait(&g_cmd.cv, &g_cmd.lock, &ts);
+#endif
+    }
+    const uint64_t n = g_cmd.n;
+    if (line) {
+        if (g_cmd.eof) strcpy(line, "quit");
+        else memcpy(line, g_cmd.line, sizeof g_cmd.line);
+    }
+    CMD_UNLOCK();
+    return n;
+}
+
+static int cmd_newer(uint64_t seen)
+{
+    CMD_LOCK();
+    const int r = g_cmd.n != seen;
+    CMD_UNLOCK();
+    return r;
+}
+
+/* ---- --preview-session: frames out on stdout ----------------------------- *
+ *
+ * Text lines, except that a FRAME line is followed by its two images:
+ *   READY duration=<ms> width=<w> height=<h> fps=<n>/<d>
+ *   FRAME id=<id> pts=<ms> src=<bytes> out=<bytes>  + source JPEG + output JPEG
+ *   END id=<id>   (the video ended before the position, or playing reached
+ *                  the end)
+ * (PROGRESS lines come first while an engine builds.) */
+
+static int sess_send_frame(enc_ctx *c, int64_t pts, const AVPacket *src,
+                           const AVPacket *out)
+{
+    printf("FRAME id=%lld pts=%lld src=%d out=%d\n", c->sess_id,
+           (long long)av_rescale_q(pts, c->out_tb, (AVRational){1, 1000}),
+           src ? src->size : 0, out->size);
+    if ((src && fwrite(src->data, 1, src->size, stdout) != (size_t)src->size) ||
+        fwrite(out->data, 1, out->size, stdout) != (size_t)out->size ||
+        fflush(stdout)) {
+        loge("preview session: stdout closed");
+        return -1;
+    }
+    return 0;
+}
+
+static void sess_free_sources(enc_ctx *c)
+{
+    for (int i = 0; i < c->sess_src_n; i++)
+        av_packet_free(&c->sess_src[i].pkt);
+    c->sess_src_n = 0;
+}
+
+/* a source frame at or after the position: encode it to go out with its
+ * upscale */
+static int sess_add_source(enc_ctx *c, const AVFrame *fr)
+{
+    AVPacket *pkt = encode_image(c, &c->sess_src_img, fr, 0, c->sess_w,
+                                 0, 0);
+    if (!pkt) { loge("preview session: source image failed"); return -1; }
+    if (c->sess_src_n == FF_ARRAY_ELEMS(c->sess_src)) {
+        av_packet_free(&c->sess_src[0].pkt);
+        memmove(c->sess_src, c->sess_src + 1,
+                (c->sess_src_n - 1) * sizeof *c->sess_src);
+        c->sess_src_n--;
+    }
+    c->sess_src[c->sess_src_n++] = (src_image){fr->pts, pkt};
+    return 0;
+}
+
+/* emit_output in a session: frames before the target are lead-in; one frame
+ * is sent once, playing sends each in real time */
+static int sess_emit(enc_ctx *c, AVFrame *f, int64_t pts)
+{
+    if (c->sess_abort || c->sess_done || c->sess_target == AV_NOPTS_VALUE ||
+        pts < c->sess_target)
+        return 0;
+    if (c->sess_play) {
+        const int64_t now = av_gettime_relative();
+        int64_t due = c->sess_clock +
+                      av_rescale_q(pts - c->sess_pts0, c->out_tb, AV_TIME_BASE_Q);
+        if (!c->sess_clock || now - due > 250000) {
+            /* the first frame, or running behind: restart the clock here
+             * rather than rushing to catch up */
+            c->sess_clock = now;
+            c->sess_pts0 = pts;
+            due = now;
+        }
+        if (due > now && cmd_wait(c->sess_cmd, NULL, due) != c->sess_cmd) {
+            c->sess_abort = 1;
+            return 0;
+        }
+    }
+    /* the source frame shown with it: the latest at or before it (RIFE's
+     * in-between frames show the one before) */
+    while (c->sess_src_n > 1 && c->sess_src[1].pts <= pts) {
+        av_packet_free(&c->sess_src[0].pkt);
+        memmove(c->sess_src, c->sess_src + 1,
+                (c->sess_src_n - 1) * sizeof *c->sess_src);
+        c->sess_src_n--;
+    }
+    AVPacket *out = encode_image(c, &c->preview_img, f, 0, c->sess_w,
+                                 c->out_w, c->out_h);
+    if (!out) { loge("preview session: output image failed"); return -1; }
+    int r = sess_send_frame(c, pts, c->sess_src_n ? c->sess_src[0].pkt : NULL,
+                            out);
+    av_packet_free(&out);
+    if (!c->sess_play) c->sess_done = 1;
+    return r;
 }
 
 /* ---- emit one finished output frame: resize -> encode -> mux ------------- */
@@ -1418,6 +1735,10 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out, int64_t pts)
     AVFrame *to_encode = NULL;
     AVFrame *resized = NULL;
     int rc = -1;
+
+    /* a preview session encodes nothing: the frame goes to the GUI (the
+     * final resize is done in its image scaler) */
+    if (c->o.session) return sess_emit(c, cuda_out, pts);
 
     /* Zero-copy only when the libaji output is a CUDA NV12/P010 frame NVENC
      * can read directly. Anything routed through the YUV444P16 intermediate
@@ -1953,6 +2274,27 @@ static int push_frame(enc_ctx *c, AVFrame *fr)
 {
     if (fr)
         fr->pts = frame_pts(c, fr);
+    if (fr && c->o.session) {
+        /* the first frame at or after the position is the one asked for.
+         * Earlier frames are lead-in, and only as many go on through the
+         * pipeline as a temporal window or a RIFE pair needs - the rest are
+         * dropped rather than upscaled. */
+        const int64_t lead = (int64_t)(c->temporal_r + 2) * c->frame_dur;
+        if (c->sess_target == AV_NOPTS_VALUE && fr->pts < c->sess_at - lead) {
+            av_frame_free(&fr);
+            return 0;
+        }
+        if (c->sess_target == AV_NOPTS_VALUE && fr->pts >= c->sess_at)
+            c->sess_target = fr->pts;
+        if (c->sess_target != AV_NOPTS_VALUE) {
+            if ((c->sess_play || c->sess_after == 0) &&
+                sess_add_source(c, fr) < 0) {
+                av_frame_free(&fr);
+                return -1;
+            }
+            c->sess_after++;
+        }
+    }
     if (fr && (!c->passthrough || c->rife_only) && !(fr = to_device(c, fr)))
         return -1;
     if (!c->rife) return push_upscale(c, fr);
@@ -2037,6 +2379,163 @@ fail:
     return rc;
 }
 
+/* ---- --preview-session: serving requests --------------------------------- */
+
+/* Forget everything in the pipeline (its frames are from before a seek):
+ * in-flight upscales are waited on and dropped, the temporal history, RIFE's
+ * held frames, the decoder and the deinterlacer start over. */
+static int sess_reset(enc_ctx *c)
+{
+    while (c->ring_count > 0) {
+        slot *s = &c->ring[(c->ring_head - c->ring_count + MAX_RING)
+                           % MAX_RING];
+        if (s->ticket && aji_wait(c->aji, s->ticket) != AJI_OK) {
+            loge("aji_wait failed: %s", aji_last_error(c->aji));
+            return -1;
+        }
+        av_frame_free(&s->out);
+        av_frame_free(&s->in_ref);
+        s->ticket = 0;
+        c->ring_count--;
+    }
+    if (c->aji && sync_aji(c) < 0) return -1;
+    av_frame_free(&c->up_prev);
+    av_frame_free(&c->up_cur);
+    av_frame_free(&c->src_prev);
+    c->have_prev = 0;
+    if (c->temporal_r) {
+        aji_temporal_reset(c->aji);
+        c->in_seq = c->out_seq = 0;
+    }
+    c->last_pts = AV_NOPTS_VALUE;
+    avcodec_flush_buffers(c->dec);
+    if (c->dgraph && build_deint(c, c->dg_fmt, c->dg_spc, c->dg_range) < 0)
+        return -1;
+    sess_free_sources(c);
+    c->sess_target = AV_NOPTS_VALUE;
+    c->sess_after = 0;
+    c->sess_done = c->sess_abort = 0;
+    c->sess_clock = 0;
+    return 0;
+}
+
+/* Serve one request from a seek a few seconds before the position (lead-in
+ * for temporal windows, RIFE and IVTC's field matching; it lands on the
+ * keyframe before). One frame is flushed out as soon as the frames its
+ * window needs are in. Returns once it is done, a newer command came in, or
+ * at the end of the video. */
+static int sess_serve(enc_ctx *c, double sec)
+{
+    AVPacket *pkt = av_packet_alloc();
+    int rc = -1, eof = 0;
+    if (!pkt || sess_reset(c) < 0) goto done;
+    c->sess_at = av_rescale_q((int64_t)(sec * AV_TIME_BASE), AV_TIME_BASE_Q,
+                              c->out_tb);
+    const int64_t ts = c->start_us +
+                       (int64_t)(FFMAX(sec - 3, 0) * AV_TIME_BASE);
+    /* MPEG-PS/TS seek by searching for timestamps, and from the start that
+     * lands a GOP late: rewind those to the first byte instead */
+    const int rewind = sec <= 3 &&
+                       (c->ifmt->iformat->flags & AVFMT_TS_DISCONT) &&
+                       !(c->ifmt->iformat->flags & AVFMT_NO_BYTE_SEEK);
+    if ((rewind ? avformat_seek_file(c->ifmt, -1, 0, 0, 0, AVSEEK_FLAG_BYTE)
+                : avformat_seek_file(c->ifmt, -1, INT64_MIN, ts, ts, 0)) < 0)
+        loge("preview session: seek to %.3f s failed", sec);
+
+    while (!c->sess_done && !c->sess_abort) {
+        if (!eof) {
+            const int r = av_read_frame(c->ifmt, pkt);
+            if (r < 0) {
+                eof = 1;
+                avcodec_send_packet(c->dec, NULL);
+            } else if (pkt->stream_index != c->vstream) {
+                av_packet_unref(pkt);
+                continue;
+            } else {
+                const int s = avcodec_send_packet(c->dec, pkt);
+                av_packet_unref(pkt);
+                if (s < 0 && s != AVERROR(EAGAIN)) AV(s);
+            }
+        }
+        for (;;) {
+            AVFrame *fr = av_frame_alloc();
+            const int r = avcodec_receive_frame(c->dec, fr);
+            if (r == AVERROR(EAGAIN)) { av_frame_free(&fr); break; }
+            if (r == AVERROR_EOF) {
+                av_frame_free(&fr);
+                /* the rest of the video: flush the deinterlacer and the
+                 * pipeline, then say it ended */
+                if (push_decoded(c, NULL) < 0 || push_frame(c, NULL) < 0)
+                    goto done;
+                if (!c->sess_done && !c->sess_abort) {
+                    printf("END id=%lld\n", c->sess_id);
+                    fflush(stdout);
+                }
+                rc = 0;
+                goto done;
+            }
+            if (r < 0) { av_frame_free(&fr); AV(r); }
+            if (push_decoded(c, fr) < 0) goto done;
+            if (c->sess_done || c->sess_abort) break;
+            /* one frame: its window (the r frames after it) is in, flush */
+            if (!c->sess_play && c->sess_target != AV_NOPTS_VALUE &&
+                c->sess_after > c->temporal_r) {
+                if (push_frame(c, NULL) < 0) goto done;
+                break;
+            }
+        }
+        if (cmd_newer(c->sess_cmd)) c->sess_abort = 1;
+    }
+    rc = 0;
+done:
+fail:
+    av_packet_free(&pkt);
+    return rc;
+}
+
+/* --preview-session: libaji stays configured (engines loaded) while a GUI's
+ * player asks for frames; commands are lines on stdin:
+ *   frame <id> <seconds> <width>   the frame at that position (width 0 =
+ *                                  full size), with its source frame
+ *   play <id> <seconds> <width>    every frame from there on, in real time
+ *   stop                           stop playing
+ *   quit                           (or end of input) exit
+ * A new command replaces the one being served. Replies: see sess_emit. */
+static int session(enc_ctx *c)
+{
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);   /* the images are binary */
+#endif
+    if (cmd_start() < 0) { loge("preview session: no stdin thread"); return -1; }
+    const int64_t dur = c->ifmt->duration > 0 ? c->ifmt->duration / 1000 : 0;
+    printf("READY duration=%lld width=%d height=%d fps=%d/%d\n",
+           (long long)dur, c->out_w, c->out_h, c->out_fps.num, c->out_fps.den);
+    fflush(stdout);
+
+    char line[sizeof g_cmd.line];
+    uint64_t seen = 0;
+    for (;;) {
+        seen = cmd_wait(seen, line, -1);
+        char kind[16] = "";
+        long long id = 0;
+        double sec = 0;
+        int w = 0;
+        const int n = sscanf(line, "%15s %lld %lf %d", kind, &id, &sec, &w);
+        if (!strcmp(kind, "quit")) return 0;
+        if (!strcmp(kind, "stop")) continue;
+        const int play = !strcmp(kind, "play");
+        if ((!play && strcmp(kind, "frame")) || n < 3) {
+            loge("preview session: unknown command '%s'", line);
+            continue;
+        }
+        c->sess_cmd = seen;
+        c->sess_id = id;
+        c->sess_play = play;
+        c->sess_w = FFMAX(w, 0);
+        if (sess_serve(c, FFMAX(sec, 0)) < 0) return -1;
+    }
+}
+
 /* ---- cleanup ------------------------------------------------------------- */
 
 static void cleanup(enc_ctx *c)
@@ -2054,8 +2553,11 @@ static void cleanup(enc_ctx *c)
     av_frame_free(&c->host_frame);
     if (c->graph) avfilter_graph_free(&c->graph);
     avfilter_graph_free(&c->dgraph);
-    if (c->preview_sws) sws_freeContext(c->preview_sws);
-    avcodec_free_context(&c->preview_enc);
+    sws_freeContext(c->preview_img.sws);
+    avcodec_free_context(&c->preview_img.enc);
+    sws_freeContext(c->sess_src_img.sws);
+    avcodec_free_context(&c->sess_src_img.enc);
+    sess_free_sources(c);
     if (c->sws) sws_freeContext(c->sws);
     for (int i = 0; i < c->aux_n; i++) av_packet_free(&c->aux_buf[i]);
     av_free(c->aux_buf);
@@ -2097,6 +2599,7 @@ static void usage(void)
 " [--backend tensorrt|directml]\n"
 "           [--deinterlace off|ivtc|bwdif]"
 " [--preview <f.jpg> [--preview-width W]]\n"
+"           [--preview-session] (no --output: frames for a GUI's player)\n"
 "           (direct mode: --engine <e> --max-width W --max-height H)\n");
 }
 
@@ -2137,6 +2640,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-subs")) c.o.no_subs = 1;
         else if (!strcmp(a, "--no-chapters")) c.o.no_chapters = 1;
         else if (!strcmp(a, "--build-only")) c.o.build_only = 1;
+        else if (!strcmp(a, "--preview-session")) c.o.session = 1;
         else if (!strcmp(a, "--no-zerocopy")) c.o.no_zerocopy = 1;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (i >= argc - 1) { usage(); return 2; }
@@ -2214,7 +2718,7 @@ int main(int argc, char **argv)
         loge("direct mode (--engine) is TensorRT-only");
         return 2;
     }
-    if (!c.o.input || (!c.o.build_only && !c.o.output)) {
+    if (!c.o.input || (!c.o.build_only && !c.o.session && !c.o.output)) {
         usage(); return 2;
     }
     if (!c.o.conf && !c.o.engine) { loge("need --conf or --engine"); return 2; }
@@ -2248,6 +2752,10 @@ int main(int argc, char **argv)
     /* RIFE-only chains interpolate into this pool too (at the source dims) */
     if ((!c.passthrough || c.rife_only) && init_aji_pool(&c) < 0) goto out;
     if (open_decoder(&c) < 0) goto out;
+    if (c.o.session) {
+        rc = session(&c) < 0;
+        goto out;
+    }
     if (open_output(&c) < 0) goto out;
     if (run(&c) < 0) goto out;
     rc = 0;

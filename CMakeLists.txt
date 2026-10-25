@@ -106,9 +106,10 @@ else()
             libavformat libavcodec libavutil libavfilter libswscale)
     endif()
     if(FFMPEG_FOUND)
+        find_package(Threads REQUIRED)    # --preview-session's stdin reader
         add_executable(aji_encode src/encode.c)
         target_link_libraries(aji_encode PRIVATE
-            aji CUDA::cudart CUDA::cuda_driver PkgConfig::FFMPEG)
+            aji CUDA::cudart CUDA::cuda_driver PkgConfig::FFMPEG Threads::Threads)
         add_dependencies(aji_encode aji_trt)
         set_target_properties(aji_encode PROPERTIES
             BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
