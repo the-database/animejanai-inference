@@ -299,6 +299,11 @@ struct aji_ctx {
     Logger logger;
     CUcontext cu_ctx = nullptr;
     bool owns_primary = false;
+    // The device cu_ctx lives on, which need not be device 0 (mpv adopts
+    // the hwdec device, i.e. the Vulkan VO's GPU). cuda_dev is the runtime
+    // API ordinal: it names engines and is trtexec's --device.
+    CUdevice cu_dev = 0;
+    int cuda_dev = 0;
 
     std::unique_ptr<nvinfer1::IRuntime> runtime;
 
@@ -475,51 +480,66 @@ std::string trt_version_token()
     return buf;
 }
 
-std::string gpu_token()
+std::string gpu_token(int dev)
 {
     cudaDeviceProp prop = {};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess)
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
         return "unknown";
     std::string tok = sanitize_token(prop.name);
     return tok + "-sm" + std::to_string(prop.major);
 }
 
-std::string engine_suffix()
+std::string engine_suffix(int dev)
 {
-    return ".trt-" + trt_version_token() + ".gpu-" + gpu_token() + ".engine";
+    return ".trt-" + trt_version_token() + ".gpu-" + gpu_token(dev) + ".engine";
 }
 
 std::string engine_path_for(const std::string &model_dir,
                             const std::string &onnx_name,
-                            const std::string &settings)
+                            const std::string &settings, int dev)
 {
     return (fs::path(model_dir) /
-            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix()))
+            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix(dev)))
         .string();
 }
 
 std::string short_engine_path_for(const std::string &model_dir,
                                   const std::string &onnx_name,
-                                  const std::string &settings)
+                                  const std::string &settings, int dev)
 {
     char model_hash[9];
     snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
     return (fs::path(model_dir) /
             ("aji-" + std::string(model_hash) + "." +
-             std::to_string(crc32_z(settings)) + engine_suffix()))
+             std::to_string(crc32_z(settings)) + engine_suffix(dev)))
         .string();
 }
 
 void clean_stale_engines(aji_ctx *c)
 {
-    const std::string suffix = engine_suffix();
+    // Keep the engines of every GPU in the system, not just the active one:
+    // a multi-GPU user moving playback between GPUs would otherwise rebuild
+    // everything on each switch.
+    std::vector<std::string> suffixes;
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1)
+        ndev = 0;
+    for (int d = 0; d < ndev; d++)
+        suffixes.push_back(engine_suffix(d));
+    if (suffixes.empty())
+        suffixes.push_back(engine_suffix(c->cuda_dev));
     std::error_code ec;
     for (const auto &e : fs::directory_iterator(c->model_dir, ec)) {
         const std::string name = e.path().filename().string();
         if (name.size() < 7 || name.substr(name.size() - 7) != ".engine")
             continue;
-        if (name.size() >= suffix.size() &&
-            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+        bool current = false;
+        for (const std::string &suffix : suffixes) {
+            current |= name.size() >= suffix.size() &&
+                       name.compare(name.size() - suffix.size(), suffix.size(),
+                                    suffix) == 0;
+        }
+        if (current)
             continue;
         std::error_code rec;
         if (fs::remove(e.path(), rec)) {
@@ -773,6 +793,10 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
                     "\" --saveEngine=\"" + engine_path + ".tmp\" " +
                     cmd_settings +
                     " --timingCacheFile=\"" + tcache + "\"";
+    // trtexec builds on device 0 by default; build on the GPU that runs
+    // the engine (left off for device 0 to keep the usual command line)
+    if (c->cuda_dev != 0)
+        spec->cmdline += " --device=" + std::to_string(c->cuda_dev);
     spec->env_prefix = c->trtexec_env;
     spec->engine_path = engine_path;
     spec->tmp_path = engine_path + ".tmp";
@@ -977,7 +1001,8 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                   const std::string *dir = nullptr, int rank5_t = 0)
 {
     const std::string model_dir = dir ? *dir : c->model_dir;
-    const std::string short_epath = short_engine_path_for(model_dir, name, settings);
+    const std::string short_epath =
+        short_engine_path_for(model_dir, name, settings, c->cuda_dev);
 
     // Backwards compatibility: 3.5.0 and earlier cached engines used the
     // full ONNX basename in the filename. Try that legacy path first so
@@ -1105,7 +1130,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
     const std::string epath =
-        engine_path_for(c->rife_model_dir, model, settings);
+        engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev);
     int er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
                            11, &c->rife_model_dir);
     if (er < 0)
@@ -1284,6 +1309,20 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
             return nullptr;
         }
         c->owns_primary = true;
+        c->cu_dev = dev;
+    }
+    {
+        CtxGuard guard(c->cu_ctx);
+        // cudaGetDevice reports the current (pushed) context's device as a
+        // runtime ordinal, the numbering cudaGetDeviceProperties and
+        // trtexec --device use
+        if (!guard.ok || cuCtxGetDevice(&c->cu_dev) != CUDA_SUCCESS ||
+            cudaGetDevice(&c->cuda_dev) != cudaSuccess) {
+            c->set_error("failed to query the CUDA context's device");
+            if (c->owns_primary)
+                cuDevicePrimaryCtxRelease(c->cu_dev);
+            return nullptr;
+        }
     }
 
     c->runtime.reset(nvinfer1::createInferRuntime(c->logger));
@@ -1651,7 +1690,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         while ((pos = settings.find("%video_resolution%")) != std::string::npos)
             settings.replace(pos, strlen("%video_resolution%"), dims);
 
-        const std::string epath = engine_path_for(c->model_dir, m.name, settings);
+        const std::string epath =
+            engine_path_for(c->model_dir, m.name, settings, c->cuda_dev);
         ModelEngine me;
         int er = ensure_engine(c, m.name, settings, epath, &me, bw, bh, 3 * t,
                                nullptr, rank5 ? t : 0);
@@ -2874,11 +2914,8 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->direct.engine.reset();
         c->runtime.reset();
     }
-    if (c->owns_primary) {
-        CUdevice dev;
-        if (cuDeviceGet(&dev, 0) == CUDA_SUCCESS)
-            cuDevicePrimaryCtxRelease(dev);
-    }
+    if (c->owns_primary)
+        cuDevicePrimaryCtxRelease(c->cu_dev);
     delete c;
     *pc = nullptr;
 }
