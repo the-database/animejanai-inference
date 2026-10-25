@@ -248,8 +248,18 @@ typedef struct {
     AVCodecContext  *enc;
     int              vout;           /* output video stream index */
     int             *smap;           /* input stream idx -> output idx (-1) */
-    AVRational       out_tb;         /* video stream time_base */
-    AVRational       out_fps;
+    AVRational       out_tb;         /* video encoder time_base: the source
+                                        stream's, divided by the RIFE factor so
+                                        interpolated frames land on whole ticks */
+    AVRational       out_fps;        /* nominal (encoder rate control, tags) */
+    AVRational       src_tb;         /* video stream time_base */
+    AVRational       src_fps;        /* source frame rate (guessed) */
+    int64_t          start_us;       /* input start, subtracted from every
+                                        stream's timestamps (AV_TIME_BASE) */
+    int64_t          last_pts;       /* last frame timestamp (out_tb) */
+    int64_t          frame_dur;      /* nominal frame duration (out_tb) */
+    int64_t          seq_pts[64];    /* temporal: timestamp by sequence number */
+    int             *aux_src;        /* input stream of each buffered aux packet */
     int              opened;         /* header written */
     AVPacket       **aux_buf;        /* aux packets seen before header */
     int              aux_n, aux_cap;
@@ -285,7 +295,7 @@ typedef struct {
 } enc_ctx;
 
 /* forward decls */
-static int emit_output(enc_ctx *c, AVFrame *cuda_out);
+static int emit_output(enc_ctx *c, AVFrame *cuda_out, int64_t pts);
 static int drain_encoder(enc_ctx *c, int flush);
 
 /* ---- decoder: force NVDEC's CUDA output format --------------------------- */
@@ -425,6 +435,14 @@ static int open_input(enc_ctx *c)
 
     c->out_fps = av_guess_frame_rate(c->ifmt, vst, NULL);
     if (c->out_fps.num == 0) c->out_fps = (AVRational){24000, 1001};
+    /* Output frames keep the source frames' own timestamps (variable frame
+     * rate sources stay in sync with their audio), all streams shifted by the
+     * input's start time so the output starts at 0 */
+    c->src_tb = vst->time_base;
+    c->src_fps = c->out_fps;
+    c->start_us = c->ifmt->start_time != AV_NOPTS_VALUE ? c->ifmt->start_time
+                                                         : 0;
+    c->last_pts = AV_NOPTS_VALUE;
 
     /* frame-count estimate for progress */
     if (vst->nb_frames > 0)
@@ -527,6 +545,7 @@ fail:
 
 static int init_aji(enc_ctx *c)
 {
+    c->out_tb = c->src_tb;     /* RIFE refines it below */
     aji_create_params p = {
         .api_version    = AJI_API_VERSION,
         .cuda_context   = (void *)c->cuctx,
@@ -591,6 +610,7 @@ static int init_aji(enc_ctx *c)
         }
         c->rife = 1;
         c->out_fps = av_mul_q(c->out_fps, (AVRational){c->rnum, c->rden});
+        c->out_tb = av_div_q(c->src_tb, (AVRational){c->rnum, 1});
         if (c->passthrough) {
             /* RIFE-only chain (no scaling): the engine interpolates the
              * passthrough frames, so they go to the device like any input -
@@ -889,7 +909,6 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     int w = first->width, h = first->height;
     c->enc->width  = w;
     c->enc->height = h;
-    c->out_tb = av_inv_q(c->out_fps);
     c->enc->time_base = c->out_tb;
     c->enc->framerate = c->out_fps;
     c->enc->colorspace            = c->color_space;
@@ -1016,6 +1035,23 @@ fail:
     return -1;
 }
 
+/* Write one stream-copied packet (in its input stream's time base), shifted
+ * by the input start like the video, then rescaled to its output stream.
+ * Takes ownership. */
+static void write_aux(enc_ctx *c, AVPacket *pkt, int in_idx)
+{
+    const AVStream *in = c->ifmt->streams[in_idx];
+    const int oidx = c->smap[in_idx];
+    const int64_t off = av_rescale_q(c->start_us, AV_TIME_BASE_Q,
+                                     in->time_base);
+    if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= off;
+    if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= off;
+    pkt->stream_index = oidx;
+    av_packet_rescale_ts(pkt, in->time_base, c->ofmt->streams[oidx]->time_base);
+    av_interleaved_write_frame(c->ofmt, pkt);
+    av_packet_free(&pkt);
+}
+
 /* Finish output setup once the first encoded video frame is known: copy the
  * encoder params onto the video stream, open the file, write the header, and
  * flush any aux packets buffered before this point. */
@@ -1043,8 +1079,8 @@ static int finalize_output(enc_ctx *c)
     c->opened = 1;
 
     for (int i = 0; i < c->aux_n; i++) {
-        av_interleaved_write_frame(c->ofmt, c->aux_buf[i]);
-        av_packet_free(&c->aux_buf[i]);
+        write_aux(c, c->aux_buf[i], c->aux_src[i]);
+        c->aux_buf[i] = NULL;
     }
     c->aux_n = 0;
     return 0;
@@ -1117,12 +1153,11 @@ static int resize_needed(enc_ctx *c)
 
 /* ---- emit one finished output frame: resize -> encode -> mux ------------- */
 
-/* Emit one finished output frame. Frames arrive in display order (the
- * non-RIFE ring drains FIFO; RIFE emits base then phases in order), so we
- * assign the monotonic CFR PTS here and own the emitted-frame count. */
-static int emit_output(enc_ctx *c, AVFrame *cuda_out)
+/* Emit one finished output frame at pts (out_tb). Frames arrive in display
+ * order (the non-RIFE ring drains FIFO; RIFE emits base then phases in
+ * order); the timestamps come from the source frames (frame_pts). */
+static int emit_output(enc_ctx *c, AVFrame *cuda_out, int64_t pts)
 {
-    int64_t pts = c->out_frames;
     AVFrame *to_encode = NULL;
     AVFrame *resized = NULL;
     int rc = -1;
@@ -1259,7 +1294,7 @@ static int ring_reclaim(enc_ctx *c, slot *s)
             return -1;
         }
     }
-    int r = emit_output(c, s->out);
+    int r = emit_output(c, s->out, s->out->pts);
     av_frame_free(&s->out);
     av_frame_free(&s->in_ref);
     s->ticket = 0;
@@ -1335,6 +1370,8 @@ static int ingest(enc_ctx *c, AVFrame *dec)
         loge("aji_ingest: %d: %s", ret, aji_last_error(c->aji));
         return -1;
     }
+    /* the output for this frame is inferred later; keep its timestamp */
+    c->seq_pts[c->in_seq % FF_ARRAY_ELEMS(c->seq_pts)] = dec->pts;
     c->in_seq++;
     return 0;
 }
@@ -1352,6 +1389,7 @@ static AVFrame *infer_next_seq(enc_ctx *c)
         av_frame_free(&out);
         return NULL;
     }
+    out->pts = c->seq_pts[c->out_seq % FF_ARRAY_ELEMS(c->seq_pts)];
     c->out_seq++;
     return out;
 }
@@ -1410,6 +1448,7 @@ static int push_upscale(enc_ctx *c, AVFrame *dec)
         av_frame_free(&out);
         return -1;
     }
+    out->pts = dec->pts;
     ring_commit(c, dec, out, aji_flush(c->aji, c->stream));
     return 0;
 }
@@ -1430,7 +1469,14 @@ static AVFrame *upscale_one(enc_ctx *c, AVFrame *dec)
         return NULL;
     }
     if (sync_aji(c) < 0) { av_frame_free(&out); return NULL; }
+    out->pts = dec->pts;
     return out;
+}
+
+/* timestamp of interpolation phase k of n between frames a and b */
+static int64_t interp_pts(const AVFrame *a, const AVFrame *b, int k, int n)
+{
+    return a->pts + (b->pts - a->pts) * k / n;
 }
 
 /* take one upscaled frame (up==NULL flushes): emit the previous one and the
@@ -1440,7 +1486,7 @@ static int rife_step(enc_ctx *c, AVFrame *up)
     if (!up) {
         /* emit the final upscaled frame, no successor to interpolate with */
         if (c->have_prev) {
-            if (emit_output(c, c->up_prev) < 0) return -1;
+            if (emit_output(c, c->up_prev, c->up_prev->pts) < 0) return -1;
         }
         return 0;
     }
@@ -1453,7 +1499,7 @@ static int rife_step(enc_ctx *c, AVFrame *up)
     c->up_cur = up;
 
     /* emit base frame N (= up_prev) */
-    if (emit_output(c, c->up_prev) < 0) return -1;
+    if (emit_output(c, c->up_prev, c->up_prev->pts) < 0) return -1;
 
     /* interpolation phases between N and N+1 */
     double factor = (double)c->rnum / c->rden;
@@ -1479,7 +1525,8 @@ static int rife_step(enc_ctx *c, AVFrame *up)
                 loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
                 av_frame_free(&interp); return -1;
             }
-            int er = emit_output(c, emit);
+            int er = emit_output(c, emit,
+                                 interp_pts(c->up_prev, c->up_cur, k, phases));
             av_frame_free(&interp);
             if (er < 0) return -1;
         }
@@ -1555,7 +1602,7 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
     if (!dec) {
         if (!c->src_prev) return 0;
         AVFrame *up = upscale_one(c, c->src_prev);
-        int r = up ? emit_output(c, up) : -1;
+        int r = up ? emit_output(c, up, up->pts) : -1;
         av_frame_free(&up);
         return r;
     }
@@ -1571,6 +1618,7 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
         if (ret != AJI_OK)
             loge("aji_resize: %d: %s", ret, aji_last_error(c->aji));
         int r = ret == AJI_OK ? sync_aji(c) : -1;
+        cur->pts = dec->pts;
         av_frame_free(&dec);
         if (r < 0) { av_frame_free(&cur); return -1; }
     }
@@ -1580,11 +1628,12 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
     }
 
     AVFrame *base = upscale_one(c, c->src_prev);
-    int rc = base ? emit_output(c, base) : -1;
+    int rc = base ? emit_output(c, base, base->pts) : -1;
     int phases = c->rnum / c->rden;        /* integer factor: F-1 phases */
     for (int k = 1; rc == 0 && k < phases; k++) {
         AVFrame *interp = alloc_work(c);
         if (!interp) { rc = -1; break; }
+        interp->pts = interp_pts(c->src_prev, cur, k, phases);
         aji_frame a, b, o;
         fill_aji_frame(c, &a, c->src_prev, 0);
         fill_aji_frame(c, &b, cur, 0);
@@ -1593,13 +1642,13 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
                                  c->stream);
         if (ret == AJI_SCENE) {
             c->scene_dupes++;
-            rc = emit_output(c, base);
+            rc = emit_output(c, base, interp->pts);
         } else if (ret != AJI_OK) {
             loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
             rc = -1;
         } else {
             AVFrame *up = upscale_one(c, interp);
-            rc = up ? emit_output(c, up) : -1;
+            rc = up ? emit_output(c, up, up->pts) : -1;
             av_frame_free(&up);
         }
         av_frame_free(&interp);
@@ -1610,9 +1659,36 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
     return rc;
 }
 
+/* A decoded frame's timestamp in out_tb, from the input's start: the
+ * decoder's best-effort timestamp (variable frame rate sources keep their
+ * timing), filled in where missing and kept strictly increasing, by a whole
+ * source frame so RIFE's in-between timestamps stay distinct. */
+static int64_t frame_pts(enc_ctx *c, const AVFrame *fr)
+{
+    if (!c->frame_dur)
+        c->frame_dur = FFMAX(1, av_rescale_q(1, av_inv_q(c->src_fps), c->out_tb));
+    int64_t pts = fr->best_effort_timestamp;
+    if (pts != AV_NOPTS_VALUE)
+        pts = av_rescale_q(pts, c->src_tb, c->out_tb) -
+              av_rescale_q(c->start_us, AV_TIME_BASE_Q, c->out_tb);
+    if (c->last_pts != AV_NOPTS_VALUE) {
+        const int64_t min_step = c->rife ? c->rnum : 1;
+        if (pts == AV_NOPTS_VALUE)
+            pts = c->last_pts + c->frame_dur;
+        else if (pts < c->last_pts + min_step)
+            pts = c->last_pts + min_step;
+    } else if (pts == AV_NOPTS_VALUE) {
+        pts = 0;
+    }
+    c->last_pts = pts;
+    return pts;
+}
+
 /* one decoded frame into the active pipeline (NULL flushes it) */
 static int push_frame(enc_ctx *c, AVFrame *fr)
 {
+    if (fr)
+        fr->pts = frame_pts(c, fr);
     if (fr && (!c->passthrough || c->rife_only) && !(fr = to_device(c, fr)))
         return -1;
     if (!c->rife) return push_upscale(c, fr);
@@ -1642,23 +1718,20 @@ static int run(enc_ctx *c)
                 if (push_frame(c, fr) < 0) goto done;
             }
         } else if (c->smap && c->smap[pkt->stream_index] >= 0) {
-            AVStream *in = c->ifmt->streams[pkt->stream_index];
-            int oidx = c->smap[pkt->stream_index];
             AVPacket *out = av_packet_clone(pkt);
-            out->stream_index = oidx;
-            av_packet_rescale_ts(out, in->time_base,
-                                 c->opened ? c->ofmt->streams[oidx]->time_base
-                                           : in->time_base);
             if (c->opened) {
-                av_interleaved_write_frame(c->ofmt, out);
-                av_packet_free(&out);
+                write_aux(c, out, pkt->stream_index);
             } else {
-                /* header not written yet: buffer */
+                /* header not written yet: buffer (in the input time base;
+                 * the output stream's is only final after the header) */
                 if (c->aux_n == c->aux_cap) {
                     c->aux_cap = c->aux_cap ? c->aux_cap * 2 : 16;
                     c->aux_buf = av_realloc_f(c->aux_buf, c->aux_cap,
                                               sizeof(*c->aux_buf));
+                    c->aux_src = av_realloc_f(c->aux_src, c->aux_cap,
+                                              sizeof(*c->aux_src));
                 }
+                c->aux_src[c->aux_n] = pkt->stream_index;
                 c->aux_buf[c->aux_n++] = out;
             }
         }
@@ -1718,6 +1791,7 @@ static void cleanup(enc_ctx *c)
     if (c->sws) sws_freeContext(c->sws);
     for (int i = 0; i < c->aux_n; i++) av_packet_free(&c->aux_buf[i]);
     av_free(c->aux_buf);
+    av_free(c->aux_src);
     av_free(c->smap);
     if (c->aji) aji_destroy(&c->aji);
     if (c->stream) cudaStreamDestroy(c->stream);
