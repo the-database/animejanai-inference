@@ -18,6 +18,12 @@
  * --rife-chain: times the full upscale+RIFE chain per source frame, honoring
  *   the slot's configured order (aji_rife_before_upscale). Use slots 1012
  *   (upscale then RIFE) vs 1013 (RIFE then upscale) for the order A/B.
+ *
+ * Temporal chains, scheduling tests (untimed; output is what matters):
+ * --ingest-ahead A: ingest A frames further ahead than needed (the aji.h
+ *   contract allows up to 4).
+ * --reset-at K: aji_temporal_reset before frame K and restart the sequence
+ *   numbers there; the frames from K on must match a run starting at K.
  */
 
 #include <stdio.h>
@@ -51,7 +57,7 @@ int main(int argc, char **argv)
     const char *rife_model_dir = NULL;
     const char *format = "nv12", *matrix = "709", *range = "limited", *siting = "left";
     int w = 0, h = 0, max_frames = 1 << 30, slot = 1, rife = 0, out444 = 0;
-    int rife_chain = 0;
+    int rife_chain = 0, ingest_ahead = -1, reset_at = -1;
 
     double fps = 23.976;
 
@@ -77,6 +83,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--width")) w = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--height")) h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames")) max_frames = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ingest-ahead")) ingest_ahead = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--reset-at")) reset_at = atoi(argv[++i]);
     }
     if ((!engine && !conf) || !input || w < 2 || h < 2) {
         fprintf(stderr, "missing required args (see header comment)\n");
@@ -421,6 +429,77 @@ int main(int argc, char **argv)
     int timed = 0;
 
     const int radius = aji_temporal_radius(aji);
+    if (radius > 0 && (ingest_ahead >= 0 || reset_at >= 0)) {
+        // Scheduling test: the whole input is held in memory so frames can
+        // be ingested ahead of the output and re-ingested after a reset.
+        // Frame k is emitted once k+radius+ahead is in (or the input ends).
+        const int ahead = ingest_ahead > 0 ? ingest_ahead : 0;
+        printf("temporal: %d-frame window, ingest %d ahead, reset at %d\n",
+               2 * radius + 1, ahead, reset_at);
+        size_t cap = 64, nfr = 0;
+        char *all = malloc(cap * frame_sz);
+        while (all && (int)nfr < max_frames &&
+               fread(h_in, 1, frame_sz, fin) == frame_sz) {
+            if (nfr == cap) {
+                char *grown = realloc(all, (cap *= 2) * frame_sz);
+                if (!grown) { free(all); all = NULL; break; }
+                all = grown;
+            }
+            memcpy(all + nfr * frame_sz, h_in, frame_sz);
+            nfr++;
+        }
+        if (!all) { fprintf(stderr, "out of memory\n"); return 1; }
+        size_t base = 0, next = 0;  // seq = frame - base
+        for (size_t k = 0; k < nfr; k++) {
+            if ((int)k == reset_at) {
+                aji_temporal_reset(aji);
+                base = next = k;
+            }
+            while (next < nfr && next <= k + radius + ahead) {
+                memcpy(h_in, all + next * frame_sz, frame_sz);
+                CK(cudaMemcpyAsync(in.plane[0], h_in, y_sz,
+                                   cudaMemcpyHostToDevice, stream));
+                CK(cudaMemcpyAsync(in.plane[1], (char *)h_in + y_sz, uv_sz,
+                                   cudaMemcpyHostToDevice, stream));
+                int ret = aji_ingest(aji, &in, (uint64_t)(next - base),
+                                     stream);
+                if (ret != AJI_OK) {
+                    fprintf(stderr, "aji_ingest: %d: %s\n", ret,
+                            aji_last_error(aji));
+                    return 1;
+                }
+                CK(cudaStreamSynchronize(stream));  // h_in is reused
+                next++;
+            }
+            int ret = aji_infer_seq(aji, (uint64_t)(k - base), &out, stream);
+            if (ret != AJI_OK) {
+                fprintf(stderr, "aji_infer_seq: %d: %s\n", ret,
+                        aji_last_error(aji));
+                return 1;
+            }
+            CK(cudaMemcpyAsync(h_out, out.plane[0], oy_sz,
+                               cudaMemcpyDeviceToHost, stream));
+            CK(cudaMemcpyAsync((char *)h_out + oy_sz, out.plane[1],
+                               out444 ? oy_sz : ouv_sz,
+                               cudaMemcpyDeviceToHost, stream));
+            if (out444)
+                CK(cudaMemcpyAsync((char *)h_out + 2 * oy_sz, out.plane[2],
+                                   oy_sz, cudaMemcpyDeviceToHost, stream));
+            CK(cudaStreamSynchronize(stream));
+            if (fout &&
+                fwrite(h_out, 1, oy_sz + ouv_sz, fout) != oy_sz + ouv_sz) {
+                perror("fwrite");
+                return 1;
+            }
+            n++;
+        }
+        free(all);
+        printf("frames: %d\n", n);
+        if (fout) fclose(fout);
+        fclose(fin);
+        aji_destroy(&aji);
+        return 0;
+    }
     if (radius > 0) {
         // Temporal chain: frames are ingested in order and frame k is
         // emitted once k+radius is in (the input is not looped: a wrap

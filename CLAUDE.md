@@ -142,6 +142,19 @@ RIFE model weights ship from this repo too, under a separate tag
 The filter lives on the mpv fork's `master` (aji ABI v9). The old standalone `vf-animejanai`
 branch is stale (ABI v4) and must not be used.
 
+## Temporal models
+
+A chain may hold several temporal (multi-frame) models, e.g. a temporal upscale followed by
+vs_temporalfix. Each is a stage with its own history ring: stage 0 is filled by `aji_ingest`,
+later stages are computed on demand (once per frame) from the previous stage's ring inside
+`aji_infer_seq`. `aji_temporal_radius` returns the summed radius, so consumers need no
+changes. Stage 0's ring holds 2R+5 frames (the `aji.h` ingest-ahead contract); on DirectML the
+gather shader's 5-bit slot indices cap that at a 27-frame combined window.
+
+`regress/temporal_regress.sh` compares a reference build with a candidate: bit-exact output
+and timing for chains without stacking, plus stacked-chain correctness. Run it before
+releasing any change to the temporal or chain code (environment variables in its header).
+
 ## Conventions
 
 - Commits: author `the-database`, short imperative subject, no co-author trailers.

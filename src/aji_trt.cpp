@@ -402,12 +402,14 @@ struct aji_ctx {
     // practice (callers queue 2-4 frames, the ring holds 8).
     static constexpr int TICK_RING = 8;
 
-    // Temporal (multi-frame) model step. Frames enter a history ring at the
-    // step's input resolution (aji_ingest runs the steps before it once per
-    // source frame); aji_infer_seq gathers the 2r+1 window into the padded
-    // model input, runs the model, crops, and runs the steps after it.
-    struct {
-        bool enabled = false;
+    // Temporal (multi-frame) model steps, one stage per temporal model. Each
+    // stage keeps a history ring of frames at its step's input resolution:
+    // stage 0's ring is filled by aji_ingest (which runs the steps before it
+    // once per source frame), stage i+1's by running stage i (and the steps
+    // between the two) once per frame, on demand. aji_infer_seq gathers the
+    // last stage's 2r+1 window into the padded model input, runs the model,
+    // crops, and runs the steps after it.
+    struct TemporalStage {
         int t = 1, r = 0;
         size_t step_idx = 0;         // index of the TEMPORAL step in steps[]
         int w = 0, h = 0;            // ring frame dims (step input)
@@ -422,6 +424,13 @@ struct aji_ctx {
         std::vector<int> matrix, range;
         void *in_tensor = nullptr;   // 3t * pw*ph fp16
         void *out_tensor = nullptr;  // 3 * pow*poh fp16
+        uint64_t runs = 0;           // model runs (AJI_TEMPORAL_STATS)
+    };
+    struct {
+        bool enabled = false;
+        int r = 0;                   // total radius: the sum over stages
+        uint64_t ingests = 0;        // AJI_TEMPORAL_STATS
+        std::vector<TemporalStage> st;
     } temporal;
 
     // ONNX input frame counts, keyed by path, valid while size/mtime match
@@ -1242,35 +1251,55 @@ aji_ctx::OnnxFrames onnx_frames(aji_ctx *c, const std::string &name)
 
 void temporal_teardown(aji_ctx *c)
 {
-    auto &T = c->temporal;
-    cudaFree(T.ring);
-    cudaFree(T.diff);
-    cudaFree(T.in_tensor);
-    cudaFree(T.out_tensor);
-    T = {};
+    auto &TT = c->temporal;
+    if (TT.enabled && getenv("AJI_TEMPORAL_STATS")) {
+        fprintf(stderr, "aji temporal stats: %llu ingested",
+                (unsigned long long)TT.ingests);
+        for (size_t i = 0; i < TT.st.size(); i++)
+            fprintf(stderr, "; stage %zu (%d frames): %llu runs", i,
+                    TT.st[i].t, (unsigned long long)TT.st[i].runs);
+        fprintf(stderr, "\n");
+    }
+    for (auto &T : TT.st) {
+        cudaFree(T.ring);
+        cudaFree(T.diff);
+        cudaFree(T.in_tensor);
+        cudaFree(T.out_tensor);
+    }
+    TT = {};
 }
 
-// Allocate the history ring and model tensors for the configured temporal
-// step. Requires the CUDA context to be current.
+// Allocate the history rings and model tensors for the configured temporal
+// stages. Requires the CUDA context to be current.
 bool setup_temporal(aji_ctx *c)
 {
-    auto &T = c->temporal;
-    T.nslots = T.t + 4;
-    const size_t frame = (size_t)3 * T.w * T.h * 2;
-    if (cudaMalloc(&T.ring, frame * T.nslots) != cudaSuccess ||
-        cudaMalloc((void **)&T.diff, sizeof(float) * T.nslots) != cudaSuccess ||
-        cudaMalloc(&T.in_tensor, (size_t)3 * T.t * T.pw * T.ph * 2) !=
-            cudaSuccess ||
-        cudaMalloc(&T.out_tensor, (size_t)3 * T.pow * T.poh * 2) !=
-            cudaSuccess) {
-        c->set_error("temporal buffer allocation failed");
-        return false;
+    auto &TT = c->temporal;
+    TT.r = 0;
+    for (const auto &T : TT.st)
+        TT.r += T.r;
+    for (auto &T : TT.st) {
+        // Stage 0 keeps the last 2R+5 frames ingested (R: the total radius;
+        // callers ingest up to R+4 ahead of the next output, see aji.h).
+        // Later stages are filled in order, on demand, and only ever need
+        // their own window held.
+        T.nslots = &T == &TT.st[0] ? 2 * TT.r + 5 : T.t + 4;
+        const size_t frame = (size_t)3 * T.w * T.h * 2;
+        if (cudaMalloc(&T.ring, frame * T.nslots) != cudaSuccess ||
+            cudaMalloc((void **)&T.diff, sizeof(float) * T.nslots) !=
+                cudaSuccess ||
+            cudaMalloc(&T.in_tensor, (size_t)3 * T.t * T.pw * T.ph * 2) !=
+                cudaSuccess ||
+            cudaMalloc(&T.out_tensor, (size_t)3 * T.pow * T.poh * 2) !=
+                cudaSuccess) {
+            c->set_error("temporal buffer allocation failed");
+            return false;
+        }
+        cudaMemset(T.diff, 0, sizeof(float) * T.nslots);
+        T.seq.assign(T.nslots, -1);
+        T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
+        T.range.assign(T.nslots, AJI_RANGE_LIMITED);
     }
-    cudaMemset(T.diff, 0, sizeof(float) * T.nslots);
-    T.seq.assign(T.nslots, -1);
-    T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
-    T.range.assign(T.nslots, AJI_RANGE_LIMITED);
-    T.enabled = true;
+    TT.enabled = true;
     return true;
 }
 
@@ -1513,7 +1542,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     int cw = w, ch = h;
 
     // Temporal models: frame counts per model step (conf override, else the
-    // onnx input shape). One temporal step per chain.
+    // onnx input shape). Each one becomes a temporal stage.
     std::vector<aji_ctx::OnnxFrames> model_frames(chain->models.size());
     int n_temporal = 0;
     for (size_t mi = 0; mi < chain->models.size(); mi++) {
@@ -1555,12 +1584,6 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             return AJI_ERR_CONF;
         }
         n_temporal++;
-    }
-    if (n_temporal > 1) {
-        c->set_error("chain %d has %d temporal models; at most one is "
-                     "supported", chain->index, n_temporal);
-        finalize_log(c);
-        return AJI_ERR_CONF;
     }
     // RIFE-first would feed interpolated frames into the temporal model's
     // window; interpolate the upscaled frames instead.
@@ -1708,7 +1731,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             return 0;
         }
         if (t > 1) {
-            auto &T = c->temporal;
+            c->temporal.st.emplace_back();
+            auto &T = c->temporal.st.back();
             const int sx = me.out_w / bw, sy = me.out_h / bh;
             if (sx < 1 || sy < 1 || me.out_w != sx * bw ||
                 me.out_h != sy * bh) {
@@ -1788,7 +1812,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     if (!ensure_buffers(c, max_bytes))
         return AJI_ERR_CUDA;
-    if (c->temporal.t > 1 && !setup_temporal(c))
+    if (!c->temporal.st.empty() && !setup_temporal(c))
         return AJI_ERR_CUDA;
 
     // In hoist mode the filter downscales source -> work via aji_resize and
@@ -2243,22 +2267,55 @@ extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
 extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
 {
     if (c && c->temporal.enabled)
-        std::fill(c->temporal.seq.begin(), c->temporal.seq.end(), -1);
+        for (auto &T : c->temporal.st)
+            std::fill(T.seq.begin(), T.seq.end(), -1);
 }
 
-static int temporal_slot(aji_ctx *c, int64_t seq)
+static int temporal_slot(aji_ctx *c, size_t lv, int64_t seq)
 {
-    auto &T = c->temporal;
+    auto &T = c->temporal.st[lv];
     if (seq < 0)
         return -1;
     const int slot = (int)(seq % T.nslots);
     return T.seq[slot] == seq ? slot : -1;
 }
 
-static void *temporal_frame(aji_ctx *c, int slot)
+static void *temporal_frame(aji_ctx *c, size_t lv, int slot)
 {
-    auto &T = c->temporal;
+    auto &T = c->temporal.st[lv];
     return (char *)T.ring + (size_t)slot * 3 * T.w * T.h * 2;
+}
+
+// Store the frame in src (the stage's ring frame dims) as `seq` in stage
+// lv's ring and record its scene-change metric against seq-1, if held.
+static int temporal_store(aji_ctx *c, size_t lv, const void *src,
+                          int64_t seq, int matrix, int range,
+                          cudaStream_t stream)
+{
+    auto &T = c->temporal.st[lv];
+    const int slot = (int)(seq % T.nslots);
+    void *dst = temporal_frame(c, lv, slot);
+    if (cudaMemcpyAsync(dst, src, (size_t)3 * T.w * T.h * 2,
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+        c->set_error("temporal ingest copy failed");
+        return AJI_ERR_CUDA;
+    }
+    // scene-change metric against the previous frame, if held
+    cudaMemsetAsync(&T.diff[slot], 0, sizeof(float), stream);
+    const int prev = temporal_slot(c, lv, seq - 1);
+    if (prev >= 0) {
+        int err = aji_rgb_diff(temporal_frame(c, lv, prev), dst, T.w, T.h,
+                               &T.diff[slot], stream);
+        if (err) {
+            c->set_error("temporal diff kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+    }
+    T.seq[slot] = seq;
+    T.matrix[slot] = matrix;
+    T.range[slot] = range;
+    return AJI_OK;
 }
 
 extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
@@ -2266,8 +2323,8 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
 {
     if (!c || !in)
         return AJI_ERR;
-    auto &T = c->temporal;
-    if (!c->active || !T.enabled) {
+    auto &TT = c->temporal;
+    if (!c->active || !TT.enabled) {
         c->set_error("aji_ingest without an active temporal configuration");
         return AJI_ERR;
     }
@@ -2276,7 +2333,7 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
     int err = check_frame(c, in, true);
     if (err != AJI_OK)
         return err;
-    if (temporal_slot(c, (int64_t)seq) >= 0)
+    if (temporal_slot(c, 0, (int64_t)seq) >= 0)
         return AJI_OK;  // already held
 
     CtxGuard guard(c->cu_ctx);
@@ -2286,69 +2343,27 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
     }
     cudaStream_t stream = (cudaStream_t)cu_stream;
 
-    // the steps before the temporal model, once per source frame
+    // the steps before the first temporal model, once per source frame
     int cur = 0, cw = in->width, ch = in->height;
     err = run_pre(c, in, c->buf[cur], stream);
     if (err == AJI_OK)
-        err = run_steps(c, 0, T.step_idx, &cur, &cw, &ch, stream);
+        err = run_steps(c, 0, TT.st[0].step_idx, &cur, &cw, &ch, stream);
     if (err != AJI_OK)
         return err;
-
-    const int slot = (int)(seq % (uint64_t)T.nslots);
-    void *dst = temporal_frame(c, slot);
-    if (cudaMemcpyAsync(dst, c->buf[cur], (size_t)3 * T.w * T.h * 2,
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
-        c->set_error("temporal ingest copy failed");
-        return AJI_ERR_CUDA;
-    }
-    // scene-change metric against the previous frame, if held
-    cudaMemsetAsync(&T.diff[slot], 0, sizeof(float), stream);
-    const int prev = temporal_slot(c, (int64_t)seq - 1);
-    if (prev >= 0) {
-        err = aji_rgb_diff(temporal_frame(c, prev), dst, T.w, T.h,
-                           &T.diff[slot], stream);
-        if (err) {
-            c->set_error("temporal diff kernel failed: %s",
-                         cudaGetErrorString((cudaError_t)err));
-            return AJI_ERR_CUDA;
-        }
-    }
-    T.seq[slot] = (int64_t)seq;
-    T.matrix[slot] = in->matrix;
-    T.range[slot] = in->range;
-    return AJI_OK;
+    TT.ingests++;
+    return temporal_store(c, 0, c->buf[cur], (int64_t)seq, in->matrix,
+                          in->range, stream);
 }
 
-extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
-                                        const aji_frame *out, void *cu_stream)
+// Run stage lv's model on the window around `center` (which its ring
+// holds) and crop the output into buf[0]. Window frames that are not held
+// (stream start, after a reset, end of stream) or lie across a scene cut
+// from the center are replaced by the nearest frame on the center's side;
+// a cut pointer exists only between two consecutive held frames.
+static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
+                              int cslot, cudaStream_t stream)
 {
-    if (!c || !out)
-        return AJI_ERR;
-    auto &T = c->temporal;
-    if (!c->active || !T.enabled) {
-        c->set_error("aji_infer_seq without an active temporal configuration");
-        return AJI_ERR;
-    }
-    int err = check_frame(c, out, false);
-    if (err != AJI_OK)
-        return err;
-    const int64_t center = (int64_t)seq;
-    const int cslot = seq > (uint64_t)INT64_MAX ? -1 : temporal_slot(c, center);
-    if (cslot < 0) {
-        c->set_error("aji_infer_seq: frame %llu was not ingested",
-                     (unsigned long long)seq);
-        return AJI_ERR;
-    }
-
-    CtxGuard guard(c->cu_ctx);
-    if (!guard.ok) {
-        c->set_error("cuCtxPushCurrent failed");
-        return AJI_ERR_CUDA;
-    }
-    cudaStream_t stream = (cudaStream_t)cu_stream;
-
-    // Window: frames that are not held take the nearest held one toward the
-    // center; a cut pointer exists only between two consecutive held frames.
+    auto &T = c->temporal.st[lv];
     aji_gather_args args = {};
     int slots[AJI_TEMPORAL_MAX];
     bool held[AJI_TEMPORAL_MAX];
@@ -2358,19 +2373,19 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
         bool clamped = false;
         for (int k = 1; k <= T.r; k++) {
             const int j = T.r + dir * k;
-            const int s = clamped ? -1 : temporal_slot(c, center + dir * k);
+            const int s = clamped ? -1 : temporal_slot(c, lv, center + dir * k);
             clamped = s < 0;
             slots[j] = clamped ? slots[j - dir] : s;
             held[j] = !clamped;
         }
     }
     for (int j = 0; j < T.t; j++) {
-        args.src[j] = temporal_frame(c, slots[j]);
+        args.src[j] = temporal_frame(c, lv, slots[j]);
         if (j + 1 < T.t && held[j] && held[j + 1])
             args.cut[j] = &T.diff[slots[j + 1]];
     }
-    err = aji_temporal_gather(&args, T.t, T.threshold, T.w, T.h, T.pw, T.ph,
-                              T.in_tensor, stream);
+    int err = aji_temporal_gather(&args, T.t, T.threshold, T.w, T.h, T.pw,
+                                  T.ph, T.in_tensor, stream);
     if (err) {
         c->set_error("temporal gather kernel failed: %s",
                      cudaGetErrorString((cudaError_t)err));
@@ -2388,13 +2403,13 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
         c->set_error("enqueueV3 failed");
         return AJI_ERR_ENGINE;
     }
+    T.runs++;
 
     // crop the padded model output into the chain buffer
-    int cur = 0;
     const size_t splane = (size_t)T.pow * T.poh * 2;
     const size_t dplane = (size_t)T.ow * T.oh * 2;
     for (int pl = 0; pl < 3; pl++) {
-        if (cudaMemcpy2DAsync((char *)c->buf[cur] + pl * dplane,
+        if (cudaMemcpy2DAsync((char *)c->buf[0] + pl * dplane,
                               (size_t)T.ow * 2,
                               (char *)T.out_tensor + pl * splane,
                               (size_t)T.pow * 2, (size_t)T.ow * 2, T.oh,
@@ -2404,7 +2419,87 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
             return AJI_ERR_CUDA;
         }
     }
+    return AJI_OK;
+}
 
+// Make stage lv's ring hold frame p if it can: run stage lv-1 on its window
+// around p (making those frames held first, oldest first) and the steps
+// between the two stages. A frame is computed once and then served from the
+// ring. Not possible when the source frame was never ingested (before the
+// stream start, past its end, a gap, or after a reset): the frame stays
+// absent and windows clamp around it.
+static int temporal_ensure(aji_ctx *c, size_t lv, int64_t p,
+                           cudaStream_t stream)
+{
+    if (p < 0 || temporal_slot(c, lv, p) >= 0 || lv == 0)
+        return AJI_OK;
+    const auto &S = c->temporal.st[lv - 1];
+    for (int64_t q = p - S.r; q <= p + S.r; q++) {
+        int err = temporal_ensure(c, lv - 1, q, stream);
+        if (err != AJI_OK)
+            return err;
+    }
+    const int cslot = temporal_slot(c, lv - 1, p);
+    if (cslot < 0)
+        return AJI_OK;
+    int err = run_temporal_stage(c, lv - 1, p, cslot, stream);
+    if (err != AJI_OK)
+        return err;
+    int cur = 0, cw = S.ow, ch = S.oh;
+    err = run_steps(c, S.step_idx + 1, c->temporal.st[lv].step_idx, &cur,
+                    &cw, &ch, stream);
+    if (err != AJI_OK)
+        return err;
+    return temporal_store(c, lv, c->buf[cur], p, S.matrix[cslot],
+                          S.range[cslot], stream);
+}
+
+extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
+                                        const aji_frame *out, void *cu_stream)
+{
+    if (!c || !out)
+        return AJI_ERR;
+    auto &TT = c->temporal;
+    if (!c->active || !TT.enabled) {
+        c->set_error("aji_infer_seq without an active temporal configuration");
+        return AJI_ERR;
+    }
+    int err = check_frame(c, out, false);
+    if (err != AJI_OK)
+        return err;
+    const int64_t center = (int64_t)seq;
+    if (seq > (uint64_t)INT64_MAX || temporal_slot(c, 0, center) < 0) {
+        c->set_error("aji_infer_seq: frame %llu was not ingested",
+                     (unsigned long long)seq);
+        return AJI_ERR;
+    }
+
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return AJI_ERR_CUDA;
+    }
+    cudaStream_t stream = (cudaStream_t)cu_stream;
+
+    // stacked temporal models: bring the last stage's window up to date
+    const size_t last = TT.st.size() - 1;
+    const auto &T = TT.st[last];
+    for (int64_t q = center - T.r; last > 0 && q <= center + T.r; q++) {
+        err = temporal_ensure(c, last, q, stream);
+        if (err != AJI_OK)
+            return err;
+    }
+    const int cslot = temporal_slot(c, last, center);
+    if (cslot < 0) {
+        c->set_error("aji_infer_seq: frame %llu is not available",
+                     (unsigned long long)seq);
+        return AJI_ERR;
+    }
+
+    err = run_temporal_stage(c, last, center, cslot, stream);
+    if (err != AJI_OK)
+        return err;
+    int cur = 0;
     int cw = T.ow, ch = T.oh;
     err = run_steps(c, T.step_idx + 1, c->steps.size(), &cur, &cw, &ch,
                     stream);
