@@ -24,7 +24,9 @@ struct AjiChainConf {
     double min_fps = 0.0, max_fps = 1e300;
     std::string min_resolution = "0x0";
     std::string max_resolution = "infxinf";
-    std::vector<AjiModelConf> models;
+    std::vector<AjiModelConf> models;          // steps to run: none when
+                                               // upscale=no, then the
+                                               // temporal fix model if set
     bool rife = false;
     int rife_factor_num = 1;                   // output fps multiplier
     int rife_factor_den = 1;
