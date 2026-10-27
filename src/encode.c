@@ -1240,6 +1240,22 @@ static int open_output(enc_ctx *c)
     if (!vs) { loge("new video stream failed"); return -1; }
     c->vout = vs->index;
 
+    /* Dispositions (default, forced, ...) aren't carried over by libav the
+     * way the ffmpeg CLI does it; without them every Matroska track is
+     * written FlagDefault=0 and players stop enabling subtitles. The video
+     * keeps only language/title: statistics tags (BPS, NUMBER_OF_FRAMES, ...)
+     * describe the source encode, not this one. */
+    {
+        const AVStream *iv = c->ifmt->streams[c->vstream];
+        static const char *const keep[] = { "language", "title" };
+        vs->disposition = iv->disposition & ~AV_DISPOSITION_ATTACHED_PIC;
+        for (size_t k = 0; k < sizeof(keep) / sizeof(*keep); k++) {
+            const AVDictionaryEntry *e = av_dict_get(iv->metadata, keep[k],
+                                                     NULL, 0);
+            if (e) av_dict_set(&vs->metadata, keep[k], e->value, 0);
+        }
+    }
+
     /* aux streams (stream-copy) */
     c->smap = av_malloc_array(c->ifmt->nb_streams, sizeof(int));
     for (unsigned i = 0; i < c->ifmt->nb_streams; i++) c->smap[i] = -1;
@@ -1264,6 +1280,7 @@ static int open_output(enc_ctx *c)
         out->codecpar->codec_tag = 0;
         out->time_base = in->time_base;
         av_dict_copy(&out->metadata, in->metadata, 0);
+        out->disposition = in->disposition;
         c->smap[i] = out->index;
     }
 
