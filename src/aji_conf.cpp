@@ -176,15 +176,20 @@ AjiChainConf parse_chain(const Section &sec, int chain)
     if (!parse_yes(get("upscale", "yes")))
         c.models.clear();
 
-    // Temporal fix (vs_temporalfix): one more temporal model after the
-    // upscale models, at whatever resolution they produce.
+    // Temporal fix (vs_temporalfix): one more temporal model, after the
+    // upscale models at the resolution they produce, or with
+    // temporal_fix_before_upscale=yes before them at the source resolution
+    // (a 2x upscale gives it a quarter of the pixels to process).
     std::string tfix = get("temporal_fix_model", "");
     if (!tfix.empty()) {
         AjiModelConf mc;
         mc.name = tfix;
         mc.temporal_scene_threshold =
             to_double(get("temporal_fix_scene_threshold", "0.150"), 0.150);
-        c.models.push_back(std::move(mc));
+        if (parse_yes(get("temporal_fix_before_upscale", "no")))
+            c.models.insert(c.models.begin(), std::move(mc));
+        else
+            c.models.push_back(std::move(mc));
     }
 
     // RIFE keys mirror animejanai_config.py: ints go through float parsing,

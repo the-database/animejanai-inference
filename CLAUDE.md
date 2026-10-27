@@ -159,6 +159,9 @@ Two chain keys add or remove steps without listing them as models (`parse_chain`
 - `chain_N_temporal_fix_model=<onnx name>` (+ `chain_N_temporal_fix_scene_threshold`, default
   0.150) appends a vs_temporalfix model after the upscale models, or alone when `upscale=no`.
   The Manager picks the file (the newest `temporalfix_s<k>_v*`); the engine just loads it.
+  `chain_N_temporal_fix_before_upscale=yes` (default no) puts it before the upscale models
+  instead, at the source resolution: roughly 2-3x cheaper for a 2x upscale, but it can't steady
+  shimmer the upscaler itself adds.
 
 `regress/temporal_regress.sh` compares a reference build with a candidate: bit-exact output
 and timing for chains without stacking, plus stacked-chain correctness. Run it before
