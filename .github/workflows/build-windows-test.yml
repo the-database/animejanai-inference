@@ -31,6 +31,7 @@ jobs:
             build/Release/aji.dll
             build/Release/aji_dml.dll
             build/Release/aji_trt.dll
+            build/Release/aji_analysis.dll
             build/Release/aji_harness_dml.exe
             build/Release/aji_harness.exe
             build/Release/aji_kernel_test.exe
