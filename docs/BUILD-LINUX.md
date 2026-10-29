@@ -91,11 +91,20 @@ Only `libnvinfer.so.11` is unpacked from the ~1.9 GB `libnvinfer11` package (the
 per-SM builder resources, which the *package* ships but this build does not need), and each
 `.deb` is deleted immediately to stay inside the runner's disk budget.
 
+Before configuring, the workflow fetches BtbN's FFmpeg 9.0 `linux64-gpl-shared` build
+(pinned by `FFMPEG_URL` + `FFMPEG_SHA256`) into `/opt/ffmpeg` and puts its `lib/pkgconfig` on
+`PKG_CONFIG_PATH`, so `aji_encode` builds. BtbN prunes old autobuilds; when the pinned URL
+404s, move to a current 9.0 build and update the checksum.
+
 ```bash
 cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
-  -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+  -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" \
+  -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/opt/ffmpeg/lib"
 cmake --build build -j"$(nproc)"
 ```
+
+`-rpath-link` lets the linker resolve the libav libraries' own dependencies (libswresample,
+...), which are not on any default search path.
 
 Staging ships **four files only**, flat, so the assembler extracts them straight into
 `animejanai/inference/`:
@@ -105,8 +114,14 @@ cp build/libaji.so build/libaji_trt.so build/aji_harness build/aji_kernel_test s
 tar --zstd -C stage -cf aji-linux-x64.tar.zst .
 ```
 
-Note what is **not** in the Linux tarball: `aji_encode` (no ffmpeg in the image) and both DML
-targets (Windows-only). The Windows zip carries seven files.
+Note what is **not** in that tarball: `aji_encode` and both DML targets (Windows-only). The
+Windows zip carries seven files.
+
+`aji_encode` ships separately, for VideoJaNai, as `aji-encode-linux-x64.tar.zst`: the binary
+plus the libav sonames it links (`libavcodec.so.63`, ...), with RPATH set to `$ORIGIN`, also
+flat for `animejanai/inference/`. It is its own asset so the player package does not carry
+~100 MB of libav it never loads. Like the player, it still needs `LD_LIBRARY_PATH` to include
+the inference dir: `libaji_trt.so`'s RUNPATH points at system TensorRT/CUDA paths.
 
 The image is built by `build-image.yml` in `the-database/mpv-AnimeJaNai` from
 `build/Dockerfile.ubuntu2204`, and is shared with that repo's Linux release leg and the mpv

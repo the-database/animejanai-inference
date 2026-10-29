@@ -17,6 +17,11 @@
  * --rife-chain: times the full upscale+RIFE chain per source frame, honoring
  *   the slot's order (aji_rife_before_upscale). Slots 1012 (upscale then RIFE)
  *   vs 1013 (RIFE then upscale) give the DirectML order A/B.
+ *
+ * Temporal chains, scheduling tests (untimed), as in aji_harness:
+ * --ingest-ahead A: ingest A frames further ahead than needed (up to 4).
+ * --reset-at K: aji_temporal_reset before frame K and restart the sequence
+ *   numbers there.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -27,6 +32,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <vector>
 
 #include "aji.h"
 
@@ -68,6 +75,7 @@ int main(int argc, char **argv)
     const char *input = NULL, *output = NULL, *conf = NULL, *mdir = NULL;
     const char *rife_mdir = NULL;
     int w = 0, h = 0, frames = 1, slot = 1, rife = 0, rife_chain = 0;
+    int ingest_ahead = -1, reset_at = -1;
     int format = AJI_FMT_NV12, matrix = AJI_MATRIX_BT709;
     int range = AJI_RANGE_LIMITED, siting = AJI_SITING_LEFT;
     double fps = 23.976;
@@ -84,6 +92,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--width")) { w = atoi(v); i++; }
         else if (!strcmp(a, "--height")) { h = atoi(v); i++; }
         else if (!strcmp(a, "--frames")) { frames = atoi(v); i++; }
+        else if (!strcmp(a, "--ingest-ahead")) { ingest_ahead = atoi(v); i++; }
+        else if (!strcmp(a, "--reset-at")) { reset_at = atoi(v); i++; }
         else if (!strcmp(a, "--slot")) { slot = atoi(v); i++; }
         else if (!strcmp(a, "--fps")) { fps = atof(v); i++; }
         else if (!strcmp(a, "--format")) {
@@ -469,6 +479,93 @@ int main(int argc, char **argv)
     // once k+radius is in (the input is not looped: a wrap would be a scene
     // cut). The last radius frames drain at EOF with a clamped window.
     const int radius = aji_temporal_radius(aji);
+    if (radius > 0 && (ingest_ahead >= 0 || reset_at >= 0)) {
+        // Scheduling test: the whole input is held in memory so frames can
+        // be ingested ahead of the output and re-ingested after a reset.
+        // Frame k is emitted once k+radius+ahead is in (or the input ends).
+        const int ahead = ingest_ahead > 0 ? ingest_ahead : 0;
+        printf("temporal: %d-frame window, ingest %d ahead, reset at %d\n",
+               2 * radius + 1, ahead, reset_at);
+        std::vector<char> all;
+        size_t nfr = 0;
+        while ((int)nfr < frames &&
+               fread(raw, 1, in_frame_bytes, fi) == in_frame_bytes) {
+            all.insert(all.end(), raw, raw + in_frame_bytes);
+            nfr++;
+        }
+        size_t base = 0, next = 0;  // seq = frame - base
+        int nout_t = 0;
+        for (size_t k = 0; k < nfr; k++) {
+            if ((int)k == reset_at) {
+                aji_temporal_reset(aji);
+                base = next = k;
+            }
+            while (next < nfr && next <= k + radius + ahead) {
+                D3D11_MAPPED_SUBRESOURCE map = {};
+                if (FAILED(ctx->Map(in_st, 0, D3D11_MAP_WRITE, 0, &map))) {
+                    fprintf(stderr, "map in staging failed\n");
+                    return 1;
+                }
+                const char *src = all.data() + next * in_frame_bytes;
+                char *dst = (char *)map.pData;
+                for (int y = 0; y < h; y++)
+                    memcpy(dst + (size_t)y * map.RowPitch,
+                           src + (size_t)y * w * bpp, (size_t)w * bpp);
+                src += (size_t)w * h * bpp;
+                dst += (size_t)map.RowPitch * h;
+                for (int y = 0; y < h / 2; y++)
+                    memcpy(dst + (size_t)y * map.RowPitch,
+                           src + (size_t)y * w * bpp, (size_t)w * bpp);
+                ctx->Unmap(in_st, 0);
+                ctx->CopyResource(in_tex, in_st);
+                int tr = aji_ingest(aji, &fin, (uint64_t)(next - base), NULL);
+                // in_tex is rewritten next: let the queue finish
+                if (tr == AJI_OK)
+                    tr = aji_wait(aji, aji_flush(aji, NULL));
+                if (tr != AJI_OK) {
+                    fprintf(stderr, "aji_ingest failed (%d): %s\n", tr,
+                            aji_last_error(aji));
+                    return 1;
+                }
+                next++;
+            }
+            int tr = aji_infer_seq(aji, (uint64_t)(k - base), &fout, NULL);
+            if (tr == AJI_OK)
+                tr = aji_wait(aji, aji_flush(aji, NULL));
+            if (tr != AJI_OK) {
+                fprintf(stderr, "aji_infer_seq failed (%d): %s\n", tr,
+                        aji_last_error(aji));
+                return 1;
+            }
+            nout_t++;
+            if (fo) {
+                D3D11_MAPPED_SUBRESOURCE map = {};
+                ctx->CopyResource(out_st, out_tex);
+                if (FAILED(ctx->Map(out_st, 0, D3D11_MAP_READ, 0, &map))) {
+                    fprintf(stderr, "map out staging failed\n");
+                    return 1;
+                }
+                const char *s = (const char *)map.pData;
+                char *d = raw_out;
+                for (int y = 0; y < oh; y++)
+                    memcpy(d + (size_t)y * ow * bpp,
+                           s + (size_t)y * map.RowPitch, (size_t)ow * bpp);
+                s += (size_t)map.RowPitch * oh;
+                d += (size_t)ow * oh * bpp;
+                for (int y = 0; y < oh / 2; y++)
+                    memcpy(d + (size_t)y * ow * bpp,
+                           s + (size_t)y * map.RowPitch, (size_t)ow * bpp);
+                ctx->Unmap(out_st, 0);
+                fwrite(raw_out, 1, out_frame_bytes, fo);
+            }
+        }
+        printf("frames: %d\n", nout_t);
+        if (fo)
+            fclose(fo);
+        fclose(fi);
+        aji_destroy(&aji);
+        return 0;
+    }
     if (radius > 0)
         printf("temporal: %d-frame window\n", 2 * radius + 1);
     int nread = 0, nout = 0;

@@ -312,12 +312,14 @@ struct aji_ctx {
         int scd_groups = 0;
     } rife;
 
-    // Temporal (multi-frame) model step, mirroring aji_trt: frames enter a
-    // ring at the step's input resolution (aji_ingest runs the steps before
-    // it once per source frame); aji_infer_seq gathers the 2r+1 window into
-    // the padded model input, runs the model, crops, and runs the rest.
-    struct {
-        bool enabled = false;
+    // Temporal (multi-frame) model steps, one stage per temporal model,
+    // mirroring aji_trt: each stage keeps a ring of frames at its step's
+    // input resolution. Stage 0's ring is filled by aji_ingest (which runs
+    // the steps before it once per source frame), stage i+1's by running
+    // stage i (and the steps between the two) once per frame, on demand.
+    // aji_infer_seq gathers the last stage's 2r+1 window into the padded
+    // model input, runs the model, crops, and runs the rest.
+    struct TemporalStage {
         int t = 1, r = 0;
         size_t step_idx = 0;         // index of the TEMPORAL step in steps[]
         int w = 0, h = 0;            // ring frame dims (step input)
@@ -335,6 +337,13 @@ struct aji_ctx {
         void *in_alloc = nullptr, *out_alloc = nullptr;
         std::vector<int64_t> seq;    // per slot, -1 = empty
         std::vector<int> format, matrix, range;
+        uint64_t runs = 0;           // model runs (AJI_TEMPORAL_STATS)
+    };
+    struct {
+        bool enabled = false;
+        int r = 0;                   // total radius: the sum over stages
+        uint64_t ingests = 0;        // AJI_TEMPORAL_STATS
+        std::vector<TemporalStage> st;
     } temporal;
 
     void set_error(const char *fmt, ...) {
@@ -1508,71 +1517,93 @@ bool read_onnx_input(aji_ctx *c, const std::string &name, AjiOnnxInput *in)
 
 void temporal_teardown(aji_ctx *c)
 {
-    auto &T = c->temporal;
-    if (T.in_alloc)
-        g_dml_api->FreeGPUAllocation(T.in_alloc);
-    if (T.out_alloc)
-        g_dml_api->FreeGPUAllocation(T.out_alloc);
-    T = {};
+    auto &TT = c->temporal;
+    if (TT.enabled && getenv("AJI_TEMPORAL_STATS")) {
+        fprintf(stderr, "aji temporal stats: %llu ingested",
+                (unsigned long long)TT.ingests);
+        for (size_t i = 0; i < TT.st.size(); i++)
+            fprintf(stderr, "; stage %zu (%d frames): %llu runs", i,
+                    TT.st[i].t, (unsigned long long)TT.st[i].runs);
+        fprintf(stderr, "\n");
+    }
+    for (auto &T : TT.st) {
+        if (T.in_alloc)
+            g_dml_api->FreeGPUAllocation(T.in_alloc);
+        if (T.out_alloc)
+            g_dml_api->FreeGPUAllocation(T.out_alloc);
+    }
+    TT = {};
 }
 
-// Allocate the ring, cut metrics and model tensors for the configured
-// temporal step and bind the model to them (its input/output are not chain
-// buffers). Requires the step's model at c->models[steps[step_idx]].
+// Allocate the rings, cut metrics and model tensors for the configured
+// temporal stages and bind each stage's model to them (its input/output are
+// not chain buffers). Requires the step models at c->models[steps[step_idx]].
 bool setup_temporal(aji_ctx *c)
 {
-    auto &T = c->temporal;
-    DmlModel &m = c->models[c->steps[T.step_idx].model_idx];
-    const size_t elem = T.fp16 ? 2 : 4;
-    T.nslots = T.t + 4;
-    const size_t in_bytes = (size_t)3 * T.t * T.pw * T.ph * elem;
-    const size_t out_bytes = (size_t)3 * T.pow * T.poh * elem;
-    T.part_groups = ((T.w + 31) / 32) * ((T.h + 7) / 8);
-    T.ring = make_buffer(c->dev.Get(),
-                         (uint64_t)T.nslots * 3 * T.w * T.h * elem, false);
-    T.diff = make_buffer(c->dev.Get(), (uint64_t)T.nslots * 4, false);
-    T.part = make_buffer(c->dev.Get(), (uint64_t)T.part_groups * 4, false);
-    T.in_tensor = make_buffer(c->dev.Get(), in_bytes, false);
-    T.out_tensor = make_buffer(c->dev.Get(), out_bytes, false);
-    if (!T.ring || !T.diff || !T.part || !T.in_tensor || !T.out_tensor) {
-        c->set_error("temporal buffer allocation failed");
-        return false;
-    }
-    if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
-                       T.in_tensor.Get(), &T.in_alloc), "temporal in alloc") ||
-        !c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
-                       T.out_tensor.Get(), &T.out_alloc), "temporal out alloc"))
-        return false;
-    m.in_val = make_tensor(c, T.in_alloc, in_bytes, 1, 3 * T.t, T.ph, T.pw,
-                           T.fp16);
-    m.out_val = make_tensor(c, T.out_alloc, out_bytes, 1, 3, T.poh, T.pow,
-                            T.fp16);
-    if (!m.in_val || !m.out_val)
-        return false;
-    if (!c->ort_ck(g_ort->BindInput(m.binding, m.in_name.c_str(), m.in_val),
-                   "temporal BindInput") ||
-        !c->ort_ck(g_ort->BindOutput(m.binding, m.out_name.c_str(),
-                                     m.out_val), "temporal BindOutput"))
-        return false;
-    // warm the rebound command list (discovery used a temporary binding)
-    // and zero the cut metrics, then drain so later segments can recycle
-    // the command allocators
-    if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
-                   "temporal warmup"))
-        return false;
-    {
-        Recorder r{c};
-        if (!r.begin() || !record_fill(c, r, T.diff.Get(), 0,
-                                       (uint32_t)T.nslots, 0) ||
-            !r.exec())
+    auto &TT = c->temporal;
+    TT.r = 0;
+    for (const auto &T : TT.st)
+        TT.r += T.r;
+    for (auto &T : TT.st) {
+        DmlModel &m = c->models[c->steps[T.step_idx].model_idx];
+        const size_t elem = T.fp16 ? 2 : 4;
+        // Stage 0 keeps the last 2R+5 frames ingested (R: the total radius;
+        // callers ingest up to R+4 ahead of the next output, see aji.h).
+        // Later stages are filled in order, on demand, and only ever need
+        // their own window held.
+        T.nslots = &T == &TT.st[0] ? 2 * TT.r + 5 : T.t + 4;
+        const size_t in_bytes = (size_t)3 * T.t * T.pw * T.ph * elem;
+        const size_t out_bytes = (size_t)3 * T.pow * T.poh * elem;
+        T.part_groups = ((T.w + 31) / 32) * ((T.h + 7) / 8);
+        T.ring = make_buffer(c->dev.Get(),
+                             (uint64_t)T.nslots * 3 * T.w * T.h * elem, false);
+        T.diff = make_buffer(c->dev.Get(), (uint64_t)T.nslots * 4, false);
+        T.part = make_buffer(c->dev.Get(), (uint64_t)T.part_groups * 4, false);
+        T.in_tensor = make_buffer(c->dev.Get(), in_bytes, false);
+        T.out_tensor = make_buffer(c->dev.Get(), out_bytes, false);
+        if (!T.ring || !T.diff || !T.part || !T.in_tensor || !T.out_tensor) {
+            c->set_error("temporal buffer allocation failed");
             return false;
+        }
+        if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
+                           T.in_tensor.Get(), &T.in_alloc),
+                       "temporal in alloc") ||
+            !c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
+                           T.out_tensor.Get(), &T.out_alloc),
+                       "temporal out alloc"))
+            return false;
+        m.in_val = make_tensor(c, T.in_alloc, in_bytes, 1, 3 * T.t, T.ph,
+                               T.pw, T.fp16);
+        m.out_val = make_tensor(c, T.out_alloc, out_bytes, 1, 3, T.poh,
+                                T.pow, T.fp16);
+        if (!m.in_val || !m.out_val)
+            return false;
+        if (!c->ort_ck(g_ort->BindInput(m.binding, m.in_name.c_str(),
+                                        m.in_val),
+                       "temporal BindInput") ||
+            !c->ort_ck(g_ort->BindOutput(m.binding, m.out_name.c_str(),
+                                         m.out_val), "temporal BindOutput"))
+            return false;
+        // warm the rebound command list (discovery used a temporary binding)
+        // and zero the cut metrics, then drain so later segments can recycle
+        // the command allocators
+        if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
+                       "temporal warmup"))
+            return false;
+        {
+            Recorder r{c};
+            if (!r.begin() || !record_fill(c, r, T.diff.Get(), 0,
+                                           (uint32_t)T.nslots, 0) ||
+                !r.exec())
+                return false;
+        }
+        drain_queue(c, 30000);
+        T.seq.assign(T.nslots, -1);
+        T.format.assign(T.nslots, AJI_FMT_NV12);
+        T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
+        T.range.assign(T.nslots, AJI_RANGE_LIMITED);
     }
-    drain_queue(c, 30000);
-    T.seq.assign(T.nslots, -1);
-    T.format.assign(T.nslots, AJI_FMT_NV12);
-    T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
-    T.range.assign(T.nslots, AJI_RANGE_LIMITED);
-    T.enabled = true;
+    TT.enabled = true;
     return true;
 }
 
@@ -1791,9 +1822,9 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     int cw = w, ch = h;
 
     // Temporal models: frame counts per model step (conf override, else the
-    // onnx input shape). One temporal step per chain.
+    // onnx input shape). Each one becomes a temporal stage.
     std::vector<int> model_frames(chain->models.size(), 1);
-    int n_temporal = 0;
+    int n_temporal = 0, total_r = 0;
     for (size_t mi = 0; mi < chain->models.size(); mi++) {
         const auto &m = chain->models[mi];
         if (m.name.empty())
@@ -1820,10 +1851,14 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             return AJI_ERR_CONF;
         }
         n_temporal++;
+        total_r += (t - 1) / 2;
     }
-    if (n_temporal > 1) {
-        c->set_error("chain %d has %d temporal models; at most one is "
-                     "supported", chain->index, n_temporal);
+    // the gather shader packs ring slot indices in 5 bits; stage 0's ring
+    // holds 2R+5 frames
+    if (2 * total_r + 5 > 32) {
+        c->set_error("chain %d: the temporal models' combined window (%d "
+                     "frames) is too large for the DirectML backend (at most "
+                     "27)", chain->index, 2 * total_r + 1);
         finalize_log(c);
         return AJI_ERR_CONF;
     }
@@ -1929,7 +1964,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         Step st;
         st.model_idx = (int)c->models.size();
         if (t > 1) {
-            auto &T = c->temporal;
+            c->temporal.st.emplace_back();
+            auto &T = c->temporal.st.back();
             const int sx = dm.out_w / bw, sy = dm.out_h / bh;
             if (sx < 1 || sy < 1 || dm.out_w != sx * bw ||
                 dm.out_h != sy * bh) {
@@ -2074,7 +2110,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         if (!model_bind(c, &c->models[st.model_idx], st.in_buf))
             return AJI_ERR_ENGINE;
     }
-    if (c->temporal.t > 1 && !setup_temporal(c))
+    if (!c->temporal.st.empty() && !setup_temporal(c))
         return AJI_ERR_ENGINE;
 
     // In hoist mode the filter downscales source -> work via aji_resize and
@@ -2399,51 +2435,26 @@ extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
 extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
 {
     if (c && c->temporal.enabled)
-        std::fill(c->temporal.seq.begin(), c->temporal.seq.end(), -1);
+        for (auto &T : c->temporal.st)
+            std::fill(T.seq.begin(), T.seq.end(), -1);
 }
 
-static int temporal_slot(aji_ctx *c, int64_t seq)
+static int temporal_slot(aji_ctx *c, size_t lv, int64_t seq)
 {
-    auto &T = c->temporal;
+    auto &T = c->temporal.st[lv];
     if (seq < 0)
         return -1;
     const int slot = (int)(seq % T.nslots);
     return T.seq[slot] == seq ? slot : -1;
 }
 
-extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
-                                     uint64_t seq, void *cu_stream)
+// Store the frame in buf[cur] (the stage's ring frame dims) as `seq` in
+// stage lv's ring and record its scene-change metric against seq-1, if held.
+static int temporal_store(aji_ctx *c, size_t lv, int cur, int64_t seq,
+                          int format, int matrix, int range)
 {
-    (void)cu_stream;
-    if (!c || !in)
-        return AJI_ERR;
-    auto &T = c->temporal;
-    if (!c->active || !T.enabled) {
-        c->set_error("aji_ingest without an active temporal configuration");
-        return AJI_ERR;
-    }
-    if (seq > (uint64_t)INT64_MAX)
-        return AJI_ERR;
-    int err = check_in_frame(c, in);
-    if (err != AJI_OK)
-        return err;
-    if (temporal_slot(c, (int64_t)seq) >= 0)
-        return AJI_OK;  // already held
-    if (FAILED(c->dev->GetDeviceRemovedReason())) {
-        diagnose_device(c, "aji_ingest entry");
-        return AJI_ERR;
-    }
-    DoneGuard done_guard{c};
-
-    // the steps before the temporal model, once per source frame
-    int cur = 0;
-    err = run_pre(c, in);
-    if (err == AJI_OK)
-        err = run_steps(c, 0, T.step_idx, &cur);
-    if (err != AJI_OK)
-        return err;
-
-    const int slot = (int)(seq % (uint64_t)T.nslots);
+    auto &T = c->temporal.st[lv];
+    const int slot = (int)(seq % T.nslots);
     const uint32_t elem = T.fp16 ? 2u : 4u;
     const uint32_t row = (uint32_t)T.w * elem;
     const uint32_t frame_elems = 3u * (uint32_t)T.w * (uint32_t)T.h;
@@ -2455,7 +2466,7 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
         return AJI_ERR;
     r.uav_barrier();
     // scene-change metric against the previous frame, if held
-    const int prev = temporal_slot(c, (int64_t)seq - 1);
+    const int prev = temporal_slot(c, lv, seq - 1);
     if (prev >= 0) {
         KernArgs a = {};
         a.di[0] = T.w;
@@ -2480,43 +2491,58 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
     if (!r.exec())
         return AJI_ERR;
 
-    T.seq[slot] = (int64_t)seq;
-    T.format[slot] = in->format;
-    T.matrix[slot] = in->matrix;
-    T.range[slot] = in->range;
+    T.seq[slot] = seq;
+    T.format[slot] = format;
+    T.matrix[slot] = matrix;
+    T.range[slot] = range;
     return AJI_OK;
 }
 
-extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
-                                        const aji_frame *out, void *cu_stream)
+extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
+                                     uint64_t seq, void *cu_stream)
 {
     (void)cu_stream;
-    if (!c || !out)
+    if (!c || !in)
         return AJI_ERR;
-    auto &T = c->temporal;
-    if (!c->active || !T.enabled) {
-        c->set_error("aji_infer_seq without an active temporal configuration");
-        return AJI_ERR;
-    }
-    const int64_t center = (int64_t)seq;
-    const int cslot = seq > (uint64_t)INT64_MAX ? -1 : temporal_slot(c, center);
-    if (cslot < 0) {
-        c->set_error("aji_infer_seq: frame %llu was not ingested",
-                     (unsigned long long)seq);
+    auto &TT = c->temporal;
+    if (!c->active || !TT.enabled) {
+        c->set_error("aji_ingest without an active temporal configuration");
         return AJI_ERR;
     }
-    int err = check_out_frame(c, out, T.format[cslot]);
+    if (seq > (uint64_t)INT64_MAX)
+        return AJI_ERR;
+    int err = check_in_frame(c, in);
     if (err != AJI_OK)
         return err;
+    if (temporal_slot(c, 0, (int64_t)seq) >= 0)
+        return AJI_OK;  // already held
     if (FAILED(c->dev->GetDeviceRemovedReason())) {
-        diagnose_device(c, "aji_infer_seq entry");
+        diagnose_device(c, "aji_ingest entry");
         return AJI_ERR;
     }
     DoneGuard done_guard{c};
 
-    // Window: frames that are not held take the nearest held one toward the
-    // center; a cut metric is valid only between two consecutive held
-    // frames (same rules as the TensorRT backend).
+    // the steps before the first temporal model, once per source frame
+    int cur = 0;
+    err = run_pre(c, in);
+    if (err == AJI_OK)
+        err = run_steps(c, 0, TT.st[0].step_idx, &cur);
+    if (err != AJI_OK)
+        return err;
+    TT.ingests++;
+    return temporal_store(c, 0, cur, (int64_t)seq, in->format, in->matrix,
+                          in->range);
+}
+
+// Run stage lv's model on the window around `center` (which its ring
+// holds) and crop the output into the step's output chain buffer (*cur).
+// Window frames that are not held take the nearest held one toward the
+// center; a cut metric is valid only between two consecutive held frames
+// (same rules as the TensorRT backend).
+static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
+                              int cslot, int *cur)
+{
+    auto &T = c->temporal.st[lv];
     int slots[AJI_TEMPORAL_MAX];
     bool held[AJI_TEMPORAL_MAX];
     slots[T.r] = cslot;
@@ -2525,7 +2551,7 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
         bool clamped = false;
         for (int k = 1; k <= T.r; k++) {
             const int j = T.r + dir * k;
-            const int s = clamped ? -1 : temporal_slot(c, center + dir * k);
+            const int s = clamped ? -1 : temporal_slot(c, lv, center + dir * k);
             clamped = s < 0;
             slots[j] = clamped ? slots[j - dir] : s;
             held[j] = !clamped;
@@ -2566,9 +2592,10 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
     if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
                    "RunWithBinding (temporal)"))
         return AJI_ERR_ENGINE;
+    T.runs++;
 
     // crop the padded model output into the step's output chain buffer
-    int cur = st.in_buf ^ 1;
+    *cur = st.in_buf ^ 1;
     const uint32_t elem = T.fp16 ? 2u : 4u;
     const uint32_t splane = (uint32_t)T.pow * (uint32_t)T.poh * elem;
     const uint32_t dplane = (uint32_t)T.ow * (uint32_t)T.oh * elem;
@@ -2576,7 +2603,7 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
         return AJI_ERR;
     for (uint32_t pl = 0; pl < 3; pl++) {
         if (!record_window(c, r, T.out_tensor.Get(), pl * splane,
-                           (uint32_t)T.pow * elem, c->buf[cur].Get(),
+                           (uint32_t)T.pow * elem, c->buf[*cur].Get(),
                            pl * dplane, (uint32_t)T.ow * elem,
                            (uint32_t)T.ow * elem, (uint32_t)T.oh))
             return AJI_ERR;
@@ -2584,8 +2611,85 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
     r.uav_barrier();
     if (!r.exec())
         return AJI_ERR;
+    return AJI_OK;
+}
 
-    err = run_steps(c, T.step_idx + 1, c->steps.size(), &cur);
+// Make stage lv's ring hold frame p if it can: run stage lv-1 on its window
+// around p (making those frames held first, oldest first) and the steps
+// between the two stages. A frame is computed once and then served from the
+// ring. Not possible when the source frame was never ingested (before the
+// stream start, past its end, a gap, or after a reset): the frame stays
+// absent and windows clamp around it.
+static int temporal_ensure(aji_ctx *c, size_t lv, int64_t p)
+{
+    if (p < 0 || temporal_slot(c, lv, p) >= 0 || lv == 0)
+        return AJI_OK;
+    const auto &S = c->temporal.st[lv - 1];
+    for (int64_t q = p - S.r; q <= p + S.r; q++) {
+        int err = temporal_ensure(c, lv - 1, q);
+        if (err != AJI_OK)
+            return err;
+    }
+    const int cslot = temporal_slot(c, lv - 1, p);
+    if (cslot < 0)
+        return AJI_OK;
+    int cur = 0;
+    int err = run_temporal_stage(c, lv - 1, p, cslot, &cur);
+    if (err == AJI_OK)
+        err = run_steps(c, S.step_idx + 1, c->temporal.st[lv].step_idx, &cur);
+    if (err != AJI_OK)
+        return err;
+    return temporal_store(c, lv, cur, p, S.format[cslot], S.matrix[cslot],
+                          S.range[cslot]);
+}
+
+extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
+                                        const aji_frame *out, void *cu_stream)
+{
+    (void)cu_stream;
+    if (!c || !out)
+        return AJI_ERR;
+    auto &TT = c->temporal;
+    if (!c->active || !TT.enabled) {
+        c->set_error("aji_infer_seq without an active temporal configuration");
+        return AJI_ERR;
+    }
+    const int64_t center = (int64_t)seq;
+    const int islot = seq > (uint64_t)INT64_MAX ? -1
+                                                : temporal_slot(c, 0, center);
+    if (islot < 0) {
+        c->set_error("aji_infer_seq: frame %llu was not ingested",
+                     (unsigned long long)seq);
+        return AJI_ERR;
+    }
+    int err = check_out_frame(c, out, TT.st[0].format[islot]);
+    if (err != AJI_OK)
+        return err;
+    if (FAILED(c->dev->GetDeviceRemovedReason())) {
+        diagnose_device(c, "aji_infer_seq entry");
+        return AJI_ERR;
+    }
+    DoneGuard done_guard{c};
+
+    // stacked temporal models: bring the last stage's window up to date
+    const size_t last = TT.st.size() - 1;
+    const auto &T = TT.st[last];
+    for (int64_t q = center - T.r; last > 0 && q <= center + T.r; q++) {
+        err = temporal_ensure(c, last, q);
+        if (err != AJI_OK)
+            return err;
+    }
+    const int cslot = temporal_slot(c, last, center);
+    if (cslot < 0) {
+        c->set_error("aji_infer_seq: frame %llu is not available",
+                     (unsigned long long)seq);
+        return AJI_ERR;
+    }
+
+    int cur = 0;
+    err = run_temporal_stage(c, last, center, cslot, &cur);
+    if (err == AJI_OK)
+        err = run_steps(c, T.step_idx + 1, c->steps.size(), &cur);
     if (err == AJI_OK)
         err = run_post(c, T.format[cslot], T.matrix[cslot], T.range[cslot],
                        cur, out);

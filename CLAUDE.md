@@ -119,7 +119,7 @@ compile — the release list builds eight architectures.
 
 | Platform | Built by | Asset |
 |---|---|---|
-| Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst` |
+| Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
 | Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip` |
 
 Both are attached to the **same release tag**, because the consumer derives both URLs from one
@@ -141,6 +141,31 @@ RIFE model weights ship from this repo too, under a separate tag
 
 The filter lives on the mpv fork's `master` (aji ABI v9). The old standalone `vf-animejanai`
 branch is stale (ABI v4) and must not be used.
+
+## Temporal models
+
+A chain may hold several temporal (multi-frame) models, e.g. a temporal upscale followed by
+vs_temporalfix. Each is a stage with its own history ring: stage 0 is filled by `aji_ingest`,
+later stages are computed on demand (once per frame) from the previous stage's ring inside
+`aji_infer_seq`. `aji_temporal_radius` returns the summed radius, so consumers need no
+changes. Stage 0's ring holds 2R+5 frames (the `aji.h` ingest-ahead contract); on DirectML the
+gather shader's 5-bit slot indices cap that at a 27-frame combined window.
+
+Two chain keys add or remove steps without listing them as models (`parse_chain` in
+`src/aji_conf.cpp`; the backends only ever see the resulting `models` list):
+
+- `chain_N_upscale=no` (default yes) skips the chain's `chain_N_model_M_*` models; they stay in
+  the conf so the Manager can turn upscaling back on.
+- `chain_N_temporal_fix_model=<onnx name>` (+ `chain_N_temporal_fix_scene_threshold`, default
+  0.150) appends a vs_temporalfix model after the upscale models, or alone when `upscale=no`.
+  The Manager picks the file (the newest `temporalfix_s<k>_v*`); the engine just loads it.
+  `chain_N_temporal_fix_before_upscale=yes` (default no) puts it before the upscale models
+  instead, at the source resolution: roughly 2-3x cheaper for a 2x upscale, but it can't steady
+  shimmer the upscaler itself adds.
+
+`regress/temporal_regress.sh` compares a reference build with a candidate: bit-exact output
+and timing for chains without stacking, plus stacked-chain correctness. Run it before
+releasing any change to the temporal or chain code (environment variables in its header).
 
 ## Conventions
 

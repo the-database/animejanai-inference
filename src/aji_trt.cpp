@@ -97,6 +97,23 @@ void remove_file(const std::string &path)
     DeleteFileW(win_long_path(path).c_str());
 }
 
+// Size in bytes, or -1 if the file can't be stat'ed.
+long long file_size(const std::string &path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a = {};
+    if (!GetFileAttributesExW(win_long_path(path).c_str(), GetFileExInfoStandard,
+                              &a))
+        return -1;
+    return ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+}
+
+// Rename over an existing file.
+bool move_file(const std::string &from, const std::string &to)
+{
+    return MoveFileExW(win_long_path(from).c_str(), win_long_path(to).c_str(),
+                       MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
 bool read_file_bytes(const std::string &path, std::vector<char> *out)
 {
     HANDLE h = CreateFileW(win_long_path(path).c_str(), GENERIC_READ,
@@ -149,6 +166,20 @@ void remove_file(const std::string &path)
 {
     std::error_code ec;
     fs::remove(path, ec);
+}
+
+long long file_size(const std::string &path)
+{
+    std::error_code ec;
+    auto n = fs::file_size(path, ec);
+    return ec ? -1 : (long long)n;
+}
+
+bool move_file(const std::string &from, const std::string &to)
+{
+    std::error_code ec;
+    fs::rename(from, to, ec);
+    return !ec;
 }
 
 bool read_file_bytes(const std::string &path, std::vector<char> *out)
@@ -236,12 +267,23 @@ std::string sanitize_token(std::string s)
     return out.empty() ? "device0" : out;
 }
 
+struct CudaFree {
+    void operator()(void *p) const { cudaFree(p); }
+};
+using CudaPtr = std::unique_ptr<void, CudaFree>;
+
 struct ModelEngine {
     std::unique_ptr<nvinfer1::ICudaEngine> engine;
     std::unique_ptr<nvinfer1::IExecutionContext> exec;
     const char *in_name = nullptr;
     const char *out_name = nullptr;
     int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    // The chain's tensors are fp16. A model exported with fp32 I/O (strongly
+    // typed, so the engine keeps it) runs through these fp32 staging buffers,
+    // cast on the way in and out (enqueue_model).
+    bool in_fp32 = false, out_fp32 = false;
+    CudaPtr in32, out32;
+    size_t in32_elems = 0, out32_elems = 0;
 };
 
 struct Step {
@@ -257,6 +299,11 @@ struct aji_ctx {
     Logger logger;
     CUcontext cu_ctx = nullptr;
     bool owns_primary = false;
+    // The device cu_ctx lives on, which need not be device 0 (mpv adopts
+    // the hwdec device, i.e. the Vulkan VO's GPU). cuda_dev is the runtime
+    // API ordinal: it names engines and is trtexec's --device.
+    CUdevice cu_dev = 0;
+    int cuda_dev = 0;
 
     std::unique_ptr<nvinfer1::IRuntime> runtime;
 
@@ -356,12 +403,14 @@ struct aji_ctx {
     // practice (callers queue 2-4 frames, the ring holds 8).
     static constexpr int TICK_RING = 8;
 
-    // Temporal (multi-frame) model step. Frames enter a history ring at the
-    // step's input resolution (aji_ingest runs the steps before it once per
-    // source frame); aji_infer_seq gathers the 2r+1 window into the padded
-    // model input, runs the model, crops, and runs the steps after it.
-    struct {
-        bool enabled = false;
+    // Temporal (multi-frame) model steps, one stage per temporal model. Each
+    // stage keeps a history ring of frames at its step's input resolution:
+    // stage 0's ring is filled by aji_ingest (which runs the steps before it
+    // once per source frame), stage i+1's by running stage i (and the steps
+    // between the two) once per frame, on demand. aji_infer_seq gathers the
+    // last stage's 2r+1 window into the padded model input, runs the model,
+    // crops, and runs the steps after it.
+    struct TemporalStage {
         int t = 1, r = 0;
         size_t step_idx = 0;         // index of the TEMPORAL step in steps[]
         int w = 0, h = 0;            // ring frame dims (step input)
@@ -376,6 +425,13 @@ struct aji_ctx {
         std::vector<int> matrix, range;
         void *in_tensor = nullptr;   // 3t * pw*ph fp16
         void *out_tensor = nullptr;  // 3 * pow*poh fp16
+        uint64_t runs = 0;           // model runs (AJI_TEMPORAL_STATS)
+    };
+    struct {
+        bool enabled = false;
+        int r = 0;                   // total radius: the sum over stages
+        uint64_t ingests = 0;        // AJI_TEMPORAL_STATS
+        std::vector<TemporalStage> st;
     } temporal;
 
     // ONNX input frame counts, keyed by path, valid while size/mtime match
@@ -434,51 +490,66 @@ std::string trt_version_token()
     return buf;
 }
 
-std::string gpu_token()
+std::string gpu_token(int dev)
 {
     cudaDeviceProp prop = {};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess)
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
         return "unknown";
     std::string tok = sanitize_token(prop.name);
     return tok + "-sm" + std::to_string(prop.major);
 }
 
-std::string engine_suffix()
+std::string engine_suffix(int dev)
 {
-    return ".trt-" + trt_version_token() + ".gpu-" + gpu_token() + ".engine";
+    return ".trt-" + trt_version_token() + ".gpu-" + gpu_token(dev) + ".engine";
 }
 
 std::string engine_path_for(const std::string &model_dir,
                             const std::string &onnx_name,
-                            const std::string &settings)
+                            const std::string &settings, int dev)
 {
     return (fs::path(model_dir) /
-            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix()))
+            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix(dev)))
         .string();
 }
 
 std::string short_engine_path_for(const std::string &model_dir,
                                   const std::string &onnx_name,
-                                  const std::string &settings)
+                                  const std::string &settings, int dev)
 {
     char model_hash[9];
     snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
     return (fs::path(model_dir) /
             ("aji-" + std::string(model_hash) + "." +
-             std::to_string(crc32_z(settings)) + engine_suffix()))
+             std::to_string(crc32_z(settings)) + engine_suffix(dev)))
         .string();
 }
 
 void clean_stale_engines(aji_ctx *c)
 {
-    const std::string suffix = engine_suffix();
+    // Keep the engines of every GPU in the system, not just the active one:
+    // a multi-GPU user moving playback between GPUs would otherwise rebuild
+    // everything on each switch.
+    std::vector<std::string> suffixes;
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1)
+        ndev = 0;
+    for (int d = 0; d < ndev; d++)
+        suffixes.push_back(engine_suffix(d));
+    if (suffixes.empty())
+        suffixes.push_back(engine_suffix(c->cuda_dev));
     std::error_code ec;
     for (const auto &e : fs::directory_iterator(c->model_dir, ec)) {
         const std::string name = e.path().filename().string();
         if (name.size() < 7 || name.substr(name.size() - 7) != ".engine")
             continue;
-        if (name.size() >= suffix.size() &&
-            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+        bool current = false;
+        for (const std::string &suffix : suffixes) {
+            current |= name.size() >= suffix.size() &&
+                       name.compare(name.size() - suffix.size(), suffix.size(),
+                                    suffix) == 0;
+        }
+        if (current)
             continue;
         std::error_code rec;
         if (fs::remove(e.path(), rec)) {
@@ -561,6 +632,8 @@ struct BuildSpec {
     std::string cmdline;      // "trtexec" --onnx=... --saveEngine=...
     std::string env_prefix;   // POSIX only, e.g. "LD_LIBRARY_PATH=..."
     std::string engine_path;
+    std::string tmp_path;     // what trtexec writes; renamed to engine_path
+                              // only once the build has succeeded
     std::string log_path;     // trtexec output, kept for diagnostics
     std::string name;
     std::string res;          // shapes_label() of the build settings
@@ -626,10 +699,19 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 // Run a build to completion; on failure remove the half-written engine and
 // append the exit code to the build log (crash/kill diagnosis). Thread-safe
 // (touches no ctx state).
+//
+// trtexec creates its --saveEngine file empty when it starts and only fills
+// it at the end, so a build that is killed (the app's Cancel, closing the
+// player, a crash) used to leave an empty engine under the real cache name.
+// It builds into tmp_path instead, renamed into place only after a successful
+// build, so the cache only ever holds complete engines.
 bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
+    remove_file(spec.tmp_path);  // a previous build's leftover
     int rc = run_build_process(spec, child);
-    if (rc != 0 || !file_exists(spec.engine_path)) {
+    if (rc != 0 || file_size(spec.tmp_path) <= 0 ||
+        !move_file(spec.tmp_path, spec.engine_path)) {
+        remove_file(spec.tmp_path);
         remove_file(spec.engine_path);
         char msg[96];
         snprintf(msg, sizeof(msg),
@@ -718,11 +800,16 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
     const std::string &cmd_settings = settings;
 #endif
     spec->cmdline = "\"" + c->trtexec + "\" --onnx=\"" + onnx_path +
-                    "\" --saveEngine=\"" + engine_path + "\" " +
+                    "\" --saveEngine=\"" + engine_path + ".tmp\" " +
                     cmd_settings +
                     " --timingCacheFile=\"" + tcache + "\"";
+    // trtexec builds on device 0 by default; build on the GPU that runs
+    // the engine (left off for device 0 to keep the usual command line)
+    if (c->cuda_dev != 0)
+        spec->cmdline += " --device=" + std::to_string(c->cuda_dev);
     spec->env_prefix = c->trtexec_env;
     spec->engine_path = engine_path;
+    spec->tmp_path = engine_path + ".tmp";
     spec->log_path = engine_path + ".build.log";
     spec->name = onnx_name;
     spec->res = shapes_label(settings);
@@ -773,6 +860,13 @@ bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
         c->set_error("engine I/O tensors not found");
         return false;
     }
+    me->in_fp32 = me->engine->getTensorDataType(me->in_name) ==
+                  nvinfer1::DataType::kFLOAT;
+    me->out_fp32 = me->engine->getTensorDataType(me->out_name) ==
+                   nvinfer1::DataType::kFLOAT;
+    if (me->in_fp32 || me->out_fp32)
+        c->verbose("%s: fp32 model I/O, cast to/from the fp16 chain",
+                   engine_path.c_str());
     me->exec.reset(me->engine->createExecutionContext());
     if (!me->exec) {
         c->set_error("createExecutionContext failed");
@@ -917,7 +1011,8 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                   const std::string *dir = nullptr, int rank5_t = 0)
 {
     const std::string model_dir = dir ? *dir : c->model_dir;
-    const std::string short_epath = short_engine_path_for(model_dir, name, settings);
+    const std::string short_epath =
+        short_engine_path_for(model_dir, name, settings, c->cuda_dev);
 
     // Backwards compatibility: 3.5.0 and earlier cached engines used the
     // full ONNX basename in the filename. Try that legacy path first so
@@ -925,6 +1020,14 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     auto try_cached = [&](const std::string &path) -> int {
         if (!file_exists(path))
             return 0;
+        if (file_size(path) <= 0) {
+            // an interrupted build from before builds went through a temp
+            // file: not an error, just rebuild (deserializing it would only
+            // print a TensorRT API error first)
+            c->verbose("removing incomplete cached engine: %s", path.c_str());
+            remove_file(path);
+            return -1;
+        }
         if (load_engine(c, path, me, w, h, ch, rank5_t))
             return 1;
         if (c->check_engines_only) {
@@ -1049,7 +1152,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
     const std::string epath =
-        engine_path_for(c->rife_model_dir, model, settings);
+        engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev);
     int er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
                            11, &c->rife_model_dir);
     if (er < 0)
@@ -1161,35 +1264,55 @@ aji_ctx::OnnxFrames onnx_frames(aji_ctx *c, const std::string &name)
 
 void temporal_teardown(aji_ctx *c)
 {
-    auto &T = c->temporal;
-    cudaFree(T.ring);
-    cudaFree(T.diff);
-    cudaFree(T.in_tensor);
-    cudaFree(T.out_tensor);
-    T = {};
+    auto &TT = c->temporal;
+    if (TT.enabled && getenv("AJI_TEMPORAL_STATS")) {
+        fprintf(stderr, "aji temporal stats: %llu ingested",
+                (unsigned long long)TT.ingests);
+        for (size_t i = 0; i < TT.st.size(); i++)
+            fprintf(stderr, "; stage %zu (%d frames): %llu runs", i,
+                    TT.st[i].t, (unsigned long long)TT.st[i].runs);
+        fprintf(stderr, "\n");
+    }
+    for (auto &T : TT.st) {
+        cudaFree(T.ring);
+        cudaFree(T.diff);
+        cudaFree(T.in_tensor);
+        cudaFree(T.out_tensor);
+    }
+    TT = {};
 }
 
-// Allocate the history ring and model tensors for the configured temporal
-// step. Requires the CUDA context to be current.
+// Allocate the history rings and model tensors for the configured temporal
+// stages. Requires the CUDA context to be current.
 bool setup_temporal(aji_ctx *c)
 {
-    auto &T = c->temporal;
-    T.nslots = T.t + 4;
-    const size_t frame = (size_t)3 * T.w * T.h * 2;
-    if (cudaMalloc(&T.ring, frame * T.nslots) != cudaSuccess ||
-        cudaMalloc((void **)&T.diff, sizeof(float) * T.nslots) != cudaSuccess ||
-        cudaMalloc(&T.in_tensor, (size_t)3 * T.t * T.pw * T.ph * 2) !=
-            cudaSuccess ||
-        cudaMalloc(&T.out_tensor, (size_t)3 * T.pow * T.poh * 2) !=
-            cudaSuccess) {
-        c->set_error("temporal buffer allocation failed");
-        return false;
+    auto &TT = c->temporal;
+    TT.r = 0;
+    for (const auto &T : TT.st)
+        TT.r += T.r;
+    for (auto &T : TT.st) {
+        // Stage 0 keeps the last 2R+5 frames ingested (R: the total radius;
+        // callers ingest up to R+4 ahead of the next output, see aji.h).
+        // Later stages are filled in order, on demand, and only ever need
+        // their own window held.
+        T.nslots = &T == &TT.st[0] ? 2 * TT.r + 5 : T.t + 4;
+        const size_t frame = (size_t)3 * T.w * T.h * 2;
+        if (cudaMalloc(&T.ring, frame * T.nslots) != cudaSuccess ||
+            cudaMalloc((void **)&T.diff, sizeof(float) * T.nslots) !=
+                cudaSuccess ||
+            cudaMalloc(&T.in_tensor, (size_t)3 * T.t * T.pw * T.ph * 2) !=
+                cudaSuccess ||
+            cudaMalloc(&T.out_tensor, (size_t)3 * T.pow * T.poh * 2) !=
+                cudaSuccess) {
+            c->set_error("temporal buffer allocation failed");
+            return false;
+        }
+        cudaMemset(T.diff, 0, sizeof(float) * T.nslots);
+        T.seq.assign(T.nslots, -1);
+        T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
+        T.range.assign(T.nslots, AJI_RANGE_LIMITED);
     }
-    cudaMemset(T.diff, 0, sizeof(float) * T.nslots);
-    T.seq.assign(T.nslots, -1);
-    T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
-    T.range.assign(T.nslots, AJI_RANGE_LIMITED);
-    T.enabled = true;
+    TT.enabled = true;
     return true;
 }
 
@@ -1228,6 +1351,20 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
             return nullptr;
         }
         c->owns_primary = true;
+        c->cu_dev = dev;
+    }
+    {
+        CtxGuard guard(c->cu_ctx);
+        // cudaGetDevice reports the current (pushed) context's device as a
+        // runtime ordinal, the numbering cudaGetDeviceProperties and
+        // trtexec --device use
+        if (!guard.ok || cuCtxGetDevice(&c->cu_dev) != CUDA_SUCCESS ||
+            cudaGetDevice(&c->cuda_dev) != cudaSuccess) {
+            c->set_error("failed to query the CUDA context's device");
+            if (c->owns_primary)
+                cuDevicePrimaryCtxRelease(c->cu_dev);
+            return nullptr;
+        }
     }
 
     c->runtime.reset(nvinfer1::createInferRuntime(c->logger));
@@ -1419,7 +1556,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     int cw = w, ch = h;
 
     // Temporal models: frame counts per model step (conf override, else the
-    // onnx input shape). One temporal step per chain.
+    // onnx input shape). Each one becomes a temporal stage.
     std::vector<aji_ctx::OnnxFrames> model_frames(chain->models.size());
     int n_temporal = 0;
     for (size_t mi = 0; mi < chain->models.size(); mi++) {
@@ -1461,12 +1598,6 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             return AJI_ERR_CONF;
         }
         n_temporal++;
-    }
-    if (n_temporal > 1) {
-        c->set_error("chain %d has %d temporal models; at most one is "
-                     "supported", chain->index, n_temporal);
-        finalize_log(c);
-        return AJI_ERR_CONF;
     }
     // RIFE-first would feed interpolated frames into the temporal model's
     // window; interpolate the upscaled frames instead.
@@ -1596,7 +1727,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         while ((pos = settings.find("%video_resolution%")) != std::string::npos)
             settings.replace(pos, strlen("%video_resolution%"), dims);
 
-        const std::string epath = engine_path_for(c->model_dir, m.name, settings);
+        const std::string epath =
+            engine_path_for(c->model_dir, m.name, settings, c->cuda_dev);
         ModelEngine me;
         int er = ensure_engine(c, m.name, settings, epath, &me, bw, bh, 3 * t,
                                nullptr, rank5 ? t : 0);
@@ -1613,7 +1745,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
             return 0;
         }
         if (t > 1) {
-            auto &T = c->temporal;
+            c->temporal.st.emplace_back();
+            auto &T = c->temporal.st.back();
             const int sx = me.out_w / bw, sy = me.out_h / bh;
             if (sx < 1 || sy < 1 || me.out_w != sx * bw ||
                 me.out_h != sy * bh) {
@@ -1693,7 +1826,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     if (!ensure_buffers(c, max_bytes))
         return AJI_ERR_CUDA;
-    if (c->temporal.t > 1 && !setup_temporal(c))
+    if (!c->temporal.st.empty() && !setup_temporal(c))
         return AJI_ERR_CUDA;
 
     // In hoist mode the filter downscales source -> work via aji_resize and
@@ -1938,6 +2071,77 @@ static int run_pre(aji_ctx *c, const aji_frame *in, void *dst,
     return AJI_OK;
 }
 
+static size_t tensor_elems(const nvinfer1::Dims &d)
+{
+    size_t n = 1;
+    for (int i = 0; i < d.nbDims; i++)
+        n *= (size_t)(d.d[i] > 0 ? d.d[i] : 0);
+    return n;
+}
+
+// Grow an fp32 staging buffer to hold n elements.
+static bool ensure_f32(aji_ctx *c, CudaPtr *buf, size_t *have, size_t n)
+{
+    if (*buf && *have >= n)
+        return true;
+    void *p = nullptr;
+    if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) {
+        c->set_error("cudaMalloc(%zu) failed for fp32 model I/O",
+                     n * sizeof(float));
+        return false;
+    }
+    buf->reset(p);
+    *have = n;
+    return true;
+}
+
+// Run one model from the fp16 tensor `in` into the fp16 tensor `out`. Models
+// with fp32 inputs/outputs are bound to fp32 staging buffers and cast around
+// the enqueue; binding the fp16 tensors to them directly is what turned their
+// output into noise.
+static int enqueue_model(aji_ctx *c, ModelEngine &me, void *in, void *out,
+                         cudaStream_t stream)
+{
+    void *bind_in = in, *bind_out = out;
+    size_t n_in = 0, n_out = 0;
+    if (me.in_fp32) {
+        n_in = tensor_elems(me.exec->getTensorShape(me.in_name));
+        if (!ensure_f32(c, &me.in32, &me.in32_elems, n_in))
+            return AJI_ERR_CUDA;
+        int err = aji_f16_to_f32(in, me.in32.get(), n_in, stream);
+        if (err) {
+            c->set_error("fp32 input cast failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+        bind_in = me.in32.get();
+    }
+    if (me.out_fp32) {
+        n_out = tensor_elems(me.exec->getTensorShape(me.out_name));
+        if (!ensure_f32(c, &me.out32, &me.out32_elems, n_out))
+            return AJI_ERR_CUDA;
+        bind_out = me.out32.get();
+    }
+    if (!me.exec->setTensorAddress(me.in_name, bind_in) ||
+        !me.exec->setTensorAddress(me.out_name, bind_out)) {
+        c->set_error("setTensorAddress failed");
+        return AJI_ERR_ENGINE;
+    }
+    if (!me.exec->enqueueV3(stream)) {
+        c->set_error("enqueueV3 failed");
+        return AJI_ERR_ENGINE;
+    }
+    if (me.out_fp32) {
+        int err = aji_f32_to_f16(me.out32.get(), out, n_out, stream);
+        if (err) {
+            c->set_error("fp32 output cast failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+    }
+    return AJI_OK;
+}
+
 // Run steps [first, last) over the ping-pong buffers, starting in buf[*cur];
 // *cur/*cw/*ch track the current buffer and dims.
 static int run_steps(aji_ctx *c, size_t first, size_t last, int *cur,
@@ -1954,16 +2158,10 @@ static int run_steps(aji_ctx *c, size_t first, size_t last, int *cur,
                 return AJI_ERR_CUDA;
             }
         } else {
-            ModelEngine &me = c->engines[st.engine_idx];
-            if (!me.exec->setTensorAddress(me.in_name, c->buf[*cur]) ||
-                !me.exec->setTensorAddress(me.out_name, c->buf[*cur ^ 1])) {
-                c->set_error("setTensorAddress failed");
-                return AJI_ERR_ENGINE;
-            }
-            if (!me.exec->enqueueV3(stream)) {
-                c->set_error("enqueueV3 failed");
-                return AJI_ERR_ENGINE;
-            }
+            int err = enqueue_model(c, c->engines[st.engine_idx],
+                                    c->buf[*cur], c->buf[*cur ^ 1], stream);
+            if (err != AJI_OK)
+                return err;
         }
         *cur ^= 1;
         *cw = st.out_w;
@@ -2042,16 +2240,9 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
     int cw = in->width, ch = in->height;
 
     if (!c->conf_mode) {
-        ModelEngine &me = c->direct;
-        if (!me.exec->setTensorAddress(me.in_name, c->buf[cur]) ||
-            !me.exec->setTensorAddress(me.out_name, c->buf[cur ^ 1])) {
-            c->set_error("setTensorAddress failed");
-            return AJI_ERR_ENGINE;
-        }
-        if (!me.exec->enqueueV3(stream)) {
-            c->set_error("enqueueV3 failed");
-            return AJI_ERR_ENGINE;
-        }
+        err = enqueue_model(c, c->direct, c->buf[cur], c->buf[cur ^ 1], stream);
+        if (err != AJI_OK)
+            return err;
         cur ^= 1;
         cw = c->out_w; ch = c->out_h;
     } else {
@@ -2090,22 +2281,55 @@ extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
 extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
 {
     if (c && c->temporal.enabled)
-        std::fill(c->temporal.seq.begin(), c->temporal.seq.end(), -1);
+        for (auto &T : c->temporal.st)
+            std::fill(T.seq.begin(), T.seq.end(), -1);
 }
 
-static int temporal_slot(aji_ctx *c, int64_t seq)
+static int temporal_slot(aji_ctx *c, size_t lv, int64_t seq)
 {
-    auto &T = c->temporal;
+    auto &T = c->temporal.st[lv];
     if (seq < 0)
         return -1;
     const int slot = (int)(seq % T.nslots);
     return T.seq[slot] == seq ? slot : -1;
 }
 
-static void *temporal_frame(aji_ctx *c, int slot)
+static void *temporal_frame(aji_ctx *c, size_t lv, int slot)
 {
-    auto &T = c->temporal;
+    auto &T = c->temporal.st[lv];
     return (char *)T.ring + (size_t)slot * 3 * T.w * T.h * 2;
+}
+
+// Store the frame in src (the stage's ring frame dims) as `seq` in stage
+// lv's ring and record its scene-change metric against seq-1, if held.
+static int temporal_store(aji_ctx *c, size_t lv, const void *src,
+                          int64_t seq, int matrix, int range,
+                          cudaStream_t stream)
+{
+    auto &T = c->temporal.st[lv];
+    const int slot = (int)(seq % T.nslots);
+    void *dst = temporal_frame(c, lv, slot);
+    if (cudaMemcpyAsync(dst, src, (size_t)3 * T.w * T.h * 2,
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+        c->set_error("temporal ingest copy failed");
+        return AJI_ERR_CUDA;
+    }
+    // scene-change metric against the previous frame, if held
+    cudaMemsetAsync(&T.diff[slot], 0, sizeof(float), stream);
+    const int prev = temporal_slot(c, lv, seq - 1);
+    if (prev >= 0) {
+        int err = aji_rgb_diff(temporal_frame(c, lv, prev), dst, T.w, T.h,
+                               &T.diff[slot], stream);
+        if (err) {
+            c->set_error("temporal diff kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+    }
+    T.seq[slot] = seq;
+    T.matrix[slot] = matrix;
+    T.range[slot] = range;
+    return AJI_OK;
 }
 
 extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
@@ -2113,8 +2337,8 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
 {
     if (!c || !in)
         return AJI_ERR;
-    auto &T = c->temporal;
-    if (!c->active || !T.enabled) {
+    auto &TT = c->temporal;
+    if (!c->active || !TT.enabled) {
         c->set_error("aji_ingest without an active temporal configuration");
         return AJI_ERR;
     }
@@ -2123,7 +2347,7 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
     int err = check_frame(c, in, true);
     if (err != AJI_OK)
         return err;
-    if (temporal_slot(c, (int64_t)seq) >= 0)
+    if (temporal_slot(c, 0, (int64_t)seq) >= 0)
         return AJI_OK;  // already held
 
     CtxGuard guard(c->cu_ctx);
@@ -2133,69 +2357,27 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
     }
     cudaStream_t stream = (cudaStream_t)cu_stream;
 
-    // the steps before the temporal model, once per source frame
+    // the steps before the first temporal model, once per source frame
     int cur = 0, cw = in->width, ch = in->height;
     err = run_pre(c, in, c->buf[cur], stream);
     if (err == AJI_OK)
-        err = run_steps(c, 0, T.step_idx, &cur, &cw, &ch, stream);
+        err = run_steps(c, 0, TT.st[0].step_idx, &cur, &cw, &ch, stream);
     if (err != AJI_OK)
         return err;
-
-    const int slot = (int)(seq % (uint64_t)T.nslots);
-    void *dst = temporal_frame(c, slot);
-    if (cudaMemcpyAsync(dst, c->buf[cur], (size_t)3 * T.w * T.h * 2,
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
-        c->set_error("temporal ingest copy failed");
-        return AJI_ERR_CUDA;
-    }
-    // scene-change metric against the previous frame, if held
-    cudaMemsetAsync(&T.diff[slot], 0, sizeof(float), stream);
-    const int prev = temporal_slot(c, (int64_t)seq - 1);
-    if (prev >= 0) {
-        err = aji_rgb_diff(temporal_frame(c, prev), dst, T.w, T.h,
-                           &T.diff[slot], stream);
-        if (err) {
-            c->set_error("temporal diff kernel failed: %s",
-                         cudaGetErrorString((cudaError_t)err));
-            return AJI_ERR_CUDA;
-        }
-    }
-    T.seq[slot] = (int64_t)seq;
-    T.matrix[slot] = in->matrix;
-    T.range[slot] = in->range;
-    return AJI_OK;
+    TT.ingests++;
+    return temporal_store(c, 0, c->buf[cur], (int64_t)seq, in->matrix,
+                          in->range, stream);
 }
 
-extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
-                                        const aji_frame *out, void *cu_stream)
+// Run stage lv's model on the window around `center` (which its ring
+// holds) and crop the output into buf[0]. Window frames that are not held
+// (stream start, after a reset, end of stream) or lie across a scene cut
+// from the center are replaced by the nearest frame on the center's side;
+// a cut pointer exists only between two consecutive held frames.
+static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
+                              int cslot, cudaStream_t stream)
 {
-    if (!c || !out)
-        return AJI_ERR;
-    auto &T = c->temporal;
-    if (!c->active || !T.enabled) {
-        c->set_error("aji_infer_seq without an active temporal configuration");
-        return AJI_ERR;
-    }
-    int err = check_frame(c, out, false);
-    if (err != AJI_OK)
-        return err;
-    const int64_t center = (int64_t)seq;
-    const int cslot = seq > (uint64_t)INT64_MAX ? -1 : temporal_slot(c, center);
-    if (cslot < 0) {
-        c->set_error("aji_infer_seq: frame %llu was not ingested",
-                     (unsigned long long)seq);
-        return AJI_ERR;
-    }
-
-    CtxGuard guard(c->cu_ctx);
-    if (!guard.ok) {
-        c->set_error("cuCtxPushCurrent failed");
-        return AJI_ERR_CUDA;
-    }
-    cudaStream_t stream = (cudaStream_t)cu_stream;
-
-    // Window: frames that are not held take the nearest held one toward the
-    // center; a cut pointer exists only between two consecutive held frames.
+    auto &T = c->temporal.st[lv];
     aji_gather_args args = {};
     int slots[AJI_TEMPORAL_MAX];
     bool held[AJI_TEMPORAL_MAX];
@@ -2205,19 +2387,19 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
         bool clamped = false;
         for (int k = 1; k <= T.r; k++) {
             const int j = T.r + dir * k;
-            const int s = clamped ? -1 : temporal_slot(c, center + dir * k);
+            const int s = clamped ? -1 : temporal_slot(c, lv, center + dir * k);
             clamped = s < 0;
             slots[j] = clamped ? slots[j - dir] : s;
             held[j] = !clamped;
         }
     }
     for (int j = 0; j < T.t; j++) {
-        args.src[j] = temporal_frame(c, slots[j]);
+        args.src[j] = temporal_frame(c, lv, slots[j]);
         if (j + 1 < T.t && held[j] && held[j + 1])
             args.cut[j] = &T.diff[slots[j + 1]];
     }
-    err = aji_temporal_gather(&args, T.t, T.threshold, T.w, T.h, T.pw, T.ph,
-                              T.in_tensor, stream);
+    int err = aji_temporal_gather(&args, T.t, T.threshold, T.w, T.h, T.pw,
+                                  T.ph, T.in_tensor, stream);
     if (err) {
         c->set_error("temporal gather kernel failed: %s",
                      cudaGetErrorString((cudaError_t)err));
@@ -2235,13 +2417,13 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
         c->set_error("enqueueV3 failed");
         return AJI_ERR_ENGINE;
     }
+    T.runs++;
 
     // crop the padded model output into the chain buffer
-    int cur = 0;
     const size_t splane = (size_t)T.pow * T.poh * 2;
     const size_t dplane = (size_t)T.ow * T.oh * 2;
     for (int pl = 0; pl < 3; pl++) {
-        if (cudaMemcpy2DAsync((char *)c->buf[cur] + pl * dplane,
+        if (cudaMemcpy2DAsync((char *)c->buf[0] + pl * dplane,
                               (size_t)T.ow * 2,
                               (char *)T.out_tensor + pl * splane,
                               (size_t)T.pow * 2, (size_t)T.ow * 2, T.oh,
@@ -2251,7 +2433,87 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
             return AJI_ERR_CUDA;
         }
     }
+    return AJI_OK;
+}
 
+// Make stage lv's ring hold frame p if it can: run stage lv-1 on its window
+// around p (making those frames held first, oldest first) and the steps
+// between the two stages. A frame is computed once and then served from the
+// ring. Not possible when the source frame was never ingested (before the
+// stream start, past its end, a gap, or after a reset): the frame stays
+// absent and windows clamp around it.
+static int temporal_ensure(aji_ctx *c, size_t lv, int64_t p,
+                           cudaStream_t stream)
+{
+    if (p < 0 || temporal_slot(c, lv, p) >= 0 || lv == 0)
+        return AJI_OK;
+    const auto &S = c->temporal.st[lv - 1];
+    for (int64_t q = p - S.r; q <= p + S.r; q++) {
+        int err = temporal_ensure(c, lv - 1, q, stream);
+        if (err != AJI_OK)
+            return err;
+    }
+    const int cslot = temporal_slot(c, lv - 1, p);
+    if (cslot < 0)
+        return AJI_OK;
+    int err = run_temporal_stage(c, lv - 1, p, cslot, stream);
+    if (err != AJI_OK)
+        return err;
+    int cur = 0, cw = S.ow, ch = S.oh;
+    err = run_steps(c, S.step_idx + 1, c->temporal.st[lv].step_idx, &cur,
+                    &cw, &ch, stream);
+    if (err != AJI_OK)
+        return err;
+    return temporal_store(c, lv, c->buf[cur], p, S.matrix[cslot],
+                          S.range[cslot], stream);
+}
+
+extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
+                                        const aji_frame *out, void *cu_stream)
+{
+    if (!c || !out)
+        return AJI_ERR;
+    auto &TT = c->temporal;
+    if (!c->active || !TT.enabled) {
+        c->set_error("aji_infer_seq without an active temporal configuration");
+        return AJI_ERR;
+    }
+    int err = check_frame(c, out, false);
+    if (err != AJI_OK)
+        return err;
+    const int64_t center = (int64_t)seq;
+    if (seq > (uint64_t)INT64_MAX || temporal_slot(c, 0, center) < 0) {
+        c->set_error("aji_infer_seq: frame %llu was not ingested",
+                     (unsigned long long)seq);
+        return AJI_ERR;
+    }
+
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return AJI_ERR_CUDA;
+    }
+    cudaStream_t stream = (cudaStream_t)cu_stream;
+
+    // stacked temporal models: bring the last stage's window up to date
+    const size_t last = TT.st.size() - 1;
+    const auto &T = TT.st[last];
+    for (int64_t q = center - T.r; last > 0 && q <= center + T.r; q++) {
+        err = temporal_ensure(c, last, q, stream);
+        if (err != AJI_OK)
+            return err;
+    }
+    const int cslot = temporal_slot(c, last, center);
+    if (cslot < 0) {
+        c->set_error("aji_infer_seq: frame %llu is not available",
+                     (unsigned long long)seq);
+        return AJI_ERR;
+    }
+
+    err = run_temporal_stage(c, last, center, cslot, stream);
+    if (err != AJI_OK)
+        return err;
+    int cur = 0;
     int cw = T.ow, ch = T.oh;
     err = run_steps(c, T.step_idx + 1, c->steps.size(), &cur, &cw, &ch,
                     stream);
@@ -2777,11 +3039,8 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->direct.engine.reset();
         c->runtime.reset();
     }
-    if (c->owns_primary) {
-        CUdevice dev;
-        if (cuDeviceGet(&dev, 0) == CUDA_SUCCESS)
-            cuDevicePrimaryCtxRelease(dev);
-    }
+    if (c->owns_primary)
+        cuDevicePrimaryCtxRelease(c->cu_dev);
     delete c;
     *pc = nullptr;
 }

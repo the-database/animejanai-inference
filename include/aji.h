@@ -260,11 +260,13 @@ AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
 /* Temporal (multi-frame) models. A chain model whose input takes T = 2r+1
  * frames (oldest first, the frame to upscale in the middle) is a temporal
  * step: it needs the neighboring source frames, so a chain containing one
- * is driven through aji_ingest + aji_infer_seq instead of aji_infer.
+ * is driven through aji_ingest + aji_infer_seq instead of aji_infer. A
+ * chain may hold several (e.g. a temporal upscale followed by a temporal
+ * cleanup): each one's window is made of the previous one's outputs.
  *
- * Returns r after aji_configure(): 0 when the active chain has no temporal
- * step (use aji_infer as before). Both backends; DirectML needs a 4-D
- * [1, T*3, H, W] model input. */
+ * Returns r after aji_configure(), summed over the chain's temporal steps:
+ * 0 when the active chain has none (use aji_infer as before). Both
+ * backends; DirectML needs a 4-D [1, T*3, H, W] model input. */
 AJI_EXPORT int aji_temporal_radius(aji_ctx *c);
 
 /* Add one source frame to the frame history under a caller-assigned
