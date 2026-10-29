@@ -125,8 +125,21 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
             if(!p->engine) {
                 if(state)state(opaque,9);
                 auto bytes=read(path);
+#if defined(_WIN32) && NV_TENSORRT_MAJOR >= 11
+                // TensorRT loads builder resources lazily. Its documented
+                // resource path is independent of LoadLibraryEx's DLL path.
+                // Keep it beside this optional module, never relative to the
+                // player's working directory or a guest-provided location.
+                HMODULE self; wchar_t module_path[32768];
+                require(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(&aji_observer_create), &self), "Could not locate the analysis runtime.");
+                DWORD length = GetModuleFileNameW(self,module_path,32768);
+                require(length > 0 && length < 32768, "Could not locate the analysis runtime directory.");
+                auto library_path = std::filesystem::path(module_path).parent_path().u8string();
+                require(nvinfer1::setInternalLibraryPath(library_path.c_str()), "Could not set the TensorRT builder resource directory.");
+#endif
                 std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(p->logger));
-                require(bool(builder),"TensorRT engine builder is unavailable.");
+                require(bool(builder),p->logger.error.empty()?"TensorRT engine builder is unavailable.":p->logger.error.c_str());
                 std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(0));
                 std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network,p->logger));
                 require(bool(parser) && parser->parse(bytes.data(),bytes.size()), "Could not parse the approved character-mask model.");
