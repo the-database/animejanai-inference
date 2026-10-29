@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -38,6 +39,37 @@ struct Current {
 };
 void check(cudaError_t result) { if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result)); }
 void require(bool condition, const char *message) { if (!condition) throw std::runtime_error(message); }
+#ifdef _WIN32
+[[noreturn]] void windows_error(const char *message, DWORD code = GetLastError()) {
+    throw std::runtime_error(std::string(message) + " (Windows error " + std::to_string(code) + ").");
+}
+#endif
+std::filesystem::path native_path(std::filesystem::path path) {
+#ifdef _WIN32
+    // Like the TRT backend's win_long_path, use an absolute extended path.
+    // mpv.net does not declare longPathAware. Normalize before adding the
+    // prefix, then derive ALL model/cache/lock/temporary paths from this one.
+    std::wstring value = path.make_preferred().native();
+    if (value.rfind(L"\\\\?\\", 0) == 0 || value.rfind(L"\\\\.\\", 0) == 0) return path;
+    DWORD needed = GetFullPathNameW(value.c_str(), 0, nullptr, nullptr);
+    if (!needed) windows_error("Could not resolve the analysis model path");
+    std::vector<wchar_t> full(needed);
+    DWORD length = GetFullPathNameW(value.c_str(), needed, full.data(), nullptr);
+    if (!length || length >= needed) windows_error("Could not resolve the analysis model path");
+    value.assign(full.data(), length);
+    return value.rfind(L"\\\\", 0) == 0 ? L"\\\\?\\UNC" + value.substr(1) : L"\\\\?\\" + value;
+#else
+    return path;
+#endif
+}
+[[noreturn]] void file_error(const char *message) {
+#ifdef _WIN32
+    unsigned long code = 0; _get_doserrno(&code);
+    windows_error(message, code);
+#else
+    throw std::runtime_error(message);
+#endif
+}
 struct Progress : nvinfer1::IProgressMonitor {
     aji_observer_cancel_fn cancel; void *opaque;
     Progress(aji_observer_cancel_fn cancel, void *opaque) : cancel(cancel), opaque(opaque) {}
@@ -49,7 +81,8 @@ std::vector<char> read(const std::filesystem::path &path) {
     auto size = std::filesystem::file_size(path);
     require(size > 0 && size < 2ULL*1024*1024*1024, "Invalid analysis engine/model file size.");
     std::vector<char> bytes((size_t)size); std::ifstream stream(path, std::ios::binary);
-    require(bool(stream.read(bytes.data(), bytes.size())), "Could not read analysis engine/model."); return bytes;
+    if (!stream.read(bytes.data(), bytes.size())) file_error("Could not read analysis engine/model");
+    return bytes;
 }
 bool shape(nvinfer1::Dims d, int c) { return d.nbDims == 4 && d.d[0] == 1 && d.d[1] == c && d.d[2] == 1024 && d.d[3] == 1024; }
 }
@@ -95,7 +128,7 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
         check(cudaMalloc(&p->color, width*height*4));
         check(cudaMallocHost(&p->download, width*height*(model ? 6 : 4)));
         if (model) {
-            std::filesystem::path path = std::filesystem::u8path(model);
+            std::filesystem::path path = native_path(std::filesystem::u8path(model));
             require(std::filesystem::exists(path), "Approved isnetis.onnx is missing; provision it through the addon host.");
             int device, driver; check(cudaGetDevice(&device)); check(cudaDriverGetVersion(&driver));
             cudaDeviceProp gpu{}; check(cudaGetDeviceProperties(&gpu,device));
@@ -113,7 +146,8 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
                 require(!cancelled || !cancelled(opaque), "Analysis setup cancelled.");
                 lock = CreateFileW(lock_path.c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr);
                 if (lock == INVALID_HANDLE_VALUE) {
-                    require(GetLastError() == ERROR_SHARING_VIOLATION, "Cannot lock the analysis engine cache directory.");
+                    DWORD code = GetLastError();
+                    if (code != ERROR_SHARING_VIOLATION) windows_error("Cannot lock the analysis engine cache directory", code);
                     if(state)state(opaque,9); Sleep(100);
                 }
             }
@@ -160,7 +194,12 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
                 p->engine.reset(p->runtime->deserializeCudaEngine(plan->data(),plan->size()));
                 require(bool(p->engine),"New character-mask engine did not load.");
                 auto temporary=cached;temporary+=".partial";
-                { std::ofstream out(temporary,std::ios::binary|std::ios::trunc); require(bool(out.write((const char*)plan->data(),plan->size())),"Could not save the analysis engine."); }
+                {
+                    std::ofstream out(temporary,std::ios::binary|std::ios::trunc);
+                    if (!out.write((const char*)plan->data(),plan->size())) file_error("Could not save the analysis engine");
+                    out.close();
+                    if (!out) file_error("Could not finish saving the analysis engine");
+                }
                 if(std::filesystem::exists(cached))std::filesystem::remove(cached);
                 std::filesystem::rename(temporary,cached);
             }
@@ -173,6 +212,13 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
             require(p->execution->setTensorAddress("img",p->input)&&p->execution->setTensorAddress("mask",p->mask),"Could not bind character-mask tensors.");
         }
         return p.release();
+    } catch(const std::filesystem::filesystem_error &e) {
+#ifdef _WIN32
+        if(error && error_size)std::snprintf(error,error_size,"%s (Windows error %d).",e.what(),e.code().value());
+#else
+        if(error && error_size)std::snprintf(error,error_size,"%s",e.what());
+#endif
+        return nullptr;
     } catch(const std::exception &e) { if(error && error_size)std::snprintf(error,error_size,"%s",e.what());return nullptr; }
 }
 
