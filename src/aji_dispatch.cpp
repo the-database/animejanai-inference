@@ -12,6 +12,7 @@
 
 #include "aji.h"
 #include "aji_conf.h"
+#include "core/fileio.h"
 
 #include <cctype>
 #include <cstdarg>
@@ -75,28 +76,7 @@ static void logf_to(aji_log_fn log, void *opaque, int level,
     log(opaque, level, buf);
 }
 
-static std::string own_dir(void)
-{
-#ifdef _WIN32
-    HMODULE self = NULL;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCSTR)&own_dir, &self);
-    char path[MAX_PATH] = {0};
-    GetModuleFileNameA(self, path, sizeof(path));
-    char *slash = strrchr(path, '\\');
-    if (slash)
-        *slash = 0;
-    return path;
-#else
-    Dl_info info = {};
-    if (!dladdr((void *)&own_dir, &info) || !info.dli_fname)
-        return ".";
-    char buf[4096];
-    snprintf(buf, sizeof(buf), "%s", info.dli_fname);
-    return dirname(buf);
-#endif
-}
+using ajicore::own_dir;
 
 static aji_lib lib_open(const std::string &path)
 {
