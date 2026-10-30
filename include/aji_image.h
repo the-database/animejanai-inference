@@ -79,7 +79,8 @@ typedef struct aji_img_device {
 
 /* Number of usable devices for `backend`, filling up to `max` entries
  * of `out` (which may be NULL). Negative if the backend or its runtime
- * cannot be loaded. */
+ * cannot be loaded. Each physical GPU is listed once (DirectML skips the
+ * adapters Windows adds for virtual displays). */
 AJI_IMG_EXPORT int aji_img_enum_devices(int backend, aji_img_device *out,
                                         int max);
 

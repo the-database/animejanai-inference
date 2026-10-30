@@ -52,7 +52,44 @@ std::string narrow(const wchar_t *w)
     return s;
 }
 
-// Hardware adapters that can create a D3D12 device, in DXGI order.
+// An indirect-display adapter: a virtual monitor (Parsec, Meta Quest Link, any
+// IddCx driver). DXGI lists one per virtual display, each describing the GPU
+// that renders for it (same name, VRAM and D3D12 support, its own LUID), so a
+// single card would show up once per virtual display. The kernel adapter type
+// tells them apart. The D3DKMT structs mirror d3dkmthk.h (which needs the
+// driver-kit NTSTATUS headers); a failed lookup keeps the adapter.
+bool is_indirect_display(const LUID &luid)
+{
+    struct OpenFromLuid { LUID luid; UINT handle; };
+    struct QueryInfo { UINT handle; UINT type; void *data; UINT size; };
+    struct CloseAdapter { UINT handle; };
+    using OpenFn = LONG(APIENTRY *)(OpenFromLuid *);
+    using QueryFn = LONG(APIENTRY *)(const QueryInfo *);
+    using CloseFn = LONG(APIENTRY *)(const CloseAdapter *);
+    constexpr UINT KMTQAITYPE_ADAPTERTYPE = 15;
+    constexpr UINT INDIRECT_DISPLAY_DEVICE = 1u << 6; // D3DKMT_ADAPTERTYPE bit
+
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi)
+        gdi = LoadLibraryW(L"gdi32.dll");
+    auto open = gdi ? (OpenFn)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid") : nullptr;
+    auto query = gdi ? (QueryFn)GetProcAddress(gdi, "D3DKMTQueryAdapterInfo") : nullptr;
+    auto close = gdi ? (CloseFn)GetProcAddress(gdi, "D3DKMTCloseAdapter") : nullptr;
+    if (!open || !query || !close)
+        return false;
+    OpenFromLuid o = {luid, 0};
+    if (open(&o) != 0)
+        return false;
+    UINT type = 0;
+    QueryInfo q = {o.handle, KMTQAITYPE_ADAPTERTYPE, &type, sizeof(type)};
+    bool indirect = query(&q) == 0 && (type & INDIRECT_DISPLAY_DEVICE);
+    CloseAdapter c = {o.handle};
+    close(&c);
+    return indirect;
+}
+
+// Hardware adapters that can create a D3D12 device, in DXGI order, without
+// the virtual-display duplicates (is_indirect_display).
 std::vector<ComPtr<IDXGIAdapter1>> adapters()
 {
     std::vector<ComPtr<IDXGIAdapter1>> out;
@@ -64,6 +101,7 @@ std::vector<ComPtr<IDXGIAdapter1>> adapters()
         DXGI_ADAPTER_DESC1 d = {};
         a->GetDesc1(&d);
         if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            !is_indirect_display(d.AdapterLuid) &&
             SUCCEEDED(D3D12CreateDevice(a.Get(), D3D_FEATURE_LEVEL_11_0,
                                         __uuidof(ID3D12Device), nullptr)))
             out.push_back(a);
