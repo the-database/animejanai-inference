@@ -51,6 +51,7 @@
 #include "dml_shaders.h"
 #include "onnx_shape.h"
 #include "resample.h"
+#include "core/fileio.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -63,19 +64,7 @@ const OrtDmlApi *g_dml_api = nullptr;
 HRESULT(WINAPI *g_dml_create_device)(ID3D12Device *, DML_CREATE_DEVICE_FLAGS,
                                      REFIID, void **) = nullptr;
 
-std::string own_dir(void)
-{
-    HMODULE self = NULL;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCSTR)&own_dir, &self);
-    char path[MAX_PATH] = {0};
-    GetModuleFileNameA(self, path, sizeof(path));
-    char *slash = strrchr(path, '\\');
-    if (slash)
-        *slash = 0;
-    return path;
-}
+using ajicore::own_dir;
 
 // Loads DirectML.dll then onnxruntime.dll from our own directory (the
 // order matters: onnxruntime delay-loads DirectML, and preloading ours
@@ -125,14 +114,7 @@ bool load_ort(std::string *err)
     return true;
 }
 
-std::wstring widen(const std::string &s)
-{
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
-    std::wstring w(n ? n - 1 : 0, L'\0');
-    if (n)
-        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
-    return w;
-}
+std::wstring widen(const std::string &s) { return ajicore::widen_utf8(s); }
 
 /* ---------------- D3D12 plumbing ---------------- */
 
