@@ -38,11 +38,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-uint64_t luid_id(const LUID &l)
-{
-    return ((uint64_t)(uint32_t)l.HighPart << 32) | (uint64_t)l.LowPart;
-}
-
 std::string narrow(const wchar_t *w)
 {
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
@@ -52,13 +47,10 @@ std::string narrow(const wchar_t *w)
     return s;
 }
 
-// An indirect-display adapter: a virtual monitor (Parsec, Meta Quest Link, any
-// IddCx driver). DXGI lists one per virtual display, each describing the GPU
-// that renders for it (same name, VRAM and D3D12 support, its own LUID), so a
-// single card would show up once per virtual display. The kernel adapter type
-// tells them apart. The D3DKMT structs mirror d3dkmthk.h (which needs the
-// driver-kit NTSTATUS headers); a failed lookup keeps the adapter.
-bool is_indirect_display(const LUID &luid)
+// D3DKMTQueryAdapterInfo for the adapter `luid`; false if anything fails.
+// The D3DKMT structs mirror d3dkmthk.h (which needs the driver-kit NTSTATUS
+// headers), and the calls resolve from gdi32 at runtime.
+bool kmt_query(const LUID &luid, UINT type, void *data, UINT size)
 {
     struct OpenFromLuid { LUID luid; UINT handle; };
     struct QueryInfo { UINT handle; UINT type; void *data; UINT size; };
@@ -66,8 +58,6 @@ bool is_indirect_display(const LUID &luid)
     using OpenFn = LONG(APIENTRY *)(OpenFromLuid *);
     using QueryFn = LONG(APIENTRY *)(const QueryInfo *);
     using CloseFn = LONG(APIENTRY *)(const CloseAdapter *);
-    constexpr UINT KMTQAITYPE_ADAPTERTYPE = 15;
-    constexpr UINT INDIRECT_DISPLAY_DEVICE = 1u << 6; // D3DKMT_ADAPTERTYPE bit
 
     HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
     if (!gdi)
@@ -80,12 +70,40 @@ bool is_indirect_display(const LUID &luid)
     OpenFromLuid o = {luid, 0};
     if (open(&o) != 0)
         return false;
-    UINT type = 0;
-    QueryInfo q = {o.handle, KMTQAITYPE_ADAPTERTYPE, &type, sizeof(type)};
-    bool indirect = query(&q) == 0 && (type & INDIRECT_DISPLAY_DEVICE);
+    QueryInfo q = {o.handle, type, data, size};
+    bool ok = query(&q) == 0;
     CloseAdapter c = {o.handle};
     close(&c);
-    return indirect;
+    return ok;
+}
+
+// An indirect-display adapter: a virtual monitor (Parsec, Meta Quest Link, any
+// IddCx driver). DXGI lists one per virtual display, each describing the GPU
+// that renders for it (same name, VRAM and D3D12 support, its own LUID), so a
+// single card would show up once per virtual display. The kernel adapter type
+// tells them apart; a failed lookup keeps the adapter.
+bool is_indirect_display(const LUID &luid)
+{
+    constexpr UINT KMTQAITYPE_ADAPTERTYPE = 15;
+    constexpr UINT INDIRECT_DISPLAY_DEVICE = 1u << 6; // D3DKMT_ADAPTERTYPE bit
+    UINT type = 0;
+    return kmt_query(luid, KMTQAITYPE_ADAPTERTYPE, &type, sizeof(type)) &&
+           (type & INDIRECT_DISPLAY_DEVICE);
+}
+
+// The device id: the adapter's PCI location, encoded as aji_img_trt's pci_id
+// does, so a card has the same id on both backends and keeps it across
+// reboots and driver restarts (a LUID is only unique until the next boot).
+// D3DKMT reports no PCI domain; it is 0 on single-segment (desktop) systems.
+// If Windows can't report an address, the LUID stands in (bit 63 clear, so
+// it can't collide with a PCI id).
+uint64_t device_id(const LUID &luid)
+{
+    constexpr UINT KMTQAITYPE_ADAPTERADDRESS = 6;
+    struct { UINT bus, device, function; } addr = {}; // D3DKMT_ADAPTERADDRESS
+    if (kmt_query(luid, KMTQAITYPE_ADAPTERADDRESS, &addr, sizeof(addr)))
+        return (1ull << 63) | ((uint64_t)addr.bus << 8) | (uint64_t)(addr.device & 0xff);
+    return ((uint64_t)(uint32_t)luid.HighPart << 32) | (uint64_t)luid.LowPart;
 }
 
 // Hardware adapters that can create a D3D12 device, in DXGI order, without
@@ -293,7 +311,7 @@ extern "C" AJI_IMG_EXPORT int aji_img_enum_devices(int backend,
         as[i]->GetDesc1(&d);
         aji_img_device &o = out[i];
         memset(&o, 0, sizeof(o));
-        o.id = luid_id(d.AdapterLuid);
+        o.id = device_id(d.AdapterLuid);
         snprintf(o.name, sizeof(o.name), "%s", narrow(d.Description).c_str());
         o.vram_bytes = d.DedicatedVideoMemory;
     }
@@ -317,7 +335,7 @@ extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_param
     for (auto &a : adapters()) {
         DXGI_ADAPTER_DESC1 d = {};
         a->GetDesc1(&d);
-        if (p->device_id == 0 || luid_id(d.AdapterLuid) == p->device_id) {
+        if (p->device_id == 0 || device_id(d.AdapterLuid) == p->device_id) {
             adapter = a;
             break;
         }
