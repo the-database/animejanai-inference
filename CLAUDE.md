@@ -51,6 +51,30 @@ Manager's default profiles.
 
 User slots 1–9 come from `animejanai.conf`, which the Manager writes.
 
+### Two front-ends over one internal core
+
+`aji.h` (video) is one front-end; `include/aji_image.h` (still images: 8-bit gray/RGB in host
+memory, any size, any ONNX SR model — no conf, slots, fps or YUV) is the other. Both are
+exported by `aji.dll` (`aji_img_dispatch.cpp` forwards the image ABI to the backend named at
+`aji_img_create`) and implemented inside the same backend DLLs: `aji_img_trt.cpp` in `aji_trt`,
+`aji_img_dml.cpp` in `aji_dml`.
+
+What both front-ends share lives in `src/core/`, compiled into each library with hidden
+visibility (an internal static "library", no ABI of its own):
+
+| File | What |
+|---|---|
+| `core/fileio` | UTF-8/long-path file helpers, `own_dir()` |
+| `core/trt_engine` | engine cache naming, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading |
+| `core/ort_dml` | ORT + DirectML loading (DirectML.dll before onnxruntime.dll) |
+| `core/tiling` | the image path's tile cover / reflect pad / overlap blend (backend-agnostic) |
+| `core/half` | fp16/bf16 conversions |
+
+Core functions take explicit paths/devices and return errors as strings; each front-end reports
+them through its own context. **A change to engine caching or builds goes in the core**, so both
+front-ends get it. The image front-end does inference only — model selection, grayscale
+detection, resizes and alpha are the caller's (yosh / MangaJaNaiConverterGui keep that policy).
+
 ## Build system
 
 CMake only (`cmake_minimum_required(VERSION 3.24)`, C11 / C++17, `LANGUAGES C CXX CUDA`).
@@ -86,6 +110,8 @@ and `<root>/lib/x86_64-linux-gnu`.
 | `aji_harness_dml` | EXE | `aji`, `d3d11` | **WIN32 only** |
 | `aji_encode` | EXE | `aji`, CUDA, ffmpeg libs | **conditional** — see below |
 | `aji_kernel_test` | EXE | `CUDA::cudart` | kernel unit tests |
+| `aji_image` | EXE | `aji` | image-ABI CLI (PNM in/out); the reference consumer of `aji_image.h` |
+| `aji_tiling_test` | EXE | — | CPU-only checks of `core/tiling` and the fp16/bf16 conversions |
 
 **`aji_encode` is skipped silently** unless its ffmpeg dependency resolves. On Windows that
 means `AJI_FFMPEG_ROOT` must be set; on Linux, pkg-config must find `libavformat libavcodec
@@ -141,6 +167,15 @@ RIFE model weights ship from this repo too, under a separate tag
 
 The filter lives on the mpv fork's `master` (aji ABI v9). The old standalone `vf-animejanai`
 branch is stale (ABI v4) and must not be used.
+
+`include/aji_image.h` has its own `AJI_IMAGE_API_VERSION`, independent of the video ABI: an
+image-ABI change never touches the mpv fork. Its consumers (e.g. yosh's upscaling add-on) load
+`aji.dll` at runtime and check the version through `aji_img_create`.
+
+**Regression gate for core changes:** the video harnesses must stay byte-identical — run
+`aji_harness` / `aji_harness_dml` (slots 1 and 3, `--output`) before and after, with cached
+*and* freshly built engines, and compare md5s. Image path: `aji_tiling_test`, then `aji_image`
+on a test page with both backends.
 
 ## Temporal models
 
