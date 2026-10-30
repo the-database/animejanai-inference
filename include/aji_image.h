@@ -69,9 +69,12 @@ typedef int (*aji_img_progress_fn)(void *opaque, int tiles_done,
                                    int tiles_total);
 
 typedef struct aji_img_device {
-    uint64_t id;            /* stable across runs: PCI domain/bus/device
-                               (TensorRT) or the DXGI adapter LUID
-                               (DirectML). Pass to aji_img_create. */
+    uint64_t id;            /* stable across runs: the PCI domain/bus/
+                               device, the same value on both backends
+                               on single-PCI-segment (desktop) systems
+                               (DirectML falls back to the adapter LUID
+                               if Windows reports no address). Pass to
+                               aji_img_create. */
     char name[128];
     uint64_t vram_bytes;
     int sm_major, sm_minor; /* CUDA compute capability; 0 for DirectML */
