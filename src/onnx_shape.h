@@ -3,9 +3,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 struct AjiOnnxInput {
+    std::string name;            // graph input name (trtexec shape flags)
     int elem_type = 0;           // TensorProto.DataType (1 f32, 10 f16, 16 bf16)
     std::vector<int64_t> dims;   // -1 = symbolic/unknown
 };
