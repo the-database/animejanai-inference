@@ -195,6 +195,7 @@ bool aji_onnx_input(const char *data, size_t size, AjiOnnxInput *out)
         for (auto &kv : inputs) {
             if (!inits.count(kv.first)) {
                 *out = kv.second;
+                out->name = kv.first;
                 return true;
             }
         }

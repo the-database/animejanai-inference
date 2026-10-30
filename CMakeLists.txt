@@ -37,7 +37,8 @@ find_package(CUDAToolkit REQUIRED)
 # aji: thin dispatcher (what the mpv filter loads as lib=). Parses the
 # conf's [global] backend key and forwards the C ABI to the sibling
 # backend library. No CUDA/TRT/ORT dependencies of its own.
-add_library(aji SHARED src/aji_dispatch.cpp src/aji_conf.cpp src/core/fileio.cpp)
+add_library(aji SHARED src/aji_dispatch.cpp src/aji_conf.cpp src/core/fileio.cpp
+    src/aji_img_dispatch.cpp)
 target_include_directories(aji PUBLIC include)
 target_link_libraries(aji PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(aji PROPERTIES
@@ -47,6 +48,7 @@ set_target_properties(aji PROPERTIES
 # aji_trt: TensorRT/CUDA backend (the former aji.dll).
 add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/onnx_shape.cpp
     src/core/fileio.cpp src/core/trt_engine.cpp
+    src/aji_img_trt.cpp src/core/tiling.cpp
     src/kernels.cu)
 target_include_directories(aji_trt
     PUBLIC include
@@ -64,6 +66,14 @@ if(NOT WIN32)
     # internal references locally so the global (dispatcher) symbols
     # can't interpose
     target_link_options(aji_trt PRIVATE -Wl,-Bsymbolic)
+endif()
+
+# aji_image: image-ABI CLI harness (PNM in/out); any backend via aji.dll.
+add_executable(aji_image src/aji_image_cli.cpp $<$<BOOL:${WIN32}>:src/utf8-argv.manifest>)
+target_link_libraries(aji_image PRIVATE aji)
+add_dependencies(aji_image aji_trt)
+if(WIN32)
+    add_dependencies(aji_image aji_dml)
 endif()
 
 # The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so argv/fopen
@@ -148,6 +158,10 @@ endif()
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
+
+# Image-ABI tiling/blending checks: CPU only, no GPU or models.
+add_executable(aji_tiling_test sanity/tiling_test.cpp src/core/tiling.cpp)
+target_include_directories(aji_tiling_test PRIVATE include src)
 
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
 target_include_directories(aji_msb444_test PRIVATE include src)
