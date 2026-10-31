@@ -134,8 +134,12 @@ of `lib/` and `bin/` at the root — which is the layout `CMakeLists.txt` expect
 
 **Keep this, the Linux workflow's `TRT_VERSION`, and `TrtVersion` in the package assembler on
 the same version.** `aji_trt` links `nvinfer_11`, which every TensorRT 11.x release ships under
-the same name — so an engine built against an older 11.x also loads on a newer 11.x runtime —
-but release builds are made against the TensorRT they ship with.
+the same name, so the DLL runs on any 11.x runtime. **Engines do not carry over**: a serialized
+engine only loads on the TensorRT version that built it (the 11.4 runtime rejects 11.0 engines,
+serialization version 243 vs 245). That is why the engine cache name carries the version
+(`...trt-11.4.0.gpu-...engine`): a runtime upgrade rebuilds every engine once on first use, and
+the stale-engine cleanup deletes the old version's files. Release builds are made against the
+TensorRT they ship with.
 
 > **The CUDA flavour is part of the URL and is not derivable from the TensorRT version.**
 > NVIDIA's pairing wanders: 11.0 -> cuda-13.2, 11.1 -> 13.3, 11.2 -> 13.3, 11.3 -> 13.4,
@@ -203,6 +207,11 @@ What differs from TensorRT:
   (<https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/reference/sla.html>) allows
   distributing the libraries only incorporated into an application with material added
   functionality; developer tools (`tensorrt_rtx.exe`) are internal use only, so do not ship it.
+  The terms the libraries reach users under must be consistent with the SLA, and NVIDIA's
+  notices may not be removed: the package therefore ships `TensorRT-RTX-NOTICE.txt` (from
+  `ci\windows\`: what the DLLs are, NVIDIA's copyright, the SLA link, use with this application
+  only) and the SDK's `doc\Acknowledgements.txt` unmodified as
+  `TensorRT-RTX-Acknowledgements.txt` (the third-party licences inside the DLLs).
 
 ### 3. `trtexec.exe` — NVIDIA's, not a patched fork
 
@@ -343,7 +352,7 @@ and prints each one's entry list and size:
 | Asset | Contents | Size |
 |---|---|---|
 | `aji-windows-x64.zip` | `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_encode.exe`, `aji_harness.exe`, `aji_harness_dml.exe`, `aji_kernel_test.exe` | ~0.8 MB |
-| `aji-trtrtx-windows-x64.zip` | `aji_trtrtx.dll` plus the TensorRT-RTX runtime from `-TrtRtxRoot` (default `%AJI_TRTRTX_ROOT%`, else `%AJI_WIN%\trtrtx171`): exactly one `tensorrt_rtx_*.dll` and one `tensorrt_onnxparser_rtx_*.dll`, or it throws | ~91 MB |
+| `aji-trtrtx-windows-x64.zip` | `aji_trtrtx.dll` plus the TensorRT-RTX runtime from `-TrtRtxRoot` (default `%AJI_TRTRTX_ROOT%`, else `%AJI_WIN%\trtrtx171`): exactly one `tensorrt_rtx_*.dll` and one `tensorrt_onnxparser_rtx_*.dll`, or it throws; plus `TensorRT-RTX-NOTICE.txt` and `TensorRT-RTX-Acknowledgements.txt` (the SDK's `doc\Acknowledgements.txt`; throws if absent) | ~91 MB |
 
 Output:
 

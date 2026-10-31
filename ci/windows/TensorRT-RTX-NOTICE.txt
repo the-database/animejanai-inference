@@ -1,0 +1,23 @@
+NVIDIA TensorRT for RTX
+=======================
+
+aji_trtrtx.dll (the optional TensorRT-RTX backend of libaji) runs on NVIDIA
+TensorRT for RTX. The two runtime files shipped with it,
+
+    tensorrt_rtx_1_7.dll
+    tensorrt_onnxparser_rtx_1_7.dll
+
+are NVIDIA proprietary software:
+
+    Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+They are distributed under, and their use is governed by, the NVIDIA TensorRT
+for RTX Software License Agreement:
+
+    https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/reference/sla.html
+
+They are provided for use by the application they ship with, and may not be
+used separately or redistributed except as that agreement permits.
+
+TensorRT for RTX includes third-party components; their licences and notices
+are reproduced, as NVIDIA ships them, in TensorRT-RTX-Acknowledgements.txt.

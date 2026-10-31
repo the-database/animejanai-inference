@@ -4,7 +4,10 @@
 #   aji-trtrtx-windows-x64.zip  the opt-in TensorRT for RTX backend: aji_trtrtx.dll
 #                               and the two runtime DLLs it needs (never
 #                               tensorrt_rtx.exe, which the SDK licence keeps
-#                               internal). Extracted flat on top of the first.
+#                               internal), plus TensorRT-RTX-NOTICE.txt and
+#                               the SDK's third-party notices as
+#                               TensorRT-RTX-Acknowledgements.txt. Extracted
+#                               flat on top of the first.
 # A consumer that never offers backend=TensorRT-RTX skips the second (~91 MB);
 # with it missing, the dispatcher falls back to TensorRT.
 param(
@@ -33,13 +36,21 @@ foreach ($pat in 'tensorrt_rtx_*.dll', 'tensorrt_onnxparser_rtx_*.dll') {
     if ($hit.Count -ne 1) { throw "expected one $pat in ${TrtRtxRoot}, found $($hit.Count)" }
     $trtrtx += $hit[0].FullName
 }
+# its licence notices; the SDK's own file is shipped unmodified, renamed so it
+# can't collide with TensorRT's Acknowledgements in the same flat directory
+$ack = Join-Path $TrtRtxRoot 'doc\Acknowledgements.txt'
+if (-not (Test-Path $ack)) { throw "missing TensorRT-RTX third-party notices: $ack" }
+$trtrtxRenamed = @{ 'TensorRT-RTX-Acknowledgements.txt' = $ack }
+$trtrtx += Join-Path $PSScriptRoot 'TensorRT-RTX-NOTICE.txt'
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-function New-FlatZip([string]$name, [string[]]$paths) {
+# $paths keep their file names; $renamed maps a zip entry name to its source
+function New-FlatZip([string]$name, [string[]]$paths, [hashtable]$renamed = @{}) {
     $stage = Join-Path $OutDir "$Tag\stage"
     Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $stage | Out-Null
     foreach ($p in $paths) { Copy-Item $p $stage }
+    foreach ($k in $renamed.Keys) { Copy-Item $renamed[$k] (Join-Path $stage $k) }
     $zip = Join-Path $OutDir "$Tag\$name"
     Remove-Item -Force $zip -ErrorAction SilentlyContinue
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
@@ -51,4 +62,4 @@ function New-FlatZip([string]$name, [string[]]$paths) {
 }
 
 New-FlatZip 'aji-windows-x64.zip' $engine
-New-FlatZip 'aji-trtrtx-windows-x64.zip' $trtrtx
+New-FlatZip 'aji-trtrtx-windows-x64.zip' $trtrtx $trtrtxRenamed
