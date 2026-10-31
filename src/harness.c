@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <cuda_runtime.h>
 
@@ -42,6 +43,14 @@
         return 1; \
     } \
 } while (0)
+
+/* wall clock, ms */
+static double now_ms(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
 
 static void log_cb(void *opaque, int level, const char *msg)
 {
@@ -111,6 +120,7 @@ int main(int argc, char **argv)
         .max_height = h,
         .log = log_cb,
     };
+    const double t_create = now_ms();
     aji_ctx *aji = aji_create(&params);
     if (!aji) {
         fprintf(stderr, "aji_create failed\n");
@@ -118,12 +128,17 @@ int main(int argc, char **argv)
     }
 
     int ow = 0, oh = 0;
+    const double t_configure = now_ms();
     int act = aji_configure(aji, w, h, fps, &ow, &oh);
     if (act < 0) {
         fprintf(stderr, "aji_configure: %d: %s\n", act, aji_last_error(aji));
         return 1;
     }
     printf("%s\n", aji_current_log(aji));
+    /* wall clock; configure includes any engine build and, on TensorRT-RTX,
+     * the kernel JIT at execution-context creation */
+    printf("timing: create %.1f ms, configure %.1f ms (wall)\n",
+           t_configure - t_create, now_ms() - t_configure);
 
     if (rife_chain) {
         // Full upscale+RIFE chain timing, honoring the chain's configured
@@ -588,6 +603,9 @@ int main(int argc, char **argv)
         CK(cudaMemcpyAsync(in.plane[1], (char *)h_in + y_sz, uv_sz,
                            cudaMemcpyHostToDevice, stream));
 
+        if (n == 0)
+            CK(cudaStreamSynchronize(stream));  /* upload out of the wall time */
+        const double t_frame = now_ms();
         CK(cudaEventRecord(ev0, stream));
         int ret = aji_infer(aji, &in, &out, stream);
         if (ret != AJI_OK) {
@@ -595,6 +613,11 @@ int main(int argc, char **argv)
             return 1;
         }
         CK(cudaEventRecord(ev1, stream));
+        if (n == 0) {
+            CK(cudaStreamSynchronize(stream));
+            printf("timing: first frame %.1f ms (wall, incl. graph capture)\n",
+                   now_ms() - t_frame);
+        }
 
         if (fout) {
             CK(cudaMemcpyAsync(h_out, out.plane[0], oy_sz,
