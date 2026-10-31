@@ -194,11 +194,14 @@ compile — the release list builds eight architectures.
 | Platform | Built by | Asset |
 |---|---|---|
 | Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
-| Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip` |
+| Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip`, `aji-trtrtx-windows-x64.zip` (opt-in: `aji_trtrtx.dll` + TensorRT-RTX runtime, ~91 MB) |
 
-Both are attached to the **same release tag**, because the consumer derives both URLs from one
+All are attached to the **same release tag**, because the consumer derives every URL from one
 `AjiVersion` constant. `the-database/mpv-AnimeJaNai`'s assembler downloads them in `InstallAji`
-and extracts them flat into `animejanai/inference/`.
+and extracts them flat into `animejanai/inference/`. It does not take the TensorRT-RTX asset
+for now (mpv's background builds start each play with a short warm-up passthrough on
+TensorRT-RTX); VideoJaNai, MangaJaNaiConverterGui and yosh are the intended takers. Without
+`aji_trtrtx.dll`, `backend=TensorRT-RTX` falls back to TensorRT.
 
 RIFE model weights ship from this repo too, under a separate tag
 (`RifeModelsVersion`, currently `models-rife-fp16-1`), converted with
