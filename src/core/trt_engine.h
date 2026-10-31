@@ -74,6 +74,9 @@ struct RuntimeCache {
     std::unique_ptr<nvinfer1::IRuntimeCache> cache;
     std::unique_ptr<nvinfer1::IRuntimeConfig> config;
     std::string path;
+    // what was loaded from `path`: save() skips an unchanged cache
+    size_t loaded_size = 0;
+    uint32_t loaded_crc = 0;
     RuntimeCache() = default;
     RuntimeCache(RuntimeCache &&) = default;
     RuntimeCache &operator=(RuntimeCache &&o) noexcept {
@@ -82,6 +85,8 @@ struct RuntimeCache {
             cache = std::move(o.cache);
             config = std::move(o.config);
             path = std::move(o.path);
+            loaded_size = o.loaded_size;
+            loaded_crc = o.loaded_crc;
         }
         return *this;
     }
@@ -158,6 +163,10 @@ struct BuildSpec {
     std::string onnx_path;
     std::string settings;     // trtexec-style flags; shapes etc. honored
     int dev = 0;
+    // TensorRT-RTX: no build - load the existing engine_path once and warm
+    // it up (see warm_up), to fill the JIT caches off the caller's thread.
+    // A failure leaves the engine in place.
+    bool warm_only = false;
 };
 
 // Build spec for {dir}/{onnx_name}.onnx with its timing cache beside it,
@@ -232,10 +241,13 @@ struct AsyncBuild {
 // input shape: [1, in_ch, in_h, in_w], or [1, rank5_t, 3, in_h, in_w]
 // when rank5_t > 0. Fills me->out_w/out_h from the resolved output and
 // me->in_fp32/out_fp32 from the I/O tensor types. TensorRT-RTX: the
-// execution context gets the runtime cache {engine_path}.jitcache.
+// execution context gets the runtime cache {engine_path}.jitcache, and the
+// engine one warm-up inference. *keep (optional) is set on failure when the
+// engine file itself deserialized fine (context, shape or warm-up failed):
+// not a stale cache entry to delete and rebuild.
 bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
                  ModelEngine *me, int in_w, int in_h, int in_ch, int rank5_t,
-                 std::string *err);
+                 std::string *err, bool *keep = nullptr);
 
 } // namespace ajicore
 

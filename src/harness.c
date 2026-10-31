@@ -153,9 +153,14 @@ int main(int argc, char **argv)
      * the kernel JIT at execution-context creation */
     printf("timing: create %.1f ms, configure %.1f ms (wall)\n",
            t_configure - t_create, now_ms() - t_configure);
-    /* async: a passthrough configure that logged a build gets polled for
-     * and redone, as the player does (multi-engine chains cascade) */
-    while (async_build && act == 0 && strstr(aji_current_log(aji), "Building")) {
+    /* async: while the configure log shows a background job (an engine
+     * build, or TensorRT-RTX's warm-up of a cached engine), poll for it and
+     * reconfigure, as the player does. This includes a chain that came back
+     * active without its RIFE step while the RIFE engine builds, and
+     * multi-engine chains, which cascade one job at a time. */
+    while (async_build && act >= 0 &&
+           (strstr(aji_current_log(aji), "Building") ||
+            strstr(aji_current_log(aji), "Preparing"))) {
         const double t_wait = now_ms();
         while (!aji_poll(aji)) {
             if (now_ms() - t_wait > 600000) {

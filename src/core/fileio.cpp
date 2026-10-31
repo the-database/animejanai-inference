@@ -150,6 +150,11 @@ bool write_file_bytes(const std::string &path, const void *data, size_t size)
     return ok;
 }
 
+std::FILE *fopen_utf8(const std::string &path, const char *mode)
+{
+    return _wfopen(win_long_path(path).c_str(), widen_utf8(mode).c_str());
+}
+
 std::string own_dir()
 {
     HMODULE self = NULL;
@@ -218,6 +223,11 @@ bool write_file_bytes(const std::string &path, const void *data, size_t size)
     if (!ok)
         remove_file(path);
     return ok;
+}
+
+std::FILE *fopen_utf8(const std::string &path, const char *mode)
+{
+    return fopen(path.c_str(), mode);
 }
 
 std::string own_dir()

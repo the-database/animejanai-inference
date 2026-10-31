@@ -283,24 +283,29 @@ static bool fall_back_to_trt(aji_ctx *c, const char *what)
 {
     const aji_create_params &p = c->params->p;
     const std::string why = c->be.last_error(c->inner);
-    logf_to(p.log, p.log_opaque, 1,
-            "TensorRT-RTX failed (%s: %s); using TensorRT instead", what,
-            why.c_str());
-    c->rtx = false;
+    c->rtx = false;  // one attempt per context
     aji_backend be = {};
     std::string err;
-    if (!load_backend("aji_trt", &be, &err)) {
-        logf_to(p.log, p.log_opaque, 0, "backend TensorRT (aji_trt): %s",
+    aji_ctx *inner = nullptr;
+    if (load_backend("aji_trt", &be, &err)) {
+        aji_create_params np = p;
+        np.slot = c->slot;
+        inner = be.create(&np);
+        if (!inner) {
+            lib_close(be.lib);
+            err = "aji_create failed";
+        }
+    }
+    if (!inner) {
+        logf_to(p.log, p.log_opaque, 1,
+                "TensorRT-RTX failed (%s: %s) and TensorRT is unavailable "
+                "(%s); continuing on TensorRT-RTX", what, why.c_str(),
                 err.c_str());
         return false;
     }
-    aji_create_params np = p;
-    np.slot = c->slot;
-    aji_ctx *inner = be.create(&np);
-    if (!inner) {
-        lib_close(be.lib);
-        return false;
-    }
+    logf_to(p.log, p.log_opaque, 1,
+            "TensorRT-RTX failed (%s: %s); using TensorRT instead", what,
+            why.c_str());
     c->be.destroy(&c->inner);
     lib_close(c->be.lib);
     c->be = be;
@@ -321,10 +326,15 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                                         int *out_w, int *out_h)
 {
     int r = c->be.configure(c->inner, w, h, fps, out_w, out_h);
-    // an engine that won't build or load (blocking, or after a background
-    // build: aji_trtrtx reports that as an error instead of passthrough)
-    if (r == AJI_ERR_ENGINE && c->rtx && fall_back_to_trt(c, "engine"))
+    // An engine that won't build or load (blocking, or after a background
+    // build: aji_trtrtx reports that once as an error instead of
+    // passthrough). Repeat the call either way: on TensorRT after the
+    // fallback, or - if TensorRT can't be loaded - on TensorRT-RTX again,
+    // which then degrades to passthrough like aji_trt (async mode).
+    if (r == AJI_ERR_ENGINE && c->rtx) {
+        fall_back_to_trt(c, "engine");
         r = c->be.configure(c->inner, w, h, fps, out_w, out_h);
+    }
     return r;
 }
 
