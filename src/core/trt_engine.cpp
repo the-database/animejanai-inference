@@ -24,9 +24,23 @@
 
 #include <cuda_runtime.h>
 
+#ifdef AJI_TRTRTX
+#include <NvOnnxParser.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace ajicore {
+
+#ifdef AJI_TRTRTX
+const char *const ENGINE_EXT = ".rtxengine";
+static const char *const VERSION_TAG = ".trtrtx-";
+// JIT (runtime) cache beside each engine: {engine}.jitcache
+static const char *const JIT_CACHE_EXT = ".jitcache";
+#else
+const char *const ENGINE_EXT = ".engine";
+static const char *const VERSION_TAG = ".trt-";
+#endif
 
 void TrtLogger::log(Severity sev, const char *msg) noexcept
 {
@@ -71,6 +85,14 @@ std::string sanitize_token(std::string s)
 
 std::string trt_version_token()
 {
+#ifdef AJI_TRTRTX
+    // TensorRT-RTX's packed getInferLibVersion() has its own encoding;
+    // the split getters are unambiguous
+    char rbuf[32];
+    snprintf(rbuf, sizeof(rbuf), "%d.%d.%d", getInferLibMajorVersion(),
+             getInferLibMinorVersion(), getInferLibPatchVersion());
+    return rbuf;
+#else
     int32_t v = getInferLibVersion();
     int major, minor, patch;
     if (v < 10000) {
@@ -81,6 +103,7 @@ std::string trt_version_token()
     char buf[32];
     snprintf(buf, sizeof(buf), "%d.%d.%d", major, minor, patch);
     return buf;
+#endif
 }
 
 std::string gpu_token(int dev)
@@ -94,7 +117,8 @@ std::string gpu_token(int dev)
 
 std::string engine_suffix(int dev)
 {
-    return ".trt-" + trt_version_token() + ".gpu-" + gpu_token(dev) + ".engine";
+    return VERSION_TAG + trt_version_token() + ".gpu-" + gpu_token(dev) +
+           ENGINE_EXT;
 }
 
 std::string engine_path_for(const std::string &model_dir,
@@ -132,17 +156,23 @@ void clean_stale_engines(const std::string &dir, int fallback_dev,
         suffixes.push_back(engine_suffix(d));
     if (suffixes.empty())
         suffixes.push_back(engine_suffix(fallback_dev));
+    auto ends_with = [](const std::string &s, const std::string &tail) {
+        return s.size() >= tail.size() &&
+               s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+    };
     std::error_code ec;
     for (const auto &e : fs::directory_iterator(dir, ec)) {
         const std::string name = e.path().filename().string();
-        if (name.size() < 7 || name.substr(name.size() - 7) != ".engine")
+        std::string key = name;  // the engine name this file belongs to
+#ifdef AJI_TRTRTX
+        if (ends_with(key, JIT_CACHE_EXT))  // an engine's JIT cache goes with it
+            key.resize(key.size() - strlen(JIT_CACHE_EXT));
+#endif
+        if (!ends_with(key, ENGINE_EXT))
             continue;
         bool current = false;
-        for (const std::string &suffix : suffixes) {
-            current |= name.size() >= suffix.size() &&
-                       name.compare(name.size() - suffix.size(), suffix.size(),
-                                    suffix) == 0;
-        }
+        for (const std::string &suffix : suffixes)
+            current |= ends_with(key, suffix);
         if (current)
             continue;
         std::error_code rec;
@@ -213,7 +243,9 @@ bool parse_shape_wh(const std::string &settings, const char *key, int *w, int *h
 
 int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
-#ifdef _WIN32
+#ifdef AJI_TRTRTX
+    return run_build_inprocess(spec, child);
+#elif defined(_WIN32)
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE log = CreateFileW(win_long_path(spec.log_path).c_str(), GENERIC_WRITE,
                              FILE_SHARE_READ, &sa, CREATE_ALWAYS,
@@ -375,6 +407,17 @@ bool make_build_spec_paths(const std::string &trtexec,
 #else
     const std::string &cmd_settings = settings;
 #endif
+#ifdef AJI_TRTRTX
+    // built in-process: no trtexec, no timing cache (TensorRT-RTX has no
+    // autotuning to cache); the command line is only a log description
+    (void)trtexec;
+    (void)tcache;
+    (void)cmd_settings;
+    spec->cmdline = "in-process TensorRT-RTX build of \"" + onnx_path +
+                    "\" (" + settings + ")";
+    if (dev != 0)
+        spec->cmdline += " on device " + std::to_string(dev);
+#else
     spec->cmdline = "\"" + trtexec + "\" --onnx=\"" + onnx_path +
                     "\" --saveEngine=\"" + engine_path + ".tmp\" " +
                     cmd_settings +
@@ -383,12 +426,16 @@ bool make_build_spec_paths(const std::string &trtexec,
     // the engine (left off for device 0 to keep the usual command line)
     if (dev != 0)
         spec->cmdline += " --device=" + std::to_string(dev);
+#endif
     spec->env_prefix = trtexec_env;
     spec->engine_path = engine_path;
     spec->tmp_path = engine_path + ".tmp";
     spec->log_path = engine_path + ".build.log";
     spec->name = name;
     spec->res = shapes_label(settings);
+    spec->onnx_path = onnx_path;
+    spec->settings = settings;
+    spec->dev = dev;
     return true;
 }
 
@@ -399,6 +446,7 @@ void AsyncBuild::start(const BuildSpec &spec)
     epath = spec.engine_path;
     done_flag = 0;
     ok = false;
+    child = 0;
     running = true;
     thread = std::thread([this, spec]() {
         bool r = run_build_spec(spec, &child);
@@ -411,6 +459,9 @@ void AsyncBuild::start(const BuildSpec &spec)
 void AsyncBuild::stop()
 {
     if (running.load()) {
+#ifdef AJI_TRTRTX
+        child = 1;  // in-process build: the progress monitor cancels
+#else
         intptr_t h = child.load();
         if (h) {
 #ifdef _WIN32
@@ -419,10 +470,224 @@ void AsyncBuild::stop()
             kill((pid_t)h, SIGKILL);
 #endif
         }
+#endif
     }
     if (thread.joinable())
         thread.join();
+#ifdef AJI_TRTRTX
+    child = 0;  // the cancel flag; a later synchronous build must not see it
+#endif
 }
+
+#ifdef AJI_TRTRTX
+namespace {
+
+// Builder log -> the engine's .build.log, like trtexec's output.
+class FileLogger : public nvinfer1::ILogger {
+public:
+    std::string path;
+    void log(Severity sev, const char *msg) noexcept override
+    {
+        if (sev > Severity::kINFO)
+            return;
+        static const char *tags[] = {"F", "E", "W", "I", "V"};
+        append_file_text(path, std::string("[") + tags[(int)sev] + "] " +
+                                   msg + "\n");
+    }
+};
+
+class CancelMonitor : public nvinfer1::IProgressMonitor {
+public:
+    std::atomic<intptr_t> *cancel = nullptr;
+    void phaseStart(const char *, const char *, int32_t) noexcept override {}
+    bool stepComplete(const char *, int32_t) noexcept override
+    {
+        return !cancel || cancel->load() == 0;
+    }
+    void phaseFinish(const char *) noexcept override {}
+};
+
+// trtexec shape flag value "name:AxBxC[,name2:...]" -> dims of `input`.
+bool shape_flag_dims(const std::string &settings, const char *flag,
+                     const std::string &input, nvinfer1::Dims *out)
+{
+    size_t p = settings.find(flag);
+    if (p == std::string::npos)
+        return false;
+    p += strlen(flag);
+    size_t end = settings.find(' ', p);
+    std::string val = settings.substr(p, end == std::string::npos ? end : end - p);
+    size_t start = 0;
+    while (start <= val.size()) {
+        size_t comma = val.find(',', start);
+        std::string item = val.substr(start, comma == std::string::npos
+                                                 ? comma : comma - start);
+        size_t colon = item.rfind(':');
+        if (colon != std::string::npos) {
+            std::string name = item.substr(0, colon);
+            if (name.size() >= 2 && name.front() == '\'' && name.back() == '\'')
+                name = name.substr(1, name.size() - 2);
+            if (name == input) {
+                nvinfer1::Dims d{};
+                const char *q = item.c_str() + colon + 1;
+                while (*q && d.nbDims < nvinfer1::Dims::MAX_DIMS) {
+                    char *e = nullptr;
+                    d.d[d.nbDims++] = strtoll(q, &e, 10);
+                    if (e == q)
+                        return false;
+                    if (*e != 'x')
+                        break;
+                    q = e + 1;
+                }
+                *out = d;
+                return d.nbDims > 0;
+            }
+        }
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return false;
+}
+
+bool int_flag(const std::string &settings, const char *flag, long long *v)
+{
+    size_t p = settings.find(flag);
+    if (p == std::string::npos)
+        return false;
+    const char *b = settings.c_str() + p + strlen(flag);
+    char *e = nullptr;
+    *v = strtoll(b, &e, 10);
+    return e != b;
+}
+
+} // namespace
+
+int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel)
+{
+    FileLogger log;
+    log.path = spec.log_path;
+    remove_file(spec.log_path);
+    auto fail = [&](const std::string &msg) {
+        log.log(nvinfer1::ILogger::Severity::kERROR, msg.c_str());
+        return 1;
+    };
+    log.log(nvinfer1::ILogger::Severity::kINFO, spec.cmdline.c_str());
+
+    // The builder targets the current device (ComputeCapability::kCURRENT).
+    // On the caller's thread the engine's context is already current; a
+    // background worker starts with none, so select the device there - and
+    // put back whatever context was current when done.
+    struct RestoreCtx {
+        CUcontext ctx = nullptr;
+        RestoreCtx() { cuCtxGetCurrent(&ctx); }
+        ~RestoreCtx() { if (ctx) cuCtxSetCurrent(ctx); }
+    } restore;
+    int cur = -1;
+    if ((cudaGetDevice(&cur) != cudaSuccess || cur != spec.dev) &&
+        cudaSetDevice(spec.dev) != cudaSuccess)
+        return fail("cudaSetDevice(" + std::to_string(spec.dev) + ") failed");
+
+    std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(log));
+    if (!builder)
+        return fail("createInferBuilder failed");
+    // TensorRT-RTX networks are always strongly typed
+    std::unique_ptr<nvinfer1::INetworkDefinition> net(builder->createNetworkV2(0));
+    std::unique_ptr<nvonnxparser::IParser> parser(
+        net ? nvonnxparser::createParser(*net, log) : nullptr);
+    if (!parser)
+        return fail("cannot create the network/ONNX parser");
+    // read through fileio (UTF-8 / long paths), not parseFromFile
+    std::vector<char> blob;
+    if (!read_file_bytes(spec.onnx_path, &blob))
+        return fail("cannot read " + spec.onnx_path);
+    if (!parser->parse(blob.data(), blob.size())) {
+        for (int i = 0; i < parser->getNbErrors(); i++)
+            log.log(nvinfer1::ILogger::Severity::kERROR,
+                    parser->getError(i)->desc());
+        return fail("ONNX parse failed: " + spec.onnx_path);
+    }
+    blob.clear();
+    blob.shrink_to_fit();
+
+    std::unique_ptr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
+    if (!cfg)
+        return fail("createBuilderConfig failed");
+    cfg->setNbComputeCapabilities(1);
+    cfg->setComputeCapability(nvinfer1::ComputeCapability::kCURRENT, 0);
+    long long v;
+    if (int_flag(spec.settings, "--builderOptimizationLevel=", &v))
+        cfg->setBuilderOptimizationLevel((int32_t)v);
+    if (int_flag(spec.settings, "--memPoolSize=workspace:", &v))
+        cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE,
+                                (size_t)v << 20);  // trtexec's default unit: MiB
+    CancelMonitor mon;
+    mon.cancel = cancel;
+    cfg->setProgressMonitor(&mon);
+
+    // trtexec's shape semantics: a missing opt is the max (else the min), a
+    // missing min/max is the opt; without any shape flag every dynamic
+    // dimension becomes 1
+    nvinfer1::IOptimizationProfile *prof = nullptr;
+    for (int i = 0; i < net->getNbInputs(); i++) {
+        nvinfer1::ITensor *t = net->getInput(i);
+        nvinfer1::Dims d = t->getDimensions();
+        bool dynamic = false;
+        for (int k = 0; k < d.nbDims; k++)
+            dynamic |= d.d[k] < 0;
+        nvinfer1::Dims mn{}, op{}, mx{};
+        const bool hmn = shape_flag_dims(spec.settings, "--minShapes=", t->getName(), &mn);
+        const bool hop = shape_flag_dims(spec.settings, "--optShapes=", t->getName(), &op);
+        const bool hmx = shape_flag_dims(spec.settings, "--maxShapes=", t->getName(), &mx);
+        if (!dynamic)
+            continue;  // a static input takes no profile entry
+        if (!hmn && !hop && !hmx) {
+            for (int k = 0; k < d.nbDims; k++)
+                if (d.d[k] < 0)
+                    d.d[k] = 1;
+            mn = op = mx = d;
+        } else {
+            if (!hop)
+                op = hmx ? mx : mn;
+            if (!hmn)
+                mn = op;
+            if (!hmx)
+                mx = op;
+        }
+        if (!prof)
+            prof = builder->createOptimizationProfile();
+        if (!prof ||
+            !prof->setDimensions(t->getName(), nvinfer1::OptProfileSelector::kMIN, mn) ||
+            !prof->setDimensions(t->getName(), nvinfer1::OptProfileSelector::kOPT, op) ||
+            !prof->setDimensions(t->getName(), nvinfer1::OptProfileSelector::kMAX, mx))
+            return fail(std::string("bad shape profile for input ") + t->getName());
+    }
+    if (prof && cfg->addOptimizationProfile(prof) < 0)
+        return fail("addOptimizationProfile failed");
+
+    std::unique_ptr<nvinfer1::IHostMemory> plan(
+        builder->buildSerializedNetwork(*net, *cfg));
+    if (!plan || !plan->size())
+        return fail(cancel && cancel->load() ? "build cancelled"
+                                             : "buildSerializedNetwork failed");
+    if (!write_file_bytes(spec.tmp_path, plan->data(), plan->size()))
+        return fail("cannot write " + spec.tmp_path);
+    return 0;
+}
+
+void RuntimeCache::save()
+{
+    if (cache && !path.empty()) {
+        std::unique_ptr<nvinfer1::IHostMemory> blob(cache->serialize());
+        if (blob && blob->size() &&
+            write_file_bytes(path + ".tmp", blob->data(), blob->size()) &&
+            !move_file(path + ".tmp", path))
+            remove_file(path + ".tmp");
+    }
+    config.reset();
+    cache.reset();
+}
+#endif
 
 bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
                  ModelEngine *me, int in_w, int in_h, int in_ch, int rank5_t,
@@ -433,6 +698,11 @@ bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
         *err = "cannot open engine: " + engine_path;
         return false;
     }
+#ifdef AJI_TRTRTX
+    me->exec.reset();  // a previous engine's context goes before its cache
+    me->engine.reset();
+    me->rt = RuntimeCache();
+#endif
     me->engine.reset(runtime->deserializeCudaEngine(blob.data(), blob.size()));
     if (!me->engine) {
         *err = "engine deserialization failed: " + engine_path;
@@ -453,7 +723,28 @@ bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
                   nvinfer1::DataType::kFLOAT;
     me->out_fp32 = me->engine->getTensorDataType(me->out_name) ==
                    nvinfer1::DataType::kFLOAT;
+#ifdef AJI_TRTRTX
+    // Kernels compile for this GPU here (JIT), at context creation; the
+    // runtime cache beside the engine makes that a load after first use.
+    me->rt.config.reset(me->engine->createRuntimeConfig());
+    if (me->rt.config) {
+        me->rt.cache.reset(me->rt.config->createRuntimeCache());
+        if (me->rt.cache) {
+            std::vector<char> rc;
+            const std::string rc_path = engine_path + JIT_CACHE_EXT;
+            if (read_file_bytes(rc_path, &rc) && !rc.empty() &&
+                !me->rt.cache->deserialize(rc.data(), rc.size()))
+                remove_file(rc_path);  // other driver/GPU/version: rebuilt
+            me->rt.config->setRuntimeCache(*me->rt.cache);
+            me->rt.path = rc_path;
+        }
+    }
+    me->exec.reset(me->rt.config
+                       ? me->engine->createExecutionContext(me->rt.config.get())
+                       : me->engine->createExecutionContext());
+#else
     me->exec.reset(me->engine->createExecutionContext());
+#endif
     if (!me->exec) {
         *err = "createExecutionContext failed";
         return false;

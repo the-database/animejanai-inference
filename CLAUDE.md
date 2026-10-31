@@ -33,10 +33,23 @@ DirectML backend.
 ```
 vf_animejanai (mpv)  ──dlopen──►  aji.dll / libaji.so        (aji_dispatch.cpp — thin dispatcher)
                                         │ forwards over aji.h
-                          ┌─────────────┴─────────────┐
-                    aji_trt.dll                  aji_dml.dll        (Windows only)
-                  TensorRT + CUDA               DirectML + D3D12
+                  ┌─────────────────────┼─────────────────────┐
+            aji_trt.dll          aji_trtrtx.dll          aji_dml.dll        (Windows only)
+          TensorRT + CUDA     TensorRT for RTX + CUDA   DirectML + D3D12
 ```
+
+`[global] backend=` picks the library: `DirectML` (or the retired `NCNN`) -> `aji_dml`,
+`TensorRT-RTX` (also `TensorRT_RTX`, `TRT-RTX`, `TRTRTX`; case-insensitive) -> `aji_trtrtx`,
+anything else -> `aji_trt`. The image ABI selects it with `AJI_IMG_TENSORRT_RTX`.
+
+**`aji_trtrtx` is `aji_trt`'s sources compiled with `AJI_TRTRTX`** against the TensorRT for
+RTX SDK; every difference lives in `core/trt_engine` (plus a few `#ifdef`s for log wording and
+runtime-cache saves). Engines build **in-process** through the builder API (about a second, no
+`trtexec`; the trtexec-style settings string is parsed for its shape/optimization-level/
+workspace flags), are cached as `....trtrtx-<ver>.gpu-<name-smN>.rtxengine` — deliberately not
+`*.engine`, which `aji_trt`'s stale cleanup (including released builds) would delete — and run
+with a TensorRT-RTX runtime cache saved beside each engine as `<engine>.jitcache`. Each backend's
+stale cleanup only touches its own extension, so both share a model directory.
 
 `aji` is deliberately dependency-free — no CUDA, no TensorRT, no ORT — so the player can load it
 on any machine and the backend resolves later. The backends load `onnxruntime.dll` /
@@ -65,7 +78,7 @@ visibility (an internal static "library", no ABI of its own):
 | File | What |
 |---|---|
 | `core/fileio` | UTF-8/long-path file helpers, `own_dir()` |
-| `core/trt_engine` | engine cache naming, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading |
+| `core/trt_engine` | engine cache naming, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading; under `AJI_TRTRTX` the in-process builder and the runtime (JIT) cache |
 | `core/ort_dml` | ORT + DirectML loading (DirectML.dll before onnxruntime.dll) |
 | `core/tiling` | the image path's tile cover / reflect pad / overlap blend (backend-agnostic) |
 | `core/half` | fp16/bf16 conversions |
@@ -87,6 +100,7 @@ There is no Cargo, meson, vcpkg, or conan manifest anywhere. The single `find_pa
 |---|---|---|---|
 | `AJI_TRT_ROOT` | PATH | `""` | `$ENV{HOME}/sdk/tensorrt/usr` |
 | `AJI_NVINFER` | STRING | `nvinfer_10` | `nvinfer` (plain `set`, not cached) |
+| `AJI_TRTRTX_ROOT` | PATH | `""` (target skipped) | `""` (target skipped) |
 | `AJI_FFMPEG_ROOT` | PATH | `""` | *(unused; pkg-config instead)* |
 | `AJI_ORT_ROOT` | PATH | `""` | *(Windows only)* |
 | `AJI_DML_ROOT` | PATH | `""` | *(Windows only)* |
@@ -94,6 +108,11 @@ There is no Cargo, meson, vcpkg, or conan manifest anywhere. The single `find_pa
 The include/lib layout under `AJI_TRT_ROOT` differs by platform: Windows expects headers in
 `<root>/include` and libs at `<root>` itself; Linux expects `<root>/include/x86_64-linux-gnu`
 and `<root>/lib/x86_64-linux-gnu`.
+
+`AJI_TRTRTX_ROOT` takes the same flat layout on Windows (`<root>/include`, libs at `<root>`;
+Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Windows
+(`tensorrt_rtx_1_7.lib`, `tensorrt_onnxparser_rtx_1_7.lib`); CMake reads them from the SDK's
+`NvInferVersion.h`, so there is no `AJI_NVINFER`-style name option to forget.
 
 > **`AJI_NVINFER` defaults to `nvinfer_10` but the project now builds against TensorRT 11.**
 > Every current build passes `-DAJI_NVINFER=nvinfer_11` explicitly. Omitting it on Windows
@@ -105,8 +124,9 @@ and `<root>/lib/x86_64-linux-gnu`.
 |---|---|---|---|
 | `aji` | SHARED | `${CMAKE_DL_LIBS}` | the dispatcher; `CXX_VISIBILITY_PRESET hidden`, PIC on |
 | `aji_trt` | SHARED | `${AJI_NVINFER}`, `CUDA::cuda_driver`, `CUDA::cudart` | non-Windows adds `-Wl,-Bsymbolic` |
+| `aji_trtrtx` | SHARED | `tensorrt_rtx_<M>_<m>`, `tensorrt_onnxparser_rtx_<M>_<m>`, CUDA | `aji_trt`'s sources + `AJI_TRTRTX`; **only with `AJI_TRTRTX_ROOT`** |
 | `aji_dml` | SHARED | `d3d12 d3d11 dxgi d3dcompiler` | **WIN32 only**; ORT/DirectML loaded at runtime, not import-linked |
-| `aji_harness` | EXE | `aji`, `CUDA::cudart` | depends on `aji_trt` |
+| `aji_harness` | EXE | `aji`, `CUDA::cudart` | depends on `aji_trt` (and `aji_trtrtx`); prints wall-clock create/configure/first-frame `timing:` lines |
 | `aji_harness_dml` | EXE | `aji`, `d3d11` | **WIN32 only** |
 | `aji_encode` | EXE | `aji`, CUDA, ffmpeg libs | **conditional** — see below |
 | `aji_kernel_test` | EXE | `CUDA::cudart` | kernel unit tests |

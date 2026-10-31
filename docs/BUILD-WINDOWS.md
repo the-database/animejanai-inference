@@ -36,6 +36,11 @@ part of the contract:
 │   ├── nvinfer_11.dll  nvinfer_plugin_11.dll  nvonnxparser_11.dll  trtexec.exe
 │   ├── nvinfer_builder_resource_{ptx,sm75,sm80,sm86,sm89,sm90,sm100,sm120}_11.dll
 │   └── Acknowledgements.txt
+├── trtrtx171\                     TensorRT for RTX 1.7.1.116 (optional, aji_trtrtx; see 2b.)
+│   ├── include\                   NvInfer*.h, NvOnnxParser.h (TRT_MAJOR_RTX 1, TRT_MINOR_RTX 7)
+│   ├── tensorrt_rtx_1_7.lib  tensorrt_onnxparser_rtx_1_7.lib
+│   ├── tensorrt_rtx_1_7.dll  tensorrt_onnxparser_rtx_1_7.dll  tensorrt_rtx.exe
+│   └── doc\  cmake\  python\
 ├── ort\
 │   ├── ort-dml-1.24.4.nupkg       +  Microsoft.ML.OnnxRuntime.DirectML\   (extracted)
 │   └── directml-1.15.4.nupkg      +  Microsoft.AI.DirectML\               (extracted)
@@ -154,6 +159,43 @@ Previous releases assembled the headers and an `nvinfer_11.lib` (synthesized fro
 export table) by hand. Both are obsolete — the zip ships NVIDIA's own headers and import
 libraries.
 
+### 2b. TensorRT for RTX — optional, for `aji_trtrtx`
+
+`aji_trtrtx` (selected by `backend=TensorRT-RTX`) builds only when `AJI_TRTRTX_ROOT` is set.
+`trtrtx171` comes from NVIDIA's public download (the `secure/` path redirects to a tokenized
+CDN URL without a login):
+
+```
+https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.7/
+  tensorrt-rtx-1.7.1.116-windows-amd64-cuda-13.4-release-external.zip
+  (served as TensorRT-RTX-1.7.1.116-Windows-amd64-cuda-13.4-Release-external.zip,
+   99,783,796 bytes,
+   sha256 2002294a19f81135e4cfd074faddf1f842eb46979f36f7e6db57ff83016ba71d)
+```
+
+The release list is on <https://developer.nvidia.com/tensorrt-rtx>; each version comes in a
+CUDA 12.9 and a CUDA 13.x flavour, and the CUDA 13.4 one matches `cuda134`. Extract it like
+TensorRT, **flat**: `include/` as is, the contents of `lib/` and `bin/` at the root. Check
+`include\NvInferVersion.h` for `TRT_MAJOR_RTX 1` / `TRT_MINOR_RTX 7` / `TRT_PATCH_RTX 1`.
+Then add `-DAJI_TRTRTX_ROOT=%AJI_WIN%/trtrtx171` to the configure line; it prints
+`aji_trtrtx: TensorRT-RTX 1.7 (tensorrt_rtx_1_7;tensorrt_onnxparser_rtx_1_7)`, or
+`AJI_TRTRTX_ROOT not set; skipping aji_trtrtx target` without it.
+
+What differs from TensorRT:
+
+- **Runtime is two DLLs, ~232 MB** (`tensorrt_rtx_1_7.dll` 229 MB +
+  `tensorrt_onnxparser_rtx_1_7.dll` 2.3 MB), against ~2.4 GB for TensorRT 11.4's DLLs. There are
+  no per-SM builder resources and no `trtexec`: `aji_trtrtx` builds engines in-process. The DLLs
+  import only Windows system libraries — no CUDA DLL (the driver is reached at run time).
+  `aji_trtrtx.dll` itself links `cudart64_13.dll`, like `aji_trt`.
+- **GPUs**: compute capability 7.5+ per NVIDIA's support matrix (Turing through Blackwell; the
+  header's build targets are sm75/80/86/89/120/121). Engines are built for the current GPU
+  (`ComputeCapability::kCURRENT`), so Turing works too.
+- **Licence**: the NVIDIA TensorRT for RTX SLA
+  (<https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/reference/sla.html>) allows
+  distributing the libraries only incorporated into an application with material added
+  functionality; developer tools (`tensorrt_rtx.exe`) are internal use only, so do not ship it.
+
 ### 3. `trtexec.exe` — NVIDIA's, not a patched fork
 
 The package ships the `trtexec.exe` from this zip. Earlier packages took vs-mlrt's rebuild of
@@ -262,6 +304,11 @@ set PATH=%AJI_WIN%\cuda134\bin;%AJI_WIN%\trt114;%PATH%
 ```
 
 prints `MSB 4:4:4 GPU normalization and quantization passed`.
+
+With `AJI_TRTRTX_ROOT` set (see 2b.) the build also produces `aji_trtrtx.dll`. The release
+script and the package do not include it yet: `build-aji-release.bat` would need the
+`-DAJI_TRTRTX_ROOT` flag, `package-aji-release.ps1` the extra artifact, and the assembler the two
+TensorRT-RTX runtime DLLs in `animejanai/inference/`.
 
 ### Dev build (much faster)
 

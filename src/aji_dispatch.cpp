@@ -4,8 +4,10 @@
  * Thin dispatcher honoring animejanai.conf's [global] backend key
  * (3.3.x semantics: case-insensitive; "directml" -> DML, "ncnn" -> DML
  * with a warning (NCNN is retired; DirectML serves its audience),
- * anything else incl. absent/no conf -> TensorRT). Loads the sibling
- * backend library (aji_trt / aji_dml) from its own directory and
+ * "tensorrt-rtx" (also "tensorrt_rtx", "trt-rtx", "trtrtx") -> TensorRT
+ * for RTX, anything else incl. absent/no conf -> TensorRT). Loads the
+ * sibling backend library (aji_trt / aji_trtrtx / aji_dml) from its own
+ * directory and
  * forwards the whole C ABI. Keeps nvinfer/onnxruntime out of the
  * process until the chosen backend actually needs them.
  */
@@ -185,7 +187,10 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         lower.push_back((char)tolower((unsigned char)ch));
 
     const char *stem = "aji_trt";
-    if (lower == "directml") {
+    if (lower == "tensorrt-rtx" || lower == "tensorrt_rtx" ||
+        lower == "trt-rtx" || lower == "trtrtx") {
+        stem = "aji_trtrtx";
+    } else if (lower == "directml") {
         stem = "aji_dml";
     } else if (lower == "ncnn") {
         logf_to(params->log, params->log_opaque, 2,
