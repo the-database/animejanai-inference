@@ -204,8 +204,10 @@ TensorRT-RTX); VideoJaNai, MangaJaNaiConverterGui and yosh are the intended take
 `aji_trtrtx.dll`, `backend=TensorRT-RTX` falls back to TensorRT.
 
 RIFE model weights ship from this repo too, under a separate tag
-(`RifeModelsVersion`, currently `models-rife-fp16-1`), converted with
-`tools/convert_rife_fp16.py`.
+(`RifeModelsVersion`, currently `models-rife-fp16-2`), converted with
+`tools/convert_rife_fp16.py`. Set 2 differs from set 1 only in naming the input's H/W dims,
+which the DirectML backend needs to pin them (~10% faster RIFE there); outputs are
+bit-identical, and TensorRT reuses existing engines (cache names come from the file name).
 
 ## The ABI contract
 

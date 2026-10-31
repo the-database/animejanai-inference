@@ -184,4 +184,4 @@ tools/convert_rife_fp16.py SRC_DIR DST_DIR [model.onnx ...]
 
 No model list converts every `*.onnx` in `SRC_DIR`. Needs `numpy` and `onnx`. The output is
 published under its own release tag, which the assembler pins separately as
-`RifeModelsVersion` (currently `models-rife-fp16-1`).
+`RifeModelsVersion` (currently `models-rife-fp16-2`).
