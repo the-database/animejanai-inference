@@ -307,11 +307,11 @@ operable program or batch file.
 -- aji_trtrtx: TensorRT-RTX 1.7 (tensorrt_rtx_1_7;tensorrt_onnxparser_rtx_1_7)
 -- Configuring done
 ...
-[48/48] Linking CUDA executable aji_msb444_test.exe
+[43/43] Linking C executable aji_encode.exe
 AJI-RELEASE-BUILD-OK
 ```
 
-**48 build edges, and all eight release artifacts plus `aji_msb444_test.exe`.** If the edge
+**43 build edges, and all eight release artifacts plus `aji_msb444_test.exe`.** If the edge
 count is lower, a target was skipped — check the configure output for the
 `skipping aji_encode target` and `skipping aji_trtrtx target` messages. `AJI-RELEASE-BUILD-OK` on the last line is the success
 marker; a MSVC warning C4819 about code page 932 is expected noise on a Japanese ANSI code page.
