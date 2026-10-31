@@ -129,6 +129,11 @@ struct aji_ctx {
     bool async_build = false;
     ajicore::AsyncBuild build;
     std::set<std::string> failed_builds;
+#ifdef AJI_TRTRTX
+    // engines built by this context: one that then fails to load is an
+    // error, not a stale cache entry to rebuild (which would loop)
+    std::set<std::string> built_engines;
+#endif
 
     // resampling plans: per-step resize plans live in steps[]; pre/post are
     // (re)built lazily per frame key since siting arrives with frames
@@ -312,6 +317,9 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
                      onnx_name.c_str(), spec.log_path.c_str());
         return false;
     }
+#ifdef AJI_TRTRTX
+    c->built_engines.insert(engine_path);
+#endif
     return true;
 }
 
@@ -453,6 +461,10 @@ int ensure_engine(aji_ctx *c, const std::string &name,
         }
         if (load_engine(c, path, me, w, h, ch, rank5_t))
             return 1;
+#ifdef AJI_TRTRTX
+        if (c->built_engines.count(path))
+            return -2;  // just built and still unusable; errbuf has why
+#endif
         c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
         remove_file(path);
         return -1;
@@ -461,10 +473,14 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     int cached = try_cached(epath);
     if (cached == 1)
         return 1;
+    if (cached == -2)
+        return -1;
     if (short_epath != epath) {
         cached = try_cached(short_epath);
         if (cached == 1)
             return 1;
+        if (cached == -2)
+            return -1;
     }
 
     // New builds use a short filename. This avoids MAX_PATH failures for
@@ -472,6 +488,12 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     const std::string &build_epath = short_epath;
     if (c->async_build) {
         if (c->failed_builds.count(build_epath)) {
+#ifdef AJI_TRTRTX
+            // an error, so the dispatcher can fall back to TensorRT
+            c->set_error("TensorRT-RTX engine build failed for %s (see %s.build.log)",
+                         name.c_str(), build_epath.c_str());
+            return -1;
+#endif
             // permanent (until reconfigure changes the cache key):
             // play passthrough instead of failing the filter
             c->log_steps.push_back(
@@ -779,6 +801,10 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     }
 
     c->runtime.reset(nvinfer1::createInferRuntime(c->logger));
+#ifdef AJI_TRTRTX
+    if (ajicore::forced_failure("create"))
+        c->runtime.reset();
+#endif
     if (!c->runtime) {
         c->set_error("createInferRuntime failed");
         return nullptr;
@@ -2152,6 +2178,10 @@ extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
         c->verbose("background engine build failed: %s (see .build.log)",
                    c->build.epath.c_str());
     }
+#ifdef AJI_TRTRTX
+    else
+        c->built_engines.insert(c->build.epath);
+#endif
     return 1;  // reconfigure either way; failures latch to passthrough
 }
 

@@ -76,7 +76,9 @@ endif()
 # NvInferVersion.h so a new SDK needs no extra option.
 set(AJI_TRTRTX_ROOT "" CACHE PATH "TensorRT for RTX root (include/ + libs)")
 if(AJI_TRTRTX_ROOT)
-    file(STRINGS "${AJI_TRTRTX_ROOT}/include/NvInferVersion.h" _rtx_ver
+    # tolerate a backslashed Windows path from a .bat
+    file(TO_CMAKE_PATH "${AJI_TRTRTX_ROOT}" _rtx_root)
+    file(STRINGS "${_rtx_root}/include/NvInferVersion.h" _rtx_ver
          REGEX "#define TRT_(MAJOR|MINOR)_RTX ")
     string(REGEX MATCH "TRT_MAJOR_RTX ([0-9]+)" _m "${_rtx_ver}")
     set(_rtx_major "${CMAKE_MATCH_1}")
@@ -84,14 +86,14 @@ if(AJI_TRTRTX_ROOT)
     set(_rtx_minor "${CMAKE_MATCH_1}")
     if(_rtx_major STREQUAL "" OR _rtx_minor STREQUAL "")
         message(FATAL_ERROR "AJI_TRTRTX_ROOT: no TensorRT-RTX NvInferVersion.h "
-                            "in ${AJI_TRTRTX_ROOT}/include")
+                            "in ${_rtx_root}/include")
     endif()
     if(WIN32)
-        set(AJI_TRTRTX_LIB "${AJI_TRTRTX_ROOT}")
+        set(AJI_TRTRTX_LIB "${_rtx_root}")
         set(_rtx_libs tensorrt_rtx_${_rtx_major}_${_rtx_minor}
                       tensorrt_onnxparser_rtx_${_rtx_major}_${_rtx_minor})
     else()
-        set(AJI_TRTRTX_LIB "${AJI_TRTRTX_ROOT}/lib")
+        set(AJI_TRTRTX_LIB "${_rtx_root}/lib")
         set(_rtx_libs tensorrt_rtx tensorrt_onnxparser_rtx)
     endif()
     message(STATUS "aji_trtrtx: TensorRT-RTX ${_rtx_major}.${_rtx_minor} "
@@ -103,7 +105,7 @@ if(AJI_TRTRTX_ROOT)
     target_compile_definitions(aji_trtrtx PRIVATE AJI_TRTRTX)
     target_include_directories(aji_trtrtx
         PUBLIC include
-        PRIVATE "${AJI_TRTRTX_ROOT}/include")
+        PRIVATE "${_rtx_root}/include")
     target_link_directories(aji_trtrtx PRIVATE ${AJI_TRTRTX_LIB})
     target_link_libraries(aji_trtrtx PRIVATE ${_rtx_libs}
         CUDA::cuda_driver CUDA::cudart)

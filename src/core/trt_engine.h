@@ -192,8 +192,23 @@ bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child);
 // (--minShapes/--optShapes/--maxShapes, --builderOptimizationLevel,
 // --memPoolSize=workspace:); the other flags are trtexec-only and ignored.
 // Writes the engine to spec.tmp_path and the builder log to spec.log_path.
-// Returns 0 on success; *cancel nonzero aborts the build.
+// Returns 0 on success; *cancel nonzero aborts the build. A successful
+// build is then loaded once and warmed up (see warm_up), so the first-use
+// kernel compiles land in the JIT caches on this (background) thread and
+// not on the caller's first frame.
 int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel);
+
+// One throwaway inference on zeroed scratch buffers at the context's
+// current input shapes (dynamic ones not yet set take the profile's opt
+// shape). TensorRT-RTX compiles part of its kernels at the first enqueue,
+// into the driver's compute cache; doing that here keeps it off the first
+// real frame. Synchronous; the caller's context must be current.
+bool warm_up(nvinfer1::IExecutionContext *exec, std::string *err);
+
+// Test hook: true when AJI_TRTRTX_FAIL names `stage` ("create", "build" or
+// "context"), forcing that step to fail so the fallback to TensorRT can be
+// exercised.
+bool forced_failure(const char *stage);
 #endif
 
 // One background trtexec at a time. The worker touches only these

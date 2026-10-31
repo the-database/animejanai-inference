@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -563,6 +564,122 @@ bool int_flag(const std::string &settings, const char *flag, long long *v)
 
 } // namespace
 
+bool forced_failure(const char *stage)
+{
+    const char *v = getenv("AJI_TRTRTX_FAIL");
+    return v && !strcmp(v, stage);
+}
+
+namespace {
+
+size_t dtype_bytes(nvinfer1::DataType t)
+{
+    switch (t) {
+    case nvinfer1::DataType::kFLOAT:
+    case nvinfer1::DataType::kINT32: return 4;
+    case nvinfer1::DataType::kHALF:
+    case nvinfer1::DataType::kBF16: return 2;
+    case nvinfer1::DataType::kINT64: return 8;
+    default: return 1;
+    }
+}
+
+// Load a just-built plan with the runtime cache at `jit_cache`, warm it up
+// (at the profile's opt shapes, i.e. the build shape) and save the cache.
+bool warm_built_plan(nvinfer1::ILogger &log, const void *plan, size_t size,
+                     const std::string &jit_cache, std::string *err)
+{
+    std::unique_ptr<nvinfer1::IRuntime> rt(nvinfer1::createInferRuntime(log));
+    std::unique_ptr<nvinfer1::ICudaEngine> eng(
+        rt ? rt->deserializeCudaEngine(plan, size) : nullptr);
+    if (!eng) {
+        *err = "cannot load the built engine";
+        return false;
+    }
+    RuntimeCache rc;
+    rc.config.reset(eng->createRuntimeConfig());
+    if (rc.config) {
+        rc.cache.reset(rc.config->createRuntimeCache());
+        if (rc.cache) {
+            std::vector<char> blob;
+            if (read_file_bytes(jit_cache, &blob) && !blob.empty())
+                rc.cache->deserialize(blob.data(), blob.size());
+            rc.config->setRuntimeCache(*rc.cache);
+            rc.path = jit_cache;
+        }
+    }
+    std::unique_ptr<nvinfer1::IExecutionContext> exec(
+        rc.config ? eng->createExecutionContext(rc.config.get())
+                  : eng->createExecutionContext());
+    if (!exec) {
+        *err = "createExecutionContext failed for the built engine";
+        return false;
+    }
+    bool ok = warm_up(exec.get(), err);
+    exec.reset();
+    eng.reset();
+    rc.save();  // still on this thread's (current) context
+    return ok;
+}
+
+} // namespace
+
+bool warm_up(nvinfer1::IExecutionContext *exec, std::string *err)
+{
+    const nvinfer1::ICudaEngine &eng = exec->getEngine();
+    const int n = eng.getNbIOTensors();
+    // dynamic inputs not set yet: the profile's opt shape
+    for (int i = 0; i < n; i++) {
+        const char *name = eng.getIOTensorName(i);
+        if (eng.getTensorIOMode(name) != nvinfer1::TensorIOMode::kINPUT)
+            continue;
+        nvinfer1::Dims d = exec->getTensorShape(name);
+        bool unset = d.nbDims < 0;
+        for (int k = 0; k < d.nbDims; k++)
+            unset |= d.d[k] < 0;
+        if (unset &&
+            !exec->setInputShape(name, eng.getProfileShape(
+                                           name, 0, nvinfer1::OptProfileSelector::kOPT))) {
+            *err = std::string("warm-up: cannot set the shape of ") + name;
+            return false;
+        }
+    }
+    std::vector<void *> bufs;
+    cudaStream_t stream = nullptr;
+    bool ok = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+    for (int i = 0; ok && i < n; i++) {
+        const char *name = eng.getIOTensorName(i);
+        nvinfer1::Dims d = exec->getTensorShape(name);
+        size_t bytes = dtype_bytes(eng.getTensorDataType(name));
+        for (int k = 0; k < d.nbDims; k++)
+            bytes *= (size_t)(d.d[k] > 0 ? d.d[k] : 1);
+        void *p = nullptr;
+        ok = cudaMalloc(&p, bytes) == cudaSuccess;
+        if (ok) {
+            bufs.push_back(p);
+            ok = cudaMemsetAsync(p, 0, bytes, stream) == cudaSuccess &&
+                 exec->setTensorAddress(name, p);
+        }
+    }
+    if (!ok)
+        *err = "warm-up: scratch buffer setup failed";
+    if (ok && !exec->enqueueV3(stream)) {
+        *err = "warm-up inference (enqueueV3) failed";
+        ok = false;
+    }
+    if (stream && cudaStreamSynchronize(stream) != cudaSuccess && ok) {
+        *err = "warm-up inference failed on the GPU";
+        ok = false;
+    }
+    for (void *p : bufs)
+        cudaFree(p);
+    if (stream)
+        cudaStreamDestroy(stream);
+    // the scratch addresses are gone: callers bind their own before every
+    // enqueue
+    return ok;
+}
+
 int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel)
 {
     FileLogger log;
@@ -573,6 +690,8 @@ int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel)
         return 1;
     };
     log.log(nvinfer1::ILogger::Severity::kINFO, spec.cmdline.c_str());
+    if (forced_failure("build"))
+        return fail("forced build failure (AJI_TRTRTX_FAIL=build)");
 
     // The builder targets the current device (ComputeCapability::kCURRENT).
     // On the caller's thread the engine's context is already current; a
@@ -672,6 +791,21 @@ int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel)
                                              : "buildSerializedNetwork failed");
     if (!write_file_bytes(spec.tmp_path, plan->data(), plan->size()))
         return fail("cannot write " + spec.tmp_path);
+
+    // Warm the new engine here, on the build thread, so the kernels it
+    // compiles at first use land in the JIT caches before anyone plays it.
+    // A failure here fails the build: the engine would not run anyway.
+    builder.reset();
+    std::string werr;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!warm_built_plan(log, plan->data(), plan->size(),
+                         spec.engine_path + JIT_CACHE_EXT, &werr))
+        return fail("warm-up of the built engine failed: " + werr);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "warm-up inference done (%.2f s)",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                 .count());
+    log.log(nvinfer1::ILogger::Severity::kINFO, msg);
     return 0;
 }
 
@@ -739,9 +873,10 @@ bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
             me->rt.path = rc_path;
         }
     }
-    me->exec.reset(me->rt.config
-                       ? me->engine->createExecutionContext(me->rt.config.get())
-                       : me->engine->createExecutionContext());
+    if (!forced_failure("context"))
+        me->exec.reset(me->rt.config
+                           ? me->engine->createExecutionContext(me->rt.config.get())
+                           : me->engine->createExecutionContext());
 #else
     me->exec.reset(me->engine->createExecutionContext());
 #endif
@@ -772,6 +907,16 @@ bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
     me->in_h = in_h;
     me->out_w = (int)od.d[3];
     me->out_h = (int)od.d[2];
+#ifdef AJI_TRTRTX
+    // One throwaway inference at the configured shape, so the first real
+    // frame doesn't pay TensorRT-RTX's first-enqueue compiles (cheap when
+    // the build thread already warmed the caches).
+    std::string werr;
+    if (!warm_up(me->exec.get(), &werr)) {
+        *err = werr + " (" + engine_path + ")";
+        return false;
+    }
+#endif
     return true;
 }
 
