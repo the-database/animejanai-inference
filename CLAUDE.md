@@ -55,17 +55,25 @@ TensorRT-RTX compiles kernels at the first enqueue (seconds, into the driver's c
 so every engine gets a **warm-up**: one throwaway inference on zeroed scratch buffers, on the
 build thread right after a build (`run_build_inprocess`, so with `async_build` it is part of the
 background build, before `aji_poll` fires) and again in `load_engine` (cheap once the caches are
-warm). The first `aji_infer` is then as fast as TensorRT's; what's left (~0.2-0.4 s, or the full
-compile after a driver update empties the driver cache) is paid in `aji_configure`. TensorRT
-(`aji_trt`) has no JIT and gets no warm-up.
+warm). With `async_build`, a *cached* engine not yet warmed by this context also goes through the
+worker first (a warm-only `AsyncBuild` job, logged as `Preparing TensorRT-RTX engine ...`;
+passthrough until `aji_poll`), because after a driver update its JIT takes seconds: ~0.25-0.4 s
+of extra passthrough per play when the caches are warm. The first `aji_infer` is then as fast as
+TensorRT's; ~0.2-0.35 s (context creation + the warm enqueue) stays in `aji_configure`.
+Synchronous in-process builds run on a thread of their own, so the caller's CUDA context and
+runtime device are never touched. A `.jitcache` is rewritten only when its contents changed.
+A cached engine that deserializes but then fails (context, warm-up) is kept and reported, not
+deleted and rebuilt. TensorRT (`aji_trt`) has no JIT and gets none of this.
 
 **TensorRT-RTX falls back to TensorRT** (TensorRT-RTX is opt-in and experimental; TensorRT stays
 the default). The dispatcher keeps a copy of the create params for an `aji_trtrtx` context; if
 `aji_create` fails, or `aji_configure` returns `AJI_ERR_ENGINE` (build or context failure,
 blocking or after a background build — `aji_trtrtx` reports a failed background build as an
-error instead of passthrough), it logs one line, `TensorRT-RTX failed (...); using TensorRT
+error instead of passthrough, once), it logs one line, `TensorRT-RTX failed (...); using TensorRT
 instead`, re-creates the context on `aji_trt` (same params, current slot) and repeats the call.
-Sticky for the context's life; conf mode only. The image ABI has no fallback: its caller picks
+Sticky for the context's life; conf mode only. If `aji_trt` can't be loaded either, it logs that
+and repeats the call on `aji_trtrtx`, which then plays passthrough like `aji_trt` does after a
+failed background build (blocking mode keeps returning the error). The image ABI has no fallback: its caller picks
 the backend explicitly and can retry with `AJI_IMG_TENSORRT`. Test hook:
 `AJI_TRTRTX_FAIL=create|build|context` forces that step to fail in `aji_trtrtx`
 (`~/aji-win/trtx-work/fallback-test.cmd` drives all cases).
@@ -142,8 +150,9 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | Target | Kind | Links | Notes |
 |---|---|---|---|
 | `aji` | SHARED | `${CMAKE_DL_LIBS}` | the dispatcher; `CXX_VISIBILITY_PRESET hidden`, PIC on |
-| `aji_trt` | SHARED | `${AJI_NVINFER}`, `CUDA::cuda_driver`, `CUDA::cudart` | non-Windows adds `-Wl,-Bsymbolic` |
-| `aji_trtrtx` | SHARED | `tensorrt_rtx_<M>_<m>`, `tensorrt_onnxparser_rtx_<M>_<m>`, CUDA | `aji_trt`'s sources + `AJI_TRTRTX`; **only with `AJI_TRTRTX_ROOT`** |
+| `aji_trt_common` | OBJECT | — | conf, ONNX shape, fileio, tiling, `kernels.cu`: the TensorRT-independent sources, compiled once for both TensorRT backends |
+| `aji_trt` | SHARED | `${AJI_NVINFER}`, `CUDA::cuda_driver`, `CUDA::cudart` | + `aji_trt_common`; non-Windows adds `-Wl,-Bsymbolic` |
+| `aji_trtrtx` | SHARED | `tensorrt_rtx_<M>_<m>`, `tensorrt_onnxparser_rtx_<M>_<m>`, CUDA | `aji_trt`'s sources + `AJI_TRTRTX`, + `aji_trt_common`; **only with `AJI_TRTRTX_ROOT`** |
 | `aji_dml` | SHARED | `d3d12 d3d11 dxgi d3dcompiler` | **WIN32 only**; ORT/DirectML loaded at runtime, not import-linked |
 | `aji_harness` | EXE | `aji`, `CUDA::cudart` | depends on `aji_trt` (and `aji_trtrtx`); prints wall-clock create/configure/first-frame `timing:` lines; `--async-build` = the player's build mode (poll + reconfigure) |
 | `aji_harness_dml` | EXE | `aji`, `d3d11` | **WIN32 only** |

@@ -45,11 +45,21 @@ set_target_properties(aji PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden)
 
+# The TensorRT-independent part of the TensorRT backends (conf parsing, ONNX
+# shape probing, file I/O, image tiling, the CUDA kernels), compiled once
+# and linked into both aji_trt and aji_trtrtx. Nothing in it depends on
+# the TensorRT flavour (AJI_TRTRTX) or includes TensorRT headers.
+add_library(aji_trt_common OBJECT src/aji_conf.cpp src/onnx_shape.cpp
+    src/core/fileio.cpp src/core/tiling.cpp src/kernels.cu)
+target_include_directories(aji_trt_common PRIVATE include)
+set_target_properties(aji_trt_common PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    CUDA_VISIBILITY_PRESET hidden)
+
 # aji_trt: TensorRT/CUDA backend (the former aji.dll).
-add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/onnx_shape.cpp
-    src/core/fileio.cpp src/core/trt_engine.cpp
-    src/aji_img_trt.cpp src/core/tiling.cpp
-    src/kernels.cu)
+add_library(aji_trt SHARED src/aji_trt.cpp src/core/trt_engine.cpp
+    src/aji_img_trt.cpp $<TARGET_OBJECTS:aji_trt_common>)
 target_include_directories(aji_trt
     PUBLIC include
     PRIVATE ${AJI_TRT_INCLUDE})
@@ -78,6 +88,11 @@ set(AJI_TRTRTX_ROOT "" CACHE PATH "TensorRT for RTX root (include/ + libs)")
 if(AJI_TRTRTX_ROOT)
     # tolerate a backslashed Windows path from a .bat
     file(TO_CMAKE_PATH "${AJI_TRTRTX_ROOT}" _rtx_root)
+    if(NOT EXISTS "${_rtx_root}/include/NvInferVersion.h")
+        message(FATAL_ERROR "AJI_TRTRTX_ROOT=${AJI_TRTRTX_ROOT}: no TensorRT-RTX SDK "
+                            "there (missing include/NvInferVersion.h). See "
+                            "docs/BUILD-WINDOWS.md, 2b.")
+    endif()
     file(STRINGS "${_rtx_root}/include/NvInferVersion.h" _rtx_ver
          REGEX "#define TRT_(MAJOR|MINOR)_RTX ")
     string(REGEX MATCH "TRT_MAJOR_RTX ([0-9]+)" _m "${_rtx_ver}")
@@ -98,10 +113,8 @@ if(AJI_TRTRTX_ROOT)
     endif()
     message(STATUS "aji_trtrtx: TensorRT-RTX ${_rtx_major}.${_rtx_minor} "
                    "(${_rtx_libs})")
-    add_library(aji_trtrtx SHARED src/aji_trt.cpp src/aji_conf.cpp src/onnx_shape.cpp
-        src/core/fileio.cpp src/core/trt_engine.cpp
-        src/aji_img_trt.cpp src/core/tiling.cpp
-        src/kernels.cu)
+    add_library(aji_trtrtx SHARED src/aji_trt.cpp src/core/trt_engine.cpp
+        src/aji_img_trt.cpp $<TARGET_OBJECTS:aji_trt_common>)
     target_compile_definitions(aji_trtrtx PRIVATE AJI_TRTRTX)
     target_include_directories(aji_trtrtx
         PUBLIC include

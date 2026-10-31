@@ -179,7 +179,14 @@ TensorRT, **flat**: `include/` as is, the contents of `lib/` and `bin/` at the r
 `include\NvInferVersion.h` for `TRT_MAJOR_RTX 1` / `TRT_MINOR_RTX 7` / `TRT_PATCH_RTX 1`.
 Then add `-DAJI_TRTRTX_ROOT=%AJI_WIN%/trtrtx171` to the configure line; it prints
 `aji_trtrtx: TensorRT-RTX 1.7 (tensorrt_rtx_1_7;tensorrt_onnxparser_rtx_1_7)`, or
-`AJI_TRTRTX_ROOT not set; skipping aji_trtrtx target` without it.
+`AJI_TRTRTX_ROOT not set; skipping aji_trtrtx target` without it. A root that holds no SDK
+stops the configure with `AJI_TRTRTX_ROOT=...: no TensorRT-RTX SDK there (missing
+include/NvInferVersion.h)`.
+
+**The release build requires it**: `build-aji-release.bat` always passes `AJI_TRTRTX_ROOT`
+(default `%AJI_WIN%\trtrtx171`) because the package ships `aji_trtrtx.dll` and its runtime, so a
+missing SDK fails the release configure with that error instead of silently producing a package
+without the backend.
 
 What differs from TensorRT:
 

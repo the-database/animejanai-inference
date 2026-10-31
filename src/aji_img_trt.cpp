@@ -190,11 +190,13 @@ struct aji_img_model : TileModel {
 namespace {
 
 // Deserialize the model's engine and set up tile buffers. Context pushed.
-bool finalize(aji_img_model *m, std::string *err)
+// *keep (optional): see load_engine - set when the engine file itself is
+// fine, so a failure is not a stale cache entry.
+bool finalize(aji_img_model *m, std::string *err, bool *keep = nullptr)
 {
     aji_img_ctx *c = m->c;
     if (!load_engine(c->runtime.get(), m->engine_path, &m->me, m->tile_w,
-                     m->tile_h, m->in_ch, 0, err))
+                     m->tile_h, m->in_ch, 0, err, keep))
         return false;
     nvinfer1::Dims od = m->me.exec->getTensorShape(m->me.out_name);
     m->out_ch = (int)od.d[1];
@@ -444,11 +446,25 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
     if (file_exists(m->engine_path)) {
         std::string e;
         CtxGuard guard(c->cu_ctx);
+#ifdef AJI_TRTRTX
+        bool keep = false;
+        if (finalize(m.get(), &e, &keep)) {
+#else
         if (finalize(m.get(), &e)) {
+#endif
             m->state = AJI_IMG_STATE_READY;
             c->models.insert(m.get());
             return m.release();
         }
+#ifdef AJI_TRTRTX
+        if (keep) {
+            // the engine deserialized; the context or warm-up failed (e.g.
+            // out of memory): rebuilding would not help, report it
+            m->free_buffers();
+            c->set_error(e);
+            return nullptr;
+        }
+#endif
         c->info("cached engine unusable, rebuilding: " + e);
         m->free_buffers();
         remove_file(m->engine_path);
@@ -471,8 +487,12 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
             return nullptr;
         }
         become_ready(m.get());
-        if (m->state != AJI_IMG_STATE_READY)
+        if (m->state != AJI_IMG_STATE_READY) {
+            // release the engine (and save its JIT cache) under the context
+            CtxGuard guard(c->cu_ctx);
+            m->free_buffers();
             return nullptr;
+        }
     } else {
         m->state = AJI_IMG_STATE_BUILDING;
         c->build_queue.push_back(m.get());

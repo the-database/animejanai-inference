@@ -11,6 +11,7 @@
 #include <cstring>
 #include <chrono>
 #include <filesystem>
+#include <mutex>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -245,7 +246,15 @@ bool parse_shape_wh(const std::string &settings, const char *key, int *w, int *h
 int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
 #ifdef AJI_TRTRTX
-    return run_build_inprocess(spec, child);
+    // On a thread of its own, joined: the build selects its device
+    // (cudaSetDevice) and makes contexts current, which must not leak into
+    // the caller's thread (a host app's runtime calls would land on the
+    // wrong device). Background builds already run on AsyncBuild's worker;
+    // the extra thread costs nothing next to a build.
+    int rc = 1;
+    std::thread t([&]() { rc = run_build_inprocess(spec, child); });
+    t.join();
+    return rc;
 #elif defined(_WIN32)
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE log = CreateFileW(win_long_path(spec.log_path).c_str(), GENERIC_WRITE,
@@ -305,6 +314,10 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 // build, so the cache only ever holds complete engines.
 bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
+#ifdef AJI_TRTRTX
+    if (spec.warm_only)  // the engine exists; on failure it stays
+        return run_build_process(spec, child) == 0;
+#endif
     remove_file(spec.tmp_path);  // a previous build's leftover
     int rc = run_build_process(spec, child);
     if (rc != 0 || file_size(spec.tmp_path) <= 0 ||
@@ -483,18 +496,38 @@ void AsyncBuild::stop()
 #ifdef AJI_TRTRTX
 namespace {
 
-// Builder log -> the engine's .build.log, like trtexec's output.
+// Builder log -> the engine's .build.log, like trtexec's output. One
+// handle for the whole build, opened (truncating) at the first message at
+// or above `min_sev`, flushed per line so a crash keeps what was logged.
 class FileLogger : public nvinfer1::ILogger {
 public:
     std::string path;
+    Severity min_sev = Severity::kINFO;
+    ~FileLogger() override
+    {
+        if (f)
+            fclose(f);
+    }
     void log(Severity sev, const char *msg) noexcept override
     {
-        if (sev > Severity::kINFO)
+        if (sev > min_sev)
             return;
         static const char *tags[] = {"F", "E", "W", "I", "V"};
-        append_file_text(path, std::string("[") + tags[(int)sev] + "] " +
-                                   msg + "\n");
+        std::lock_guard<std::mutex> lock(mu);
+        if (!f && !opened) {
+            opened = true;
+            f = fopen_utf8(path, "w");
+        }
+        if (f) {
+            fprintf(f, "[%s] %s\n", tags[(int)sev], msg);
+            fflush(f);
+        }
     }
+
+private:
+    std::mutex mu;
+    std::FILE *f = nullptr;
+    bool opened = false;
 };
 
 class CancelMonitor : public nvinfer1::IProgressMonitor {
@@ -584,35 +617,50 @@ size_t dtype_bytes(nvinfer1::DataType t)
     }
 }
 
+// Fill rc->cache from `path` (if it holds a compatible cache) and point rc
+// at it; a mismatched file (other driver/GPU/version) is removed.
+void load_runtime_cache(RuntimeCache *rc, const std::string &path)
+{
+    std::vector<char> blob;
+    if (read_file_bytes(path, &blob) && !blob.empty()) {
+        if (rc->cache->deserialize(blob.data(), blob.size())) {
+            rc->loaded_size = blob.size();
+            rc->loaded_crc = crc32_z(std::string(blob.data(), blob.size()));
+        } else {
+            remove_file(path);
+        }
+    }
+    rc->path = path;
+}
+
 // Load a just-built plan with the runtime cache at `jit_cache`, warm it up
 // (at the profile's opt shapes, i.e. the build shape) and save the cache.
 bool warm_built_plan(nvinfer1::ILogger &log, const void *plan, size_t size,
                      const std::string &jit_cache, std::string *err)
 {
+    // declared so that they are destroyed context, engine, cache, runtime -
+    // the order RuntimeCache needs - on every return path
     std::unique_ptr<nvinfer1::IRuntime> rt(nvinfer1::createInferRuntime(log));
+    RuntimeCache rc;
     std::unique_ptr<nvinfer1::ICudaEngine> eng(
         rt ? rt->deserializeCudaEngine(plan, size) : nullptr);
     if (!eng) {
-        *err = "cannot load the built engine";
+        *err = "cannot load the engine";
         return false;
     }
-    RuntimeCache rc;
     rc.config.reset(eng->createRuntimeConfig());
     if (rc.config) {
         rc.cache.reset(rc.config->createRuntimeCache());
         if (rc.cache) {
-            std::vector<char> blob;
-            if (read_file_bytes(jit_cache, &blob) && !blob.empty())
-                rc.cache->deserialize(blob.data(), blob.size());
+            load_runtime_cache(&rc, jit_cache);
             rc.config->setRuntimeCache(*rc.cache);
-            rc.path = jit_cache;
         }
     }
     std::unique_ptr<nvinfer1::IExecutionContext> exec(
         rc.config ? eng->createExecutionContext(rc.config.get())
                   : eng->createExecutionContext());
     if (!exec) {
-        *err = "createExecutionContext failed for the built engine";
+        *err = "createExecutionContext failed";
         return false;
     }
     bool ok = warm_up(exec.get(), err);
@@ -620,6 +668,28 @@ bool warm_built_plan(nvinfer1::ILogger &log, const void *plan, size_t size,
     eng.reset();
     rc.save();  // still on this thread's (current) context
     return ok;
+}
+
+// Warm-only job (BuildSpec::warm_only): load the cached engine and warm it.
+int run_warm_inprocess(const BuildSpec &spec)
+{
+    FileLogger log;
+    log.path = spec.log_path;
+    log.min_sev = nvinfer1::ILogger::Severity::kWARNING;  // only if trouble
+    if (cudaSetDevice(spec.dev) != cudaSuccess) {
+        log.log(nvinfer1::ILogger::Severity::kERROR, "cudaSetDevice failed");
+        return 1;
+    }
+    std::vector<char> blob;
+    std::string err;
+    if (!read_file_bytes(spec.engine_path, &blob) ||
+        !warm_built_plan(log, blob.data(), blob.size(),
+                         spec.engine_path + JIT_CACHE_EXT, &err)) {
+        log.log(nvinfer1::ILogger::Severity::kERROR,
+                ("warm-up of " + spec.engine_path + " failed: " + err).c_str());
+        return 1;
+    }
+    return 0;
 }
 
 } // namespace
@@ -682,6 +752,8 @@ bool warm_up(nvinfer1::IExecutionContext *exec, std::string *err)
 
 int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel)
 {
+    if (spec.warm_only)
+        return run_warm_inprocess(spec);
     FileLogger log;
     log.path = spec.log_path;
     remove_file(spec.log_path);
@@ -694,17 +766,10 @@ int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel)
         return fail("forced build failure (AJI_TRTRTX_FAIL=build)");
 
     // The builder targets the current device (ComputeCapability::kCURRENT).
-    // On the caller's thread the engine's context is already current; a
-    // background worker starts with none, so select the device there - and
-    // put back whatever context was current when done.
-    struct RestoreCtx {
-        CUcontext ctx = nullptr;
-        RestoreCtx() { cuCtxGetCurrent(&ctx); }
-        ~RestoreCtx() { if (ctx) cuCtxSetCurrent(ctx); }
-    } restore;
-    int cur = -1;
-    if ((cudaGetDevice(&cur) != cudaSuccess || cur != spec.dev) &&
-        cudaSetDevice(spec.dev) != cudaSuccess)
+    // This always runs on a thread of its own (run_build_process, or
+    // AsyncBuild's worker), so selecting the device here touches no one
+    // else's state.
+    if (cudaSetDevice(spec.dev) != cudaSuccess)
         return fail("cudaSetDevice(" + std::to_string(spec.dev) + ") failed");
 
     std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(log));
@@ -812,8 +877,15 @@ int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel)
 void RuntimeCache::save()
 {
     if (cache && !path.empty()) {
+        // serializing is cheap (in memory); rewriting the file on every
+        // configure / slot switch is not worth it when nothing compiled
         std::unique_ptr<nvinfer1::IHostMemory> blob(cache->serialize());
-        if (blob && blob->size() &&
+        const bool changed =
+            blob && blob->size() &&
+            (blob->size() != loaded_size ||
+             crc32_z(std::string((const char *)blob->data(), blob->size())) !=
+                 loaded_crc);
+        if (changed &&
             write_file_bytes(path + ".tmp", blob->data(), blob->size()) &&
             !move_file(path + ".tmp", path))
             remove_file(path + ".tmp");
@@ -825,8 +897,10 @@ void RuntimeCache::save()
 
 bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
                  ModelEngine *me, int in_w, int in_h, int in_ch, int rank5_t,
-                 std::string *err)
+                 std::string *err, bool *keep)
 {
+    if (keep)
+        *keep = false;
     std::vector<char> blob;
     if (!read_file_bytes(engine_path, &blob)) {
         *err = "cannot open engine: " + engine_path;
@@ -842,6 +916,9 @@ bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
         *err = "engine deserialization failed: " + engine_path;
         return false;
     }
+    // from here on a failure is not the file's fault
+    if (keep)
+        *keep = true;
     for (int i = 0; i < me->engine->getNbIOTensors(); i++) {
         const char *name = me->engine->getIOTensorName(i);
         if (me->engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
@@ -864,13 +941,8 @@ bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
     if (me->rt.config) {
         me->rt.cache.reset(me->rt.config->createRuntimeCache());
         if (me->rt.cache) {
-            std::vector<char> rc;
-            const std::string rc_path = engine_path + JIT_CACHE_EXT;
-            if (read_file_bytes(rc_path, &rc) && !rc.empty() &&
-                !me->rt.cache->deserialize(rc.data(), rc.size()))
-                remove_file(rc_path);  // other driver/GPU/version: rebuilt
+            load_runtime_cache(&me->rt, engine_path + JIT_CACHE_EXT);
             me->rt.config->setRuntimeCache(*me->rt.cache);
-            me->rt.path = rc_path;
         }
     }
     if (!forced_failure("context"))
