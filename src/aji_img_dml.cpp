@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "aji_image.h"
+#include "onnx_shape.h"
 #include "core/fileio.h"
 #include "core/half.h"
 #include "core/ort_dml.h"
@@ -396,6 +397,30 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
         g_ort->SetSessionExecutionMode(so, ORT_SEQUENTIAL);
         g_ort->DisableMemPattern(so);
         g_ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL);
+        // Every run is one (1, 3, tile_h, tile_w) tile, so pin a dynamic
+        // model's symbolic dims to it: with free dims the DML EP dispatches
+        // the graph op by op instead of compiling it whole. A model with
+        // static H/W fixes the tile size itself (below), so leave it alone.
+        {
+            std::vector<char> blob;
+            AjiOnnxInput oin;
+            if (ajicore::read_file_bytes(p->onnx_path, &blob) &&
+                aji_onnx_input(blob.data(), blob.size(), &oin) &&
+                oin.dims.size() == 4 && oin.dims[2] <= 0 && oin.dims[3] <= 0) {
+                const int64_t tw = p->tile_w > 0 ? p->tile_w : DEFAULT_TILE;
+                const int64_t th = p->tile_h > 0 ? p->tile_h : DEFAULT_TILE;
+                bool pin_ok = true;
+                for (const auto &pin : aji_onnx_pin_dims(oin, {1, 3, th, tw}))
+                    if (!c->ck(g_ort->AddFreeDimensionOverrideByName(
+                                   so, pin.first.c_str(), pin.second),
+                               "AddFreeDimensionOverrideByName", &e)) {
+                        pin_ok = false;
+                        break;
+                    }
+                if (!pin_ok)
+                    break;
+            }
+        }
         if (!c->ck(g_dml_api->SessionOptionsAppendExecutionProvider_DML1(
                        so, c->dml_dev.Get(), c->queue.Get()),
                    "DML EP append", &e))
