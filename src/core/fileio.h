@@ -28,6 +28,8 @@ long long file_size(const std::string &path);
 bool move_file(const std::string &from, const std::string &to);
 bool read_file_bytes(const std::string &path, std::vector<char> *out);
 void append_file_text(const std::string &path, const std::string &text);
+// Create/truncate `path` with `size` bytes of `data`.
+bool write_file_bytes(const std::string &path, const void *data, size_t size);
 
 // Directory of the library this code is compiled into (aji.dll,
 // aji_trt.dll, ...): backends resolve their runtime dependencies there.

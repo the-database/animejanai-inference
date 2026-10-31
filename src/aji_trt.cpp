@@ -1,5 +1,7 @@
 /*
  * aji_trt — TensorRT backend for the aji C ABI (see include/aji.h).
+ * Also built as aji_trtrtx (AJI_TRTRTX, TensorRT for RTX): the engine
+ * plumbing differences live in core/trt_engine.
  *
  * Conf mode executes animejanai.conf chains: per-model Catmull-Rom resize
  * steps + 2x model steps, all on fp16 NCHW RGB ping-pong buffers, with
@@ -268,7 +270,8 @@ void clean_stale_engines(aji_ctx *c)
     ajicore::clean_stale_engines(c->model_dir, c->cuda_dev, &removed);
     for (const std::string &name : removed) {
         c->log_steps.push_back(
-            "Removed stale TensorRT engine (different GPU or TensorRT version): " + name);
+            "Removed stale " AJI_TRT_PRODUCT " engine (different GPU or "
+            AJI_TRT_PRODUCT " version): " + name);
         c->verbose("removed stale engine %s", name.c_str());
     }
 }
@@ -297,11 +300,15 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
     if (!make_build_spec(c, onnx_name, settings, engine_path, dir, &spec))
         return false;
     c->verbose("building engine: %s", spec.cmdline.c_str());
-    c->log_steps.push_back("Building TensorRT engine for " + onnx_name +
+    c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " + onnx_name +
                            " for " + spec.res +
                            " (first play at this resolution)");
     if (!run_build_spec(spec, &c->build.child)) {
+#ifdef AJI_TRTRTX
+        c->set_error("TensorRT-RTX engine build failed for %s (see %s)",
+#else
         c->set_error("trtexec failed building engine for %s (see %s)",
+#endif
                      onnx_name.c_str(), spec.log_path.c_str());
         return false;
     }
@@ -408,7 +415,7 @@ bool ensure_buffers(aji_ctx *c, size_t bytes)
 // returns passthrough, and aji_poll() tells the caller when to reconfigure.
 void start_async_build(aji_ctx *c, const BuildSpec &spec)
 {
-    c->log_steps.push_back("Building TensorRT engine for " + spec.name +
+    c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " + spec.name +
                            " for " + spec.res +
                            " (first play at this resolution)");
     c->verbose("background engine build: %s", spec.cmdline.c_str());
@@ -476,7 +483,7 @@ int ensure_engine(aji_ctx *c, const std::string &name,
         if (c->build.running.load()) {
             // one build at a time; multi-engine chains cascade through
             // repeated poll() -> reconfigure cycles
-            c->log_steps.push_back("Building TensorRT engine for " +
+            c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " +
                                    name + " for " +
                                    shapes_label(settings) +
                                    " (first play at this resolution)");
@@ -2413,6 +2420,9 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->engines.clear();
         c->direct.exec.reset();
         c->direct.engine.reset();
+#ifdef AJI_TRTRTX
+        c->direct.rt.save();  // needs the context
+#endif
         c->runtime.reset();
     }
     if (c->owns_primary)

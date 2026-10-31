@@ -68,12 +68,67 @@ if(NOT WIN32)
     target_link_options(aji_trt PRIVATE -Wl,-Bsymbolic)
 endif()
 
+# aji_trtrtx: the same backend sources built against TensorRT for RTX
+# (AJI_TRTRTX): engines build in-process through the builder API (no
+# trtexec) and cache under their own names. Optional: skipped unless
+# -DAJI_TRTRTX_ROOT=<SDK root> is given. The import library names carry
+# the SDK's major/minor on Windows (tensorrt_rtx_1_7.lib), read from its
+# NvInferVersion.h so a new SDK needs no extra option.
+set(AJI_TRTRTX_ROOT "" CACHE PATH "TensorRT for RTX root (include/ + libs)")
+if(AJI_TRTRTX_ROOT)
+    file(STRINGS "${AJI_TRTRTX_ROOT}/include/NvInferVersion.h" _rtx_ver
+         REGEX "#define TRT_(MAJOR|MINOR)_RTX ")
+    string(REGEX MATCH "TRT_MAJOR_RTX ([0-9]+)" _m "${_rtx_ver}")
+    set(_rtx_major "${CMAKE_MATCH_1}")
+    string(REGEX MATCH "TRT_MINOR_RTX ([0-9]+)" _m "${_rtx_ver}")
+    set(_rtx_minor "${CMAKE_MATCH_1}")
+    if(_rtx_major STREQUAL "" OR _rtx_minor STREQUAL "")
+        message(FATAL_ERROR "AJI_TRTRTX_ROOT: no TensorRT-RTX NvInferVersion.h "
+                            "in ${AJI_TRTRTX_ROOT}/include")
+    endif()
+    if(WIN32)
+        set(AJI_TRTRTX_LIB "${AJI_TRTRTX_ROOT}")
+        set(_rtx_libs tensorrt_rtx_${_rtx_major}_${_rtx_minor}
+                      tensorrt_onnxparser_rtx_${_rtx_major}_${_rtx_minor})
+    else()
+        set(AJI_TRTRTX_LIB "${AJI_TRTRTX_ROOT}/lib")
+        set(_rtx_libs tensorrt_rtx tensorrt_onnxparser_rtx)
+    endif()
+    message(STATUS "aji_trtrtx: TensorRT-RTX ${_rtx_major}.${_rtx_minor} "
+                   "(${_rtx_libs})")
+    add_library(aji_trtrtx SHARED src/aji_trt.cpp src/aji_conf.cpp src/onnx_shape.cpp
+        src/core/fileio.cpp src/core/trt_engine.cpp
+        src/aji_img_trt.cpp src/core/tiling.cpp
+        src/kernels.cu)
+    target_compile_definitions(aji_trtrtx PRIVATE AJI_TRTRTX)
+    target_include_directories(aji_trtrtx
+        PUBLIC include
+        PRIVATE "${AJI_TRTRTX_ROOT}/include")
+    target_link_directories(aji_trtrtx PRIVATE ${AJI_TRTRTX_LIB})
+    target_link_libraries(aji_trtrtx PRIVATE ${_rtx_libs}
+        CUDA::cuda_driver CUDA::cudart)
+    set_target_properties(aji_trtrtx PROPERTIES
+        BUILD_RPATH "${AJI_TRTRTX_LIB}"
+        INSTALL_RPATH "${AJI_TRTRTX_LIB}"
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        CUDA_VISIBILITY_PRESET hidden)
+    if(NOT WIN32)
+        target_link_options(aji_trtrtx PRIVATE -Wl,-Bsymbolic)
+    endif()
+else()
+    message(STATUS "AJI_TRTRTX_ROOT not set; skipping aji_trtrtx target")
+endif()
+
 # aji_image: image-ABI CLI harness (PNM in/out); any backend via aji.dll.
 add_executable(aji_image src/aji_image_cli.cpp $<$<BOOL:${WIN32}>:src/utf8-argv.manifest>)
 target_link_libraries(aji_image PRIVATE aji)
 add_dependencies(aji_image aji_trt)
 if(WIN32)
     add_dependencies(aji_image aji_dml)
+endif()
+if(TARGET aji_trtrtx)
+    add_dependencies(aji_image aji_trtrtx)
 endif()
 
 # The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so argv/fopen
@@ -82,6 +137,9 @@ endif()
 add_executable(aji_harness src/harness.c $<$<BOOL:${WIN32}>:src/utf8-argv.manifest>)
 target_link_libraries(aji_harness PRIVATE aji CUDA::cudart)
 add_dependencies(aji_harness aji_trt)
+if(TARGET aji_trtrtx)
+    add_dependencies(aji_harness aji_trtrtx)
+endif()
 set_target_properties(aji_harness PROPERTIES
     BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
 

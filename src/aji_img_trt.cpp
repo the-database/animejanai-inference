@@ -7,6 +7,9 @@
  * aji_img_load unless AJI_IMG_LOAD_ASYNC_BUILD. Tiles travel through pinned
  * host staging in the engine's own I/O dtype (fp32/fp16/bf16) on a
  * per-model stream; core/tiling does the cover/pad/blend on the host.
+ *
+ * Also built into aji_trtrtx (AJI_TRTRTX) as the AJI_IMG_TENSORRT_RTX
+ * backend: engines then build in-process (core/trt_engine).
  */
 
 #include <algorithm>
@@ -33,6 +36,12 @@
 
 namespace fs = std::filesystem;
 using namespace ajicore;
+
+#ifdef AJI_TRTRTX
+#define AJI_IMG_THIS_BACKEND AJI_IMG_TENSORRT_RTX
+#else
+#define AJI_IMG_THIS_BACKEND AJI_IMG_TENSORRT
+#endif
 
 namespace {
 
@@ -143,7 +152,7 @@ struct aji_img_model : TileModel {
         cudaError_t e = cudaMemcpyAsync(d_in, h_in, in_bytes,
                                         cudaMemcpyHostToDevice, stream);
         if (e == cudaSuccess && !me.exec->enqueueV3(stream)) {
-            *err = "TensorRT enqueue failed for " + name;
+            *err = AJI_TRT_PRODUCT " enqueue failed for " + name;
             return AJI_IMG_ERR;
         }
         if (e == cudaSuccess)
@@ -172,6 +181,9 @@ struct aji_img_model : TileModel {
         stream = nullptr;
         me.exec.reset();
         me.engine.reset();
+#ifdef AJI_TRTRTX
+        me.rt.save();  // needs the context, which the callers hold
+#endif
     }
 };
 
@@ -253,7 +265,7 @@ void pump(aji_img_ctx *c)
         if (c->build.ok.load())
             become_ready(m);
         else
-            fail(m, "TensorRT engine build failed for " + m->name + " (see " +
+            fail(m, AJI_TRT_PRODUCT " engine build failed for " + m->name + " (see " +
                         m->engine_path + ".build.log)");
     }
     while (!c->building && !c->build_queue.empty()) {
@@ -267,7 +279,7 @@ void pump(aji_img_ctx *c)
             fail(m, e);
             continue;
         }
-        c->info("building TensorRT engine for " + m->name + " (" + spec.res +
+        c->info("building " AJI_TRT_PRODUCT " engine for " + m->name + " (" + spec.res +
                 " tiles): " + spec.cmdline);
         c->building = m;
         c->build.start(spec);
@@ -291,7 +303,7 @@ void copy_err(const std::string &e, char *err, size_t n)
 extern "C" AJI_IMG_EXPORT int aji_img_enum_devices(int backend,
                                                    aji_img_device *out, int max)
 {
-    if (backend != AJI_IMG_TENSORRT)
+    if (backend != AJI_IMG_THIS_BACKEND)
         return -1;
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess)
@@ -315,7 +327,7 @@ extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_param
                                                       char *err, size_t err_size)
 {
     if (!p || p->api_version != AJI_IMAGE_API_VERSION ||
-        p->backend != AJI_IMG_TENSORRT) {
+        p->backend != AJI_IMG_THIS_BACKEND) {
         copy_err("aji_img_create: bad params or API version mismatch", err, err_size);
         return nullptr;
     }
@@ -353,7 +365,7 @@ extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_param
     }
     if (!c->runtime) {
         cuDevicePrimaryCtxRelease(c->cu_dev);
-        copy_err("createInferRuntime failed (TensorRT runtime missing?)", err, err_size);
+        copy_err("createInferRuntime failed (" AJI_TRT_PRODUCT " runtime missing?)", err, err_size);
         return nullptr;
     }
     c->cache_dir = p->cache_dir ? p->cache_dir : "";
@@ -451,10 +463,10 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
             c->set_error(e);
             return nullptr;
         }
-        c->info("building TensorRT engine for " + m->name + ": " + spec.cmdline);
+        c->info("building " AJI_TRT_PRODUCT " engine for " + m->name + ": " + spec.cmdline);
         std::atomic<intptr_t> child{0};
         if (!run_build_spec(spec, &child)) {
-            c->set_error("TensorRT engine build failed for " + m->name + " (see " +
+            c->set_error(AJI_TRT_PRODUCT " engine build failed for " + m->name + " (see " +
                          spec.log_path + ")");
             return nullptr;
         }
