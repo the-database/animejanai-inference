@@ -127,6 +127,34 @@ void append_file_text(const std::string &path, const std::string &text)
     CloseHandle(h);
 }
 
+bool write_file_bytes(const std::string &path, const void *data, size_t size)
+{
+    HANDLE h = CreateFileW(win_long_path(path).c_str(), GENERIC_WRITE, 0,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    const char *src = (const char *)data;
+    size_t left = size;
+    bool ok = true;
+    while (ok && left > 0) {
+        DWORD chunk = (DWORD)std::min<size_t>(left, 1u << 30);
+        DWORD put = 0;
+        ok = WriteFile(h, src, chunk, &put, nullptr) && put == chunk;
+        src += put;
+        left -= put;
+    }
+    ok = CloseHandle(h) && ok;
+    if (!ok)
+        remove_file(path);
+    return ok;
+}
+
+std::FILE *fopen_utf8(const std::string &path, const char *mode)
+{
+    return _wfopen(win_long_path(path).c_str(), widen_utf8(mode).c_str());
+}
+
 std::string own_dir()
 {
     HMODULE self = NULL;
@@ -183,6 +211,23 @@ void append_file_text(const std::string &path, const std::string &text)
         fwrite(text.data(), 1, text.size(), f);
         fclose(f);
     }
+}
+
+bool write_file_bytes(const std::string &path, const void *data, size_t size)
+{
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f)
+        return false;
+    bool ok = fwrite(data, 1, size, f) == size;
+    ok = fclose(f) == 0 && ok;
+    if (!ok)
+        remove_file(path);
+    return ok;
+}
+
+std::FILE *fopen_utf8(const std::string &path, const char *mode)
+{
+    return fopen(path.c_str(), mode);
 }
 
 std::string own_dir()

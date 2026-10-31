@@ -8,8 +8,8 @@
  * detection, pre/post resizes) belongs to the caller.
  *
  * Exported by aji.dll / libaji.so, which forwards to the backend chosen
- * at aji_img_create (aji_trt / aji_dml, loaded from its own directory),
- * and by the backend libraries themselves.
+ * at aji_img_create (aji_trt / aji_trtrtx / aji_dml, loaded from its own
+ * directory), and by the backend libraries themselves.
  *
  * Models are ONNX files with one NCHW input and one NCHW output
  * (C = 1 or 3), an integer scale, and a dynamic or fixed spatial shape.
@@ -45,6 +45,11 @@ typedef struct aji_img_model aji_img_model;
 enum aji_img_backend {
     AJI_IMG_TENSORRT = 1,
     AJI_IMG_DIRECTML = 2,   /* Windows only */
+    AJI_IMG_TENSORRT_RTX = 3, /* TensorRT for RTX (aji_trtrtx): engines
+                                 build in-process in seconds; trtexec and
+                                 trtexec_env are ignored. aji.dll builds
+                                 from before this value reject it as an
+                                 unknown backend. */
 };
 
 enum aji_img_status {

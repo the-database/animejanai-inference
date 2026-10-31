@@ -33,10 +33,50 @@ DirectML backend.
 ```
 vf_animejanai (mpv)  ──dlopen──►  aji.dll / libaji.so        (aji_dispatch.cpp — thin dispatcher)
                                         │ forwards over aji.h
-                          ┌─────────────┴─────────────┐
-                    aji_trt.dll                  aji_dml.dll        (Windows only)
-                  TensorRT + CUDA               DirectML + D3D12
+                  ┌─────────────────────┼─────────────────────┐
+            aji_trt.dll          aji_trtrtx.dll          aji_dml.dll        (Windows only)
+          TensorRT + CUDA     TensorRT for RTX + CUDA   DirectML + D3D12
 ```
+
+`[global] backend=` picks the library: `DirectML` (or the retired `NCNN`) -> `aji_dml`,
+`TensorRT-RTX` (also `TensorRT_RTX`, `TRT-RTX`, `TRTRTX`; case-insensitive) -> `aji_trtrtx`,
+anything else -> `aji_trt`. The image ABI selects it with `AJI_IMG_TENSORRT_RTX`.
+
+**`aji_trtrtx` is `aji_trt`'s sources compiled with `AJI_TRTRTX`** against the TensorRT for
+RTX SDK; every difference lives in `core/trt_engine` (plus a few `#ifdef`s for log wording and
+runtime-cache saves). Engines build **in-process** through the builder API (about a second, no
+`trtexec`; the trtexec-style settings string is parsed for its shape/optimization-level/
+workspace flags), are cached as `....trtrtx-<ver>.gpu-<name-smN>.rtxengine` — deliberately not
+`*.engine`, which `aji_trt`'s stale cleanup (including released builds) would delete — and run
+with a TensorRT-RTX runtime cache saved beside each engine as `<engine>.jitcache`. Each backend's
+stale cleanup only touches its own extension, so both share a model directory.
+
+TensorRT-RTX compiles kernels at the first enqueue (seconds, into the driver's compute cache),
+so every engine gets a **warm-up**: one throwaway inference on zeroed scratch buffers, on the
+build thread right after a build (`run_build_inprocess`, so with `async_build` it is part of the
+background build, before `aji_poll` fires) and again in `load_engine` (cheap once the caches are
+warm). With `async_build`, a *cached* engine not yet warmed by this context also goes through the
+worker first (a warm-only `AsyncBuild` job, logged as `Preparing TensorRT-RTX engine ...`;
+passthrough until `aji_poll`), because after a driver update its JIT takes seconds: ~0.25-0.4 s
+of extra passthrough per play when the caches are warm. The first `aji_infer` is then as fast as
+TensorRT's; ~0.2-0.35 s (context creation + the warm enqueue) stays in `aji_configure`.
+Synchronous in-process builds run on a thread of their own, so the caller's CUDA context and
+runtime device are never touched. A `.jitcache` is rewritten only when its contents changed.
+A cached engine that deserializes but then fails (context, warm-up) is kept and reported, not
+deleted and rebuilt. TensorRT (`aji_trt`) has no JIT and gets none of this.
+
+**TensorRT-RTX falls back to TensorRT** (TensorRT-RTX is opt-in and experimental; TensorRT stays
+the default). The dispatcher keeps a copy of the create params for an `aji_trtrtx` context; if
+`aji_create` fails, or `aji_configure` returns `AJI_ERR_ENGINE` (build or context failure,
+blocking or after a background build — `aji_trtrtx` reports a failed background build as an
+error instead of passthrough, once), it logs one line, `TensorRT-RTX failed (...); using TensorRT
+instead`, re-creates the context on `aji_trt` (same params, current slot) and repeats the call.
+Sticky for the context's life; conf mode only. If `aji_trt` can't be loaded either, it logs that
+and repeats the call on `aji_trtrtx`, which then plays passthrough like `aji_trt` does after a
+failed background build (blocking mode keeps returning the error). The image ABI has no fallback: its caller picks
+the backend explicitly and can retry with `AJI_IMG_TENSORRT`. Test hook:
+`AJI_TRTRTX_FAIL=create|build|context` forces that step to fail in `aji_trtrtx`
+(`~/aji-win/trtx-work/fallback-test.cmd` drives all cases).
 
 `aji` is deliberately dependency-free — no CUDA, no TensorRT, no ORT — so the player can load it
 on any machine and the backend resolves later. The backends load `onnxruntime.dll` /
@@ -65,7 +105,7 @@ visibility (an internal static "library", no ABI of its own):
 | File | What |
 |---|---|
 | `core/fileio` | UTF-8/long-path file helpers, `own_dir()` |
-| `core/trt_engine` | engine cache naming, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading |
+| `core/trt_engine` | engine cache naming, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading; under `AJI_TRTRTX` the in-process builder and the runtime (JIT) cache |
 | `core/ort_dml` | ORT + DirectML loading (DirectML.dll before onnxruntime.dll) |
 | `core/tiling` | the image path's tile cover / reflect pad / overlap blend (backend-agnostic) |
 | `core/half` | fp16/bf16 conversions |
@@ -87,6 +127,7 @@ There is no Cargo, meson, vcpkg, or conan manifest anywhere. The single `find_pa
 |---|---|---|---|
 | `AJI_TRT_ROOT` | PATH | `""` | `$ENV{HOME}/sdk/tensorrt/usr` |
 | `AJI_NVINFER` | STRING | `nvinfer_10` | `nvinfer` (plain `set`, not cached) |
+| `AJI_TRTRTX_ROOT` | PATH | `""` (target skipped) | `""` (target skipped) |
 | `AJI_FFMPEG_ROOT` | PATH | `""` | *(unused; pkg-config instead)* |
 | `AJI_ORT_ROOT` | PATH | `""` | *(Windows only)* |
 | `AJI_DML_ROOT` | PATH | `""` | *(Windows only)* |
@@ -94,6 +135,11 @@ There is no Cargo, meson, vcpkg, or conan manifest anywhere. The single `find_pa
 The include/lib layout under `AJI_TRT_ROOT` differs by platform: Windows expects headers in
 `<root>/include` and libs at `<root>` itself; Linux expects `<root>/include/x86_64-linux-gnu`
 and `<root>/lib/x86_64-linux-gnu`.
+
+`AJI_TRTRTX_ROOT` takes the same flat layout on Windows (`<root>/include`, libs at `<root>`;
+Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Windows
+(`tensorrt_rtx_1_7.lib`, `tensorrt_onnxparser_rtx_1_7.lib`); CMake reads them from the SDK's
+`NvInferVersion.h`, so there is no `AJI_NVINFER`-style name option to forget.
 
 > **`AJI_NVINFER` defaults to `nvinfer_10` but the project now builds against TensorRT 11.**
 > Every current build passes `-DAJI_NVINFER=nvinfer_11` explicitly. Omitting it on Windows
@@ -104,9 +150,11 @@ and `<root>/lib/x86_64-linux-gnu`.
 | Target | Kind | Links | Notes |
 |---|---|---|---|
 | `aji` | SHARED | `${CMAKE_DL_LIBS}` | the dispatcher; `CXX_VISIBILITY_PRESET hidden`, PIC on |
-| `aji_trt` | SHARED | `${AJI_NVINFER}`, `CUDA::cuda_driver`, `CUDA::cudart` | non-Windows adds `-Wl,-Bsymbolic` |
+| `aji_trt_common` | OBJECT | — | conf, ONNX shape, fileio, tiling, `kernels.cu`: the TensorRT-independent sources, compiled once for both TensorRT backends |
+| `aji_trt` | SHARED | `${AJI_NVINFER}`, `CUDA::cuda_driver`, `CUDA::cudart` | + `aji_trt_common`; non-Windows adds `-Wl,-Bsymbolic` |
+| `aji_trtrtx` | SHARED | `tensorrt_rtx_<M>_<m>`, `tensorrt_onnxparser_rtx_<M>_<m>`, CUDA | `aji_trt`'s sources + `AJI_TRTRTX`, + `aji_trt_common`; **only with `AJI_TRTRTX_ROOT`** |
 | `aji_dml` | SHARED | `d3d12 d3d11 dxgi d3dcompiler` | **WIN32 only**; ORT/DirectML loaded at runtime, not import-linked |
-| `aji_harness` | EXE | `aji`, `CUDA::cudart` | depends on `aji_trt` |
+| `aji_harness` | EXE | `aji`, `CUDA::cudart` | depends on `aji_trt` (and `aji_trtrtx`); prints wall-clock create/configure/first-frame `timing:` lines; `--async-build` = the player's build mode (poll + reconfigure) |
 | `aji_harness_dml` | EXE | `aji`, `d3d11` | **WIN32 only** |
 | `aji_encode` | EXE | `aji`, CUDA, ffmpeg libs | **conditional** — see below |
 | `aji_kernel_test` | EXE | `CUDA::cudart` | kernel unit tests |
@@ -146,11 +194,14 @@ compile — the release list builds eight architectures.
 | Platform | Built by | Asset |
 |---|---|---|
 | Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
-| Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip` |
+| Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip`, `aji-trtrtx-windows-x64.zip` (opt-in: `aji_trtrtx.dll` + TensorRT-RTX runtime, ~91 MB) |
 
-Both are attached to the **same release tag**, because the consumer derives both URLs from one
+All are attached to the **same release tag**, because the consumer derives every URL from one
 `AjiVersion` constant. `the-database/mpv-AnimeJaNai`'s assembler downloads them in `InstallAji`
-and extracts them flat into `animejanai/inference/`.
+and extracts them flat into `animejanai/inference/`. It does not take the TensorRT-RTX asset
+for now (mpv's background builds start each play with a short warm-up passthrough on
+TensorRT-RTX); VideoJaNai, MangaJaNaiConverterGui and yosh are the intended takers. Without
+`aji_trtrtx.dll`, `backend=TensorRT-RTX` falls back to TensorRT.
 
 RIFE model weights ship from this repo too, under a separate tag
 (`RifeModelsVersion`, currently `models-rife-fp16-1`), converted with
