@@ -8,7 +8,7 @@ in [`ci/windows/`](../ci/windows/):
 | Script | Does |
 |---|---|
 | `ci\windows\build-aji-release.bat` | the release build of this checkout (all architectures, clean) |
-| `ci\windows\package-aji-release.ps1` | zips the seven release artifacts into `aji-windows-x64.zip` |
+| `ci\windows\package-aji-release.ps1` | zips the eight release artifacts and the TensorRT-RTX runtime into `aji-windows-x64.zip` |
 
 The SDKs they build against live **outside** the repo, in a working area. Linux build:
 [`BUILD-LINUX.md`](BUILD-LINUX.md). Engine overview: [`../CLAUDE.md`](../CLAUDE.md).
@@ -257,13 +257,15 @@ Without `AJI_FFMPEG_ROOT`, `aji_encode` is silently skipped.
 %REPO%\ci\windows\build-aji-release.bat
 ```
 
-It configures and builds this checkout into `%REPO%\build-win-release` with:
+It configures and builds this checkout into `%REPO%\build-win-release` with (`AJI_TRTRTX_ROOT`
+defaults to `%AJI_WIN%\trtrtx171`):
 
 ```
 cmake -S %REPO% -B %REPO%\build-win-release -G Ninja -DCMAKE_BUILD_TYPE=Release ^
       "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ^
       "-DCMAKE_CUDA_COMPILER=%AJI_WIN%/cuda134/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%AJI_WIN%/cuda134" ^
       -DAJI_TRT_ROOT=%AJI_WIN%/trt114 -DAJI_NVINFER=nvinfer_11 ^
+      "-DAJI_TRTRTX_ROOT:PATH=%AJI_TRTRTX_ROOT%" ^
       -DAJI_ORT_ROOT=%AJI_WIN%/ort/Microsoft.ML.OnnxRuntime.DirectML ^
       -DAJI_DML_ROOT=%AJI_WIN%/ort/Microsoft.AI.DirectML ^
       -DAJI_FFMPEG_ROOT=%AJI_WIN%/ffmpeg-shared/ffmpeg-9.0.2-full_build-shared ^
@@ -285,15 +287,16 @@ Three things in there are deliberate and easy to lose:
 operable program or batch file.
 -- The CUDA compiler identification is NVIDIA 13.4.59 with host compiler MSVC 19.51.36260.0
 -- Found CUDAToolkit: %AJI_WIN%/cuda134/include;%AJI_WIN%/cuda134/include/cccl (found version "13.4.59")
+-- aji_trtrtx: TensorRT-RTX 1.7 (tensorrt_rtx_1_7;tensorrt_onnxparser_rtx_1_7)
 -- Configuring done
 ...
-[24/24] Linking C executable aji_encode.exe
+[48/48] Linking CUDA executable aji_msb444_test.exe
 AJI-RELEASE-BUILD-OK
 ```
 
-**24 build edges, and all seven release artifacts plus `aji_msb444_test.exe`.** If the edge
+**48 build edges, and all eight release artifacts plus `aji_msb444_test.exe`.** If the edge
 count is lower, a target was skipped — check the configure output for the
-`skipping aji_encode target` message. `AJI-RELEASE-BUILD-OK` on the last line is the success
+`skipping aji_encode target` and `skipping aji_trtrtx target` messages. `AJI-RELEASE-BUILD-OK` on the last line is the success
 marker; a MSVC warning C4819 about code page 932 is expected noise on a Japanese ANSI code page.
 
 Quick GPU self-check after a build (TensorRT and CUDA on `PATH`):
@@ -304,11 +307,6 @@ set PATH=%AJI_WIN%\cuda134\bin;%AJI_WIN%\trt114;%PATH%
 ```
 
 prints `MSB 4:4:4 GPU normalization and quantization passed`.
-
-With `AJI_TRTRTX_ROOT` set (see 2b.) the build also produces `aji_trtrtx.dll`. The release
-script and the package do not include it yet: `build-aji-release.bat` would need the
-`-DAJI_TRTRTX_ROOT` flag, `package-aji-release.ps1` the extra artifact, and the assembler the two
-TensorRT-RTX runtime DLLs in `animejanai/inference/`.
 
 ### Dev build (much faster)
 
@@ -331,10 +329,12 @@ built.
 pwsh %REPO%\ci\windows\package-aji-release.ps1 -Tag v0.11.2
 ```
 
-It stages exactly seven files — `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_encode.exe`,
-`aji_harness.exe`, `aji_harness_dml.exe`, `aji_kernel_test.exe` — **throwing
-`missing build artifact: <path>` if any is absent**, zips them flat, and prints the entry list
-and size. Output:
+It stages the eight build artifacts — `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_trtrtx.dll`,
+`aji_encode.exe`, `aji_harness.exe`, `aji_harness_dml.exe`, `aji_kernel_test.exe` — **throwing
+`missing build artifact: <path>` if any is absent**, plus the TensorRT-RTX runtime from
+`-TrtRtxRoot` (default `%AJI_TRTRTX_ROOT%`, else `%AJI_WIN%\trtrtx171`): exactly one
+`tensorrt_rtx_*.dll` and one `tensorrt_onnxparser_rtx_*.dll`, or it throws. It zips them flat
+and prints the entry list and size. Output:
 
 ```
 %AJI_WIN%\dist\<tag>\aji-windows-x64.zip
@@ -343,7 +343,11 @@ and size. Output:
 The contents are flat because the assembler extracts them straight into
 `animejanai/inference/`.
 
-**The zip carries the engine only — no runtime dependencies.** It contains no TensorRT DLLs, no
+**The zip carries the engine and, as the one exception, the TensorRT-RTX runtime.** The two
+TensorRT-RTX DLLs (~232 MB, which take the zip from 0.8 MB to ~92 MB) ship here because nothing
+else pins them yet; **never `tensorrt_rtx.exe`**, which the SDK licence keeps for internal use.
+Moving them to the assembler (an `InstallTrtRtx()` from NVIDIA's zip, like `TrtVersion`) would
+restore the rule below. Otherwise it contains no TensorRT DLLs, no
 `trtexec.exe`, no `onnxruntime.dll` and no `DirectML.dll`, even though the backends load those
 from their own directory at runtime. The package assembler drops them into that same
 `animejanai/inference/` directory from its own independently pinned sources:
