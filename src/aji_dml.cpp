@@ -1104,6 +1104,29 @@ bool model_open(aji_ctx *c, DmlModel *m, const std::string &onnx_path,
     g_ort->SetSessionExecutionMode(so, ORT_SEQUENTIAL);
     g_ort->DisableMemPattern(so);
     g_ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL);
+
+    // A session only ever runs at (1, in_ch, in_h, in_w), so pin the
+    // input's symbolic dims to it. With free dims the DML EP cannot compile
+    // the graph as a whole and dispatches it op by op: ~1.7x slower at 1080p.
+    {
+        std::vector<char> blob;
+        AjiOnnxInput oin;
+        if (ajicore::read_file_bytes(onnx_path, &blob) &&
+            aji_onnx_input(blob.data(), blob.size(), &oin)) {
+            for (const auto &pin : aji_onnx_pin_dims(
+                     oin, {1, in_ch, in_h, in_w})) {
+                if (!c->ort_ck(g_ort->AddFreeDimensionOverrideByName(
+                                   so, pin.first.c_str(), pin.second),
+                               "AddFreeDimensionOverrideByName")) {
+                    g_ort->ReleaseSessionOptions(so);
+                    return false;
+                }
+                c->verbose("%s: pinned dim %s=%lld", onnx_path.c_str(),
+                           pin.first.c_str(), (long long)pin.second);
+            }
+        }
+    }
+
     OrtStatus *st = g_dml_api->SessionOptionsAppendExecutionProvider_DML1(
         so, c->dml_dev.Get(), c->queue.Get());
     if (st) {
