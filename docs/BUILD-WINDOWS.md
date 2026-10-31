@@ -134,8 +134,12 @@ of `lib/` and `bin/` at the root — which is the layout `CMakeLists.txt` expect
 
 **Keep this, the Linux workflow's `TRT_VERSION`, and `TrtVersion` in the package assembler on
 the same version.** `aji_trt` links `nvinfer_11`, which every TensorRT 11.x release ships under
-the same name — so an engine built against an older 11.x also loads on a newer 11.x runtime —
-but release builds are made against the TensorRT they ship with.
+the same name, so the DLL runs on any 11.x runtime. **Engines do not carry over**: a serialized
+engine only loads on the TensorRT version that built it (the 11.4 runtime rejects 11.0 engines,
+serialization version 243 vs 245). That is why the engine cache name carries the version
+(`...trt-11.4.0.gpu-...engine`): a runtime upgrade rebuilds every engine once on first use, and
+the stale-engine cleanup deletes the old version's files. Release builds are made against the
+TensorRT they ship with.
 
 > **The CUDA flavour is part of the URL and is not derivable from the TensorRT version.**
 > NVIDIA's pairing wanders: 11.0 -> cuda-13.2, 11.1 -> 13.3, 11.2 -> 13.3, 11.3 -> 13.4,
