@@ -2,9 +2,11 @@
 REM The release build of the aji engine: every architecture, clean build.
 REM Dependency layout and rationale: docs\BUILD-WINDOWS.md.
 REM   AJI_WIN  the SDK working area (default %USERPROFILE%\aji-win)
+REM   AJI_TRTRTX_ROOT  TensorRT for RTX SDK for aji_trtrtx (default %AJI_WIN%\trtrtx171)
 REM Builds this checkout into build-win-release\ and prints AJI-RELEASE-BUILD-OK.
 setlocal
 if not defined AJI_WIN set "AJI_WIN=%USERPROFILE%\aji-win"
+if not defined AJI_TRTRTX_ROOT set "AJI_TRTRTX_ROOT=%AJI_WIN%\trtrtx171"
 for %%i in ("%~dp0..\..") do set "SRC=%%~fi"
 set "BLD=%SRC%\build-win-release"
 for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -version [18.0^,19.0^) -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
@@ -16,6 +18,7 @@ cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ^
   "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_PATH%" ^
   -DAJI_TRT_ROOT=%AJI_WIN%/trt114 -DAJI_NVINFER=nvinfer_11 ^
+  "-DAJI_TRTRTX_ROOT:PATH=%AJI_TRTRTX_ROOT%" ^
   -DAJI_ORT_ROOT=%AJI_WIN%/ort/Microsoft.ML.OnnxRuntime.DirectML ^
   -DAJI_DML_ROOT=%AJI_WIN%/ort/Microsoft.AI.DirectML ^
   -DAJI_FFMPEG_ROOT=%AJI_WIN%/ffmpeg-shared/ffmpeg-9.0.2-full_build-shared ^

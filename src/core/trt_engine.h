@@ -7,6 +7,11 @@
  * Nothing here knows about conf slots, chains or frame formats: callers
  * pass explicit paths/settings and get errors back as strings, which
  * they report through their own context.
+ *
+ * The same sources build aji_trtrtx with AJI_TRTRTX defined, against
+ * TensorRT for RTX: engines are built in-process through the builder API
+ * (no trtexec), cached under their own name and extension, and run with a
+ * persistent JIT (runtime) cache beside each engine.
  */
 
 #ifndef AJI_CORE_TRT_ENGINE_H
@@ -22,6 +27,13 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <NvInfer.h>
+
+// Product name for logs ("Building TensorRT engine for ...").
+#ifdef AJI_TRTRTX
+#define AJI_TRT_PRODUCT "TensorRT-RTX"
+#else
+#define AJI_TRT_PRODUCT "TensorRT"
+#endif
 
 namespace ajicore {
 
@@ -52,7 +64,41 @@ struct CudaFree {
 };
 using CudaPtr = std::unique_ptr<void, CudaFree>;
 
+#ifdef AJI_TRTRTX
+// TensorRT-RTX compiles kernels for the GPU at first inference (JIT). The
+// runtime cache holds those kernels; it is loaded from `path` with the
+// engine and written back when the engine is released, so later sessions
+// skip the JIT. Declared ahead of the engine in ModelEngine, so the
+// execution context and engine are gone before it saves.
+struct RuntimeCache {
+    std::unique_ptr<nvinfer1::IRuntimeCache> cache;
+    std::unique_ptr<nvinfer1::IRuntimeConfig> config;
+    std::string path;
+    // what was loaded from `path`: save() skips an unchanged cache
+    size_t loaded_size = 0;
+    uint32_t loaded_crc = 0;
+    RuntimeCache() = default;
+    RuntimeCache(RuntimeCache &&) = default;
+    RuntimeCache &operator=(RuntimeCache &&o) noexcept {
+        if (this != &o) {
+            save();
+            cache = std::move(o.cache);
+            config = std::move(o.config);
+            path = std::move(o.path);
+            loaded_size = o.loaded_size;
+            loaded_crc = o.loaded_crc;
+        }
+        return *this;
+    }
+    ~RuntimeCache() { save(); }
+    void save();
+};
+#endif
+
 struct ModelEngine {
+#ifdef AJI_TRTRTX
+    RuntimeCache rt;
+#endif
     std::unique_ptr<nvinfer1::ICudaEngine> engine;
     std::unique_ptr<nvinfer1::IExecutionContext> exec;
     const char *in_name = nullptr;
@@ -72,6 +118,11 @@ std::string sanitize_token(std::string s);
 
 // Engine cache key: {onnx}.{crc32(settings)}.trt-{ver}.gpu-{name-smN}.engine.
 // `dev` is the CUDA runtime ordinal of the GPU that runs the engine.
+// TensorRT-RTX (AJI_TRTRTX): {...}.trtrtx-{ver}.gpu-{name-smN}.rtxengine.
+// The extension deliberately does not end in ".engine": aji_trt's stale
+// cleanup (including in already released builds) deletes every *.engine
+// that isn't its own, and both backends share the model directory.
+extern const char *const ENGINE_EXT;
 std::string trt_version_token();
 std::string gpu_token(int dev);
 std::string engine_suffix(int dev);
@@ -100,6 +151,7 @@ bool parse_shape_wh(const std::string &settings, const char *key, int *w, int *h
 // a background thread.
 struct BuildSpec {
     std::string cmdline;      // "trtexec" --onnx=... --saveEngine=...
+                              // (TensorRT-RTX: a description for logs)
     std::string env_prefix;   // POSIX only, e.g. "LD_LIBRARY_PATH=..."
     std::string engine_path;
     std::string tmp_path;     // what trtexec writes; renamed to engine_path
@@ -107,6 +159,14 @@ struct BuildSpec {
     std::string log_path;     // trtexec output, kept for diagnostics
     std::string name;
     std::string res;          // shapes_label() of the build settings
+    // what an in-process build (TensorRT-RTX) needs
+    std::string onnx_path;
+    std::string settings;     // trtexec-style flags; shapes etc. honored
+    int dev = 0;
+    // TensorRT-RTX: no build - load the existing engine_path once and warm
+    // it up (see warm_up), to fill the JIT caches off the caller's thread.
+    // A failure leaves the engine in place.
+    bool warm_only = false;
 };
 
 // Build spec for {dir}/{onnx_name}.onnx with its timing cache beside it,
@@ -126,12 +186,39 @@ bool make_build_spec_paths(const std::string &trtexec,
 
 // Run the build subprocess (no console window on win32) with output to
 // spec.log_path; the child handle/pid is published to *child while it runs.
+// TensorRT-RTX: builds in-process instead (see run_build_inprocess), and
+// *child is a cancel flag - nonzero aborts the build.
 int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child);
 // Run a build to completion. trtexec writes spec.tmp_path, renamed to
 // spec.engine_path only on success, so the cache only ever holds complete
 // engines; on failure the leftovers are removed and the exit code appended
 // to the build log. Thread-safe.
 bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child);
+
+#ifdef AJI_TRTRTX
+// Parse spec.onnx_path and build it with the TensorRT-RTX builder on CUDA
+// device spec.dev, honoring the trtexec-style shape flags in spec.settings
+// (--minShapes/--optShapes/--maxShapes, --builderOptimizationLevel,
+// --memPoolSize=workspace:); the other flags are trtexec-only and ignored.
+// Writes the engine to spec.tmp_path and the builder log to spec.log_path.
+// Returns 0 on success; *cancel nonzero aborts the build. A successful
+// build is then loaded once and warmed up (see warm_up), so the first-use
+// kernel compiles land in the JIT caches on this (background) thread and
+// not on the caller's first frame.
+int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel);
+
+// One throwaway inference on zeroed scratch buffers at the context's
+// current input shapes (dynamic ones not yet set take the profile's opt
+// shape). TensorRT-RTX compiles part of its kernels at the first enqueue,
+// into the driver's compute cache; doing that here keeps it off the first
+// real frame. Synchronous; the caller's context must be current.
+bool warm_up(nvinfer1::IExecutionContext *exec, std::string *err);
+
+// Test hook: true when AJI_TRTRTX_FAIL names `stage` ("create", "build" or
+// "context"), forcing that step to fail so the fallback to TensorRT can be
+// exercised.
+bool forced_failure(const char *stage);
+#endif
 
 // One background trtexec at a time. The worker touches only these
 // atomics; the owning thread reads `epath` and reaps via done_flag.
@@ -145,17 +232,22 @@ struct AsyncBuild {
 
     void start(const BuildSpec &spec);
     // Kill an in-flight trtexec (the worker's failure path removes the
-    // partial engine) and join the worker.
+    // partial engine) and join the worker. TensorRT-RTX: cancel the
+    // in-process build and join.
     void stop();
 };
 
 // Deserialize `engine_path`, bind its single input/output and set the
 // input shape: [1, in_ch, in_h, in_w], or [1, rank5_t, 3, in_h, in_w]
 // when rank5_t > 0. Fills me->out_w/out_h from the resolved output and
-// me->in_fp32/out_fp32 from the I/O tensor types.
+// me->in_fp32/out_fp32 from the I/O tensor types. TensorRT-RTX: the
+// execution context gets the runtime cache {engine_path}.jitcache, and the
+// engine one warm-up inference. *keep (optional) is set on failure when the
+// engine file itself deserialized fine (context, shape or warm-up failed):
+// not a stale cache entry to delete and rebuild.
 bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
                  ModelEngine *me, int in_w, int in_h, int in_ch, int rank5_t,
-                 std::string *err);
+                 std::string *err, bool *keep = nullptr);
 
 } // namespace ajicore
 

@@ -2673,7 +2673,7 @@ static void usage(void)
 "           [--no-audio] [--no-subs] [--no-chapters]"
 " [--progress none|line|json]\n"
 "           [--build-only] [--log <f>] [--decoder auto|nvdec|cpu]"
-" [--backend tensorrt|directml]\n"
+" [--backend tensorrt|tensorrt-rtx|directml]\n"
 "           [--deinterlace off|ivtc|bwdif] [--square-pixels off|before|after]\n"
 "           [--preview <f.jpg> [--preview-width W]]\n"
 "           [--preview-session] (no --output: frames for a GUI's player)\n"
@@ -2790,8 +2790,11 @@ int main(int argc, char **argv)
      * dispatcher loads; this only picks the device the frames live on. */
     if (!av_strcasecmp(c.o.backend, "directml")) {
         c.dml = 1;
-    } else if (av_strcasecmp(c.o.backend, "tensorrt")) {
-        loge("unknown --backend '%s' (tensorrt|directml)", c.o.backend);
+    } else if (av_strcasecmp(c.o.backend, "tensorrt") &&
+               av_strcasecmp(c.o.backend, "tensorrt-rtx")) {
+        /* tensorrt-rtx: CUDA frames, like tensorrt */
+        loge("unknown --backend '%s' (tensorrt|tensorrt-rtx|directml)",
+             c.o.backend);
         return 2;
     }
     if (c.dml && c.o.pix_fmt >= OUT_444P8) {

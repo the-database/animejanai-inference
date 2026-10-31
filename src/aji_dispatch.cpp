@@ -4,8 +4,10 @@
  * Thin dispatcher honoring animejanai.conf's [global] backend key
  * (3.3.x semantics: case-insensitive; "directml" -> DML, "ncnn" -> DML
  * with a warning (NCNN is retired; DirectML serves its audience),
- * anything else incl. absent/no conf -> TensorRT). Loads the sibling
- * backend library (aji_trt / aji_dml) from its own directory and
+ * "tensorrt-rtx" (also "tensorrt_rtx", "trt-rtx", "trtrtx") -> TensorRT
+ * for RTX, anything else incl. absent/no conf -> TensorRT). Loads the
+ * sibling backend library (aji_trt / aji_trtrtx / aji_dml) from its own
+ * directory and
  * forwards the whole C ABI. Keeps nvinfer/onnxruntime out of the
  * process until the chosen backend actually needs them.
  */
@@ -18,6 +20,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 
 #ifdef _WIN32
@@ -57,10 +60,42 @@ struct aji_backend {
     void (*destroy)(aji_ctx **);
 };
 
+/* aji_create_params with owned strings, to re-create a context on another
+ * backend (the TensorRT-RTX -> TensorRT fallback). */
+struct saved_params {
+    aji_create_params p;
+    std::string conf_path, model_dir, trtexec, trtexec_env, rife_model_dir,
+        engine_path;
+
+    explicit saved_params(const aji_create_params &in) : p(in)
+    {
+        keep(&p.conf_path, &conf_path);
+        keep(&p.model_dir, &model_dir);
+        keep(&p.trtexec, &trtexec);
+        keep(&p.trtexec_env, &trtexec_env);
+        keep(&p.rife_model_dir, &rife_model_dir);
+        keep(&p.engine_path, &engine_path);
+    }
+    saved_params(const saved_params &) = delete;
+
+private:
+    static void keep(const char **field, std::string *store)
+    {
+        if (*field) {
+            *store = *field;
+            *field = store->c_str();
+        }
+    }
+};
+
 /* The dispatcher's aji_ctx wraps the backend's. */
 struct aji_ctx {
     aji_backend be;
     aji_ctx *inner;
+    // TensorRT-RTX contexts can fall back to TensorRT (once, then stay)
+    bool rtx = false;
+    std::unique_ptr<saved_params> params;
+    int slot = 1;
 };
 
 static void logf_to(aji_log_fn log, void *opaque, int level,
@@ -185,7 +220,10 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         lower.push_back((char)tolower((unsigned char)ch));
 
     const char *stem = "aji_trt";
-    if (lower == "directml") {
+    if (lower == "tensorrt-rtx" || lower == "tensorrt_rtx" ||
+        lower == "trt-rtx" || lower == "trtrtx") {
+        stem = "aji_trtrtx";
+    } else if (lower == "directml") {
         stem = "aji_dml";
     } else if (lower == "ncnn") {
         logf_to(params->log, params->log_opaque, 2,
@@ -193,34 +231,111 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         stem = "aji_dml";
     }
 
+    const bool rtx = !strcmp(stem, "aji_trtrtx");
     aji_backend be = {};
     std::string err;
+    aji_ctx *inner = nullptr;
     if (!load_backend(stem, &be, &err)) {
-        logf_to(params->log, params->log_opaque, 0,
+        logf_to(params->log, params->log_opaque, rtx ? 2 : 0,
                 "backend %s (%s): %s", backend.c_str(), stem, err.c_str());
-        return nullptr;
+    } else {
+        logf_to(params->log, params->log_opaque, 3,
+                "backend: %s (%s)", backend.c_str(), stem);
+        inner = be.create(params);
+        if (!inner) {
+            lib_close(be.lib);
+            be.lib = nullptr;
+        }
     }
-    logf_to(params->log, params->log_opaque, 3,
-            "backend: %s (%s)", backend.c_str(), stem);
-
-    aji_ctx *inner = be.create(params);
-    if (!inner) {
-        lib_close(be.lib);
-        return nullptr;
+    if (!inner && rtx) {
+        // TensorRT-RTX missing or failing (its error is logged above):
+        // keep playing on TensorRT
+        logf_to(params->log, params->log_opaque, 1,
+                "TensorRT-RTX failed to start; using TensorRT instead");
+        be = {};
+        if (!load_backend("aji_trt", &be, &err)) {
+            logf_to(params->log, params->log_opaque, 0,
+                    "backend TensorRT (aji_trt): %s", err.c_str());
+            return nullptr;
+        }
+        inner = be.create(params);
+        if (!inner) {
+            lib_close(be.lib);
+            return nullptr;
+        }
+        return new aji_ctx{be, inner, false, nullptr, params->slot};
     }
-    aji_ctx *c = new aji_ctx{be, inner};
+    if (!inner)
+        return nullptr;
+    aji_ctx *c = new aji_ctx{be, inner, rtx, nullptr, params->slot};
+    // conf mode only: a direct-mode engine is backend-specific anyway
+    if (rtx && params->conf_path)
+        c->params = std::make_unique<saved_params>(*params);
+    else
+        c->rtx = false;
     return c;
+}
+
+/* TensorRT-RTX could not build or run an engine: replace the context with a
+ * TensorRT one created from the same parameters and slot. The caller then
+ * repeats the call that failed. Once only - the fallback is sticky. */
+static bool fall_back_to_trt(aji_ctx *c, const char *what)
+{
+    const aji_create_params &p = c->params->p;
+    const std::string why = c->be.last_error(c->inner);
+    c->rtx = false;  // one attempt per context
+    aji_backend be = {};
+    std::string err;
+    aji_ctx *inner = nullptr;
+    if (load_backend("aji_trt", &be, &err)) {
+        aji_create_params np = p;
+        np.slot = c->slot;
+        inner = be.create(&np);
+        if (!inner) {
+            lib_close(be.lib);
+            err = "aji_create failed";
+        }
+    }
+    if (!inner) {
+        logf_to(p.log, p.log_opaque, 1,
+                "TensorRT-RTX failed (%s: %s) and TensorRT is unavailable "
+                "(%s); continuing on TensorRT-RTX", what, why.c_str(),
+                err.c_str());
+        return false;
+    }
+    logf_to(p.log, p.log_opaque, 1,
+            "TensorRT-RTX failed (%s: %s); using TensorRT instead", what,
+            why.c_str());
+    c->be.destroy(&c->inner);
+    lib_close(c->be.lib);
+    c->be = be;
+    c->inner = inner;
+    c->params.reset();
+    return true;
 }
 
 extern "C" AJI_EXPORT int aji_set_slot(aji_ctx *c, int slot)
 {
-    return c->be.set_slot(c->inner, slot);
+    int r = c->be.set_slot(c->inner, slot);
+    if (r == AJI_OK)
+        c->slot = slot;
+    return r;
 }
 
 extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                                         int *out_w, int *out_h)
 {
-    return c->be.configure(c->inner, w, h, fps, out_w, out_h);
+    int r = c->be.configure(c->inner, w, h, fps, out_w, out_h);
+    // An engine that won't build or load (blocking, or after a background
+    // build: aji_trtrtx reports that once as an error instead of
+    // passthrough). Repeat the call either way: on TensorRT after the
+    // fallback, or - if TensorRT can't be loaded - on TensorRT-RTX again,
+    // which then degrades to passthrough like aji_trt (async mode).
+    if (r == AJI_ERR_ENGINE && c->rtx) {
+        fall_back_to_trt(c, "engine");
+        r = c->be.configure(c->inner, w, h, fps, out_w, out_h);
+    }
+    return r;
 }
 
 extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,

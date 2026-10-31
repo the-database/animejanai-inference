@@ -1,5 +1,7 @@
 /*
  * aji_trt — TensorRT backend for the aji C ABI (see include/aji.h).
+ * Also built as aji_trtrtx (AJI_TRTRTX, TensorRT for RTX): the engine
+ * plumbing differences live in core/trt_engine.
  *
  * Conf mode executes animejanai.conf chains: per-model Catmull-Rom resize
  * steps + 2x model steps, all on fp16 NCHW RGB ping-pong buffers, with
@@ -127,6 +129,19 @@ struct aji_ctx {
     bool async_build = false;
     ajicore::AsyncBuild build;
     std::set<std::string> failed_builds;
+#ifdef AJI_TRTRTX
+    // engines built by this context: one that then fails to load is an
+    // error, not a stale cache entry to rebuild (which would loop)
+    std::set<std::string> built_engines;
+    // async: engines warmed up on the worker this session (built or
+    // warm-only jobs), so their caller-thread load is cheap
+    std::set<std::string> warmed;
+    bool build_warm_only = false;   // the running AsyncBuild job's kind
+    // failures already reported as an error (for the dispatcher's
+    // TensorRT fallback); if it comes back anyway (no fallback possible),
+    // the next configure degrades to passthrough as aji_trt does
+    std::set<std::string> reported_failures;
+#endif
 
     // resampling plans: per-step resize plans live in steps[]; pre/post are
     // (re)built lazily per frame key since siting arrives with frames
@@ -268,7 +283,8 @@ void clean_stale_engines(aji_ctx *c)
     ajicore::clean_stale_engines(c->model_dir, c->cuda_dev, &removed);
     for (const std::string &name : removed) {
         c->log_steps.push_back(
-            "Removed stale TensorRT engine (different GPU or TensorRT version): " + name);
+            "Removed stale " AJI_TRT_PRODUCT " engine (different GPU or "
+            AJI_TRT_PRODUCT " version): " + name);
         c->verbose("removed stale engine %s", name.c_str());
     }
 }
@@ -297,24 +313,33 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
     if (!make_build_spec(c, onnx_name, settings, engine_path, dir, &spec))
         return false;
     c->verbose("building engine: %s", spec.cmdline.c_str());
-    c->log_steps.push_back("Building TensorRT engine for " + onnx_name +
+    c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " + onnx_name +
                            " for " + spec.res +
                            " (first play at this resolution)");
     if (!run_build_spec(spec, &c->build.child)) {
+#ifdef AJI_TRTRTX
+        c->set_error("TensorRT-RTX engine build failed for %s (see %s)",
+#else
         c->set_error("trtexec failed building engine for %s (see %s)",
+#endif
                      onnx_name.c_str(), spec.log_path.c_str());
         return false;
     }
+#ifdef AJI_TRTRTX
+    c->built_engines.insert(engine_path);
+#endif
     return true;
 }
 
 // rank5_t > 0: the input is [1, rank5_t, 3, H, W] (in_ch is then ignored).
+// *keep: see ajicore::load_engine.
 bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
-                 int in_w, int in_h, int in_ch = 3, int rank5_t = 0)
+                 int in_w, int in_h, int in_ch = 3, int rank5_t = 0,
+                 bool *keep = nullptr)
 {
     std::string err;
     if (!ajicore::load_engine(c->runtime.get(), engine_path, me, in_w, in_h,
-                              in_ch, rank5_t, &err)) {
+                              in_ch, rank5_t, &err, keep)) {
         c->set_error("%s", err.c_str());
         return false;
     }
@@ -408,12 +433,48 @@ bool ensure_buffers(aji_ctx *c, size_t bytes)
 // returns passthrough, and aji_poll() tells the caller when to reconfigure.
 void start_async_build(aji_ctx *c, const BuildSpec &spec)
 {
-    c->log_steps.push_back("Building TensorRT engine for " + spec.name +
+    c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " + spec.name +
                            " for " + spec.res +
                            " (first play at this resolution)");
     c->verbose("background engine build: %s", spec.cmdline.c_str());
+#ifdef AJI_TRTRTX
+    c->build_warm_only = false;
+#endif
     c->build.start(spec);
 }
+
+#ifdef AJI_TRTRTX
+// TensorRT-RTX, async: a cached engine not yet warmed this session is
+// loaded and warmed on the worker first (after a driver update the JIT can
+// take seconds); the configure that called this plays passthrough until
+// aji_poll() fires. With warm caches the job is a fraction of a second.
+// Returns true if the caller must defer (0).
+bool defer_to_warm_up(aji_ctx *c, const std::string &name,
+                      const std::string &settings, const std::string &path)
+{
+    if (c->warmed.count(path) || c->built_engines.count(path) ||
+        file_size(path) <= 0)
+        return false;
+    const std::string line = "Preparing " AJI_TRT_PRODUCT " engine for " +
+                             name + " for " + shapes_label(settings) +
+                             " (first use this session)";
+    c->log_steps.push_back(line);
+    if (c->build.running.load())
+        return true;  // one job at a time; poll() -> reconfigure cascades
+    BuildSpec spec;
+    spec.warm_only = true;
+    spec.engine_path = path;
+    spec.log_path = path + ".warm.log";
+    spec.name = name;
+    spec.res = shapes_label(settings);
+    spec.dev = c->cuda_dev;
+    spec.cmdline = "warm-up of " + path;
+    c->verbose("background engine warm-up: %s", path.c_str());
+    c->build_warm_only = true;
+    c->build.start(spec);
+    return true;
+}
+#endif
 
 // Build-if-missing + load, with a self-healing retry: a cached engine that
 // fails to deserialize (e.g. built by a different trtexec version than the
@@ -429,6 +490,25 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath =
         short_engine_path_for(model_dir, name, settings, c->cuda_dev);
+#ifdef AJI_TRTRTX
+    // a failure already reported (and not replaced by the TensorRT
+    // fallback): passthrough, as aji_trt does for a failed build
+    for (const std::string *p : {&epath, &short_epath}) {
+        if (c->async_build && c->failed_builds.count(*p) &&
+            c->reported_failures.count(*p)) {
+            c->log_steps.push_back(
+                "Engine FAILED for " + name + " for " + shapes_label(settings) +
+                " (see " + *p + ".build.log); playing without this chain");
+            return 0;
+        }
+    }
+    if (c->async_build) {
+        const std::string &cached_path = file_exists(epath) ? epath : short_epath;
+        if (file_exists(cached_path) &&
+            defer_to_warm_up(c, name, settings, cached_path))
+            return 0;
+    }
+#endif
 
     // Backwards compatibility: 3.5.0 and earlier cached engines used the
     // full ONNX basename in the filename. Try that legacy path first so
@@ -444,8 +524,23 @@ int ensure_engine(aji_ctx *c, const std::string &name,
             remove_file(path);
             return -1;
         }
+#ifdef AJI_TRTRTX
+        bool keep = false;
+        if (load_engine(c, path, me, w, h, ch, rank5_t, &keep))
+            return 1;
+        if (keep || c->built_engines.count(path)) {
+            // the file is fine (context/warm-up failed) or was just built:
+            // an error to report, not a stale entry to delete and rebuild
+            if (c->async_build) {
+                c->failed_builds.insert(path);
+                c->reported_failures.insert(path);
+            }
+            return -2;  // errbuf has why
+        }
+#else
         if (load_engine(c, path, me, w, h, ch, rank5_t))
             return 1;
+#endif
         c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
         remove_file(path);
         return -1;
@@ -454,10 +549,14 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     int cached = try_cached(epath);
     if (cached == 1)
         return 1;
+    if (cached == -2)
+        return -1;
     if (short_epath != epath) {
         cached = try_cached(short_epath);
         if (cached == 1)
             return 1;
+        if (cached == -2)
+            return -1;
     }
 
     // New builds use a short filename. This avoids MAX_PATH failures for
@@ -465,6 +564,15 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     const std::string &build_epath = short_epath;
     if (c->async_build) {
         if (c->failed_builds.count(build_epath)) {
+#ifdef AJI_TRTRTX
+            // an error once, so the dispatcher can fall back to TensorRT;
+            // after that (no fallback possible) the passthrough below
+            if (c->reported_failures.insert(build_epath).second) {
+                c->set_error("TensorRT-RTX engine build failed for %s (see "
+                             "%s.build.log)", name.c_str(), build_epath.c_str());
+                return -1;
+            }
+#endif
             // permanent (until reconfigure changes the cache key):
             // play passthrough instead of failing the filter
             c->log_steps.push_back(
@@ -476,7 +584,7 @@ int ensure_engine(aji_ctx *c, const std::string &name,
         if (c->build.running.load()) {
             // one build at a time; multi-engine chains cascade through
             // repeated poll() -> reconfigure cycles
-            c->log_steps.push_back("Building TensorRT engine for " +
+            c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " +
                                    name + " for " +
                                    shapes_label(settings) +
                                    " (first play at this resolution)");
@@ -772,6 +880,10 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     }
 
     c->runtime.reset(nvinfer1::createInferRuntime(c->logger));
+#ifdef AJI_TRTRTX
+    if (ajicore::forced_failure("create"))
+        c->runtime.reset();
+#endif
     if (!c->runtime) {
         c->set_error("createInferRuntime failed");
         return nullptr;
@@ -2140,11 +2252,26 @@ extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
         return 0;
     if (c->build.thread.joinable())
         c->build.thread.join();
+#ifdef AJI_TRTRTX
+    if (c->build_warm_only) {
+        // ok or not: the caller-thread load comes next either way and
+        // reports a real problem (the warm log has the worker's view)
+        c->warmed.insert(c->build.epath);
+        if (!c->build.ok.load())
+            c->verbose("background engine warm-up failed: %s (see .warm.log)",
+                       c->build.epath.c_str());
+        return 1;
+    }
+#endif
     if (!c->build.ok.load()) {
         c->failed_builds.insert(c->build.epath);
         c->verbose("background engine build failed: %s (see .build.log)",
                    c->build.epath.c_str());
     }
+#ifdef AJI_TRTRTX
+    else
+        c->built_engines.insert(c->build.epath);
+#endif
     return 1;  // reconfigure either way; failures latch to passthrough
 }
 
@@ -2413,6 +2540,9 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->engines.clear();
         c->direct.exec.reset();
         c->direct.engine.reset();
+#ifdef AJI_TRTRTX
+        c->direct.rt.save();  // needs the context
+#endif
         c->runtime.reset();
     }
     if (c->owns_primary)
