@@ -51,6 +51,25 @@ workspace flags), are cached as `....trtrtx-<ver>.gpu-<name-smN>.rtxengine` — 
 with a TensorRT-RTX runtime cache saved beside each engine as `<engine>.jitcache`. Each backend's
 stale cleanup only touches its own extension, so both share a model directory.
 
+TensorRT-RTX compiles kernels at the first enqueue (seconds, into the driver's compute cache),
+so every engine gets a **warm-up**: one throwaway inference on zeroed scratch buffers, on the
+build thread right after a build (`run_build_inprocess`, so with `async_build` it is part of the
+background build, before `aji_poll` fires) and again in `load_engine` (cheap once the caches are
+warm). The first `aji_infer` is then as fast as TensorRT's; what's left (~0.2-0.4 s, or the full
+compile after a driver update empties the driver cache) is paid in `aji_configure`. TensorRT
+(`aji_trt`) has no JIT and gets no warm-up.
+
+**TensorRT-RTX falls back to TensorRT** (TensorRT-RTX is opt-in and experimental; TensorRT stays
+the default). The dispatcher keeps a copy of the create params for an `aji_trtrtx` context; if
+`aji_create` fails, or `aji_configure` returns `AJI_ERR_ENGINE` (build or context failure,
+blocking or after a background build — `aji_trtrtx` reports a failed background build as an
+error instead of passthrough), it logs one line, `TensorRT-RTX failed (...); using TensorRT
+instead`, re-creates the context on `aji_trt` (same params, current slot) and repeats the call.
+Sticky for the context's life; conf mode only. The image ABI has no fallback: its caller picks
+the backend explicitly and can retry with `AJI_IMG_TENSORRT`. Test hook:
+`AJI_TRTRTX_FAIL=create|build|context` forces that step to fail in `aji_trtrtx`
+(`~/aji-win/trtx-work/fallback-test.cmd` drives all cases).
+
 `aji` is deliberately dependency-free — no CUDA, no TensorRT, no ORT — so the player can load it
 on any machine and the backend resolves later. The backends load `onnxruntime.dll` /
 `DirectML.dll` from their own directory at runtime, which is why nothing is import-linked for
@@ -126,7 +145,7 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_trt` | SHARED | `${AJI_NVINFER}`, `CUDA::cuda_driver`, `CUDA::cudart` | non-Windows adds `-Wl,-Bsymbolic` |
 | `aji_trtrtx` | SHARED | `tensorrt_rtx_<M>_<m>`, `tensorrt_onnxparser_rtx_<M>_<m>`, CUDA | `aji_trt`'s sources + `AJI_TRTRTX`; **only with `AJI_TRTRTX_ROOT`** |
 | `aji_dml` | SHARED | `d3d12 d3d11 dxgi d3dcompiler` | **WIN32 only**; ORT/DirectML loaded at runtime, not import-linked |
-| `aji_harness` | EXE | `aji`, `CUDA::cudart` | depends on `aji_trt` (and `aji_trtrtx`); prints wall-clock create/configure/first-frame `timing:` lines |
+| `aji_harness` | EXE | `aji`, `CUDA::cudart` | depends on `aji_trt` (and `aji_trtrtx`); prints wall-clock create/configure/first-frame `timing:` lines; `--async-build` = the player's build mode (poll + reconfigure) |
 | `aji_harness_dml` | EXE | `aji`, `d3d11` | **WIN32 only** |
 | `aji_encode` | EXE | `aji`, CUDA, ffmpeg libs | **conditional** — see below |
 | `aji_kernel_test` | EXE | `CUDA::cudart` | kernel unit tests |
