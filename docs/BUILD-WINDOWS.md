@@ -8,7 +8,7 @@ in [`ci/windows/`](../ci/windows/):
 | Script | Does |
 |---|---|
 | `ci\windows\build-aji-release.bat` | the release build of this checkout (all architectures, clean) |
-| `ci\windows\package-aji-release.ps1` | zips the eight release artifacts and the TensorRT-RTX runtime into `aji-windows-x64.zip` |
+| `ci\windows\package-aji-release.ps1` | zips the seven engine artifacts into `aji-windows-x64.zip`, and `aji_trtrtx.dll` with the TensorRT-RTX runtime into `aji-trtrtx-windows-x64.zip` |
 
 The SDKs they build against live **outside** the repo, in a working area. Linux build:
 [`BUILD-LINUX.md`](BUILD-LINUX.md). Engine overview: [`../CLAUDE.md`](../CLAUDE.md).
@@ -46,6 +46,7 @@ part of the contract:
 │   └── directml-1.15.4.nupkg      +  Microsoft.AI.DirectML\               (extracted)
 ├── ffmpeg-shared\ffmpeg-9.0.2-full_build-shared\{include,lib,bin}
 └── dist\<tag>\aji-windows-x64.zip      packaging output
+             aji-trtrtx-windows-x64.zip
 %REPO%\build-win-release\               release build directory  [created by the build]
 ```
 
@@ -184,7 +185,7 @@ stops the configure with `AJI_TRTRTX_ROOT=...: no TensorRT-RTX SDK there (missin
 include/NvInferVersion.h)`.
 
 **The release build requires it**: `build-aji-release.bat` always passes `AJI_TRTRTX_ROOT`
-(default `%AJI_WIN%\trtrtx171`) because the package ships `aji_trtrtx.dll` and its runtime, so a
+(default `%AJI_WIN%\trtrtx171`) because the release ships `aji_trtrtx.dll` and its runtime, so a
 missing SDK fails the release configure with that error instead of silently producing a package
 without the backend.
 
@@ -336,25 +337,36 @@ built.
 pwsh %REPO%\ci\windows\package-aji-release.ps1 -Tag v0.11.2
 ```
 
-It stages the eight build artifacts — `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_trtrtx.dll`,
-`aji_encode.exe`, `aji_harness.exe`, `aji_harness_dml.exe`, `aji_kernel_test.exe` — **throwing
-`missing build artifact: <path>` if any is absent**, plus the TensorRT-RTX runtime from
-`-TrtRtxRoot` (default `%AJI_TRTRTX_ROOT%`, else `%AJI_WIN%\trtrtx171`): exactly one
-`tensorrt_rtx_*.dll` and one `tensorrt_onnxparser_rtx_*.dll`, or it throws. It zips them flat
-and prints the entry list and size. Output:
+It builds two zips, **throwing `missing build artifact: <path>` if any artifact is absent**,
+and prints each one's entry list and size:
+
+| Asset | Contents | Size |
+|---|---|---|
+| `aji-windows-x64.zip` | `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_encode.exe`, `aji_harness.exe`, `aji_harness_dml.exe`, `aji_kernel_test.exe` | ~0.8 MB |
+| `aji-trtrtx-windows-x64.zip` | `aji_trtrtx.dll` plus the TensorRT-RTX runtime from `-TrtRtxRoot` (default `%AJI_TRTRTX_ROOT%`, else `%AJI_WIN%\trtrtx171`): exactly one `tensorrt_rtx_*.dll` and one `tensorrt_onnxparser_rtx_*.dll`, or it throws | ~91 MB |
+
+Output:
 
 ```
 %AJI_WIN%\dist\<tag>\aji-windows-x64.zip
+%AJI_WIN%\dist\<tag>\aji-trtrtx-windows-x64.zip
 ```
 
-The contents are flat because the assembler extracts them straight into
-`animejanai/inference/`.
+The contents are flat because consumers extract them straight into their inference directory
+(the assembler: `animejanai/inference/`); the TensorRT-RTX zip goes on top of the engine zip.
 
-**The zip carries the engine and, as the one exception, the TensorRT-RTX runtime.** The two
-TensorRT-RTX DLLs (~232 MB, which take the zip from 0.8 MB to ~92 MB) ship here because nothing
-else pins them yet; **never `tensorrt_rtx.exe`**, which the SDK licence keeps for internal use.
-Moving them to the assembler (an `InstallTrtRtx()` from NVIDIA's zip, like `TrtVersion`) would
-restore the rule below. Otherwise it contains no TensorRT DLLs, no
+**TensorRT-RTX is a separate asset so consumers opt in to its ~232 MB runtime.** It is
+experimental and not offered by every consumer: mpv AnimeJaNai leaves it out for now (its
+background-build mode starts each play with a short passthrough while the engine warms up),
+while the offline and image consumers (VideoJaNai, MangaJaNaiConverterGui, yosh) block on the
+load and gain the most from its fast builds. A consumer that skips the asset loses nothing: a
+conf asking for `backend=TensorRT-RTX` without `aji_trtrtx.dll` logs `TensorRT-RTX failed to
+start; using TensorRT instead` and plays on TensorRT. The runtime ships here because nothing
+else pins it yet; **never `tensorrt_rtx.exe`**, which the SDK licence keeps for internal use.
+Moving it to the consumers' own installers (from NVIDIA's zip, like `TrtVersion`) would restore
+the rule below for this asset too.
+
+The engine zip contains no TensorRT DLLs, no
 `trtexec.exe`, no `onnxruntime.dll` and no `DirectML.dll`, even though the backends load those
 from their own directory at runtime. The package assembler drops them into that same
 `animejanai/inference/` directory from its own independently pinned sources:
@@ -367,10 +379,11 @@ against — it never ships them.
 
 `-BuildDir` and `-OutDir` are overridable.
 
-Then attach it to the release that the Linux CI job created for the same tag:
+Then attach both to the release that the Linux CI job created for the same tag:
 
 ```bash
 gh release upload v0.11.2 %AJI_WIN%/dist/v0.11.2/aji-windows-x64.zip \
+  %AJI_WIN%/dist/v0.11.2/aji-trtrtx-windows-x64.zip \
   -R the-database/animejanai-inference
 ```
 
