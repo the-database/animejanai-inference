@@ -170,7 +170,8 @@ if(WIN32)
         target_include_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/include")
         target_link_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/lib")
         target_link_libraries(aji_encode PRIVATE aji CUDA::cudart CUDA::cuda_driver
-            avformat avcodec avutil avfilter swscale)
+            avformat avcodec avutil avfilter swscale
+            dxgi dxguid)   # AMF adapter selection
         # --backend directml makes no CUDA call; delay-loading the CUDA DLLs
         # lets aji_encode start on machines without the NVIDIA driver
         # (nvcuda.dll) or the TensorRT component pack (cudart).
