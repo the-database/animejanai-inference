@@ -55,8 +55,20 @@ and CUDA 13.3 passed 85 calls in each mode: 83 output hashes and two scene
 decisions were identical. The original 75-call sequence also matched saved
 stock-backend results independently. Capture counts were 0/2/7 for
 off/engine/chain, including reset and format/range invalidation. The complete
-TensorRT backend compiled. This is not a new FPS measurement; Linux and
-TensorRT-RTX builds/execution and RTX 4090 execution were not tested here.
+TensorRT backend compiled.
+
+Native mpv playback of this port also passed with the public API, RIFE 4.22 2x
+before original Balanced 3.1, native 3840x2160 and Vulkan queues fixed at 3.
+All three modes had zero rendered/decoder drops. Both graph modes' generated
+4K captures at the same interpolated timestamp were byte-identical to graphs
+off (zero changed pixels). Logs confirmed the requested graph mode was captured.
+One smoke sample per mode measured 102.97 / 104.01 / 104.00 rendered FPS for
+off / engine / chain. These single samples establish working playback, not a
+dependable speedup. The earlier historical timings used optimized Balanced
+and must not be compared as a before/after result for this port.
+
+Linux and TensorRT-RTX builds/execution and RTX 4090 execution were not tested
+here. No Vulkan queue change or image-quality tolerance was introduced.
 
 ## Focused regression
 
