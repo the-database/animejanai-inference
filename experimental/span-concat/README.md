@@ -107,6 +107,13 @@ rounds (Balanced concat: 110.14 then 79.63 fps), so these runs establish playbac
 integration, not a new speedup. Historical gains above remain separate evidence.
 New 4090 native-display timing and wider content/driver coverage are outstanding.
 
+A completed 5090 540p check used a looped 24-frame real-video fixture, 10 seconds
+warmup and 20 seconds measurement in each of two reversed-order rounds. The 2x
+model output was 1920x1080, rendered to the native 3840x2160 display with NVDEC,
+three Vulkan queues and no dropped frames. Median Original/concat throughput
+was 417.424/417.123 fps (-0.072%); paired changes had opposite signs. This is a
+tie within observed variation. The separate NativeTail7 result is in #37.
+
 These paths remain explicitly opt-in.
 The later Ada grouped-convolution and 48 MiB Performance-cache experiments are
 separate changes; this directory does not silently enable them.
