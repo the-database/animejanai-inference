@@ -79,7 +79,7 @@ struct aji_plan {
     int dw = 0, dh = 0;        // resize: dst dims
     pass ph, pv;
     float *tmp0 = nullptr;     // after the first pass
-    float *tmp1 = nullptr;     // after the second pass (pre only)
+    float *tmp1 = nullptr;     // after the horizontal pass (post only)
 };
 
 /* ---------------- device helpers ---------------- */
@@ -121,37 +121,34 @@ __global__ void k_uv_h(const uint8_t *uv, ptrdiff_t stride, int ch, pass px,
     dst[plane + idx] = v;
 }
 
-// vertical resample of N planar fp32 planes (gridDim.z = N)
-__global__ void k_v_f32(const float *src, int w, pass py, float *dst)
+// Vertical chroma resample + matrix. Keep both accumulators in fp32, in the
+// same tap order as the separate pass; only the final RGB is rounded to fp16.
+// This avoids writing and rereading two full-resolution fp32 chroma planes.
+template <typename T>
+__global__ void k_pre_v_combine(const uint8_t *y_plane, ptrdiff_t y_stride,
+                              const float *uvf, int w, pass py, aji_csp csp,
+                              __half *dst)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= py.dst)
         return;
-    const float *sp = src + (size_t)blockIdx.z * w * py.src;
+    const size_t plane = (size_t)w * py.dst, idx = (size_t)y * w + x;
+
+    const size_t uv_plane = (size_t)w * py.src;
     const float *wt = py.wt + (size_t)y * py.taps;
     const int s0 = py.start[y];
-    float a = 0.0f;
-    for (int j = 0; j < py.taps; j++)
-        a += wt[j] * sp[(size_t)mirr(s0 + j, py.src) * w + x];
-    dst[(size_t)blockIdx.z * w * py.dst + (size_t)y * w + x] = a;
-}
-
-template <typename T>
-__global__ void k_pre_combine(const uint8_t *y_plane, ptrdiff_t y_stride,
-                              const float *uvf, int w, int h, aji_csp csp,
-                              __half *dst)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h)
-        return;
-    const size_t plane = (size_t)w * h, idx = (size_t)y * w + x;
+    float u = 0.0f, v = 0.0f;
+    for (int j = 0; j < py.taps; j++) {
+        const size_t pos = (size_t)mirr(s0 + j, py.src) * w + x;
+        u += wt[j] * uvf[pos];
+        v += wt[j] * uvf[uv_plane + pos];
+    }
 
     const T *yrow = (const T *)(y_plane + (size_t)y * y_stride);
     const float Y = ((float)yrow[x] - csp.yoff) / csp.yscale;
-    const float U = (uvf[idx] - csp.coff) / csp.cscale;
-    const float V = (uvf[plane + idx] - csp.coff) / csp.cscale;
+    const float U = (u - csp.coff) / csp.cscale;
+    const float V = (v - csp.coff) / csp.cscale;
 
     const float kg = 1.0f - csp.kr - csp.kb;
     const float r = Y + 2.0f * (1.0f - csp.kr) * V;
@@ -386,8 +383,7 @@ extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting,
     chroma_shifts(siting, true, &sx, &sy);
     if (!build_pass(&p->ph, cw, w, sx, filter) ||
         !build_pass(&p->pv, ch, h, sy, filter) ||
-        cudaMalloc(&p->tmp0, (size_t)2 * w * ch * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&p->tmp1, (size_t)2 * w * h * sizeof(float)) != cudaSuccess) {
+        cudaMalloc(&p->tmp0, (size_t)2 * w * ch * sizeof(float)) != cudaSuccess) {
         aji_plan_destroy(p);
         return nullptr;
     }
@@ -454,14 +450,13 @@ extern "C" int aji_run_pre(aji_plan *p,
         k_uv_h<uint16_t><<<GRID(w, ch, 1), 0, s>>>(
             (const uint8_t *)uv_plane, uv_stride, ch, p->ph, p->tmp0);
     }
-    k_v_f32<<<GRID(w, h, 2), 0, s>>>(p->tmp0, w, p->pv, p->tmp1);
     if (p->format == AJI_FMT_NV12) {
-        k_pre_combine<uint8_t><<<GRID(w, h, 1), 0, s>>>(
-            (const uint8_t *)y_plane, y_stride, p->tmp1, w, h, *csp,
+        k_pre_v_combine<uint8_t><<<GRID(w, h, 1), 0, s>>>(
+            (const uint8_t *)y_plane, y_stride, p->tmp0, w, p->pv, *csp,
             (__half *)dst_f16);
     } else {
-        k_pre_combine<uint16_t><<<GRID(w, h, 1), 0, s>>>(
-            (const uint8_t *)y_plane, y_stride, p->tmp1, w, h, *csp,
+        k_pre_v_combine<uint16_t><<<GRID(w, h, 1), 0, s>>>(
+            (const uint8_t *)y_plane, y_stride, p->tmp0, w, p->pv, *csp,
             (__half *)dst_f16);
     }
     return (int)cudaGetLastError();

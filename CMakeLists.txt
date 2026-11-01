@@ -244,6 +244,12 @@ add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
 
+# Exact parity of the fused NV12/P010 preprocessor against its former passes.
+# The test includes kernels.cu to inspect the private resampling plan.
+add_executable(aji_pre_fusion_test sanity/pre_fusion.cu)
+target_include_directories(aji_pre_fusion_test PRIVATE include src)
+target_link_libraries(aji_pre_fusion_test PRIVATE CUDA::cudart)
+
 # Image-ABI conversion and tiling checks: CPU only, no GPU or models.
 add_executable(aji_half_test sanity/half_array_test.cpp ${AJI_HALF_SOURCES})
 target_include_directories(aji_half_test PRIVATE src)
