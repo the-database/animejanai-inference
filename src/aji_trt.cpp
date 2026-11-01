@@ -184,6 +184,10 @@ struct aji_ctx {
         void *in_tensor = nullptr;   // 11 * pw*ph fp16
         void *out_tensor = nullptr;  // 3 * pw*ph fp16
         float *scd = nullptr;        // device diff accumulator
+        // Opt-in replay of stable private tensors, never caller frame contents.
+        int graph_mode = 0;          // 0: off, 1: engine, 2: pre/engine/post
+        cudaGraphExec_t graph_exec = nullptr;
+        int graph_format = 0, graph_range = 0;
     } rife;
 
     // CUDA graph replay of the whole chain (pre -> steps -> post). The
@@ -620,6 +624,8 @@ std::string rife_model_name(int code, bool ensemble)
 void rife_teardown(aji_ctx *c)
 {
     auto &R = c->rife;
+    if (R.graph_exec)
+        cudaGraphExecDestroy(R.graph_exec);
     aji_plan_destroy(R.pre);
     aji_plan_destroy(R.post);
     cudaFree(R.pad_a);
@@ -640,6 +646,17 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
                 double fps, bool before_upscale)
 {
     auto &R = c->rife;
+    const char *graph = getenv("AJI_RIFE_GRAPH");
+    if (graph && *graph) {
+        if (!strcmp(graph, "engine"))
+            R.graph_mode = 1;
+        else if (!strcmp(graph, "chain"))
+            R.graph_mode = 2;
+        else {
+            c->set_error("AJI_RIFE_GRAPH must be engine or chain, or unset");
+            return false;
+        }
+    }
     R.w = w;
     R.h = h;
     R.pw = (w + 63) / 64 * 64;
@@ -2328,6 +2345,24 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     const size_t py = prow * R.ph;
     const size_t plane = (size_t)R.pw * R.ph;          // fp16 elements
 
+    if (R.graph_mode && !stream) {
+        c->set_error("RIFE CUDA graphs require an explicit CUDA stream");
+        return AJI_ERR_CUDA;
+    }
+    // A chain capture references format-specific padding and filter tables,
+    // and bakes the color-range arguments. Retire it BEFORE freeing tables.
+    if (R.graph_mode == 2 && R.graph_exec &&
+        (R.graph_format != fmt || R.graph_range != a->range)) {
+        cudaError_t e = cudaStreamSynchronize(stream);
+        if (e == cudaSuccess)
+            e = cudaGraphExecDestroy(R.graph_exec);
+        if (e != cudaSuccess) {
+            c->set_error("RIFE graph invalidation failed: %s", cudaGetErrorString(e));
+            return AJI_ERR_CUDA;
+        }
+        R.graph_exec = nullptr;
+    }
+
     // format-dependent staging + plans, built on first use
     if (R.format != fmt) {
         aji_plan_destroy(R.pre);
@@ -2423,62 +2458,109 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         }
     }
 
-    // padded YUV -> RGB into input channels 0-2 (frame a) and 3-5 (b);
-    // 4:2:0 upsamples chroma bilinearly like rife_cuda.py, 4:4:4 needs
-    // no resampling at all. Matrix hardcoded BT.709 like the reference.
     const aji_csp csp = aji_make_csp(fmt, AJI_MATRIX_BT709, a->range);
     char *tin = (char *)R.in_tensor;
-    for (int i = 0; i < 2; i++) {
-        if (f444) {
-            err = aji_run_pre444(R.pw, R.ph,
-                                 pad[i], prow,
-                                 (char *)pad[i] + py, prow,
-                                 (char *)pad[i] + 2 * py, prow,
-                                 &csp, tin + plane * 2 * (i * 3), stream);
-        } else {
-            err = aji_run_pre(R.pre, pad[i], prow, (char *)pad[i] + py,
-                              prow, &csp, tin + plane * 2 * (i * 3),
-                              stream);
-        }
-        if (err) {
-            c->set_error("rife pre kernel failed: %s",
-                         cudaGetErrorString((cudaError_t)err));
-            return AJI_ERR_CUDA;
-        }
-    }
-    // channel 6: the timestep plane
+    // The timestep must stay outside capture so replay reads this call's t.
     err = aji_fill_f16(tin + plane * 2 * 6, plane, (float)t, stream);
     if (err) {
         c->set_error("timestep fill failed");
         return AJI_ERR_CUDA;
     }
 
-    ModelEngine &me = R.engine;
-    if (!me.exec->setTensorAddress(me.in_name, R.in_tensor) ||
-        !me.exec->setTensorAddress(me.out_name, R.out_tensor)) {
-        c->set_error("rife setTensorAddress failed");
-        return AJI_ERR_ENGINE;
-    }
-    if (!me.exec->enqueueV3(stream)) {
-        c->set_error("rife enqueueV3 failed");
-        return AJI_ERR_ENGINE;
-    }
+    auto submit_graph = [&](auto compute) -> int {
+        if (R.graph_exec) {
+            cudaError_t e = cudaGraphLaunch(R.graph_exec, stream);
+            if (e != cudaSuccess) {
+                c->set_error("RIFE graph launch failed: %s", cudaGetErrorString(e));
+                return AJI_ERR_CUDA;
+            }
+            return AJI_OK;
+        }
+        // Let TensorRT perform lazy setup outside capture. This normal run
+        // supplies the first output; capture records but does not run it again.
+        int status = compute();
+        if (status != AJI_OK)
+            return status;
+        cudaError_t e = cudaStreamSynchronize(stream);
+        if (e == cudaSuccess)
+            e = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+        cudaGraph_t graph = nullptr;
+        if (e == cudaSuccess) {
+            status = compute();
+            e = cudaStreamEndCapture(stream, &graph);
+            if (status == AJI_OK && e == cudaSuccess)
+                e = cudaGraphInstantiate(&R.graph_exec, graph, 0);
+        }
+        if (graph)
+            cudaGraphDestroy(graph);
+        if (status != AJI_OK)
+            return status;
+        if (e != cudaSuccess) {
+            c->set_error("RIFE graph capture failed: %s", cudaGetErrorString(e));
+            return AJI_ERR_CUDA;
+        }
+        R.graph_format = fmt;
+        R.graph_range = a->range;
+        c->verbose("RIFE CUDA graph captured: %s",
+                   R.graph_mode == 1 ? "engine" : "chain");
+        return AJI_OK;
+    };
 
-    // RGB -> padded YUV, then crop the window out
-    if (f444) {
-        err = aji_run_post444(fmt, R.pw, R.ph, R.out_tensor, &csp,
-                              R.pad_o, prow,
-                              (char *)R.pad_o + py, prow,
-                              (char *)R.pad_o + 2 * py, prow, stream);
-    } else {
-        err = aji_run_post(R.post, R.out_tensor, &csp, R.pad_o, prow,
-                           (char *)R.pad_o + py, prow, stream);
-    }
-    if (err) {
-        c->set_error("rife post kernel failed: %s",
-                     cudaGetErrorString((cudaError_t)err));
-        return AJI_ERR_CUDA;
-    }
+    auto enqueue = [&]() -> int {
+        ModelEngine &me = R.engine;
+        if (!me.exec->setTensorAddress(me.in_name, R.in_tensor) ||
+            !me.exec->setTensorAddress(me.out_name, R.out_tensor)) {
+            c->set_error("rife setTensorAddress failed");
+            return AJI_ERR_ENGINE;
+        }
+        if (!me.exec->enqueueV3(stream)) {
+            c->set_error("rife enqueueV3 failed");
+            return AJI_ERR_ENGINE;
+        }
+        return AJI_OK;
+    };
+
+    auto compute = [&]() -> int {
+        // Same bilinear BT.709 conversions as the uncaptured path.
+        for (int i = 0; i < 2; i++) {
+            if (f444) {
+                err = aji_run_pre444(R.pw, R.ph, pad[i], prow,
+                                     (char *)pad[i] + py, prow,
+                                     (char *)pad[i] + 2 * py, prow,
+                                     &csp, tin + plane * 2 * (i * 3), stream);
+            } else {
+                err = aji_run_pre(R.pre, pad[i], prow, (char *)pad[i] + py,
+                                  prow, &csp, tin + plane * 2 * (i * 3), stream);
+            }
+            if (err) {
+                c->set_error("rife pre kernel failed: %s",
+                             cudaGetErrorString((cudaError_t)err));
+                return AJI_ERR_CUDA;
+            }
+        }
+        int status = R.graph_mode == 1 ? submit_graph(enqueue) : enqueue();
+        if (status != AJI_OK)
+            return status;
+        if (f444) {
+            err = aji_run_post444(fmt, R.pw, R.ph, R.out_tensor, &csp,
+                                  R.pad_o, prow, (char *)R.pad_o + py, prow,
+                                  (char *)R.pad_o + 2 * py, prow, stream);
+        } else {
+            err = aji_run_post(R.post, R.out_tensor, &csp, R.pad_o, prow,
+                               (char *)R.pad_o + py, prow, stream);
+        }
+        if (err) {
+            c->set_error("rife post kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+        return AJI_OK;
+    };
+    err = R.graph_mode == 2 ? submit_graph(compute) : compute();
+    if (err != AJI_OK)
+        return err;
+
+    // Crop copies and caller-owned frame pointers are never captured.
     bool ok;
     if (f444) {
         ok = true;
