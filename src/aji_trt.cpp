@@ -51,6 +51,7 @@
 #include "onnx_shape.h"
 #include "core/fileio.h"
 #include "core/trt_engine.h"
+#include "rife_warp_plugin.h"
 
 namespace fs = std::filesystem;
 
@@ -302,6 +303,10 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
         c->set_error("%s", err.c_str());
         return false;
     }
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+    if (onnx_name == AJI_RIFE_WARP_MODEL)
+        spec->cmdline += " --dynamicPlugins=\"" + aji_rife_warp_plugin_path() + "\"";
+#endif
     return true;
 }
 
@@ -653,8 +658,26 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     R.den = chain->rife_factor_den;
     R.scd_threshold = chain->rife_scd_threshold;
 
-    const std::string model =
-        rife_model_name(chain->rife_model, chain->rife_ensemble);
+    std::string model = rife_model_name(chain->rife_model, chain->rife_ensemble);
+    const char *warp = std::getenv("AJI_RIFE_WARP");
+    if (warp && std::strcmp(warp, "1") == 0) {
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+        if (model != "rife_v4.22" || w != 1920 || h != 1080) {
+            c->set_error("AJI_RIFE_WARP requires non-ensemble RIFE 4.22 at 1920x1080");
+            return false;
+        }
+        if (!aji_register_rife_warp_plugin()) {
+            c->set_error("Cannot register rife-warp-plugin.dll beside the backend");
+            return false;
+        }
+        // Distinct ONNX and engine-cache identity: never load a stock engine
+        // when the experiment is selected, or vice versa.
+        model = AJI_RIFE_WARP_MODEL;
+#else
+        c->set_error("AJI_RIFE_WARP currently requires Windows and TensorRT 11");
+        return false;
+#endif
+    }
     char dims[64];
     snprintf(dims, sizeof(dims), "1x11x%dx%d", R.ph, R.pw);
     // strongly-typed build from the fp16-typed rife onnx (the shipped
