@@ -2,6 +2,7 @@
 // the normal upscaler and RIFE paths never construct or invoke this object.
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -21,6 +22,7 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <bcrypt.h>
 #endif
 
 namespace {
@@ -85,6 +87,20 @@ std::vector<char> read(const std::filesystem::path &path) {
     return bytes;
 }
 bool shape(nvinfer1::Dims d, int c) { return d.nbDims == 4 && d.d[0] == 1 && d.d[1] == c && d.d[2] == 1024 && d.d[3] == 1024; }
+std::string model_hash(const std::vector<char> &bytes) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    require(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0,
+            "Could not open SHA-256 for the analysis model.");
+    unsigned char digest[32];
+    NTSTATUS result = BCryptHash(algorithm, nullptr, 0,
+        reinterpret_cast<PUCHAR>(const_cast<char *>(bytes.data())),
+        static_cast<ULONG>(bytes.size()), digest, sizeof digest);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    require(result >= 0, "Could not hash the analysis model.");
+    std::string hex;
+    for (unsigned char b : digest) { char pair[3]; std::snprintf(pair, sizeof pair, "%02x", b); hex += pair; }
+    return hex;
+}
 }
 
 struct aji_observer {
@@ -103,14 +119,16 @@ struct aji_observer {
     aji_observer(CUcontext context, int w, int h) : context(context), width(w), height(h) {}
     ~aji_observer() {
         CUcontext previous;
-        if (cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
-        if (stream) cudaStreamSynchronize(stream);
+        bool current = cuCtxPushCurrent(context) == CUDA_SUCCESS;
+        if (current && stream) cudaStreamSynchronize(stream);
+        // Even after context loss, release host/TRT objects and attempt all
+        // resource teardown. A destroyed CUDA context already owns no buffers.
         execution.reset(); engine.reset(); runtime.reset();
         cudaFree(input); cudaFree(mask); cudaFree(color); cudaFree(small_mask);
         if (download) cudaFreeHost(download);
         if (decoded) cudaEventDestroy(decoded); if (start) cudaEventDestroy(start); if (finish) cudaEventDestroy(finish);
         if (stream) cudaStreamDestroy(stream);
-        cuCtxPopCurrent(&previous);
+        if (current) cuCtxPopCurrent(&previous);
     }
 };
 
@@ -130,11 +148,14 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
         if (model) {
             std::filesystem::path path = native_path(std::filesystem::u8path(model));
             require(std::filesystem::exists(path), "Approved isnetis.onnx is missing; provision it through the addon host.");
+            // Hash and parse the same bytes. Replacing a model at the same
+            // filename must not reuse an engine built for its previous content.
+            auto model_bytes = read(path);
             int device, driver; check(cudaGetDevice(&device)); check(cudaDriverGetVersion(&driver));
             cudaDeviceProp gpu{}; check(cudaGetDeviceProperties(&gpu,device));
-            std::string key = ".trt-"+std::to_string(getInferLibVersion())+".driver-"+std::to_string(driver)+".gpu-";
+            std::string key = ".model-"+model_hash(model_bytes)+".trt-"+std::to_string(getInferLibVersion())+".driver-"+std::to_string(driver)+".gpu-";
             for (unsigned char b : gpu.uuid.bytes) { char hex[3]; std::snprintf(hex,sizeof hex,"%02x",b); key += hex; }
-            auto cached = path; cached += key + ".engine";
+            auto cached = path; cached += key + ".analysisengine";
             p->runtime.reset(nvinfer1::createInferRuntime(p->logger));
             require(bool(p->runtime), "Could not create the TensorRT analysis runtime.");
             // OS lock prevents two observed players from building/writing the
@@ -142,8 +163,11 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
 #ifdef _WIN32
             auto lock_path = cached; lock_path += ".lock";
             HANDLE lock = INVALID_HANDLE_VALUE;
+            auto wait_started = std::chrono::steady_clock::now();
             while (lock == INVALID_HANDLE_VALUE) {
                 require(!cancelled || !cancelled(opaque), "Analysis setup cancelled.");
+                require(std::chrono::steady_clock::now() - wait_started < std::chrono::minutes(10),
+                        "Timed out waiting for the analysis engine cache lock.");
                 lock = CreateFileW(lock_path.c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr);
                 if (lock == INVALID_HANDLE_VALUE) {
                     DWORD code = GetLastError();
@@ -158,7 +182,6 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
             }
             if(!p->engine) {
                 if(state)state(opaque,9);
-                auto bytes=read(path);
 #if defined(_WIN32) && NV_TENSORRT_MAJOR >= 11
                 // TensorRT loads builder resources lazily. Its documented
                 // resource path is independent of LoadLibraryEx's DLL path.
@@ -176,7 +199,7 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
                 require(bool(builder),p->logger.error.empty()?"TensorRT engine builder is unavailable.":p->logger.error.c_str());
                 std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(0));
                 std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network,p->logger));
-                require(bool(parser) && parser->parse(bytes.data(),bytes.size()), "Could not parse the approved character-mask model.");
+                require(bool(parser) && parser->parse(model_bytes.data(),model_bytes.size()), "Could not parse the approved character-mask model.");
                 require(network->getNbInputs()==1 && network->getNbOutputs()==1 &&
                     std::string(network->getInput(0)->getName())=="img" && shape(network->getInput(0)->getDimensions(),3) &&
                     std::string(network->getOutput(0)->getName())=="mask" && shape(network->getOutput(0)->getDimensions(),1),
@@ -225,6 +248,8 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
 extern "C" AJI_EXPORT int aji_observer_run(aji_observer *p,const aji_frame *frame,const int crop[4],void *decode_stream,
     unsigned char *bgra,uint16_t *mask,double *gpu_ms)
 {
+    if (!p || !frame || !crop || !bgra || !gpu_ms || (p->execution && !mask))
+        return AJI_ERR;
     try {
         Current current(p->context);
         require(crop[0]>=0&&crop[1]>=0&&crop[2]>0&&crop[3]>0&&crop[0]<=frame->width-crop[2]&&crop[1]<=frame->height-crop[3],"Invalid source crop.");

@@ -518,6 +518,10 @@ int ensure_engine(aji_ctx *c, const std::string &name,
         if (!file_exists(path))
             return 0;
         if (file_size(path) <= 0) {
+            if (c->check_engines_only) {
+                c->set_error("AJN_ENGINE_INCOMPATIBLE: model=%s; path=%s; empty engine", name.c_str(), path.c_str());
+                return -1;
+            }
             // an interrupted build from before builds went through a temp
             // file: not an error, just rebuild (deserializing it would only
             // print a TensorRT API error first)
@@ -543,7 +547,7 @@ int ensure_engine(aji_ctx *c, const std::string &name,
             return 1;
 #endif
         if (c->check_engines_only) {
-            c->set_error("AJN_ENGINE_INCOMPATIBLE");
+            c->set_error("AJN_ENGINE_INCOMPATIBLE: model=%s; path=%s", name.c_str(), path.c_str());
             return -1;
         }
         c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
@@ -572,7 +576,7 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     // portable installs while keeping the model/settings/GPU/TRT cache key.
     const std::string &build_epath = short_epath;
     if (c->check_engines_only) {
-        c->set_error("AJN_ENGINE_MISSING");
+        c->set_error("AJN_ENGINE_MISSING: model=%s; expected=%s", name.c_str(), build_epath.c_str());
         return -1;
     }
     if (c->async_build) {
@@ -1073,7 +1077,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         chain->max_resolution + ";    FPS Range: " + fmt_num(chain->min_fps) +
         " - " + fmt_num(chain->max_fps));
 
-    if (!c->engines_cleaned) {
+    if (!c->engines_cleaned && !c->check_engines_only) {
         clean_stale_engines(c);
         c->engines_cleaned = true;
     }
@@ -2403,26 +2407,29 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
         R.format = fmt;
     }
 
-    // scene detection on the unpadded luma (misc.SCDetect's metric)
-    cudaMemsetAsync(R.scd, 0, sizeof(float), stream);
-    int err = aji_scd_diff(fmt, a->plane[0], a->stride[0], b->plane[0],
-                           b->stride[0], R.w, R.h, R.scd, stream);
-    if (err) {
-        c->set_error("scd kernel failed: %s",
-                     cudaGetErrorString((cudaError_t)err));
-        return AJI_ERR_CUDA;
+    int err = 0;
+    if (scene < 0) {
+        // scene detection on the unpadded luma (misc.SCDetect's metric)
+        cudaMemsetAsync(R.scd, 0, sizeof(float), stream);
+        err = aji_scd_diff(fmt, a->plane[0], a->stride[0], b->plane[0],
+                               b->stride[0], R.w, R.h, R.scd, stream);
+        if (err) {
+            c->set_error("scd kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+        float sum = 0.0f;
+        cudaMemcpyAsync(&sum, R.scd, sizeof(float), cudaMemcpyDeviceToHost,
+                        stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            c->set_error("scd sync failed");
+            return AJI_ERR_CUDA;
+        }
+        // The reference runs SCDetect on the padded clip; the constant borders
+        // contribute zero difference, so its mean divides by the padded area.
+        if (sum / ((double)R.pw * R.ph) > R.scd_threshold)
+            return AJI_SCENE;
     }
-    float sum = 0.0f;
-    cudaMemcpyAsync(&sum, R.scd, sizeof(float), cudaMemcpyDeviceToHost,
-                    stream);
-    if (cudaStreamSynchronize(stream) != cudaSuccess) {
-        c->set_error("scd sync failed");
-        return AJI_ERR_CUDA;
-    }
-    // The reference runs SCDetect on the padded clip; the constant borders
-    // contribute zero difference, so its mean divides by the padded area.
-    if (scene == -1 && sum / ((double)R.pw * R.ph) > R.scd_threshold)
-        return AJI_SCENE;
 
     // stage both frames into the padded buffers (interior only)
     const size_t doff_y = (size_t)R.pad_t * prow + (size_t)R.pad_l * bpp;

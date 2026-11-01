@@ -3093,48 +3093,52 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
         }
         c->cl->ResourceBarrier(4, bs);
     }
-    {
-        KernArgs sa = {};
-        sa.di[0] = R.w;
-        sa.di[1] = R.h;
-        sa.di[2] = (R.w + 31) / 32;
-        sa.dj[0] = (int)R.st_pitch;
-        sa.dj[1] = (int)R.st_pitch;
-        sa.kr = t16 ? 1.0f / 65472.0f : 1.0f / 255.0f;
-        if (!r.dispatch(K_SCD_PARTIAL, t16, false, sa, NULL, NULL,
-                        R.st_y[0].Get(), R.st_y[1].Get(), R.scd_part.Get(),
-                        R.w, R.h, 1))
+    if (scene < 0) {
+        {
+            KernArgs sa = {};
+            sa.di[0] = R.w;
+            sa.di[1] = R.h;
+            sa.di[2] = (R.w + 31) / 32;
+            sa.dj[0] = (int)R.st_pitch;
+            sa.dj[1] = (int)R.st_pitch;
+            sa.kr = t16 ? 1.0f / 65472.0f : 1.0f / 255.0f;
+            if (!r.dispatch(K_SCD_PARTIAL, t16, false, sa, NULL, NULL,
+                            R.st_y[0].Get(), R.st_y[1].Get(), R.scd_part.Get(),
+                            R.w, R.h, 1))
+                return AJI_ERR;
+            r.uav_barrier();
+            KernArgs sf = {};
+            sf.di[0] = R.scd_groups;
+            if (!r.dispatch(K_SCD_FINAL, false, false, sf, NULL, NULL,
+                            R.scd_part.Get(), R.scd_sum.Get(), NULL, 32, 1, 1))
+                return AJI_ERR;
+            r.transition(R.scd_sum.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_COPY_SOURCE, 0);
+            c->cl->CopyBufferRegion(R.scd_read.Get(), 0, R.scd_sum.Get(), 0, 4);
+        }
+        if (!r.exec())
             return AJI_ERR;
-        r.uav_barrier();
-        KernArgs sf = {};
-        sf.di[0] = R.scd_groups;
-        if (!r.dispatch(K_SCD_FINAL, false, false, sf, NULL, NULL,
-                        R.scd_part.Get(), R.scd_sum.Get(), NULL, 32, 1, 1))
+        if (!wait_done_val(c, signal_done(c), 10000)) {
+            c->set_error("GPU timeout in rife scene detect");
             return AJI_ERR;
-        r.transition(R.scd_sum.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                     D3D12_RESOURCE_STATE_COPY_SOURCE, 0);
-        c->cl->CopyBufferRegion(R.scd_read.Get(), 0, R.scd_sum.Get(), 0, 4);
-    }
-    if (!r.exec())
+        }
+        float sum = 0.0f;
+        {
+            void *m = nullptr;
+            D3D12_RANGE rr = {0, 4};
+            if (FAILED(R.scd_read->Map(0, &rr, &m)))
+                return AJI_ERR;
+            memcpy(&sum, m, 4);
+            D3D12_RANGE none = {0, 0};
+            R.scd_read->Unmap(0, &none);
+        }
+        // The reference runs SCDetect on the padded clip; the constant borders
+        // contribute zero difference, so its mean divides by the padded area.
+        if (sum / ((double)R.pw * R.ph) > R.scd_threshold)
+            return AJI_SCENE;
+    } else if (!r.exec()) {
         return AJI_ERR;
-    if (!wait_done_val(c, signal_done(c), 10000)) {
-        c->set_error("GPU timeout in rife scene detect");
-        return AJI_ERR;
     }
-    float sum = 0.0f;
-    {
-        void *m = nullptr;
-        D3D12_RANGE rr = {0, 4};
-        if (FAILED(R.scd_read->Map(0, &rr, &m)))
-            return AJI_ERR;
-        memcpy(&sum, m, 4);
-        D3D12_RANGE none = {0, 0};
-        R.scd_read->Unmap(0, &none);
-    }
-    // The reference runs SCDetect on the padded clip; the constant borders
-    // contribute zero difference, so its mean divides by the padded area.
-    if (scene == -1 && sum / ((double)R.pw * R.ph) > R.scd_threshold)
-        return AJI_SCENE;
 
     // embed the frames into the pad interiors, convert, run, convert back
     const uint32_t doff_y = (uint32_t)R.pad_t * prow +

@@ -1,0 +1,13 @@
+{
+  "cuda": "13.4.1",
+  "cudaDirectory": "cuda134",
+  "tensorRT": "11.4.0.106",
+  "tensorRTDirectory": "trt114",
+  "tensorRTLibrary": "nvinfer_11",
+  "tensorRTUrl": "https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.4.0/zip/TensorRT-Enterprise-11.4.0.106-Windows-amd64-cuda-13.4-Release-external.zip",
+  "tensorRTSha256": "b6fd86301ad803492adf7a06de29ce45e3968d29637a1437d0fb0994f412c980",
+  "onnxRuntime": "1.24.4",
+  "onnxRuntimeSha256": "57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681",
+  "directML": "1.15.4",
+  "directMLSha256": "4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9"
+}

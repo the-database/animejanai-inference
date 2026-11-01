@@ -84,12 +84,18 @@ set_target_properties(aji_trt PROPERTIES
 
 # Optional observation module: neither aji nor aji_trt imports it. Its model
 # parser, allocations and kernels are loaded only for an addon subscription.
-string(REPLACE "nvinfer" "nvonnxparser" AJI_NVONNXPARSER "${AJI_NVINFER}")
-add_library(aji_analysis SHARED src/aji_analysis.cpp src/analysis_kernels.cu src/kernels.cu)
-target_include_directories(aji_analysis PUBLIC include PRIVATE ${AJI_TRT_INCLUDE})
-target_link_directories(aji_analysis PRIVATE ${AJI_TRT_LIB})
-target_link_libraries(aji_analysis PRIVATE ${AJI_NVINFER} ${AJI_NVONNXPARSER} CUDA::cuda_driver CUDA::cudart)
-set_target_properties(aji_analysis PROPERTIES CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden)
+option(AJI_BUILD_ANALYSIS "Build the optional Windows addon observation module" OFF)
+if(AJI_BUILD_ANALYSIS)
+    if(NOT WIN32)
+        message(FATAL_ERROR "AJI_BUILD_ANALYSIS currently supports Windows only")
+    endif()
+    string(REPLACE "nvinfer" "nvonnxparser" AJI_NVONNXPARSER "${AJI_NVINFER}")
+    add_library(aji_analysis SHARED src/aji_analysis.cpp src/analysis_kernels.cu src/kernels.cu)
+    target_include_directories(aji_analysis PUBLIC include PRIVATE ${AJI_TRT_INCLUDE})
+    target_link_directories(aji_analysis PRIVATE ${AJI_TRT_LIB})
+    target_link_libraries(aji_analysis PRIVATE ${AJI_NVINFER} ${AJI_NVONNXPARSER} CUDA::cuda_driver CUDA::cudart bcrypt)
+    set_target_properties(aji_analysis PROPERTIES CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden)
+endif()
 if(NOT WIN32)
     # backends export the same aji_* names as the dispatcher; bind their
     # internal references locally so the global (dispatcher) symbols
