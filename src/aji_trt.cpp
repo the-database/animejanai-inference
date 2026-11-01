@@ -660,10 +660,10 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
 
     std::string model = rife_model_name(chain->rife_model, chain->rife_ensemble);
     const char *warp = std::getenv("AJI_RIFE_WARP");
-    if (warp && std::strcmp(warp, "1") == 0) {
+    if (chain->rife_fp16_warp || (warp && std::strcmp(warp, "1") == 0)) {
 #if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
         if (model != "rife_v4.22" || w != 1920 || h != 1080) {
-            c->set_error("AJI_RIFE_WARP requires non-ensemble RIFE 4.22 at 1920x1080");
+            c->set_error("FP16 RIFE warp requires non-ensemble RIFE 4.22 at 1920x1080");
             return false;
         }
         if (!aji_register_rife_warp_plugin()) {
@@ -674,7 +674,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         // when the experiment is selected, or vice versa.
         model = AJI_RIFE_WARP_MODEL;
 #else
-        c->set_error("AJI_RIFE_WARP currently requires Windows and TensorRT 11");
+        c->set_error("FP16 RIFE warp currently requires Windows and TensorRT 11");
         return false;
 #endif
     }

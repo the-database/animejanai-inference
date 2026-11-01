@@ -1,0 +1,75 @@
+{
+  "date": "2026-11-01",
+  "source_base": "4848d1357407e4d87a8d24f3d4f87794cb61f4a2",
+  "platform": "Windows x64; classic TensorRT 11.3; CUDA 13.3",
+  "plugin_architectures": [
+    "SM89",
+    "SM120"
+  ],
+  "output_scope": "Finite real-video samples. Learned weights unchanged; output equality to stock is not guaranteed.",
+  "untested": [
+    "Fresh 4090 native-display timing",
+    "Linux",
+    "DirectML runtime",
+    "TensorRT-RTX runtime",
+    "Other drivers/content"
+  ],
+  "clean_cache_builds": "Separate stock/warp engines built on both GPUs.",
+  "direct_api": {
+    "RTX 5090": {
+      "warp_frames": 71,
+      "aggregate_psnr_db": 70.05576738270402,
+      "worst_psnr_db": 65.89559294656219,
+      "switching_identical": true,
+      "calls": 149,
+      "metric": "direct NV12; peak=255; Y and interleaved chroma",
+      "scene_decisions_match": true
+    },
+    "RTX 4090": {
+      "warp_frames": 71,
+      "aggregate_psnr_db": 70.75826730583644,
+      "worst_psnr_db": 67.05577261653355,
+      "switching_identical": true,
+      "calls": 149,
+      "metric": "direct NV12; peak=255; Y and interleaved chroma",
+      "scene_decisions_match": true
+    }
+  },
+  "playback": {
+    "gpu": "RTX 5090",
+    "input_size": [
+      1920,
+      1080
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "vulkan_queues": 3,
+    "render_drops": 0,
+    "decoder_drops": 0,
+    "interpretation": "Playback integration only: unstable controls; no new speedup claim.",
+    "samples": [
+      {
+        "profile": "rife-stock",
+        "round": 1,
+        "fps": 79.57823714377692
+      },
+      {
+        "profile": "rife-warp",
+        "round": 1,
+        "fps": 79.50552864884658
+      },
+      {
+        "profile": "rife-warp",
+        "round": 2,
+        "fps": 79.10981871514983
+      },
+      {
+        "profile": "rife-stock",
+        "round": 2,
+        "fps": 49.26919256761875
+      }
+    ]
+  }
+}
