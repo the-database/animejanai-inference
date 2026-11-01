@@ -1,5 +1,7 @@
 /*
  * aji_trt — TensorRT backend for the aji C ABI (see include/aji.h).
+ * Also built as aji_trtrtx (AJI_TRTRTX, TensorRT for RTX): the engine
+ * plumbing differences live in core/trt_engine.
  *
  * Conf mode executes animejanai.conf chains: per-model Catmull-Rom resize
  * steps + 2x model steps, all on fp16 NCHW RGB ping-pong buffers, with
@@ -47,159 +49,12 @@
 #include "aji_conf.h"
 #include "kernels.h"
 #include "onnx_shape.h"
+#include "core/fileio.h"
+#include "core/trt_engine.h"
 
 namespace fs = std::filesystem;
 
 namespace {
-
-#ifdef _WIN32
-std::wstring widen_utf8(const std::string &s)
-{
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 0)
-        return std::wstring();
-    std::wstring w((size_t)n - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
-    return w;
-}
-
-std::wstring win_long_path(const std::string &path)
-{
-    std::wstring w = widen_utf8(path);
-    if (w.empty() || w.rfind(L"\\\\?\\", 0) == 0 ||
-        w.rfind(L"\\\\.\\", 0) == 0)
-        return w;
-
-    DWORD need = GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
-    if (need > 0) {
-        std::vector<wchar_t> full(need);
-        DWORD n = GetFullPathNameW(w.c_str(), need, full.data(), nullptr);
-        if (n > 0 && n < need)
-            w.assign(full.data(), n);
-    }
-
-    if (w.rfind(L"\\\\", 0) == 0)
-        return L"\\\\?\\UNC" + w.substr(1);
-    if (w.size() >= 2 && w[1] == L':')
-        return L"\\\\?\\" + w;
-    return w;
-}
-
-bool file_exists(const std::string &path)
-{
-    DWORD attrs = GetFileAttributesW(win_long_path(path).c_str());
-    return attrs != INVALID_FILE_ATTRIBUTES &&
-           !(attrs & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-void remove_file(const std::string &path)
-{
-    DeleteFileW(win_long_path(path).c_str());
-}
-
-// Size in bytes, or -1 if the file can't be stat'ed.
-long long file_size(const std::string &path)
-{
-    WIN32_FILE_ATTRIBUTE_DATA a = {};
-    if (!GetFileAttributesExW(win_long_path(path).c_str(), GetFileExInfoStandard,
-                              &a))
-        return -1;
-    return ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
-}
-
-// Rename over an existing file.
-bool move_file(const std::string &from, const std::string &to)
-{
-    return MoveFileExW(win_long_path(from).c_str(), win_long_path(to).c_str(),
-                       MOVEFILE_REPLACE_EXISTING) != 0;
-}
-
-bool read_file_bytes(const std::string &path, std::vector<char> *out)
-{
-    HANDLE h = CreateFileW(win_long_path(path).c_str(), GENERIC_READ,
-                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return false;
-    LARGE_INTEGER size = {};
-    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 ||
-        size.QuadPart > SIZE_MAX) {
-        CloseHandle(h);
-        return false;
-    }
-    out->resize((size_t)size.QuadPart);
-    char *dst = out->data();
-    size_t left = out->size();
-    while (left > 0) {
-        DWORD chunk = (DWORD)std::min<size_t>(left, 1u << 30);
-        DWORD got = 0;
-        if (!ReadFile(h, dst, chunk, &got, nullptr) || got == 0) {
-            CloseHandle(h);
-            return false;
-        }
-        dst += got;
-        left -= got;
-    }
-    CloseHandle(h);
-    return true;
-}
-
-void append_file_text(const std::string &path, const std::string &text)
-{
-    HANDLE h = CreateFileW(win_long_path(path).c_str(), FILE_APPEND_DATA,
-                           FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return;
-    DWORD written = 0;
-    WriteFile(h, text.data(), (DWORD)text.size(), &written, nullptr);
-    CloseHandle(h);
-}
-#else
-bool file_exists(const std::string &path)
-{
-    std::error_code ec;
-    return fs::is_regular_file(path, ec);
-}
-
-void remove_file(const std::string &path)
-{
-    std::error_code ec;
-    fs::remove(path, ec);
-}
-
-long long file_size(const std::string &path)
-{
-    std::error_code ec;
-    auto n = fs::file_size(path, ec);
-    return ec ? -1 : (long long)n;
-}
-
-bool move_file(const std::string &from, const std::string &to)
-{
-    std::error_code ec;
-    fs::rename(from, to, ec);
-    return !ec;
-}
-
-bool read_file_bytes(const std::string &path, std::vector<char> *out)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return false;
-    out->assign(std::istreambuf_iterator<char>(f),
-                std::istreambuf_iterator<char>());
-    return true;
-}
-
-void append_file_text(const std::string &path, const std::string &text)
-{
-    if (FILE *f = fopen(path.c_str(), "a")) {
-        fwrite(text.data(), 1, text.size(), f);
-        fclose(f);
-    }
-}
-#endif
 
 // TRT 11: strongly-typed is the default (--stronglyTyped is a no-op), and sanitize_settings_trt11
 // strips --inputIOFormats/--outputIOFormats/--tacticSources anyway (types come from the network;
@@ -209,82 +64,21 @@ const char *DEFAULT_TRT_ENGINE_SETTINGS =
     "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% "
     "--skipInference";
 
-class Logger : public nvinfer1::ILogger {
-public:
-    aji_log_fn fn = nullptr;
-    void *opaque = nullptr;
-    void log(Severity sev, const char *msg) noexcept override {
-        if (fn)
-            fn(opaque, (int)sev, msg);
-        else if (sev <= Severity::kWARNING)
-            fprintf(stderr, "[aji-trt] %s\n", msg);
-    }
-};
+using ajicore::BuildSpec;
+using ajicore::CtxGuard;
+using ajicore::CudaPtr;
+using ajicore::ModelEngine;
+using ajicore::engine_path_for;
+using ajicore::file_exists;
+using ajicore::file_size;
+using ajicore::parse_shape_wh;
+using ajicore::read_file_bytes;
+using ajicore::remove_file;
+using ajicore::run_build_spec;
+using ajicore::shapes_label;
+using ajicore::short_engine_path_for;
+using Logger = ajicore::TrtLogger;
 
-struct CtxGuard {
-    CUcontext ctx;
-    bool ok;
-    explicit CtxGuard(CUcontext c) : ctx(c), ok(cuCtxPushCurrent(c) == CUDA_SUCCESS) {}
-    ~CtxGuard() {
-        if (ok) {
-            CUcontext dummy;
-            cuCtxPopCurrent(&dummy);
-        }
-    }
-};
-
-// zlib-compatible CRC-32 (matches Python zlib.crc32 used for engine names).
-uint32_t crc32_z(const std::string &data)
-{
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            table[i] = c;
-        }
-        init = true;
-    }
-    uint32_t c = 0xFFFFFFFFu;
-    for (unsigned char ch : data)
-        c = table[(c ^ ch) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
-}
-
-std::string sanitize_token(std::string s)
-{
-    for (auto &ch : s) {
-        if (ch == ' ')
-            ch = '-';
-    }
-    std::string out;
-    for (char ch : s) {
-        if (isalnum((unsigned char)ch) || ch == '.' || ch == '_' || ch == '-')
-            out += ch;
-    }
-    return out.empty() ? "device0" : out;
-}
-
-struct CudaFree {
-    void operator()(void *p) const { cudaFree(p); }
-};
-using CudaPtr = std::unique_ptr<void, CudaFree>;
-
-struct ModelEngine {
-    std::unique_ptr<nvinfer1::ICudaEngine> engine;
-    std::unique_ptr<nvinfer1::IExecutionContext> exec;
-    const char *in_name = nullptr;
-    const char *out_name = nullptr;
-    int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
-    // The chain's tensors are fp16. A model exported with fp32 I/O (strongly
-    // typed, so the engine keeps it) runs through these fp32 staging buffers,
-    // cast on the way in and out (enqueue_model).
-    bool in_fp32 = false, out_fp32 = false;
-    CudaPtr in32, out32;
-    size_t in32_elems = 0, out32_elems = 0;
-};
 
 struct Step {
     enum Kind { RESIZE, MODEL, TEMPORAL } kind;
@@ -329,18 +123,26 @@ struct aji_ctx {
     size_t buf_bytes = 0;
 
     // Background engine builds (async_build): one trtexec at a time on a
-    // worker thread that touches no ctx state beyond these atomics. The
-    // caller thread owns build_epath/failed_builds (written only while no
+    // worker thread that touches no ctx state beyond build's atomics. The
+    // caller thread owns build.epath/failed_builds (written only while no
     // worker is running / in aji_poll).
     bool async_build = false;
     bool check_engines_only = false;
-    std::thread build_thread;
-    std::atomic<bool> build_running{false};
-    std::atomic<int> build_done_flag{0};
-    std::atomic<bool> build_ok{false};
-    std::atomic<intptr_t> build_child{0};
-    std::string build_epath;
+    ajicore::AsyncBuild build;
     std::set<std::string> failed_builds;
+#ifdef AJI_TRTRTX
+    // engines built by this context: one that then fails to load is an
+    // error, not a stale cache entry to rebuild (which would loop)
+    std::set<std::string> built_engines;
+    // async: engines warmed up on the worker this session (built or
+    // warm-only jobs), so their caller-thread load is cheap
+    std::set<std::string> warmed;
+    bool build_warm_only = false;   // the running AsyncBuild job's kind
+    // failures already reported as an error (for the dispatcher's
+    // TensorRT fallback); if it comes back anyway (no fallback possible),
+    // the next configure degrades to passthrough as aji_trt does
+    std::set<std::string> reported_failures;
+#endif
 
     // resampling plans: per-step resize plans live in steps[]; pre/post are
     // (re)built lazily per frame key since siting arrives with frames
@@ -476,343 +278,31 @@ aji_csp make_csp(const aji_frame *f)
     return aji_make_csp(f->format, f->matrix, f->range);
 }
 
-std::string trt_version_token()
-{
-    int32_t v = getInferLibVersion();
-    int major, minor, patch;
-    if (v < 10000) {
-        major = v / 1000; minor = (v / 100) % 10; patch = v % 100;
-    } else {
-        major = v / 10000; minor = (v / 100) % 100; patch = v % 100;
-    }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d.%d.%d", major, minor, patch);
-    return buf;
-}
-
-std::string gpu_token(int dev)
-{
-    cudaDeviceProp prop = {};
-    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
-        return "unknown";
-    std::string tok = sanitize_token(prop.name);
-    return tok + "-sm" + std::to_string(prop.major);
-}
-
-std::string engine_suffix(int dev)
-{
-    return ".trt-" + trt_version_token() + ".gpu-" + gpu_token(dev) + ".engine";
-}
-
-std::string engine_path_for(const std::string &model_dir,
-                            const std::string &onnx_name,
-                            const std::string &settings, int dev)
-{
-    return (fs::path(model_dir) /
-            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix(dev)))
-        .string();
-}
-
-std::string short_engine_path_for(const std::string &model_dir,
-                                  const std::string &onnx_name,
-                                  const std::string &settings, int dev)
-{
-    char model_hash[9];
-    snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
-    return (fs::path(model_dir) /
-            ("aji-" + std::string(model_hash) + "." +
-             std::to_string(crc32_z(settings)) + engine_suffix(dev)))
-        .string();
-}
-
 void clean_stale_engines(aji_ctx *c)
 {
-    // Keep the engines of every GPU in the system, not just the active one:
-    // a multi-GPU user moving playback between GPUs would otherwise rebuild
-    // everything on each switch.
-    std::vector<std::string> suffixes;
-    int ndev = 0;
-    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1)
-        ndev = 0;
-    for (int d = 0; d < ndev; d++)
-        suffixes.push_back(engine_suffix(d));
-    if (suffixes.empty())
-        suffixes.push_back(engine_suffix(c->cuda_dev));
-    std::error_code ec;
-    for (const auto &e : fs::directory_iterator(c->model_dir, ec)) {
-        const std::string name = e.path().filename().string();
-        if (name.size() < 7 || name.substr(name.size() - 7) != ".engine")
-            continue;
-        bool current = false;
-        for (const std::string &suffix : suffixes) {
-            current |= name.size() >= suffix.size() &&
-                       name.compare(name.size() - suffix.size(), suffix.size(),
-                                    suffix) == 0;
-        }
-        if (current)
-            continue;
-        std::error_code rec;
-        if (fs::remove(e.path(), rec)) {
-            c->log_steps.push_back(
-                "Removed stale TensorRT engine (different GPU or TensorRT version): " + name);
-            c->verbose("removed stale engine %s", name.c_str());
-        }
+    std::vector<std::string> removed;
+    ajicore::clean_stale_engines(c->model_dir, c->cuda_dev, &removed);
+    for (const std::string &name : removed) {
+        c->log_steps.push_back(
+            "Removed stale " AJI_TRT_PRODUCT " engine (different GPU or "
+            AJI_TRT_PRODUCT " version): " + name);
+        c->verbose("removed stale engine %s", name.c_str());
     }
 }
-
-// Human-readable build resolution from the trtexec shape flags: the WxH of
-// --optShapes for static engines, or "minWxH-maxWxH" when min/max differ
-// (dynamic engines from custom trt_engine_settings).
-std::string shapes_label(const std::string &settings)
-{
-    auto dims = [&](const char *key) -> std::string {
-        size_t p = settings.find(key);
-        if (p == std::string::npos)
-            return "";
-        p = settings.find(':', p);  // --xxxShapes=input:NxCxHxW
-        if (p == std::string::npos)
-            return "";
-        long v[8];
-        int n = 0;
-        size_t i = p + 1;
-        while (n < 8 && i < settings.size() &&
-               isdigit((unsigned char)settings[i])) {
-            v[n++] = strtol(settings.c_str() + i, nullptr, 10);
-            while (i < settings.size() && isdigit((unsigned char)settings[i]))
-                i++;
-            if (i < settings.size() && settings[i] == 'x')
-                i++;
-        }
-        if (n < 2)
-            return "";
-        return std::to_string(v[n - 1]) + "x" + std::to_string(v[n - 2]);
-    };
-    const std::string mn = dims("--minShapes");
-    const std::string mx = dims("--maxShapes");
-    const std::string op = dims("--optShapes");
-    if (!mn.empty() && !mx.empty() && mn != mx)
-        return mn + "-" + mx;
-    if (!op.empty())
-        return op;
-    return !mx.empty() ? mx : mn;
-}
-
-// Parse the W,H of a trtexec shape flag (--minShapes/--optShapes/--maxShapes,
-// format input:NxCxHxW) out of `settings`. Returns true + fills w/h when the
-// flag is present. Mirrors shapes_label's digit walk.
-bool parse_shape_wh(const std::string &settings, const char *key, int *w, int *h)
-{
-    size_t p = settings.find(key);
-    if (p == std::string::npos)
-        return false;
-    p = settings.find(':', p);
-    if (p == std::string::npos)
-        return false;
-    long v[8];
-    int n = 0;
-    size_t i = p + 1;
-    while (n < 8 && i < settings.size() &&
-           isdigit((unsigned char)settings[i])) {
-        v[n++] = strtol(settings.c_str() + i, nullptr, 10);
-        while (i < settings.size() && isdigit((unsigned char)settings[i]))
-            i++;
-        if (i < settings.size() && settings[i] == 'x')
-            i++;
-    }
-    if (n < 2)
-        return false;
-    *w = (int)v[n - 1];  // ...HxW
-    *h = (int)v[n - 2];
-    return true;
-}
-
-// Everything a build needs, with no aji_ctx references, so it can run on a
-// background thread.
-struct BuildSpec {
-    std::string cmdline;      // "trtexec" --onnx=... --saveEngine=...
-    std::string env_prefix;   // POSIX only, e.g. "LD_LIBRARY_PATH=..."
-    std::string engine_path;
-    std::string tmp_path;     // what trtexec writes; renamed to engine_path
-                              // only once the build has succeeded
-    std::string log_path;     // trtexec output, kept for diagnostics
-    std::string name;
-    std::string res;          // shapes_label() of the build settings
-};
-
-// Run the build subprocess with no console window (win32) and its output
-// captured to spec.log_path. The child handle/pid is published to *child
-// while running so a teardown can stop it. Returns the exit code.
-int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
-{
-#ifdef _WIN32
-    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
-    HANDLE log = CreateFileW(win_long_path(spec.log_path).c_str(), GENERIC_WRITE,
-                             FILE_SHARE_READ, &sa, CREATE_ALWAYS,
-                             FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (log == INVALID_HANDLE_VALUE)
-        return -1;
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = log;
-    si.hStdError = log;
-    PROCESS_INFORMATION pi = {};
-    // The command line carries UTF-8 paths (model dir, engine, timing cache).
-    // CreateProcessA reinterprets those bytes through the process ANSI code
-    // page, handing trtexec a mangled path on any install whose path is not
-    // representable there. Widen and spawn wide, so the child gets the real
-    // path whatever the system locale is.
-    std::wstring cmd = widen_utf8(spec.cmdline);  // CreateProcess may modify it
-    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    if (log != INVALID_HANDLE_VALUE)
-        CloseHandle(log);
-    if (!ok)
-        return -1;
-    CloseHandle(pi.hThread);
-    child->store((intptr_t)pi.hProcess);
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    child->store(0);
-    CloseHandle(pi.hProcess);
-    return (int)code;
-#else
-    std::string full = (spec.env_prefix.empty() ? "" : spec.env_prefix + " ") +
-                       spec.cmdline + " >\"" + spec.log_path + "\" 2>&1";
-    pid_t pid = fork();
-    if (pid < 0)
-        return -1;
-    if (pid == 0) {
-        execl("/bin/sh", "sh", "-c", full.c_str(), (char *)nullptr);
-        _exit(127);
-    }
-    child->store((intptr_t)pid);
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-    }
-    child->store(0);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-#endif
-}
-
-// Run a build to completion; on failure remove the half-written engine and
-// append the exit code to the build log (crash/kill diagnosis). Thread-safe
-// (touches no ctx state).
-//
-// trtexec creates its --saveEngine file empty when it starts and only fills
-// it at the end, so a build that is killed (the app's Cancel, closing the
-// player, a crash) used to leave an empty engine under the real cache name.
-// It builds into tmp_path instead, renamed into place only after a successful
-// build, so the cache only ever holds complete engines.
-bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
-{
-    remove_file(spec.tmp_path);  // a previous build's leftover
-    int rc = run_build_process(spec, child);
-    if (rc != 0 || file_size(spec.tmp_path) <= 0 ||
-        !move_file(spec.tmp_path, spec.engine_path)) {
-        remove_file(spec.tmp_path);
-        remove_file(spec.engine_path);
-        char msg[96];
-        snprintf(msg, sizeof(msg),
-                 "\n[aji] build process exit code: %d (0x%x)\n", rc,
-                 (unsigned)rc);
-        append_file_text(spec.log_path, msg);
-        return false;
-    }
-    return true;
-}
-
-#if NV_TENSORRT_MAJOR >= 11
-// trtexec 11 dropped the weak-typing era flags; user confs migrated
-// from 3.3.x may still carry them. Strip from the command line only -
-// the engine-name CRC keeps hashing the original settings string.
-std::string sanitize_settings_trt11(std::string s)
-{
-    static const char *dropped[] = {"--fp16", "--bf16", "--int8", "--best",
-                                    "--buildOnly"};
-    for (const char *flag : dropped) {
-        size_t pos = 0;
-        while ((pos = s.find(flag, pos)) != std::string::npos) {
-            size_t end = pos + strlen(flag);
-            // only whole flags (--fp16 but not --fp16something)
-            if (end < s.size() && s[end] != ' ') {
-                pos = end;
-                continue;
-            }
-            while (end < s.size() && s[end] == ' ')
-                end++;
-            s.erase(pos, end - pos);
-        }
-    }
-    // typed IO formats are weak-typing flags: types now come from the
-    // network, and the fp16:/fp32: value prefixes no longer parse
-    // the cuDNN/cuBLAS tactic-source enum values are gone too (their
-    // tactics were already removed during 10.x)
-    static const char *dropped_kv[] = {"--inputIOFormats=",
-                                       "--outputIOFormats=",
-                                       "--tacticSources="};
-    for (const char *flag : dropped_kv) {
-        size_t pos;
-        while ((pos = s.find(flag)) != std::string::npos) {
-            size_t end = s.find(' ', pos);
-            end = end == std::string::npos ? s.size() : end + 1;
-            s.erase(pos, end - pos);
-        }
-    }
-    // --workspace=N became --memPoolSize=workspace:NM
-    size_t pos = s.find("--workspace=");
-    if (pos != std::string::npos) {
-        size_t vs = pos + strlen("--workspace=");
-        size_t ve = s.find(' ', vs);
-        std::string val = s.substr(vs, ve == std::string::npos ? ve
-                                                               : ve - vs);
-        s.replace(pos, (ve == std::string::npos ? s.size() : ve) - pos,
-                  "--memPoolSize=workspace:" + val + "M");
-    }
-    return s;
-}
-#endif
 
 bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
                      const std::string &settings,
                      const std::string &engine_path, const std::string *dir,
                      BuildSpec *spec)
 {
-    const std::string onnx_path =
-        (fs::path(dir ? *dir : c->model_dir) / (onnx_name + ".onnx")).string();
-    if (!file_exists(onnx_path)) {
-        c->set_error("model not found: %s", onnx_path.c_str());
+    std::string err;
+    if (!ajicore::make_build_spec(c->trtexec, c->trtexec_env,
+                                  dir ? *dir : c->model_dir, onnx_name,
+                                  settings, engine_path, c->cuda_dev, spec,
+                                  &err)) {
+        c->set_error("%s", err.c_str());
         return false;
     }
-    // Persistent per-model timing cache: tactic timings get reused across
-    // builds (other resolutions, rebuilds), which speeds builds up and is
-    // NVIDIA's mitigation for timing noise when the GPU isn't idle - our
-    // background builds run alongside playback. Appended to the command
-    // line only: the settings string feeds the engine filename CRC and
-    // must stay Python-compatible.
-    const std::string tcache =
-        (fs::path(dir ? *dir : c->model_dir) / (onnx_name + ".timing.cache"))
-            .string();
-#if NV_TENSORRT_MAJOR >= 11
-    const std::string cmd_settings = sanitize_settings_trt11(settings);
-#else
-    const std::string &cmd_settings = settings;
-#endif
-    spec->cmdline = "\"" + c->trtexec + "\" --onnx=\"" + onnx_path +
-                    "\" --saveEngine=\"" + engine_path + ".tmp\" " +
-                    cmd_settings +
-                    " --timingCacheFile=\"" + tcache + "\"";
-    // trtexec builds on device 0 by default; build on the GPU that runs
-    // the engine (left off for device 0 to keep the usual command line)
-    if (c->cuda_dev != 0)
-        spec->cmdline += " --device=" + std::to_string(c->cuda_dev);
-    spec->env_prefix = c->trtexec_env;
-    spec->engine_path = engine_path;
-    spec->tmp_path = engine_path + ".tmp";
-    spec->log_path = engine_path + ".build.log";
-    spec->name = onnx_name;
-    spec->res = shapes_label(settings);
     return true;
 }
 
@@ -824,79 +314,42 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
     if (!make_build_spec(c, onnx_name, settings, engine_path, dir, &spec))
         return false;
     c->verbose("building engine: %s", spec.cmdline.c_str());
-    c->log_steps.push_back("Building TensorRT engine for " + onnx_name +
+    c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " + onnx_name +
                            " for " + spec.res +
                            " (first play at this resolution)");
-    if (!run_build_spec(spec, &c->build_child)) {
+    if (!run_build_spec(spec, &c->build.child)) {
+#ifdef AJI_TRTRTX
+        c->set_error("TensorRT-RTX engine build failed for %s (see %s)",
+#else
         c->set_error("trtexec failed building engine for %s (see %s)",
+#endif
                      onnx_name.c_str(), spec.log_path.c_str());
         return false;
     }
+#ifdef AJI_TRTRTX
+    c->built_engines.insert(engine_path);
+#endif
     return true;
 }
 
 // rank5_t > 0: the input is [1, rank5_t, 3, H, W] (in_ch is then ignored).
+// *keep: see ajicore::load_engine.
 bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
-                 int in_w, int in_h, int in_ch = 3, int rank5_t = 0)
+                 int in_w, int in_h, int in_ch = 3, int rank5_t = 0,
+                 bool *keep = nullptr)
 {
-    std::vector<char> blob;
-    if (!read_file_bytes(engine_path, &blob)) {
-        c->set_error("cannot open engine: %s", engine_path.c_str());
+    std::string err;
+    if (!ajicore::load_engine(c->runtime.get(), engine_path, me, in_w, in_h,
+                              in_ch, rank5_t, &err, keep)) {
+        c->set_error("%s", err.c_str());
         return false;
     }
-    me->engine.reset(c->runtime->deserializeCudaEngine(blob.data(), blob.size()));
-    if (!me->engine) {
-        c->set_error("engine deserialization failed: %s", engine_path.c_str());
-        return false;
-    }
-    for (int i = 0; i < me->engine->getNbIOTensors(); i++) {
-        const char *name = me->engine->getIOTensorName(i);
-        if (me->engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
-            me->in_name = name;
-        else
-            me->out_name = name;
-    }
-    if (!me->in_name || !me->out_name) {
-        c->set_error("engine I/O tensors not found");
-        return false;
-    }
-    me->in_fp32 = me->engine->getTensorDataType(me->in_name) ==
-                  nvinfer1::DataType::kFLOAT;
-    me->out_fp32 = me->engine->getTensorDataType(me->out_name) ==
-                   nvinfer1::DataType::kFLOAT;
     if (me->in_fp32 || me->out_fp32)
         c->verbose("%s: fp32 model I/O, cast to/from the fp16 chain",
                    engine_path.c_str());
-    me->exec.reset(me->engine->createExecutionContext());
-    if (!me->exec) {
-        c->set_error("createExecutionContext failed");
-        return false;
-    }
-    nvinfer1::Dims in_dims = nvinfer1::Dims4{1, in_ch, in_h, in_w};
-    if (rank5_t > 0) {
-        in_dims.nbDims = 5;
-        in_dims.d[0] = 1;
-        in_dims.d[1] = rank5_t;
-        in_dims.d[2] = 3;
-        in_dims.d[3] = in_h;
-        in_dims.d[4] = in_w;
-    }
-    if (!me->exec->setInputShape(me->in_name, in_dims)) {
-        c->set_error("engine rejects input %dx%d (%s)", in_w, in_h,
-                     engine_path.c_str());
-        return false;
-    }
-    nvinfer1::Dims od = me->exec->getTensorShape(me->out_name);
-    if (od.nbDims != 4) {
-        c->set_error("unexpected output rank from %s", engine_path.c_str());
-        return false;
-    }
-    me->in_w = in_w;
-    me->in_h = in_h;
-    me->out_w = (int)od.d[3];
-    me->out_h = (int)od.d[2];
     return true;
 }
+
 
 int round_even(double v)
 {
@@ -981,23 +434,48 @@ bool ensure_buffers(aji_ctx *c, size_t bytes)
 // returns passthrough, and aji_poll() tells the caller when to reconfigure.
 void start_async_build(aji_ctx *c, const BuildSpec &spec)
 {
-    if (c->build_thread.joinable())
-        c->build_thread.join();  // already-finished worker awaiting reap
-    c->build_epath = spec.engine_path;
-    c->build_done_flag = 0;
-    c->build_ok = false;
-    c->build_running = true;
-    c->log_steps.push_back("Building TensorRT engine for " + spec.name +
+    c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " + spec.name +
                            " for " + spec.res +
                            " (first play at this resolution)");
     c->verbose("background engine build: %s", spec.cmdline.c_str());
-    c->build_thread = std::thread([c, spec]() {
-        bool ok = run_build_spec(spec, &c->build_child);
-        c->build_ok = ok;
-        c->build_running = false;
-        c->build_done_flag = 1;
-    });
+#ifdef AJI_TRTRTX
+    c->build_warm_only = false;
+#endif
+    c->build.start(spec);
 }
+
+#ifdef AJI_TRTRTX
+// TensorRT-RTX, async: a cached engine not yet warmed this session is
+// loaded and warmed on the worker first (after a driver update the JIT can
+// take seconds); the configure that called this plays passthrough until
+// aji_poll() fires. With warm caches the job is a fraction of a second.
+// Returns true if the caller must defer (0).
+bool defer_to_warm_up(aji_ctx *c, const std::string &name,
+                      const std::string &settings, const std::string &path)
+{
+    if (c->warmed.count(path) || c->built_engines.count(path) ||
+        file_size(path) <= 0)
+        return false;
+    const std::string line = "Preparing " AJI_TRT_PRODUCT " engine for " +
+                             name + " for " + shapes_label(settings) +
+                             " (first use this session)";
+    c->log_steps.push_back(line);
+    if (c->build.running.load())
+        return true;  // one job at a time; poll() -> reconfigure cascades
+    BuildSpec spec;
+    spec.warm_only = true;
+    spec.engine_path = path;
+    spec.log_path = path + ".warm.log";
+    spec.name = name;
+    spec.res = shapes_label(settings);
+    spec.dev = c->cuda_dev;
+    spec.cmdline = "warm-up of " + path;
+    c->verbose("background engine warm-up: %s", path.c_str());
+    c->build_warm_only = true;
+    c->build.start(spec);
+    return true;
+}
+#endif
 
 // Build-if-missing + load, with a self-healing retry: a cached engine that
 // fails to deserialize (e.g. built by a different trtexec version than the
@@ -1013,6 +491,25 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath =
         short_engine_path_for(model_dir, name, settings, c->cuda_dev);
+#ifdef AJI_TRTRTX
+    // a failure already reported (and not replaced by the TensorRT
+    // fallback): passthrough, as aji_trt does for a failed build
+    for (const std::string *p : {&epath, &short_epath}) {
+        if (c->async_build && c->failed_builds.count(*p) &&
+            c->reported_failures.count(*p)) {
+            c->log_steps.push_back(
+                "Engine FAILED for " + name + " for " + shapes_label(settings) +
+                " (see " + *p + ".build.log); playing without this chain");
+            return 0;
+        }
+    }
+    if (c->async_build) {
+        const std::string &cached_path = file_exists(epath) ? epath : short_epath;
+        if (file_exists(cached_path) &&
+            defer_to_warm_up(c, name, settings, cached_path))
+            return 0;
+    }
+#endif
 
     // Backwards compatibility: 3.5.0 and earlier cached engines used the
     // full ONNX basename in the filename. Try that legacy path first so
@@ -1028,8 +525,23 @@ int ensure_engine(aji_ctx *c, const std::string &name,
             remove_file(path);
             return -1;
         }
+#ifdef AJI_TRTRTX
+        bool keep = false;
+        if (load_engine(c, path, me, w, h, ch, rank5_t, &keep))
+            return 1;
+        if (keep || c->built_engines.count(path)) {
+            // the file is fine (context/warm-up failed) or was just built:
+            // an error to report, not a stale entry to delete and rebuild
+            if (c->async_build) {
+                c->failed_builds.insert(path);
+                c->reported_failures.insert(path);
+            }
+            return -2;  // errbuf has why
+        }
+#else
         if (load_engine(c, path, me, w, h, ch, rank5_t))
             return 1;
+#endif
         if (c->check_engines_only) {
             c->set_error("AJN_ENGINE_INCOMPATIBLE");
             return -1;
@@ -1044,12 +556,16 @@ int ensure_engine(aji_ctx *c, const std::string &name,
         return -1;
     if (cached == 1)
         return 1;
+    if (cached == -2)
+        return -1;
     if (short_epath != epath) {
         cached = try_cached(short_epath);
         if (cached < 0 && c->check_engines_only)
             return -1;
         if (cached == 1)
             return 1;
+        if (cached == -2)
+            return -1;
     }
 
     // New builds use a short filename. This avoids MAX_PATH failures for
@@ -1061,6 +577,15 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     }
     if (c->async_build) {
         if (c->failed_builds.count(build_epath)) {
+#ifdef AJI_TRTRTX
+            // an error once, so the dispatcher can fall back to TensorRT;
+            // after that (no fallback possible) the passthrough below
+            if (c->reported_failures.insert(build_epath).second) {
+                c->set_error("TensorRT-RTX engine build failed for %s (see "
+                             "%s.build.log)", name.c_str(), build_epath.c_str());
+                return -1;
+            }
+#endif
             // permanent (until reconfigure changes the cache key):
             // play passthrough instead of failing the filter
             c->log_steps.push_back(
@@ -1069,10 +594,10 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                 ".build.log); playing without this chain");
             return 0;
         }
-        if (c->build_running.load()) {
+        if (c->build.running.load()) {
             // one build at a time; multi-engine chains cascade through
             // repeated poll() -> reconfigure cycles
-            c->log_steps.push_back("Building TensorRT engine for " +
+            c->log_steps.push_back("Building " AJI_TRT_PRODUCT " engine for " +
                                    name + " for " +
                                    shapes_label(settings) +
                                    " (first play at this resolution)");
@@ -1368,6 +893,10 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     }
 
     c->runtime.reset(nvinfer1::createInferRuntime(c->logger));
+#ifdef AJI_TRTRTX
+    if (ajicore::forced_failure("create"))
+        c->runtime.reset();
+#endif
     if (!c->runtime) {
         c->set_error("createInferRuntime failed");
         return nullptr;
@@ -2733,15 +2262,30 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
 {
-    if (!c || !c->build_done_flag.exchange(0))
+    if (!c || !c->build.done_flag.exchange(0))
         return 0;
-    if (c->build_thread.joinable())
-        c->build_thread.join();
-    if (!c->build_ok.load()) {
-        c->failed_builds.insert(c->build_epath);
-        c->verbose("background engine build failed: %s (see .build.log)",
-                   c->build_epath.c_str());
+    if (c->build.thread.joinable())
+        c->build.thread.join();
+#ifdef AJI_TRTRTX
+    if (c->build_warm_only) {
+        // ok or not: the caller-thread load comes next either way and
+        // reports a real problem (the warm log has the worker's view)
+        c->warmed.insert(c->build.epath);
+        if (!c->build.ok.load())
+            c->verbose("background engine warm-up failed: %s (see .warm.log)",
+                       c->build.epath.c_str());
+        return 1;
     }
+#endif
+    if (!c->build.ok.load()) {
+        c->failed_builds.insert(c->build.epath);
+        c->verbose("background engine build failed: %s (see .build.log)",
+                   c->build.epath.c_str());
+    }
+#ifdef AJI_TRTRTX
+    else
+        c->built_engines.insert(c->build.epath);
+#endif
     return 1;  // reconfigure either way; failures latch to passthrough
 }
 
@@ -2999,18 +2543,7 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
     aji_ctx *c = *pc;
     // Stop any in-flight engine build (player quit shouldn't wait minutes
     // for trtexec); the worker's failure path removes the partial engine.
-    if (c->build_running.load()) {
-        intptr_t h = c->build_child.load();
-        if (h) {
-#ifdef _WIN32
-            TerminateProcess((HANDLE)h, 1);
-#else
-            kill((pid_t)h, SIGKILL);
-#endif
-        }
-    }
-    if (c->build_thread.joinable())
-        c->build_thread.join();
+    c->build.stop();
     {
         CtxGuard guard(c->cu_ctx);
         cudaDeviceSynchronize();    // in-flight ticketed work
@@ -3037,6 +2570,9 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->engines.clear();
         c->direct.exec.reset();
         c->direct.engine.reset();
+#ifdef AJI_TRTRTX
+        c->direct.rt.save();  // needs the context
+#endif
         c->runtime.reset();
     }
     if (c->owns_primary)
@@ -3047,5 +2583,11 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
 
 extern "C" AJI_EXPORT int aji_stream_policy_version(void)
 {
+#ifdef AJI_TRTRTX
+    // The addon cached-only contract is qualified for classic TensorRT.
+    // TensorRT-RTX warm-up/build/fallback requires separate qualification.
+    return 0;
+#else
     return 1;
+#endif
 }
