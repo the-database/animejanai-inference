@@ -1335,6 +1335,8 @@ void rife_teardown(aji_ctx *c)
 bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
                 double fps, bool before_upscale)
 {
+    if (chain->rife_fp16_warp)
+        c->log_steps.push_back("Using stock RIFE: warp requires classic TensorRT");
     auto &R = c->rife;
     R.w = w;
     R.h = h;

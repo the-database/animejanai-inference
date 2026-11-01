@@ -51,6 +51,7 @@
 #include "onnx_shape.h"
 #include "core/fileio.h"
 #include "core/trt_engine.h"
+#include "rife_warp_plugin.h"
 
 namespace fs = std::filesystem;
 
@@ -302,6 +303,10 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
         c->set_error("%s", err.c_str());
         return false;
     }
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+    if (onnx_name == AJI_RIFE_WARP_MODEL)
+        spec->cmdline += " --dynamicPlugins=\"" + aji_rife_warp_plugin_path() + "\"";
+#endif
     return true;
 }
 
@@ -485,11 +490,12 @@ bool defer_to_warm_up(aji_ctx *c, const std::string &name,
 int ensure_engine(aji_ctx *c, const std::string &name,
                   const std::string &settings, const std::string &epath,
                   ModelEngine *me, int w, int h, int ch,
-                  const std::string *dir = nullptr, int rank5_t = 0)
+                  const std::string *dir = nullptr, int rank5_t = 0,
+                  const std::string &plugin_id = {})
 {
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath =
-        short_engine_path_for(model_dir, name, settings, c->cuda_dev);
+        short_engine_path_for(model_dir, name, settings, c->cuda_dev, plugin_id);
 #ifdef AJI_TRTRTX
     // a failure already reported (and not replaced by the TensorRT
     // fallback): passthrough, as aji_trt does for a failed build
@@ -653,8 +659,34 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     R.den = chain->rife_factor_den;
     R.scd_threshold = chain->rife_scd_threshold;
 
-    const std::string model =
-        rife_model_name(chain->rife_model, chain->rife_ensemble);
+    const std::string stock_model = rife_model_name(chain->rife_model, chain->rife_ensemble);
+    std::string model = stock_model, plugin_id;
+    if (chain->rife_fp16_warp) {
+        const char *reason = nullptr;
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, c->cuda_dev) != cudaSuccess) {
+            c->set_error("Cannot query the RIFE CUDA device");
+            return false;
+        }
+        const int sm = prop.major * 10 + prop.minor;
+        if (model != "rife_v4.22" || w != 1920 || h != 1080)
+            reason = "warp requires non-ensemble RIFE 4.22 at 1920x1080";
+        else if (sm != 89 && sm != 120)
+            reason = "warp kernels support only sm_89 and sm_120";
+        else if (!file_exists((fs::path(c->rife_model_dir) /
+                               (std::string(AJI_RIFE_WARP_MODEL) + ".onnx")).string()))
+            reason = "experimental RIFE ONNX is not installed";
+        else if (!aji_register_rife_warp_plugin(&plugin_id))
+            reason = "warp plugin unavailable or changed; restart after installing it";
+#else
+        reason = "warp requires Windows and classic TensorRT 11";
+#endif
+        if (reason)
+            c->log_steps.push_back(std::string("Using stock RIFE: ") + reason);
+        else
+            model = AJI_RIFE_WARP_MODEL;
+    }
     char dims[64];
     snprintf(dims, sizeof(dims), "1x11x%dx%d", R.ph, R.pw);
     // strongly-typed build from the fp16-typed rife onnx (the shipped
@@ -663,10 +695,23 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         "--stronglyTyped --optShapes=input:") + dims +
         " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
-    const std::string epath =
-        engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev);
-    int er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
+    std::string epath =
+        engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev, plugin_id);
+    const std::string failed_path = plugin_id.empty() ? std::string() :
+        short_engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev, plugin_id);
+    int er = !failed_path.empty() && c->failed_builds.count(failed_path) ? 0 :
+        ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
+                      11, &c->rife_model_dir, 0, plugin_id);
+    if (!failed_path.empty() && (er < 0 || (er == 0 && c->failed_builds.count(failed_path)))) {
+        c->failed_builds.insert(failed_path);
+        c->log_steps.push_back("Using stock RIFE: experimental engine failed (see " +
+                               failed_path + ".build.log)");
+        model = stock_model;
+        R.engine = ModelEngine{};
+        epath = engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev);
+        er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
                            11, &c->rife_model_dir);
+    }
     if (er < 0)
         return false;
     if (er == 0)

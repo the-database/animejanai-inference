@@ -32,6 +32,7 @@ struct AjiChainConf {
     int rife_factor_den = 1;
     int rife_model = 414;                      // e.g. 414 = rife_v4.14
     bool rife_ensemble = false;
+    bool rife_fp16_warp = false;               // optional classic TRT 4.22 plugin
     double rife_scd_threshold = 0.150;         // misc.SCDetect threshold
     bool rife_before_upscale = true;           // interpolate at the source
                                                // resolution, then upscale every
