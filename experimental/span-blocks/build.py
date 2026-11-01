@@ -34,5 +34,5 @@ cmd = [*nvcc, '--shared', '-std=c++17', '-DAJ_CONV_720_M256', '-Xcompiler', '/Zc
        '-I'+str(args.trt_include.resolve()), '-I'+str(args.cutlass_include.resolve()),
        '-I'+str(args.cccl_include.resolve()), '-I'+str(args.cccl_include.resolve()/'cccl'),
        '-I'+str(output), str(source/'plugin.cu'), '-L'+str(args.cuda/'lib/x64'), '-lcuda',
-       '-o', str(output/'native-block.dll')]
+       '-o', str(output/'balanced-blocks-plugin.dll')]
 subprocess.run(cmd, check=True, cwd=output)

@@ -15,6 +15,11 @@ spec.loader.exec_module(concat)
 
 
 def prepare_blocks(kind, source, output):
+    if kind == 'performance-cache48':
+        original = concat.prepare('performance', source, output)
+        target = output/'2x_AnimeJaNai_HD_V3.1_Performance_FP16_Concat_Cache48_v1.onnx'
+        shutil.copyfile(original, target)
+        return target
     concat_model = concat.prepare('balanced', source, output/'concat-source')
     shutil.copyfile(output/'concat-source/parameters.h', output/'parameters.h')
     model = onnx.load(concat_model if kind == 'block-concat' else source)
@@ -52,7 +57,7 @@ def prepare_blocks(kind, source, output):
         outputs = ([relus[0].output[0]] if extra else []) + [convs[2].output[0]]
         replacement[convs[0].name] = helper.make_node(f'AJBalancedBlock3x3_{block-1}',
             [convs[0].input[0]], outputs, name=f'/block_{block}/CUTLASS_3Conv',
-            domain='com.astra', plugin_version='1', plugin_namespace='')
+            domain='com.astra', plugin_version='1', plugin_namespace='aji.span.blocks.v1')
         removed.update(n.name for n in convs[1:] + relus)
     header = 'static const unsigned short kConvWeights[24][36864]={' + ',\n'.join(arrays) + '};\n'
     header += 'static const unsigned short kConvBias[24][64]={' + ',\n'.join(biases) + '};\n'
@@ -65,18 +70,24 @@ def prepare_blocks(kind, source, output):
     nodes = [replacement.get(n.name, n) for n in model.graph.node if n.name not in removed]
     del model.graph.node[:]
     model.graph.node.extend(nodes)
+    for node in model.graph.node:
+        if node.op_type == 'AJBalancedConcatFP16':
+            for attr in node.attribute:
+                if attr.name == 'plugin_namespace':
+                    attr.s = b'aji.span.blocks.v1'
     if not any(o.domain == 'com.astra' for o in model.opset_import):
         model.opset_import.append(helper.make_opsetid('com.astra', 1))
     assert initializers == [t.SerializeToString() for t in model.graph.initializer]
     onnx.checker.check_model(model)
-    target = output / (kind + '.onnx')
+    name = 'Concat' if kind == 'block-concat' else 'NativeTail7'
+    target = output / f'2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Blocks_{name}_v1.onnx'
     onnx.save(model, target)
     return target
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--kind', choices=['block-concat', 'native-tail7'], required=True)
+    parser.add_argument('--kind', choices=['block-concat', 'native-tail7', 'performance-cache48'], required=True)
     parser.add_argument('--model', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()

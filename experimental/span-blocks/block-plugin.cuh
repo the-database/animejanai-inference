@@ -14,7 +14,7 @@ public:
     IPluginV3* clone()noexcept override{return new(std::nothrow) BlockPlugin(block);}
     char const* getPluginName()const noexcept override{return kBlockNames[block];}
     char const* getPluginVersion()const noexcept override{return "1";}
-    char const* getPluginNamespace()const noexcept override{return "";}
+    char const* getPluginNamespace()const noexcept override{return kBlockNamespace;}
     int32_t getNbOutputs()const noexcept override{return count();}
     int32_t getOutputDataTypes(DataType* out,int32_t no,DataType const* in,int32_t ni)const noexcept override{
         if(ni!=1||no!=count()||in[0]!=DataType::kHALF)return 1;for(int i=0;i<no;++i)out[i]=DataType::kHALF;return 0;
@@ -56,5 +56,5 @@ public:
     PluginFieldCollection const* getFieldNames()noexcept override{return &fields;}
     char const* getPluginName()const noexcept override{return kBlockNames[block];}
     char const* getPluginVersion()const noexcept override{return "1";}
-    char const* getPluginNamespace()const noexcept override{return "";}
+    char const* getPluginNamespace()const noexcept override{return kBlockNamespace;}
 };

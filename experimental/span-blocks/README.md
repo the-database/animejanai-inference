@@ -2,7 +2,9 @@
 
 This work builds on `experimental/span-concat` (PR #35). It preserves the later
 4090 tuning and the small 5090 540p gain as reproducible source experiments.
-It does **not** replace the ordinary profiles or select these engines by default.
+Its `profiles.conf` keeps the four original/concat profiles and adds slots 5-7
+for block-concat, NativeTail7 and Performance Cache48. The ordinary models remain
+available and slot 1 (Original Balanced) stays the default.
 
 The plugin groups each selected three-convolution block behind one TensorRT
 plugin boundary, using CUTLASS FP16 NHWC convolutions with the original FP16
@@ -11,9 +13,9 @@ the grouping gives explicit control over the intermediate buffer/layout.
 
 Two exports are supported:
 
-- `block-concat.onnx`: all eight blocks plus the custom concat/projection.
+- `2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Blocks_Concat_v1.onnx`: all eight blocks plus the custom concat/projection.
   Selected for the 4090 1080p experiment.
-- `native-tail7.onnx`: only the first seven blocks, with the eighth block and
+- `2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Blocks_NativeTail7_v1.onnx`: only the first seven blocks, with the eighth block and
   native concat/projection retained. Selected for the 5090 540p experiment.
 
 The attempted all-eight-block **native** tail produced incorrect images because
@@ -42,11 +44,11 @@ available when explicitly needed by the local NVCC/MSVC combination.
 Build the selected 4090 Balanced static engine:
 
 ```bat
-python experimental\span-blocks\build-engine.py --preset balanced-block-4090-1080 --trtexec "C:\TensorRT\trtexec.exe" --onnx "C:\blocks-build\block-concat.onnx" --plugin "C:\blocks-build\native-block.dll" --engine "C:\blocks-build\balanced-block-1080.engine"
+python experimental\span-blocks\build-engine.py --preset balanced-block-4090-1080 --trtexec "C:\TensorRT\trtexec.exe" --onnx "C:\blocks-build\2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Blocks_Concat_v1.onnx" --plugin "C:\blocks-build\balanced-blocks-plugin.dll" --engine "C:\blocks-build\balanced-block-1080.engine"
 ```
 
 For the 5090 540p export, use `--preset balanced-native7-5090-540`, the
-`native-tail7.onnx` file and the same plugin. For the later Performance cache
+`2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Blocks_NativeTail7_v1.onnx` file and the same plugin. For the later Performance cache
 tuning, build Performance's concat model/plugin using `span-concat/build.py`,
 then use `--preset performance-cache48-4090-1080` with that model and
 `performance-plugin.dll`. This selects 48 MiB (50,331,648 bytes), not the earlier
@@ -78,25 +80,72 @@ model, unlike the reference used for the 4090 block-concat experiment.
 The 720p grouped schedule regressed engine QPS 455.764 -> 444.863 (-2.39%).
 The later interrupted 4090 lower-resolution screen did not establish a win.
 
-Fresh source-packaging checks compiled both architectures, reproduced the
-convolution/bias/ReLU/block parameter headers, and reproduced native-tail7 ONNX
-byte-for-byte. The concat export keeps the two now-unused projection initializers
-and uses the same custom domain as the other packaged SPAN export; learned
-parameter bits are unchanged. Eight paired 5090 native-tail7 runtime outputs
-matched the previous plugin binary exactly. This is not a fresh 4090 playback
-benchmark or a newly searched engine.
+Initial source-packaging checks compiled both architectures and reproduced the
+convolution/bias/ReLU/block parameter headers. Eight paired 5090 native-tail7
+runtime outputs matched the previous plugin binary exactly. The subsequent
+named-profile integration changes ONNX plugin namespace attributes and model
+filenames; these exports intentionally differ from the historical ONNX bytes.
+Learned parameter bits remain unchanged. Historical equality refers to the
+specific engines above, not every new TensorRT tactic search.
 
-## Remaining integration work
+## Named-profile integration
 
-This is a draft research package. The block plugin registers the earlier concat
-creator as well as 24 convolution and eight block creators. Load it in a fresh
-process with the selected engine; do not load it alongside the separate Balanced
-concat plugin, whose creator name overlaps. A direct-engine API caller must load
-the DLL and call `initBalancedPlugin` before deserialization. `trtexec` does this
-through `--dynamicPlugins`.
+Copy `balanced-blocks-plugin.dll` beside the built `aji_trt.dll` and the normal
+TensorRT/CUDA runtime DLLs in an isolated installation. Put the generated ONNX
+exports beside the original/concat models. Both block exports use the dedicated
+`aji.span.blocks.v1` TensorRT namespace. Their creators coexist with the standalone
+concat plugin, so profile changes no longer require a new process.
 
-Before normal named-profile integration, give the block variants distinct
-creator/model/cache identities and validate profile switching, clean-cache
-building and native playback on the target GPUs. Do not rename these files over
-the stock model or the earlier concat model. This PR deliberately leaves those
-default routes untouched while exposing the tested kernel source and presets.
+The backend registers the correct DLL before deserializing an engine and passes
+it to the asynchronous trtexec builder. Distinct model basenames and builder
+settings produce distinct cache keys. Slot 5 selects block-concat at 1080p with
+optimization level 5 and zero auxiliary streams. Slot 6 selects NativeTail7 at
+960x540 with tiling level 3. Other sizes fail explicitly for these two exports.
+
+To create the separately named 1080p Performance Cache48 model, run:
+
+```bat
+python experimental\span-blocks\prepare.py --kind performance-cache48 --model "C:\models\2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx" --output "C:\cache48-build"
+```
+
+Copy `2x_AnimeJaNai_HD_V3.1_Performance_FP16_Concat_Cache48_v1.onnx` into the model
+directory and retain `performance-plugin.dll` from the concat build. Slot 7 uses
+that same creator with its own model/cache identity and 48 MiB tiling budget.
+The ordinary Performance and earlier 64 MiB concat profiles are unchanged.
+The supplied profiles use static engines; no automatic GPU-specific replacement
+of the user's regular model is performed.
+
+The direct-engine API still requires the caller to register the DLL before
+loading an engine; its entry point is now `initBalancedBlocksPlugin`. Historical
+unnamespaced experimental block engines must be rebuilt from the new exports.
+
+## Integration validation
+
+The complete classic backend and namespaced plugin compile with TensorRT 11.3,
+CUDA 13.3 and native SM89/SM120 code. New block-concat/Cache48 engines built
+successfully on both the 4090 and 5090 at 1080p; NativeTail7 built on the 5090 at
+540p. The six 1080p profiles load in one context, including both standalone
+concat plugins and the namespaced block plugin. Each GPU produced 72 frames and
+passed exact reverse-profile switching. A separate 16-frame 540p sequence checks
+Original, concat and NativeTail7 on the 5090.
+
+Fresh engine searches do not reproduce every historical equality result:
+block-concat versus prior concat has worst sampled PSNR 75.070 dB on the 5090 and
+70.034 dB on the 4090. Cache48 versus prior Performance concat is 70.724 dB on the
+5090 and identical for all 12 sampled 4090 frames. NativeTail7 versus Original
+is 69.156 dB on the four sampled 5090 frames, rather than bit-identical. These
+are direct YUV444P16 measurements with peak 65535, not rendered RGB48. See
+`validation.json`; the historical speed and equality records above remain
+specific to their saved engines.
+
+Use `sanity/named_profiles.py` from #35 to repeat the direct API checks, selecting
+`--slots 1,2,3,4,5,7` at 1080p or `--slots 1,2,4,6 --width 960 --height 540` with
+a raw 540p NV12 clip. A new output directory records every frame and reverse
+switching check. Different model basenames and settings isolate each engine.
+
+Fresh 5090 native 3840x2160 playback completed for block-concat and Cache48 with
+three Vulkan queues and no recorded drops. The controls varied considerably
+across the suite; it does not establish a new speedup. The fresh 540p rendered
+comparison is incomplete, and new 4090 native-display timing is not included.
+These remain optional experiments with shape restrictions, not automatic
+replacements or a new claim of bit-exact stock output.

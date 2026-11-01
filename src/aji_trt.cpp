@@ -70,11 +70,20 @@ const char *BALANCED_CONCAT_MODEL =
     "2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Concat_Tiled3_v2";
 const char *PERFORMANCE_CONCAT_MODEL =
     "2x_AnimeJaNai_HD_V3.1_Performance_FP16_Concat_v1";
+const char *BALANCED_BLOCKS_MODEL =
+    "2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Blocks_Concat_v1";
+const char *BALANCED_NATIVE7_MODEL =
+    "2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Blocks_NativeTail7_v1";
+const char *PERFORMANCE_CACHE48_MODEL =
+    "2x_AnimeJaNai_HD_V3.1_Performance_FP16_Concat_Cache48_v1";
 
 int span_plugin_kind(const std::string &name)
 {
     return name == BALANCED_CONCAT_MODEL ? 1 :
-           name == PERFORMANCE_CONCAT_MODEL ? 2 : 0;
+           name == PERFORMANCE_CONCAT_MODEL ? 2 :
+           name == BALANCED_BLOCKS_MODEL ? 3 :
+           name == BALANCED_NATIVE7_MODEL ? 4 :
+           name == PERFORMANCE_CACHE48_MODEL ? 5 : 0;
 }
 
 #if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
@@ -90,13 +99,17 @@ std::string span_plugin_path(int kind)
     if (!n || n >= 32768)
         return {};
     return (fs::path(filename).parent_path() /
-            (kind == 2 ? "performance-plugin.dll" : "balanced-next-plugin.dll")).u8string();
+            (kind == 2 || kind == 5 ? "performance-plugin.dll" :
+             kind == 3 || kind == 4 ? "balanced-blocks-plugin.dll" :
+             "balanced-next-plugin.dll")).u8string();
 }
 
 bool ensure_span_plugin(int kind)
 {
     static std::mutex mutex;
-    static bool ready[3] = {};
+    // The two block exports share one registry; Cache48 shares Performance's.
+    kind = kind == 5 ? 2 : kind == 4 ? 3 : kind;
+    static bool ready[4] = {};
     std::lock_guard<std::mutex> lock(mutex);
     if (ready[kind])
         return true;
@@ -104,7 +117,8 @@ bool ensure_span_plugin(int kind)
     HMODULE mod = LoadLibraryExW(path.c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     auto init = mod ? reinterpret_cast<int(*)()>(GetProcAddress(mod,
-        kind == 2 ? "initPerformancePlugin" : "initBalancedPlugin")) : nullptr;
+        kind == 2 ? "initPerformancePlugin" :
+        kind == 3 ? "initBalancedBlocksPlugin" : "initBalancedPlugin")) : nullptr;
     if (!init || !init()) {
         if (mod) FreeLibrary(mod);
         return false;
@@ -1311,11 +1325,19 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                 c->set_error("Cannot register the optimized SPAN model plugin");
                 return AJI_ERR_ENGINE;
             }
+            if (((kind == 3 || kind == 5) && (bw != 1920 || bh != 1080)) ||
+                (kind == 4 && (bw != 960 || bh != 540))) {
+                c->set_error("Block-concat/Cache48 require 1080p; NativeTail7 requires 960x540");
+                return AJI_ERR_ENGINE;
+            }
             settings = "--builderOptimizationLevel=5 --optShapes=input:" + std::string(dims);
-            if (kind == 1 || (bw == 1920 && bh == 1080))
+            if (kind == 3)
+                settings += " --maxAuxStreams=0";
+            else if (kind == 1 || kind == 4 || (bw == 1920 && bh == 1080))
                 settings += " --tilingOptimizationLevel=3";
-            if (bw == 1920 && bh == 1080)
-                settings += " --l2LimitForTiling=67108864";
+            if (kind != 3 && bw == 1920 && bh == 1080)
+                settings += kind == 5 ? " --l2LimitForTiling=50331648"
+                                      : " --l2LimitForTiling=67108864";
             settings += " --skipInference";
 #else
             c->set_error("Optimized SPAN plugins currently require Windows and TensorRT 11");
