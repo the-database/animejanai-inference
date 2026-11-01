@@ -1177,6 +1177,98 @@ static void inject_profile(const char *vcodec, enum out_pixfmt pf,
         av_dict_set(opts, "profile", p, 0);
 }
 
+#ifdef _WIN32
+/* An indirect-display adapter: a virtual monitor (Parsec, Meta Quest Link,
+ * any IddCx driver). DXGI lists one per virtual display, each describing the
+ * GPU that renders for it, so one card would show up several times. The
+ * kernel adapter type tells them apart; a failed lookup keeps the adapter.
+ * Same check as aji_img_dml.cpp; the D3DKMT structs mirror d3dkmthk.h and
+ * the calls resolve from gdi32 at runtime. */
+static int is_indirect_display(LUID luid)
+{
+    typedef struct { LUID luid; UINT handle; } OpenFromLuid;
+    typedef struct { UINT handle; UINT type; void *data; UINT size; } QueryInfo;
+    typedef struct { UINT handle; } CloseAdapter;
+    typedef LONG(APIENTRY *OpenFn)(OpenFromLuid *);
+    typedef LONG(APIENTRY *QueryFn)(const QueryInfo *);
+    typedef LONG(APIENTRY *CloseFn)(const CloseAdapter *);
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi) gdi = LoadLibraryW(L"gdi32.dll");
+    if (!gdi) return 0;
+    OpenFn  open  = (OpenFn)(void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid");
+    QueryFn query = (QueryFn)(void *)GetProcAddress(gdi, "D3DKMTQueryAdapterInfo");
+    CloseFn close = (CloseFn)(void *)GetProcAddress(gdi, "D3DKMTCloseAdapter");
+    if (!open || !query || !close) return 0;
+    OpenFromLuid o = {luid, 0};
+    if (open(&o) != 0) return 0;
+    UINT type = 0;
+    QueryInfo q = {o.handle, 15 /* KMTQAITYPE_ADAPTERTYPE */, &type, sizeof type};
+    int ok = query(&q) == 0;
+    CloseAdapter cl = {o.handle};
+    close(&cl);
+    return ok && (type & (1u << 6) /* IndirectDisplayDevice */);
+}
+
+typedef struct {
+    int  index;                 /* DXGI adapter index (libav D3D11VA device string) */
+    UINT vendor;                /* PCI vendor id */
+    char name[128];             /* UTF-8 */
+} gpu_adapter;
+
+/* Hardware GPUs in DXGI order, without software adapters or the
+ * virtual-display duplicates. Returns the count (at most max). */
+static int list_gpus(gpu_adapter *out, int max)
+{
+    IDXGIFactory1 *f = NULL;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f)))
+        return 0;
+    int n = 0;
+    IDXGIAdapter1 *a = NULL;
+    for (UINT i = 0; n < max &&
+         IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 d;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d)) &&
+            !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            !is_indirect_display(d.AdapterLuid)) {
+            out[n].index  = (int)i;
+            out[n].vendor = d.VendorId;
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, out[n].name,
+                                sizeof out[n].name, NULL, NULL);
+            out[n].name[sizeof out[n].name - 1] = 0;
+            n++;
+        }
+        IDXGIAdapter1_Release(a);
+    }
+    IDXGIFactory1_Release(f);
+    return n;
+}
+
+static const char *vendor_name(UINT v)
+{
+    return v == 0x10de ? "nvidia" : v == 0x1002 ? "amd" :
+           v == 0x8086 ? "intel"  : "other";
+}
+
+/* The vendor of DXGI adapter 0: the GPU libav's D3D11VA device opens on
+ * with no index, so the one --backend directml runs on. (Adapter 0 may be a
+ * virtual-display entry; it still names the GPU that renders for it.) */
+static UINT default_gpu_vendor(void)
+{
+    IDXGIFactory1 *f = NULL;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f)))
+        return 0;
+    UINT v = 0;
+    IDXGIAdapter1 *a = NULL;
+    if (IDXGIFactory1_EnumAdapters1(f, 0, &a) != DXGI_ERROR_NOT_FOUND) {
+        DXGI_ADAPTER_DESC1 d;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d))) v = d.VendorId;
+        IDXGIAdapter1_Release(a);
+    }
+    IDXGIFactory1_Release(f);
+    return v;
+}
+#endif
+
 /* AMF opens on the default adapter (DXGI adapter 0) unless handed a device,
  * so with an NVIDIA card as the default and an AMD iGPU beside it, it would
  * fail. Point it at the first AMD adapter (libav derives its AMF device from
@@ -1185,20 +1277,10 @@ static void inject_profile(const char *vcodec, enum out_pixfmt pf,
 static void amf_pick_adapter(AVCodecContext *enc)
 {
 #ifdef _WIN32
-    IDXGIFactory1 *f = NULL;
-    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f)))
-        return;
-    int idx = -1;
-    IDXGIAdapter1 *a = NULL;
-    for (UINT i = 0; idx < 0 &&
-         IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
-        DXGI_ADAPTER_DESC1 d;
-        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d)) && d.VendorId == 0x1002 &&
-            !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
-            idx = (int)i;
-        IDXGIAdapter1_Release(a);
-    }
-    IDXGIFactory1_Release(f);
+    gpu_adapter g[16];
+    int n = list_gpus(g, 16), idx = -1;
+    for (int i = 0; i < n && idx < 0; i++)
+        if (g[i].vendor == 0x1002) idx = g[i].index;
     if (idx <= 0)       /* none, or already the default */
         return;
     char s[16];
@@ -1273,14 +1355,29 @@ fail:
     return -1;
 }
 
-/* --probe-encoders: open each GPU encoder at 8- and 10-bit 4:2:0 and print
- * one machine-readable line per encoder, e.g.
+/* --probe-encoders: list the GPUs, then open each GPU encoder at 8- and
+ * 10-bit 4:2:0. One machine-readable line each, e.g.
+ *   GPU index=0 vendor=nvidia default=1 name=NVIDIA GeForce RTX 5090
  *   ENCODER name=hevc_qsv yuv420p=1 yuv420p10=1
- * Opening is what fails on a missing GPU, driver, codec or bit depth (all
- * three vendors create their hardware session in init). Software encoders
- * are always available and not listed. */
+ * default=1 marks the vendor of DXGI adapter 0, the GPU --backend directml
+ * runs on (TensorRT is always the NVIDIA card). name= is last and runs to
+ * the end of the line. Opening is what fails on a missing GPU, driver, codec
+ * or bit depth (all three vendors create their hardware session in init).
+ * Software encoders are always available and not listed. */
 static void probe_encoders(void)
 {
+#ifdef _WIN32
+    gpu_adapter g[16];
+    int ng = list_gpus(g, 16);
+    UINT def = default_gpu_vendor();
+    int def_marked = 0;
+    for (int i = 0; i < ng; i++) {
+        int is_def = !def_marked && g[i].vendor == def;
+        def_marked |= is_def;
+        printf("GPU index=%d vendor=%s default=%d name=%s\n", g[i].index,
+               vendor_name(g[i].vendor), is_def, g[i].name);
+    }
+#endif
     static const char *const names[] = {
         "hevc_nvenc", "h264_nvenc", "av1_nvenc",
         "hevc_amf",   "h264_amf",   "av1_amf",
