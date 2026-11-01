@@ -75,7 +75,38 @@ an additional supported development shape.
 ## Review status
 
 The kernel bodies are the versions exercised in the 4090/5090 experiments.
-This source packaging and current-upstream builder integration are new. They
-remain opt-in pending broader install/build, driver and content validation.
+The source packaging and named-model builder integration were compiled with
+TensorRT 11.3/CUDA 13.3. All four static 1080p engines were built from empty caches
+on both a 4090 and a 5090. Both optimized models were also built at the remaining
+five supported sizes on the 5090. Original and experimental profiles coexist in one context, and reverse
+profile switching checks that the first frame remains byte-identical to its
+earlier output within each profile. This is not equality between different models.
+The corrected upload check produced 48 frames per GPU (12 per profile). Worst
+sample PSNR against stock was 72.431 dB Balanced / 70.719 dB Performance on the
+5090, and 77.615 / 70.025 dB on the 4090. These are direct YUV444P16 comparisons
+with peak 65535, not the historical rendered RGB48 measurements above.
+`validation.json` records the integration results and individual playback timings.
+
+`sanity/named_profiles.py` reproduces the direct API build/cache/switch checks.
+It requires Windows, NumPy, the built backend/runtime DLLs and raw NV12 clips.
+For example, from the repository root, with an isolated directory containing the
+original and generated models:
+
+```bat
+python sanity\named_profiles.py --backend "C:\test\aji_trt.dll" --runtime "C:\test" --conf experimental\span-concat\profiles.conf --models "C:\test\models" --frames "C:\clips\1080p.nv12" --output "C:\checks\span" --clean-cache
+```
+
+The test uploads frames on the inference stream. An earlier default-stream
+upload raced the nonblocking inference stream on the 4090; that harness error
+reproduced with both the old and new backend and disappeared with ordered uploads.
+
+Fresh 5090 native 3840x2160 playback completed for all four profiles before
+playback testing was paused. Vulkan queue count remained three, output was 2x,
+and the checks recorded no decoder/render drops. Timing was not stable across
+rounds (Balanced concat: 110.14 then 79.63 fps), so these runs establish playback
+integration, not a new speedup. Historical gains above remain separate evidence.
+New 4090 native-display timing and wider content/driver coverage are outstanding.
+
+These paths remain explicitly opt-in.
 The later Ada grouped-convolution and 48 MiB Performance-cache experiments are
 separate changes; this directory does not silently enable them.
