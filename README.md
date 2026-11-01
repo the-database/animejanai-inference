@@ -1,5 +1,7 @@
 # animejanai-inference
 
+Optional addon interfaces are documented in [docs/ADDON-API.md](docs/ADDON-API.md), including build dependencies, inactive behavior and qualification limits.
+
 Inference shim for the native mpv AnimeJaNai pipeline. `libaji` exposes a
 strict C ABI (`include/aji.h`) that `vf_animejanai` in the
 [the-database/mpv](https://github.com/the-database/mpv) fork loads at

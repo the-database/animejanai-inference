@@ -24,6 +24,9 @@ jobs:
       - name: Build dispatcher and both inference backends
         shell: pwsh
         run: ./tools/build-windows-test.ps1
+      - name: Check cached-only dispatch without a GPU
+        shell: pwsh
+        run: python tools/test-stream-policy-dispatch.py build/Release/aji.dll
       - uses: actions/upload-artifact@v4
         with:
           name: aji-windows-scene-test
