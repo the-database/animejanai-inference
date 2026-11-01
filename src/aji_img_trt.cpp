@@ -31,6 +31,7 @@
 #include "onnx_shape.h"
 #include "core/fileio.h"
 #include "core/half.h"
+#include "core/half_array.h"
 #include "core/tiling.h"
 #include "core/trt_engine.h"
 
@@ -71,9 +72,7 @@ void pack(const float *src, void *dst, size_t n, nvinfer1::DataType t)
     if (t == nvinfer1::DataType::kFLOAT) {
         memcpy(dst, src, n * 4);
     } else if (t == nvinfer1::DataType::kHALF) {
-        uint16_t *d = (uint16_t *)dst;
-        for (size_t i = 0; i < n; i++)
-            d[i] = f32_to_f16(src[i]);
+        f32_to_f16_array(src, static_cast<uint16_t *>(dst), n);
     } else {
         uint16_t *d = (uint16_t *)dst;
         for (size_t i = 0; i < n; i++)
@@ -86,9 +85,7 @@ void unpack(const void *src, float *dst, size_t n, nvinfer1::DataType t)
     if (t == nvinfer1::DataType::kFLOAT) {
         memcpy(dst, src, n * 4);
     } else if (t == nvinfer1::DataType::kHALF) {
-        const uint16_t *s = (const uint16_t *)src;
-        for (size_t i = 0; i < n; i++)
-            dst[i] = f16_to_f32(s[i]);
+        f16_to_f32_array(static_cast<const uint16_t *>(src), dst, n);
     } else {
         const uint16_t *s = (const uint16_t *)src;
         for (size_t i = 0; i < n; i++)
