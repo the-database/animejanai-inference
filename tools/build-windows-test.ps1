@@ -42,7 +42,7 @@ foreach ($package in @(@('Microsoft.ML.OnnxRuntime.DirectML',$pins.onnxRuntime,'
 }
 $env:CUDA_PATH = "$deps/cuda"
 $env:PATH = "$env:CUDA_PATH/bin;$env:PATH"
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_BUILD_ANALYSIS=ON "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" "-DCMAKE_CUDA_COMPILER=$deps/cuda/bin/nvcc.exe" "-DAJI_TRT_ROOT=$deps/trt" "-DAJI_TRT_LIB=$deps/trt/lib" -DAJI_NVINFER=nvinfer_11 "-DAJI_ORT_ROOT=$deps/ort" "-DAJI_DML_ROOT=$deps/dml"
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_BUILD_ANALYSIS=ON "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" "-DCMAKE_CUDA_COMPILER=$deps/cuda/bin/nvcc.exe" "-DAJI_TRT_ROOT=$deps/trt" "-DAJI_TRT_LIB=$deps/trt/lib" "-DAJI_NVINFER=$($pins.tensorRTLibrary)" "-DAJI_ORT_ROOT=$deps/ort" "-DAJI_DML_ROOT=$deps/dml"
 if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
 cmake --build build --parallel 2
 if ($LASTEXITCODE -ne 0) { throw 'Inference build failed' }
