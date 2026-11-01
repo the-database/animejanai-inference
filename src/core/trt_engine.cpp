@@ -262,11 +262,28 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
                              FILE_ATTRIBUTE_NORMAL, nullptr);
     if (log == INVALID_HANDLE_VALUE)
         return -1;
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = log;
-    si.hStdError = log;
+    HANDLE input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (input == INVALID_HANDLE_VALUE) { CloseHandle(log); return -1; }
+    STARTUPINFOEXW si = {};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = input;
+    si.StartupInfo.hStdOutput = log;
+    si.StartupInfo.hStdError = log;
+    SIZE_T attribute_bytes = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_bytes);
+    std::vector<unsigned char> attributes(attribute_bytes);
+    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+    if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attribute_bytes)) {
+        CloseHandle(input); CloseHandle(log); return -1;
+    }
+    HANDLE inherited[] = {input, log};
+    if (!UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherited, sizeof(inherited), nullptr, nullptr)) {
+        DeleteProcThreadAttributeList(si.lpAttributeList);
+        CloseHandle(input); CloseHandle(log); return -1;
+    }
     PROCESS_INFORMATION pi = {};
     // The command line carries UTF-8 paths (model dir, engine, timing cache).
     // CreateProcessA reinterprets those bytes through the process ANSI code
@@ -275,7 +292,10 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
     // path whatever the system locale is.
     std::wstring cmd = widen_utf8(spec.cmdline);  // CreateProcess may modify it
     BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+                             CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                             nullptr, nullptr, &si.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(si.lpAttributeList);
+    CloseHandle(input);
     if (log != INVALID_HANDLE_VALUE)
         CloseHandle(log);
     if (!ok)

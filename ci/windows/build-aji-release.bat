@@ -5,6 +5,7 @@ REM   AJI_WIN  the SDK working area (default %USERPROFILE%\aji-win)
 REM   AJI_TRTRTX_ROOT  TensorRT for RTX SDK for aji_trtrtx (default %AJI_WIN%\trtrtx171)
 REM Builds this checkout into build-win-release\ and prints AJI-RELEASE-BUILD-OK.
 setlocal
+if not defined AJI_BUILD_ANALYSIS set "AJI_BUILD_ANALYSIS=OFF"
 if not defined AJI_WIN set "AJI_WIN=%USERPROFILE%\aji-win"
 if not defined AJI_TRTRTX_ROOT set "AJI_TRTRTX_ROOT=%AJI_WIN%\trtrtx171"
 for %%i in ("%~dp0..\..") do set "SRC=%%~fi"
@@ -12,12 +13,15 @@ set "BLD=%SRC%\build-win-release"
 for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -version [18.0^,19.0^) -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
 if not defined VSDIR (echo Visual Studio 18 with the C++ tools not found & exit /b 1)
 call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo || exit /b 1
-set "CUDA_PATH=%AJI_WIN%\cuda134"
+for /f "tokens=1,2 delims==" %%a in ('powershell -NoProfile -Command "$p=Get-Content '%~dp0dependencies.json' -Raw ^| ConvertFrom-Json; 'CUDA_DIR='+$p.cudaDirectory; 'TRT_DIR='+$p.tensorRTDirectory; 'TRT_LIB='+$p.tensorRTLibrary"') do set "%%a=%%b"
+if not defined CUDA_DIR exit /b 1
+if not defined TRT_DIR exit /b 1
+set "CUDA_PATH=%AJI_WIN%\%CUDA_DIR%"
 set "PATH=%CUDA_PATH%\bin;%PATH%"
-cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_BUILD_ANALYSIS=%AJI_BUILD_ANALYSIS% ^
   "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ^
   "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_PATH%" ^
-  -DAJI_TRT_ROOT=%AJI_WIN%/trt114 -DAJI_NVINFER=nvinfer_11 ^
+  -DAJI_TRT_ROOT=%AJI_WIN%/%TRT_DIR% -DAJI_NVINFER=%TRT_LIB% ^
   "-DAJI_TRTRTX_ROOT:PATH=%AJI_TRTRTX_ROOT%" ^
   -DAJI_ORT_ROOT=%AJI_WIN%/ort/Microsoft.ML.OnnxRuntime.DirectML ^
   -DAJI_DML_ROOT=%AJI_WIN%/ort/Microsoft.AI.DirectML ^

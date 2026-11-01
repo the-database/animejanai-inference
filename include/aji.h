@@ -107,11 +107,12 @@ typedef struct aji_create_params {
     int slot;                 /* initial slot (1-9, 1001-1003, 1010-1011) */
     const char *rife_model_dir; /* dir with rife_v*.onnx + engine cache;
                                    NULL disables RIFE even if a chain asks */
-    int async_build;          /* nonzero: missing engines build on a
-                                 background thread; aji_configure returns
-                                 passthrough (or chain-without-rife)
-                                 meanwhile, and aji_poll() reports when to
-                                 reconfigure. Zero: builds block (CLI). */
+    int async_build;          /* 0: blocking builds; 1: background builds with
+                                 passthrough until aji_poll requests a
+                                 reconfigure; 2: cached-only, no builds,
+                                 cache writes/deletes or backend fallback.
+                                 Query aji_stream_policy_version before
+                                 requesting 2 from an older library. */
     void *d3d11_device;       /* ID3D11Device* of the caller (the device
                                  the frame textures live on). Required by
                                  the DirectML backend; ignored by
