@@ -154,6 +154,14 @@ def convert_model(model: onnx.ModelProto) -> onnx.ModelProto:
                                        to=TensorProto.FLOAT16))
     out.type.tensor_type.elem_type = TensorProto.FLOAT16
 
+    # Name the input's dynamic H/W dims: the DirectML backend pins each
+    # session's symbolic dims by name (AddFreeDimensionOverrideByName), and
+    # unnamed ones stay dynamic there (~8% slower for a 1080p RIFE chain).
+    in_dims = g.input[0].type.tensor_type.shape.dim
+    for d, name in zip(in_dims[2:4], ("height", "width")):
+        if not d.dim_param and d.dim_value <= 0:
+            d.dim_param = name
+
     # topo-sort: appended casts must precede their consumers
     order = topo_sort(g)
     del g.node[:]

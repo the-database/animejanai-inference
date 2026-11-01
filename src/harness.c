@@ -24,11 +24,24 @@
  *   contract allows up to 4).
  * --reset-at K: aji_temporal_reset before frame K and restart the sequence
  *   numbers there; the frames from K on must match a run starting at K.
+ *
+ * --async-build: the player's build mode (aji_create_params.async_build):
+ *   configure returns passthrough while an engine builds in the background;
+ *   the harness polls (aji_poll) and reconfigures until the chain is active,
+ *   timing the wait and the final configure separately.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#define nap_5ms() Sleep(5)
+#else
+#define nap_5ms() nanosleep(&(struct timespec){0, 5000000}, NULL)
+#endif
 
 #include <cuda_runtime.h>
 
@@ -42,6 +55,14 @@
         return 1; \
     } \
 } while (0)
+
+/* wall clock, ms */
+static double now_ms(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
 
 static void log_cb(void *opaque, int level, const char *msg)
 {
@@ -57,7 +78,7 @@ int main(int argc, char **argv)
     const char *rife_model_dir = NULL;
     const char *format = "nv12", *matrix = "709", *range = "limited", *siting = "left";
     int w = 0, h = 0, max_frames = 1 << 30, slot = 1, rife = 0, out444 = 0;
-    int rife_chain = 0, ingest_ahead = -1, reset_at = -1;
+    int rife_chain = 0, ingest_ahead = -1, reset_at = -1, async_build = 0;
 
     double fps = 23.976;
 
@@ -65,6 +86,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--rife")) { rife = 1; continue; }
         if (!strcmp(argv[i], "--rife-chain")) { rife_chain = 1; continue; }
         if (!strcmp(argv[i], "--out444")) { out444 = 1; continue; }
+        if (!strcmp(argv[i], "--async-build")) { async_build = 1; continue; }
         if (i >= argc - 1) break;
         if (!strcmp(argv[i], "--engine")) engine = argv[++i];
         else if (!strcmp(argv[i], "--conf")) conf = argv[++i];
@@ -106,11 +128,13 @@ int main(int argc, char **argv)
         .trtexec_env = trtexec_env,
         .slot = slot,
         .rife_model_dir = rife_model_dir,
+        .async_build = async_build,
         .engine_path = engine,
         .max_width = w,
         .max_height = h,
         .log = log_cb,
     };
+    const double t_create = now_ms();
     aji_ctx *aji = aji_create(&params);
     if (!aji) {
         fprintf(stderr, "aji_create failed\n");
@@ -118,12 +142,43 @@ int main(int argc, char **argv)
     }
 
     int ow = 0, oh = 0;
+    const double t_configure = now_ms();
     int act = aji_configure(aji, w, h, fps, &ow, &oh);
     if (act < 0) {
         fprintf(stderr, "aji_configure: %d: %s\n", act, aji_last_error(aji));
         return 1;
     }
     printf("%s\n", aji_current_log(aji));
+    /* wall clock; configure includes any engine build and, on TensorRT-RTX,
+     * the kernel JIT at execution-context creation */
+    printf("timing: create %.1f ms, configure %.1f ms (wall)\n",
+           t_configure - t_create, now_ms() - t_configure);
+    /* async: while the configure log shows a background job (an engine
+     * build, or TensorRT-RTX's warm-up of a cached engine), poll for it and
+     * reconfigure, as the player does. This includes a chain that came back
+     * active without its RIFE step while the RIFE engine builds, and
+     * multi-engine chains, which cascade one job at a time. */
+    while (async_build && act >= 0 &&
+           (strstr(aji_current_log(aji), "Building") ||
+            strstr(aji_current_log(aji), "Preparing"))) {
+        const double t_wait = now_ms();
+        while (!aji_poll(aji)) {
+            if (now_ms() - t_wait > 600000) {
+                fprintf(stderr, "async build: no aji_poll after 10 min\n");
+                return 1;
+            }
+            nap_5ms();
+        }
+        const double t_re = now_ms();
+        act = aji_configure(aji, w, h, fps, &ow, &oh);
+        printf("timing: async build %.1f ms (until aji_poll), reconfigure "
+               "%.1f ms (wall)\n", t_re - t_wait, now_ms() - t_re);
+        if (act < 0) {
+            fprintf(stderr, "aji_configure: %d: %s\n", act, aji_last_error(aji));
+            return 1;
+        }
+        printf("%s\n", aji_current_log(aji));
+    }
 
     if (rife_chain) {
         // Full upscale+RIFE chain timing, honoring the chain's configured
@@ -588,6 +643,9 @@ int main(int argc, char **argv)
         CK(cudaMemcpyAsync(in.plane[1], (char *)h_in + y_sz, uv_sz,
                            cudaMemcpyHostToDevice, stream));
 
+        if (n == 0)
+            CK(cudaStreamSynchronize(stream));  /* upload out of the wall time */
+        const double t_frame = now_ms();
         CK(cudaEventRecord(ev0, stream));
         int ret = aji_infer(aji, &in, &out, stream);
         if (ret != AJI_OK) {
@@ -595,6 +653,11 @@ int main(int argc, char **argv)
             return 1;
         }
         CK(cudaEventRecord(ev1, stream));
+        if (n == 0) {
+            CK(cudaStreamSynchronize(stream));
+            printf("timing: first frame %.1f ms (wall, incl. graph capture)\n",
+                   now_ms() - t_frame);
+        }
 
         if (fout) {
             CK(cudaMemcpyAsync(h_out, out.plane[0], oy_sz,

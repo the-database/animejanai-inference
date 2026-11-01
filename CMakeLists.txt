@@ -37,16 +37,29 @@ find_package(CUDAToolkit REQUIRED)
 # aji: thin dispatcher (what the mpv filter loads as lib=). Parses the
 # conf's [global] backend key and forwards the C ABI to the sibling
 # backend library. No CUDA/TRT/ORT dependencies of its own.
-add_library(aji SHARED src/aji_dispatch.cpp src/aji_conf.cpp)
+add_library(aji SHARED src/aji_dispatch.cpp src/aji_conf.cpp src/core/fileio.cpp
+    src/aji_img_dispatch.cpp)
 target_include_directories(aji PUBLIC include)
 target_link_libraries(aji PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(aji PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden)
 
+# The TensorRT-independent part of the TensorRT backends (conf parsing, ONNX
+# shape probing, file I/O, image tiling, the CUDA kernels), compiled once
+# and linked into both aji_trt and aji_trtrtx. Nothing in it depends on
+# the TensorRT flavour (AJI_TRTRTX) or includes TensorRT headers.
+add_library(aji_trt_common OBJECT src/aji_conf.cpp src/onnx_shape.cpp
+    src/core/fileio.cpp src/core/tiling.cpp src/kernels.cu)
+target_include_directories(aji_trt_common PRIVATE include)
+set_target_properties(aji_trt_common PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    CUDA_VISIBILITY_PRESET hidden)
+
 # aji_trt: TensorRT/CUDA backend (the former aji.dll).
-add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/onnx_shape.cpp
-    src/kernels.cu)
+add_library(aji_trt SHARED src/aji_trt.cpp src/core/trt_engine.cpp
+    src/aji_img_trt.cpp $<TARGET_OBJECTS:aji_trt_common>)
 target_include_directories(aji_trt
     PUBLIC include
     PRIVATE ${AJI_TRT_INCLUDE})
@@ -74,12 +87,83 @@ if(NOT WIN32)
     target_link_options(aji_trt PRIVATE -Wl,-Bsymbolic)
 endif()
 
+# aji_trtrtx: the same backend sources built against TensorRT for RTX
+# (AJI_TRTRTX): engines build in-process through the builder API (no
+# trtexec) and cache under their own names. Optional: skipped unless
+# -DAJI_TRTRTX_ROOT=<SDK root> is given. The import library names carry
+# the SDK's major/minor on Windows (tensorrt_rtx_1_7.lib), read from its
+# NvInferVersion.h so a new SDK needs no extra option.
+set(AJI_TRTRTX_ROOT "" CACHE PATH "TensorRT for RTX root (include/ + libs)")
+if(AJI_TRTRTX_ROOT)
+    # tolerate a backslashed Windows path from a .bat
+    file(TO_CMAKE_PATH "${AJI_TRTRTX_ROOT}" _rtx_root)
+    if(NOT EXISTS "${_rtx_root}/include/NvInferVersion.h")
+        message(FATAL_ERROR "AJI_TRTRTX_ROOT=${AJI_TRTRTX_ROOT}: no TensorRT-RTX SDK "
+                            "there (missing include/NvInferVersion.h). See "
+                            "docs/BUILD-WINDOWS.md, 2b.")
+    endif()
+    file(STRINGS "${_rtx_root}/include/NvInferVersion.h" _rtx_ver
+         REGEX "#define TRT_(MAJOR|MINOR)_RTX ")
+    string(REGEX MATCH "TRT_MAJOR_RTX ([0-9]+)" _m "${_rtx_ver}")
+    set(_rtx_major "${CMAKE_MATCH_1}")
+    string(REGEX MATCH "TRT_MINOR_RTX ([0-9]+)" _m "${_rtx_ver}")
+    set(_rtx_minor "${CMAKE_MATCH_1}")
+    if(_rtx_major STREQUAL "" OR _rtx_minor STREQUAL "")
+        message(FATAL_ERROR "AJI_TRTRTX_ROOT: no TensorRT-RTX NvInferVersion.h "
+                            "in ${_rtx_root}/include")
+    endif()
+    if(WIN32)
+        set(AJI_TRTRTX_LIB "${_rtx_root}")
+        set(_rtx_libs tensorrt_rtx_${_rtx_major}_${_rtx_minor}
+                      tensorrt_onnxparser_rtx_${_rtx_major}_${_rtx_minor})
+    else()
+        set(AJI_TRTRTX_LIB "${_rtx_root}/lib")
+        set(_rtx_libs tensorrt_rtx tensorrt_onnxparser_rtx)
+    endif()
+    message(STATUS "aji_trtrtx: TensorRT-RTX ${_rtx_major}.${_rtx_minor} "
+                   "(${_rtx_libs})")
+    add_library(aji_trtrtx SHARED src/aji_trt.cpp src/core/trt_engine.cpp
+        src/aji_img_trt.cpp $<TARGET_OBJECTS:aji_trt_common>)
+    target_compile_definitions(aji_trtrtx PRIVATE AJI_TRTRTX)
+    target_include_directories(aji_trtrtx
+        PUBLIC include
+        PRIVATE "${_rtx_root}/include")
+    target_link_directories(aji_trtrtx PRIVATE ${AJI_TRTRTX_LIB})
+    target_link_libraries(aji_trtrtx PRIVATE ${_rtx_libs}
+        CUDA::cuda_driver CUDA::cudart)
+    set_target_properties(aji_trtrtx PROPERTIES
+        BUILD_RPATH "${AJI_TRTRTX_LIB}"
+        INSTALL_RPATH "${AJI_TRTRTX_LIB}"
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        CUDA_VISIBILITY_PRESET hidden)
+    if(NOT WIN32)
+        target_link_options(aji_trtrtx PRIVATE -Wl,-Bsymbolic)
+    endif()
+else()
+    message(STATUS "AJI_TRTRTX_ROOT not set; skipping aji_trtrtx target")
+endif()
+
+# aji_image: image-ABI CLI harness (PNM in/out); any backend via aji.dll.
+add_executable(aji_image src/aji_image_cli.cpp $<$<BOOL:${WIN32}>:src/utf8-argv.manifest>)
+target_link_libraries(aji_image PRIVATE aji)
+add_dependencies(aji_image aji_trt)
+if(WIN32)
+    add_dependencies(aji_image aji_dml)
+endif()
+if(TARGET aji_trtrtx)
+    add_dependencies(aji_image aji_trtrtx)
+endif()
+
 # The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so argv/fopen
 # carry non-ASCII paths intact; benchmark.ps1 runs this from the installed
 # package, which may live under a non-ASCII path.
 add_executable(aji_harness src/harness.c $<$<BOOL:${WIN32}>:src/utf8-argv.manifest>)
 target_link_libraries(aji_harness PRIVATE aji CUDA::cudart)
 add_dependencies(aji_harness aji_trt)
+if(TARGET aji_trtrtx)
+    add_dependencies(aji_harness aji_trtrtx)
+endif()
 set_target_properties(aji_harness PROPERTIES
     BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
 
@@ -137,7 +221,9 @@ if(WIN32)
         "Microsoft.ML.OnnxRuntime.DirectML package root")
     set(AJI_DML_ROOT "" CACHE PATH
         "Microsoft.AI.DirectML package root")
-    add_library(aji_dml SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp)
+    add_library(aji_dml SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp
+        src/core/fileio.cpp src/core/ort_dml.cpp
+        src/aji_img_dml.cpp src/core/tiling.cpp)
     target_include_directories(aji_dml
         PUBLIC include
         PRIVATE "${AJI_ORT_ROOT}/build/native/include"
@@ -158,6 +244,10 @@ endif()
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
+
+# Image-ABI tiling/blending checks: CPU only, no GPU or models.
+add_executable(aji_tiling_test sanity/tiling_test.cpp src/core/tiling.cpp)
+target_include_directories(aji_tiling_test PRIVATE include src)
 
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
 target_include_directories(aji_msb444_test PRIVATE include src)

@@ -4,13 +4,14 @@
  *   ModelProto.graph(7) -> GraphProto.input(11) / initializer(5)
  *   ValueInfoProto.name(1), type(2) -> TypeProto.tensor_type(1)
  *   Tensor.elem_type(1), shape(2) -> TensorShapeProto.dim(1)
- *   Dimension.dim_value(1) | dim_param(2)
+ *   Dimension.dim_value(1) | dim_param(2) (the symbolic name)
  * Every other field is skipped by wire type, so the (large) initializer
  * payloads are never decoded.
  */
 
 #include "onnx_shape.h"
 
+#include <algorithm>
 #include <set>
 #include <string>
 
@@ -79,7 +80,8 @@ std::string read_string(Reader &r)
     return std::string((const char *)s.p, (const char *)s.end);
 }
 
-bool parse_shape(Reader r, std::vector<int64_t> *dims)
+bool parse_shape(Reader r, std::vector<int64_t> *dims,
+                 std::vector<std::string> *params)
 {
     while (r.more()) {
         int wire;
@@ -87,17 +89,21 @@ bool parse_shape(Reader r, std::vector<int64_t> *dims)
         if (f == 1 && wire == 2) {
             Reader d = r.sub();
             int64_t v = -1;
+            std::string param;
             while (d.more()) {
                 int dw;
                 uint32_t df = d.tag(&dw);
                 if (df == 1 && dw == 0)
                     v = (int64_t)d.varint();
+                else if (df == 2 && dw == 2)
+                    param = read_string(d);
                 else
                     d.skip(dw);
             }
             if (!d.ok)
                 return false;
             dims->push_back(v);
+            params->push_back(v >= 0 ? std::string() : param);
         } else {
             r.skip(wire);
         }
@@ -130,7 +136,9 @@ bool parse_value_info(Reader r, std::string *name, AjiOnnxInput *out)
                         out->elem_type = (int)tt.varint();
                     } else if (ff == 2 && w == 2) {
                         out->dims.clear();
-                        if (!parse_shape(tt.sub(), &out->dims))
+                        out->dim_params.clear();
+                        if (!parse_shape(tt.sub(), &out->dims,
+                                         &out->dim_params))
                             return false;
                     } else {
                         tt.skip(w);
@@ -195,12 +203,39 @@ bool aji_onnx_input(const char *data, size_t size, AjiOnnxInput *out)
         for (auto &kv : inputs) {
             if (!inits.count(kv.first)) {
                 *out = kv.second;
+                out->name = kv.first;
                 return true;
             }
         }
         return false;
     }
     return false;
+}
+
+std::vector<std::pair<std::string, int64_t>>
+aji_onnx_pin_dims(const AjiOnnxInput &in, const std::vector<int64_t> &want)
+{
+    std::vector<std::pair<std::string, int64_t>> pins;
+    if (in.dims.size() != want.size() || in.dim_params.size() != want.size())
+        return pins;
+    std::set<std::string> conflict;
+    for (size_t i = 0; i < want.size(); i++) {
+        const std::string &name = in.dim_params[i];
+        if (name.empty() || want[i] <= 0)
+            continue;
+        auto it = std::find_if(pins.begin(), pins.end(),
+                               [&](const auto &p) { return p.first == name; });
+        if (it == pins.end())
+            pins.emplace_back(name, want[i]);
+        else if (it->second != want[i])
+            conflict.insert(name);
+    }
+    pins.erase(std::remove_if(pins.begin(), pins.end(),
+                              [&](const auto &p) {
+                                  return conflict.count(p.first) != 0;
+                              }),
+               pins.end());
+    return pins;
 }
 
 int aji_onnx_temporal_frames(const AjiOnnxInput &in)
