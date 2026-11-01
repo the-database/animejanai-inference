@@ -1190,6 +1190,11 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     AVDictionary *opts = NULL;
     parse_vquality(c->o.vquality, &opts);
     inject_profile(c->o.vcodec, c->o.pix_fmt, &opts);
+    /* libavcodec defaults thread_count to 1 (the ffmpeg CLI sets "auto"
+     * itself), which leaves ffv1/libx264/libx265 on a single core: ~8x
+     * slower for ffv1, ~13x for x264. Hardware encoders ignore it. An
+     * explicit -threads in --vquality wins. */
+    av_dict_set(&opts, "threads", "auto", AV_DICT_DONT_OVERWRITE);
 
     int r = avcodec_open2(c->enc, codec, &opts);
     AVDictionaryEntry *e = NULL;
