@@ -1,0 +1,447 @@
+{
+  "shared_timing_cache": {
+    "manifest": {
+      "stock_settings": "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% --skipInference",
+      "tiling_and_concat_settings": "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% --tilingOptimizationLevel=3 --l2LimitForTiling=67108864 --skipInference",
+      "sha256": {
+        "aji_trt.dll": "ef181a33ceaba886729180e63eb65726e113db8f82901923f819ef5ace9ba565",
+        "balanced-next-plugin.dll": "5b446fe74801e6888316bf7ca2033f3d50cbb9289a3a98327dbfb947c144d360",
+        "performance-plugin.dll": "003060814f8b2fada4b89a89cc596aff7118b7698ed048fdb5e52de855715b38",
+        "2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Concat_Tiled3_v2.onnx": "3f24c61ddc735353f5c1d1d60655ae05d4c51b68657f7bb1836992b791061fa1",
+        "2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx": "b308e93c3dda3c4f9f968295b2b7b8d1c0583a711bca53a08d51134d9d1cbd5c",
+        "2x_AnimeJaNai_HD_V3.1_Performance_FP16_Concat_v1.onnx": "7f2744be589c72d4f2611d53106dab4e2cf95525e926eca4fcdf98347e24a181",
+        "2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx": "7b804d87320f37b7269d6e27796046fbd975e95e2aa1f65d5557f52a36282716"
+      },
+      "gpu": "NVIDIA GeForce RTX 4090, 610.88",
+      "method": "Three forward/reverse/forward native-display rounds; fresh static engines; 10 s warmup, 20 s measurement; Vulkan queues 3."
+    },
+    "playback": {
+      "profiles": {
+        "balanced-original": {
+          "samples": [
+            90.24457314834656,
+            89.94808849681262,
+            90.06590383729959
+          ],
+          "median_fps": 90.06590383729959,
+          "min_fps": 89.94808849681262,
+          "max_fps": 90.24457314834656,
+          "spread_percent": 0.32918633900519345
+        },
+        "balanced-tiling": {
+          "samples": [
+            90.23257395919927,
+            88.50281803929177,
+            89.78672321873007
+          ],
+          "median_fps": 89.78672321873007,
+          "min_fps": 88.50281803929177,
+          "max_fps": 90.23257395919927,
+          "spread_percent": 1.9265163688997016
+        },
+        "balanced-concat": {
+          "samples": [
+            93.10657481358686,
+            92.97795643779571,
+            93.22866688277978
+          ],
+          "median_fps": 93.10657481358686,
+          "min_fps": 92.97795643779571,
+          "max_fps": 93.22866688277978,
+          "spread_percent": 0.2692725465264132
+        },
+        "performance-original": {
+          "samples": [
+            123.89994406745359,
+            123.71099323099267,
+            123.13441668513558
+          ],
+          "median_fps": 123.71099323099267,
+          "min_fps": 123.13441668513558,
+          "max_fps": 123.89994406745359,
+          "spread_percent": 0.618803036273925
+        },
+        "performance-tiling": {
+          "samples": [
+            124.09577960461442,
+            123.8057286726474,
+            123.7802661317732
+          ],
+          "median_fps": 123.8057286726474,
+          "min_fps": 123.7802661317732,
+          "max_fps": 124.09577960461442,
+          "spread_percent": 0.25484561677712153
+        },
+        "performance-concat": {
+          "samples": [
+            129.90126488468042,
+            129.96873564308663,
+            129.28491497858252
+          ],
+          "median_fps": 129.90126488468042,
+          "min_fps": 129.28491497858252,
+          "max_fps": 129.96873564308663,
+          "spread_percent": 0.5264157089703257
+        }
+      },
+      "comparisons": [
+        {
+          "baseline": "balanced-original",
+          "candidate": "balanced-tiling",
+          "median_change_percent": -0.30997370444850736,
+          "paired_round_change_percent": [
+            -0.01329629996428272,
+            -1.6067828473887658,
+            -0.30997370444850736
+          ]
+        },
+        {
+          "baseline": "balanced-tiling",
+          "candidate": "balanced-concat",
+          "median_change_percent": 3.697486082401369,
+          "paired_round_change_percent": [
+            3.1851034812407475,
+            5.056492547522229,
+            3.8334661747982057
+          ]
+        },
+        {
+          "baseline": "performance-original",
+          "candidate": "performance-tiling",
+          "median_change_percent": 0.07657803011722475,
+          "paired_round_change_percent": [
+            0.15805942337974166,
+            0.07657803011722475,
+            0.5245076592104381
+          ]
+        },
+        {
+          "baseline": "performance-tiling",
+          "candidate": "performance-concat",
+          "median_change_percent": 4.92346862894375,
+          "paired_round_change_percent": [
+            4.6782294277557535,
+            4.9779659120093855,
+            4.447113436441641
+          ]
+        },
+        {
+          "baseline": "balanced-original",
+          "candidate": "balanced-concat",
+          "median_change_percent": 3.3760511433717832,
+          "paired_round_change_percent": [
+            3.1713836803634265,
+            3.3684628452003818,
+            3.5116097332388962
+          ]
+        },
+        {
+          "baseline": "performance-original",
+          "candidate": "performance-concat",
+          "median_change_percent": 5.003816954350437,
+          "paired_round_change_percent": [
+            4.843683233593388,
+            5.058355970361927,
+            4.994946546239998
+          ]
+        }
+      ],
+      "all_samples_passed": true,
+      "input_size": [
+        1920,
+        1080
+      ],
+      "model_output_size": [
+        3840,
+        2160
+      ],
+      "display_size": [
+        3840,
+        2160
+      ],
+      "display_hz": 23.976,
+      "hwdec": "nvdec",
+      "vo": "gpu-next",
+      "vulkan_queues": 3,
+      "dropped_frames": 0,
+      "decoder_dropped_frames": 0,
+      "sample_count": 18
+    },
+    "quality": {
+      "metric": "direct planar YUV444P16, all planes, peak=65535",
+      "comparisons": [
+        {
+          "model": "balanced",
+          "baseline": "stock",
+          "candidate": "tiling",
+          "worst_psnr_db": "infinite",
+          "aggregate_psnr_db": "infinite",
+          "frame_count": 12
+        },
+        {
+          "model": "balanced",
+          "baseline": "tiling",
+          "candidate": "concat",
+          "worst_psnr_db": 70.2319768032534,
+          "aggregate_psnr_db": 70.84200052301766,
+          "frame_count": 12
+        },
+        {
+          "model": "balanced",
+          "baseline": "stock",
+          "candidate": "concat",
+          "worst_psnr_db": 70.2319768032534,
+          "aggregate_psnr_db": 70.84200052301766,
+          "frame_count": 12
+        },
+        {
+          "model": "performance",
+          "baseline": "stock",
+          "candidate": "tiling",
+          "worst_psnr_db": "infinite",
+          "aggregate_psnr_db": "infinite",
+          "frame_count": 12
+        },
+        {
+          "model": "performance",
+          "baseline": "tiling",
+          "candidate": "concat",
+          "worst_psnr_db": 69.96148465810958,
+          "aggregate_psnr_db": 70.78533153430571,
+          "frame_count": 12
+        },
+        {
+          "model": "performance",
+          "baseline": "stock",
+          "candidate": "concat",
+          "worst_psnr_db": 69.96148465810958,
+          "aggregate_psnr_db": 70.78533153430571,
+          "frame_count": 12
+        }
+      ]
+    }
+  },
+  "independent_timing_cache": {
+    "manifest": {
+      "stock_settings": "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% --skipInference",
+      "tiling_and_concat_settings": "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% --tilingOptimizationLevel=3 --l2LimitForTiling=67108864 --skipInference",
+      "sha256": {
+        "aji_trt.dll": "ef181a33ceaba886729180e63eb65726e113db8f82901923f819ef5ace9ba565",
+        "balanced-next-plugin.dll": "5b446fe74801e6888316bf7ca2033f3d50cbb9289a3a98327dbfb947c144d360",
+        "performance-plugin.dll": "003060814f8b2fada4b89a89cc596aff7118b7698ed048fdb5e52de855715b38",
+        "2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Concat_Tiled3_v2.onnx": "3f24c61ddc735353f5c1d1d60655ae05d4c51b68657f7bb1836992b791061fa1",
+        "2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx": "b308e93c3dda3c4f9f968295b2b7b8d1c0583a711bca53a08d51134d9d1cbd5c",
+        "2x_AnimeJaNai_HD_V3.1_Performance_FP16_Concat_v1.onnx": "7f2744be589c72d4f2611d53106dab4e2cf95525e926eca4fcdf98347e24a181",
+        "2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx": "7b804d87320f37b7269d6e27796046fbd975e95e2aa1f65d5557f52a36282716"
+      },
+      "gpu": "NVIDIA GeForce RTX 4090, 610.88",
+      "method": "Three forward/reverse/forward native-display rounds; fresh static engines; 10 s warmup, 20 s measurement; Vulkan queues 3.",
+      "timing_cache_control": "Stock and concat engines from v2; stock+tiling rebuilt without any preexisting timing cache, in v3."
+    },
+    "playback": {
+      "profiles": {
+        "balanced-original": {
+          "samples": [
+            89.99371624754157,
+            90.04221222954428,
+            89.90236857920924
+          ],
+          "median_fps": 89.99371624754157,
+          "min_fps": 89.90236857920924,
+          "max_fps": 90.04221222954428,
+          "spread_percent": 0.1553926831406503
+        },
+        "balanced-tiling": {
+          "samples": [
+            90.02253083901839,
+            89.68496861768888,
+            89.67373961282102
+          ],
+          "median_fps": 89.68496861768888,
+          "min_fps": 89.67373961282102,
+          "max_fps": 90.02253083901839,
+          "spread_percent": 0.3889071174058147
+        },
+        "balanced-concat": {
+          "samples": [
+            93.1286121897647,
+            93.2032572732385,
+            92.87294566207609
+          ],
+          "median_fps": 93.1286121897647,
+          "min_fps": 92.87294566207609,
+          "max_fps": 93.2032572732385,
+          "spread_percent": 0.3546832744477619
+        },
+        "performance-original": {
+          "samples": [
+            124.01389637715853,
+            123.73041479191208,
+            123.57636896025375
+          ],
+          "median_fps": 123.73041479191208,
+          "min_fps": 123.57636896025375,
+          "max_fps": 124.01389637715853,
+          "spread_percent": 0.3536134730014544
+        },
+        "performance-tiling": {
+          "samples": [
+            124.0993139648868,
+            123.93692328818602,
+            123.3132708061179
+          ],
+          "median_fps": 123.93692328818602,
+          "min_fps": 123.3132708061179,
+          "max_fps": 124.0993139648868,
+          "spread_percent": 0.634228394504475
+        },
+        "performance-concat": {
+          "samples": [
+            130.09124477870088,
+            130.65723374795712,
+            129.31246632654603
+          ],
+          "median_fps": 130.09124477870088,
+          "min_fps": 129.31246632654603,
+          "max_fps": 130.65723374795712,
+          "spread_percent": 1.033710933966913
+        }
+      },
+      "comparisons": [
+        {
+          "baseline": "balanced-original",
+          "candidate": "balanced-tiling",
+          "median_change_percent": -0.3430768755047664,
+          "paired_round_change_percent": [
+            0.03201844826317135,
+            -0.39675126033629216,
+            -0.25430805661897926
+          ]
+        },
+        {
+          "baseline": "balanced-tiling",
+          "candidate": "balanced-concat",
+          "median_change_percent": 3.8397109628877324,
+          "paired_round_change_percent": [
+            3.4503377341176034,
+            3.922941279655756,
+            3.5676063729114915
+          ]
+        },
+        {
+          "baseline": "performance-original",
+          "candidate": "performance-tiling",
+          "median_change_percent": 0.1669019671689087,
+          "paired_round_change_percent": [
+            0.0688774324681285,
+            0.1669019671689087,
+            -0.21290328915593015
+          ]
+        },
+        {
+          "baseline": "performance-tiling",
+          "candidate": "performance-concat",
+          "median_change_percent": 4.965688454444228,
+          "paired_round_change_percent": [
+            4.828335163488062,
+            5.422363474478553,
+            4.865003970140824
+          ]
+        },
+        {
+          "baseline": "balanced-original",
+          "candidate": "balanced-concat",
+          "median_change_percent": 3.483460926983062,
+          "paired_round_change_percent": [
+            3.483460926983062,
+            3.5106257003501673,
+            3.304225605857769
+          ]
+        },
+        {
+          "baseline": "performance-original",
+          "candidate": "performance-concat",
+          "median_change_percent": 5.140878253327075,
+          "paired_round_change_percent": [
+            4.900538229247764,
+            5.598315472953397,
+            4.641742927514891
+          ]
+        }
+      ],
+      "all_samples_passed": true,
+      "input_size": [
+        1920,
+        1080
+      ],
+      "model_output_size": [
+        3840,
+        2160
+      ],
+      "display_size": [
+        3840,
+        2160
+      ],
+      "display_hz": 23.976,
+      "hwdec": "nvdec",
+      "vo": "gpu-next",
+      "vulkan_queues": 3,
+      "dropped_frames": 0,
+      "decoder_dropped_frames": 0,
+      "sample_count": 18
+    },
+    "quality": {
+      "metric": "direct planar YUV444P16, all planes, peak=65535",
+      "comparisons": [
+        {
+          "model": "balanced",
+          "baseline": "stock",
+          "candidate": "tiling",
+          "worst_psnr_db": "infinite",
+          "aggregate_psnr_db": "infinite",
+          "frame_count": 12
+        },
+        {
+          "model": "balanced",
+          "baseline": "tiling",
+          "candidate": "concat",
+          "worst_psnr_db": 70.2319768032534,
+          "aggregate_psnr_db": 70.84200052301766,
+          "frame_count": 12
+        },
+        {
+          "model": "balanced",
+          "baseline": "stock",
+          "candidate": "concat",
+          "worst_psnr_db": 70.2319768032534,
+          "aggregate_psnr_db": 70.84200052301766,
+          "frame_count": 12
+        },
+        {
+          "model": "performance",
+          "baseline": "stock",
+          "candidate": "tiling",
+          "worst_psnr_db": 73.31148101066194,
+          "aggregate_psnr_db": 74.21275488820268,
+          "frame_count": 12
+        },
+        {
+          "model": "performance",
+          "baseline": "tiling",
+          "candidate": "concat",
+          "worst_psnr_db": 70.02455692047089,
+          "aggregate_psnr_db": 70.82148143826562,
+          "frame_count": 12
+        },
+        {
+          "model": "performance",
+          "baseline": "stock",
+          "candidate": "concat",
+          "worst_psnr_db": 69.96148465810958,
+          "aggregate_psnr_db": 70.78533153430571,
+          "frame_count": 12
+        }
+      ]
+    }
+  }
+}

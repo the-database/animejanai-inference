@@ -72,6 +72,40 @@ about 5–6.5%; concat then reduced it by another 6–7%. Those are device-laten
 reductions, not playback FPS percentages. Do not enable tiling globally from
 those results alone: gains depend on GPU and resolution.
 
+### 4090 stock / tiling / concat control (November 1)
+
+Six static 1080p engines were compared in three forward/reverse/forward native
+playback rounds, with 10 seconds warmup and 20 seconds measurement. Stock and
+concat controls were built in an empty model/cache directory. The tiled stock
+engines were then rebuilt with independent empty timing caches, to rule out the
+initial shared timing cache affecting the result. Tiling and concat used exactly
+`--tilingOptimizationLevel=3 --l2LimitForTiling=67108864`; all cases used builder
+optimization level 5. No model precision setting changed.
+
+| Model | Stock FPS | Stock + tiling FPS | Concat + tiling FPS |
+| --- | ---: | ---: | ---: |
+| Balanced | 89.994 | 89.685 | 93.129 |
+| Performance | 123.730 | 123.937 | 130.091 |
+
+Tiling alone changed median throughput by -0.343% / +0.167%, with mixed paired
+signs: no meaningful 4090 gain in this workload. Concat added +3.840% / +4.966%
+over tiled stock, positive in every paired round; versus untiled stock the full
+recipe gained +3.483% / +5.141%. The preliminary shared-cache run reached the same
+conclusion and is retained in `ablation-4090-20261101.json`. These FPS percentages
+must not be substituted for the reviewer's 5090 device-latency percentages.
+
+The 2x output rendered to the native 3840x2160 display. Its recorded refresh was
+23.976 Hz for every sample; throughput was uncapped `end video-flip` FPS using
+NVDEC/gpu-next, immediate Vulkan presentation and three queues, with no drops or
+overlapping mpv session. Driver was 610.88, TensorRT 11.3. Keep these controls
+separate from the older 60 Hz cohort below.
+
+Across 12 real frames per model, tiled Balanced output matched stock exactly.
+Tiled Performance's worst direct YUV444P16 PSNR against stock was 73.311 dB.
+Concat versus tiled stock was 70.232 dB Balanced / 70.025 dB Performance; versus
+untiled stock it was 70.232 / 69.961 dB (peak 65535, all planes). There is no
+universal pixel-equality claim. The flags are not proposed as a global default.
+
 Historical controlled 5090 native-4K-rendered Balanced throughput improved
 135.359 -> 157.052 fps with the tuned concat engine (+16.02%). Separate direct
 buffer graph replay raised that to 158.228 fps; that additional backend change
@@ -105,8 +139,20 @@ optional engine builds, including blocking/asynchronous operation and reverse
 profile switching. Fallback outputs match stock byte-for-byte. Explicit custom
 builder flags survive; a changed plugin binary gets a distinct engine cache;
 a failed registration leaves its DLL loaded and is attempted only once.
-The SM and option policy also has a CPU regression. The non-classic backends'
-fallback routes are source changes; their execution was not validated locally.
+The SM and option policy also has a CPU regression. DirectML checks of the
+shared fallback code in the #37 superset backend produce byte-identical stock
+outputs for both concat aliases (ORT DirectML 1.24.4 / DirectML 1.15.4).
+TensorRT-RTX and Linux execution of these fallback changes was not tested locally.
+
+To run the focused fallback suite, build `aji_span_policy_test` and
+`aji_span_failed_registration` as well as the optional bundle, then run:
+
+```bat
+python sanity\span_fallback.py --backend "C:\test\inference\aji_trt.dll" --models "C:\test\onnx" --runtime "C:\player\animejanai\inference" --failed-plugin "C:\build\test-plugins\failed-registration\balanced-next-plugin.dll" --output "C:\checks\span-fallback"
+```
+
+Use a new output directory and run without other GPU workloads. The fixture DLL
+is only for this regression and must not be installed into a player.
 
 The kernel bodies are the versions exercised in the 4090/5090 experiments.
 The source packaging and named-model builder integration were compiled with
