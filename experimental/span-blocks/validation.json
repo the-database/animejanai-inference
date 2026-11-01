@@ -206,5 +206,139 @@
       }
     ]
   },
-  "incomplete": "540p native-display A/B interrupted after only the Original control; not used as speed evidence."
+  "playback_540p": {
+    "all_samples_passed": true,
+    "input_size": [
+      960,
+      540
+    ],
+    "model_output_size": [
+      1920,
+      1080
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "display_hz": 143.997,
+    "hwdec": "nvdec",
+    "vo": "gpu-next",
+    "vulkan_queues": 3,
+    "dropped_frames": 0,
+    "decoder_dropped_frames": 0,
+    "gpu": "RTX 5090",
+    "driver": "616.92",
+    "source": "24-frame real-video 960x540 fixture, lossless H.264, looped",
+    "backend": "#37, including #35",
+    "warmup_seconds": 10,
+    "measurement_seconds": 20,
+    "rounds": 2,
+    "method": "Native end video-flip trace events; forward then reverse order; no concurrent mpv process.",
+    "samples": [
+      {
+        "profile": "balanced-original",
+        "round": 1,
+        "fps": 416.440865342116,
+        "frames": 8328,
+        "seconds": 19.9980374
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 1,
+        "fps": 416.73425533174293,
+        "frames": 8333,
+        "seconds": 19.9959564
+      },
+      {
+        "profile": "balanced-native7",
+        "round": 1,
+        "fps": 422.6878281903805,
+        "frames": 8452,
+        "seconds": 19.9958443
+      },
+      {
+        "profile": "balanced-native7",
+        "round": 2,
+        "fps": 422.72939914939525,
+        "frames": 8453,
+        "seconds": 19.9962435
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 2,
+        "fps": 417.51144006602516,
+        "frames": 8348,
+        "seconds": 19.9946617
+      },
+      {
+        "profile": "balanced-original",
+        "round": 2,
+        "fps": 418.4077946686776,
+        "frames": 8367,
+        "seconds": 19.9972374
+      }
+    ],
+    "profiles": {
+      "balanced-original": {
+        "samples": [
+          416.440865342116,
+          418.4077946686776
+        ],
+        "median_fps": 417.42433000539677,
+        "min_fps": 416.440865342116,
+        "max_fps": 418.4077946686776,
+        "spread_percent": 0.47120620078281955
+      },
+      "balanced-concat": {
+        "samples": [
+          416.73425533174293,
+          417.51144006602516
+        ],
+        "median_fps": 417.122847698884,
+        "min_fps": 416.73425533174293,
+        "max_fps": 417.51144006602516,
+        "spread_percent": 0.18632034628879168
+      },
+      "balanced-native7": {
+        "samples": [
+          422.6878281903805,
+          422.72939914939525
+        ],
+        "median_fps": 422.7086136698879,
+        "min_fps": 422.6878281903805,
+        "max_fps": 422.72939914939525,
+        "spread_percent": 0.009834424393158694
+      }
+    },
+    "comparisons": [
+      {
+        "baseline": "balanced-original",
+        "candidate": "balanced-concat",
+        "median_change_percent": -0.07222442125232043,
+        "paired_round_change_percent": [
+          0.07045177696138882,
+          -0.2142299006074211
+        ]
+      },
+      {
+        "baseline": "balanced-original",
+        "candidate": "balanced-native7",
+        "median_change_percent": 1.2659261295149715,
+        "paired_round_change_percent": [
+          1.5000840138809313,
+          1.0328690181643951
+        ]
+      },
+      {
+        "baseline": "balanced-concat",
+        "candidate": "balanced-native7",
+        "median_change_percent": 1.3391177207910054,
+        "paired_round_change_percent": [
+          1.4286257446962658,
+          1.249776313325679
+        ]
+      }
+    ],
+    "interpretation": "Finite workload; two rounds. Small differences may be within run-to-run variation."
+  }
 }

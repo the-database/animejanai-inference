@@ -145,7 +145,24 @@ switching check. Different model basenames and settings isolate each engine.
 
 Fresh 5090 native 3840x2160 playback completed for block-concat and Cache48 with
 three Vulkan queues and no recorded drops. The controls varied considerably
-across the suite; it does not establish a new speedup. The fresh 540p rendered
-comparison is incomplete, and new 4090 native-display timing is not included.
+across the 1080p suite; it does not establish a new speedup. New 4090
+native-display timing is not included yet.
+
+The completed 5090 540p comparison used a looped 24-frame real-video fixture,
+10 seconds warmup and 20 seconds measurement, with two reversed-order rounds.
+The model output was 1920x1080, rendered to the native 3840x2160 display through
+NVDEC/gpu-next with three Vulkan queues and no dropped frames. Medians:
+
+| Profile | Native-display FPS | Versus Original |
+| --- | ---: | ---: |
+| Original Balanced | 417.424 | reference |
+| Balanced concat | 417.123 | -0.072% |
+| Balanced NativeTail7 | 422.709 | +1.266% |
+
+NativeTail7 improved both paired rounds (+1.500% and +1.033% versus Original).
+Concat's paired changes had opposite signs and are a tie within variation.
+This small gain applies to this fixture, GPU, engine and display. It does not
+change the numerical-output differences documented above.
+
 These remain optional experiments with shape restrictions, not automatic
 replacements or a new claim of bit-exact stock output.
