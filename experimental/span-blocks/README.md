@@ -6,6 +6,14 @@ Its `profiles.conf` keeps the four original/concat profiles and adds slots 5-7
 for block-concat, NativeTail7 and Performance Cache48. The ordinary models remain
 available and slot 1 (Original Balanced) stays the default.
 
+Recipe selection is now gated before plugin loading/building: block-concat and
+Cache48 require SM89 at 1920x1080; NativeTail7 requires SM120 at 960x540. Other
+GPU/shape/backend combinations automatically use the corresponding stock model
+and log the reason. These architecture gates establish kernel/recipe eligibility,
+not a speed claim for every GPU sharing that SM. Measurements are from the 4090
+and 5090. Cache48 remains an explicit experiment; the latest paired measurements
+did not establish an additional gain over concat.
+
 The plugin groups each selected three-convolution block behind one TensorRT
 plugin boundary, using CUTLASS FP16 NHWC convolutions with the original FP16
 weights, bias and ReLU epilogues. Each convolution still launches its own kernel;
@@ -28,6 +36,8 @@ Requirements: Windows x64, MSVC developer prompt, CUDA 13.x with matching CCCL,
 TensorRT 11 headers, Python with ONNX/numpy, and CUTLASS headers. The measured
 CUTLASS checkout was `e13f5cd4142c43efc37c2f6339923eb4a57afb99`. Use its existing
 license when redistributing dependencies; the vendor source is not copied here.
+The block DLL now links CUDA in shared-runtime mode (`--cudart shared`, called
+hybrid by CUDA 13), using the CUDA runtime already required by the player.
 
 ```bat
 python experimental\span-blocks\build.py --kind block-concat --model "C:\models\2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16.onnx" --cuda "C:\CUDA" --trt-include "C:\TensorRT\include" --cutlass-include "C:\CUTLASS\include" --cccl-include "C:\CCCL\include" --output "C:\blocks-build"
@@ -41,6 +51,15 @@ committed. The build generates native SM89 and SM120 code and selects the tested
 256x64x32, three-stage convolution schedule. `--allow-unsupported-compiler` is
 available when explicitly needed by the local NVCC/MSVC combination.
 
+For the integrated build, configure CMake with the options from `span-concat`
+plus `-DAJI_BUILD_SPAN_BLOCKS=ON -DAJI_CUTLASS_INCLUDE=C:/CUTLASS/include`.
+Building `aji_trt` generates both concat bundles, the block DLL and all three
+additional exports. The `experimental-span` install component includes them and
+both stock models. The Windows release script enables this additional bundle
+when `AJI_CUTLASS_INCLUDE` and `AJI_SPAN_MODEL_DIR` are set. Keep CUTLASS at the
+tested revision above; it is an explicit local dependency, never downloaded by
+the build. The optional bundle was built and installed through this CMake path.
+
 Build the selected 4090 Balanced static engine:
 
 ```bat
@@ -49,8 +68,9 @@ python experimental\span-blocks\build-engine.py --preset balanced-block-4090-108
 
 For the 5090 540p export, use `--preset balanced-native7-5090-540`, the
 `2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Blocks_NativeTail7_v1.onnx` file and the same plugin. For the later Performance cache
-tuning, build Performance's concat model/plugin using `span-concat/build.py`,
-then use `--preset performance-cache48-4090-1080` with that model and
+tuning, build Performance's plugin using `span-concat/build.py`, generate the
+distinct Cache48 export with `span-blocks/prepare.py --kind performance-cache48`
+(full command below), then use `--preset performance-cache48-4090-1080` with that export and
 `performance-plugin.dll`. This selects 48 MiB (50,331,648 bytes), not the earlier
 64 MiB tiling budget. It does not change Performance's kernel or weights.
 
@@ -98,9 +118,12 @@ concat plugin, so profile changes no longer require a new process.
 
 The backend registers the correct DLL before deserializing an engine and passes
 it to the asynchronous trtexec builder. Distinct model basenames and builder
-settings produce distinct cache keys. Slot 5 selects block-concat at 1080p with
-optimization level 5 and zero auxiliary streams. Slot 6 selects NativeTail7 at
-960x540 with tiling level 3. Other sizes fail explicitly for these two exports.
+settings plus the actual DLL content produce distinct cache keys. Slot 5 selects
+block-concat on SM89 at 1080p, adding zero auxiliary streams when that option is
+unset. Slot 6 selects NativeTail7 on SM120 at 960x540, adding tiling level 3 when
+unset. User builder settings take precedence. Other inputs use stock; missing
+components and failed optional builds also fall back. Failed registration keeps
+the DLL resident because its already-registered creators may still be referenced.
 
 To create the separately named 1080p Performance Cache48 model, run:
 
@@ -120,6 +143,32 @@ loading an engine; its entry point is now `initBalancedBlocksPlugin`. Historical
 unnamespaced experimental block engines must be rebuilt from the new exports.
 
 ## Integration validation
+
+The review follow-up merges #35's fallback/cache/settings fixes. Its full CMake
+component and CPU policy regression pass. On a 5090, block-concat/Cache48 at
+1080p and NativeTail7 at 1080p correctly use stock, with byte-identical outputs
+and reverse profile switches. The eligible NativeTail7 540p profile builds a
+fresh plugin-tagged engine and runs; its four sampled outputs match the stock
+engine in this new test. That finite equality does not supersede the earlier
+nonzero-error results below. A failed block-DLL initialization falls back to
+stock, remains loaded after context destruction and is attempted only once.
+The production DirectML harness also passes all seven profiles: every
+experimental alias produces byte-identical output to its corresponding stock
+model, using ORT DirectML 1.24.4 / DirectML 1.15.4 and two real 540p input frames.
+TensorRT-RTX and Linux fallback execution was not tested locally.
+
+The revised component also passes on the 4090: fresh plugin-tagged block-concat
+and Cache48 engines load with stock Balanced/Performance in one context, while
+the NativeTail7 profile falls back to stock on SM89. All 60 saved outputs and
+reverse-profile checks pass; the 12 NativeTail7 fallback outputs equal stock.
+Worst PSNR versus stock is 73.771 dB for block-concat and 69.961 dB for Cache48
+(direct YUV444P16, peak 65535, 12 frames each). These are build/routing/output
+checks, not a new FPS measurement for the rebuilt recipes. The new independent
+stock/tiling/concat playback control belongs to #35 and is recorded there.
+
+The following integration records predate GPU/shape gating; they retain the
+negative cross-GPU and fresh-engine-search evidence rather than presenting those
+recipes as suitable everywhere.
 
 The complete classic backend and namespaced plugin compile with TensorRT 11.3,
 CUDA 13.3 and native SM89/SM120 code. New block-concat/Cache48 engines built
