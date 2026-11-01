@@ -107,11 +107,12 @@ typedef struct aji_create_params {
     int slot;                 /* initial slot (1-9, 1001-1003, 1010-1011) */
     const char *rife_model_dir; /* dir with rife_v*.onnx + engine cache;
                                    NULL disables RIFE even if a chain asks */
-    int async_build;          /* nonzero: missing engines build on a
-                                 background thread; aji_configure returns
-                                 passthrough (or chain-without-rife)
-                                 meanwhile, and aji_poll() reports when to
-                                 reconfigure. Zero: builds block (CLI). */
+    int async_build;          /* 0: blocking builds; 1: background builds with
+                                 passthrough until aji_poll requests a
+                                 reconfigure; 2: cached-only, no builds,
+                                 cache writes/deletes or backend fallback.
+                                 Query aji_stream_policy_version before
+                                 requesting 2 from an older library. */
     void *d3d11_device;       /* ID3D11Device* of the caller (the device
                                  the frame textures live on). Required by
                                  the DirectML backend; ignored by
@@ -138,6 +139,9 @@ typedef struct aji_frame {
     ptrdiff_t stride[3];      /* bytes */
 } aji_frame;
 
+/* Additive policy capability. async_build=2 checks cached engines without
+ * starting a builder or deleting incompatible engines. Query before use. */
+AJI_EXPORT int aji_stream_policy_version(void);
 AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params);
 
 /* Select the slot used by the next aji_configure() (conf mode). */
@@ -241,6 +245,18 @@ AJI_EXPORT int aji_poll(aji_ctx *c);
 AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, double t,
                               const aji_frame *out, void *cu_stream);
+
+/* Optional additive ABI for an isolated scene detector. No existing entry
+ * point or structure changes. Query support on the configured dispatcher:
+ * older backend libraries can still be used for ordinary interpolation.
+ * scene: -1 = built-in detector, 0 = continuous pair, 1 = cut (AJI_SCENE).
+ * The caller owns pair identity, timeouts and fallback. A continuous decision
+ * explicitly replaces the built-in decision, rather than adding another veto.
+ * All normal frame validation, GPU completion and output ownership still apply. */
+AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c);
+AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
+                              const aji_frame *b, double t,
+                              const aji_frame *out, void *cu_stream, int scene);
 
 /* Temporal (multi-frame) models. A chain model whose input takes T = 2r+1
  * frames (oldest first, the frame to upscale in the middle) is a temporal

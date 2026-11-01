@@ -22,7 +22,7 @@ endif()
 if(WIN32)
     set(AJI_TRT_ROOT "" CACHE PATH "TensorRT root")
     set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include")
-    set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
+    set(AJI_TRT_LIB "${AJI_TRT_ROOT}" CACHE PATH "TensorRT import library directory")
     set(AJI_NVINFER "nvinfer_10" CACHE STRING
         "nvinfer import library name (nvinfer_10 / nvinfer_11)")
 else()
@@ -81,6 +81,21 @@ set_target_properties(aji_trt PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden
     CUDA_VISIBILITY_PRESET hidden)
+
+# Optional observation module: neither aji nor aji_trt imports it. Its model
+# parser, allocations and kernels are loaded only for an addon subscription.
+option(AJI_BUILD_ANALYSIS "Build the optional Windows addon observation module" OFF)
+if(AJI_BUILD_ANALYSIS)
+    if(NOT WIN32)
+        message(FATAL_ERROR "AJI_BUILD_ANALYSIS currently supports Windows only")
+    endif()
+    string(REPLACE "nvinfer" "nvonnxparser" AJI_NVONNXPARSER "${AJI_NVINFER}")
+    add_library(aji_analysis SHARED src/aji_analysis.cpp src/analysis_kernels.cu src/kernels.cu)
+    target_include_directories(aji_analysis PUBLIC include PRIVATE ${AJI_TRT_INCLUDE})
+    target_link_directories(aji_analysis PRIVATE ${AJI_TRT_LIB})
+    target_link_libraries(aji_analysis PRIVATE ${AJI_NVINFER} ${AJI_NVONNXPARSER} CUDA::cuda_driver CUDA::cudart bcrypt)
+    set_target_properties(aji_analysis PROPERTIES CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden)
+endif()
 if(NOT WIN32)
     # backends export the same aji_* names as the dispatcher; bind their
     # internal references locally so the global (dispatcher) symbols
@@ -236,6 +251,9 @@ if(WIN32)
     add_executable(aji_harness_dml src/harness_dml.cpp src/utf8-argv.manifest)
     target_link_libraries(aji_harness_dml PRIVATE aji d3d11)
     add_dependencies(aji_harness_dml aji_dml)
+    add_executable(aji_scene_dml_test sanity/scene_dml.cpp)
+    target_link_libraries(aji_scene_dml_test PRIVATE aji d3d11)
+    add_dependencies(aji_scene_dml_test aji_dml)
 endif()
 
 # Parity test tool: compiles the kernels directly (the shared lib hides

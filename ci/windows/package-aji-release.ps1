@@ -14,6 +14,7 @@ param(
     [Parameter(Mandatory)][string]$Tag,
     [string]$BuildDir = (Join-Path $PSScriptRoot '..\..\build-win-release'),
     [string]$OutDir = (Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) 'dist'),
+    [string]$TrtRoot = (Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) 'trt114'),
     [string]$TrtRtxRoot = ($env:AJI_TRTRTX_ROOT ??
         (Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) 'trtrtx171'))
 )
@@ -30,6 +31,16 @@ $engine = foreach ($f in 'aji.dll', 'aji_dml.dll', 'aji_trt.dll', 'aji_encode.ex
     Get-Artifact $f
 }
 $trtrtx = @(Get-Artifact 'aji_trtrtx.dll')
+# The observation module is optional. A build that enables it must also ship
+# its parser and builder resources, including the lean runtime they require.
+if (Test-Path -LiteralPath (Join-Path $BuildDir 'aji_analysis.dll')) {
+    $engine += Get-Artifact 'aji_analysis.dll'
+    foreach ($pattern in 'nvonnxparser_*.dll', 'nvinfer_builder_resource_*.dll', 'nvinfer_lean_*.dll') {
+        $matches = @(Get-ChildItem -LiteralPath (Join-Path $TrtRoot 'lib') -Filter $pattern -File)
+        if (!$matches.Count) { throw "Analysis runtime dependency missing: $pattern in $TrtRoot/lib" }
+        $engine += $matches.FullName
+    }
+}
 # the TensorRT-RTX runtime: exactly one (versioned) core and ONNX parser DLL
 foreach ($pat in 'tensorrt_rtx_*.dll', 'tensorrt_onnxparser_rtx_*.dll') {
     $hit = @(Get-ChildItem (Join-Path $TrtRtxRoot $pat) -ErrorAction SilentlyContinue)

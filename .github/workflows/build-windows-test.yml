@@ -1,0 +1,49 @@
+name: Windows inference test build
+on:
+  push:
+    branches: [integration/addon-scene-detection]
+    paths: ['src/**', 'include/**', 'sanity/scene_dml.cpp', 'CMakeLists.txt', 'tools/build-windows-test.ps1', '.github/workflows/build-windows-test.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+      - uses: actions/cache@v4
+        with:
+          path: build-deps
+          key: aji-windows-${{ hashFiles('ci/windows/dependencies.json') }}-v2
+      - name: Build dispatcher and both inference backends
+        shell: pwsh
+        run: ./tools/build-windows-test.ps1
+      - name: Check cached-only dispatch without a GPU
+        shell: pwsh
+        run: python tools/test-stream-policy-dispatch.py build/Release/aji.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aji-windows-scene-test
+          path: |
+            build/Release/aji.dll
+            build/Release/aji_dml.dll
+            build/Release/aji_trt.dll
+            build/Release/aji_analysis.dll
+            build/Release/aji_harness_dml.exe
+            build/Release/aji_harness.exe
+            build/Release/aji_kernel_test.exe
+            build/Release/aji_scene_dml_test.exe
+            build/build-info.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: aji-windows-build-logs
+          path: build/CMakeFiles/*.yaml

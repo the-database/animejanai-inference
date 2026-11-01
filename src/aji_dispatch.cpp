@@ -52,6 +52,8 @@ struct aji_backend {
     int (*poll)(aji_ctx *);
     int (*infer_rife)(aji_ctx *, const aji_frame *, const aji_frame *,
                       double, const aji_frame *, void *);
+    int (*infer_rife_with_scene)(aji_ctx *, const aji_frame *, const aji_frame *,
+                      double, const aji_frame *, void *, int);
     int (*temporal_radius)(aji_ctx *);
     int (*ingest)(aji_ctx *, const aji_frame *, uint64_t, void *);
     int (*infer_seq)(aji_ctx *, uint64_t, const aji_frame *, void *);
@@ -187,6 +189,8 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(resize,       "aji_resize");
     SYM(poll,         "aji_poll");
     SYM(infer_rife,   "aji_infer_rife");
+    // Optional: do not make old backends unusable for existing callers.
+    *(void **)&be->infer_rife_with_scene = lib_sym(be->lib, "aji_infer_rife_with_scene");
     SYM(temporal_radius, "aji_temporal_radius");
     SYM(ingest,       "aji_ingest");
     SYM(infer_seq,    "aji_infer_seq");
@@ -241,12 +245,23 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     } else {
         logf_to(params->log, params->log_opaque, 3,
                 "backend: %s (%s)", backend.c_str(), stem);
+        if (params->async_build == 2) {
+            auto version = (int (*)(void))lib_sym(be.lib, "aji_stream_policy_version");
+            if (!version || version() != 1) {
+                logf_to(params->log, params->log_opaque, 0, "AJN_STREAM_POLICY_UNAVAILABLE");
+                lib_close(be.lib);
+                return nullptr;
+            }
+        }
         inner = be.create(params);
         if (!inner) {
             lib_close(be.lib);
             be.lib = nullptr;
         }
     }
+    // An addon streaming request must not build or switch inference backends.
+    if (!inner && params->async_build == 2)
+        return nullptr;
     if (!inner && rtx) {
         // TensorRT-RTX missing or failing (its error is logged above):
         // keep playing on TensorRT
@@ -402,6 +417,25 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     return c->be.infer_rife(c->inner, a, b, t, out, cu_stream);
 }
 
+extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
+{
+    return c && c->be.infer_rife_with_scene;
+}
+
+extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b, double t,
+                                         const aji_frame *out, void *cu_stream,
+                                         int scene)
+{
+    if (!c || scene < -1 || scene > 1)
+        return AJI_ERR;
+    if (c->be.infer_rife_with_scene)
+        return c->be.infer_rife_with_scene(c->inner, a, b, t, out, cu_stream, scene);
+    // Default remains callable with an older backend. An explicit decision
+    // cannot silently fall back to a different scene detector.
+    return scene == -1 ? c->be.infer_rife(c->inner, a, b, t, out, cu_stream) : AJI_ERR;
+}
+
 extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
 {
     return c->be.temporal_radius(c->inner);
@@ -438,4 +472,9 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **c)
     lib_close(ctx->be.lib);
     delete ctx;
     *c = nullptr;
+}
+
+extern "C" AJI_EXPORT int aji_stream_policy_version(void)
+{
+    return 1;
 }
