@@ -166,6 +166,10 @@ struct aji_ctx {
     // conversions + the vsmlrt v1 11-channel model input. Geometry state
     // is set at configure; format-dependent staging/plans build lazily on
     // the first aji_infer_rife (frames carry the format).
+    // Read once at context creation; a failed graph stays disabled across
+    // reconfiguration, even though the RIFE tensors below are replaced.
+    int rife_graph_mode = 0;
+    bool rife_graph_disabled = false;
     struct {
         bool enabled = false;
         bool before_upscale = false; // interpolate at source res, before the
@@ -646,17 +650,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
                 double fps, bool before_upscale)
 {
     auto &R = c->rife;
-    const char *graph = getenv("AJI_RIFE_GRAPH");
-    if (graph && *graph) {
-        if (!strcmp(graph, "engine"))
-            R.graph_mode = 1;
-        else if (!strcmp(graph, "chain"))
-            R.graph_mode = 2;
-        else {
-            c->set_error("AJI_RIFE_GRAPH must be engine or chain, or unset");
-            return false;
-        }
-    }
+    R.graph_mode = c->rife_graph_disabled ? 0 : c->rife_graph_mode;
     R.w = w;
     R.h = h;
     R.pw = (w + 63) / 64 * 64;
@@ -865,6 +859,16 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     c->logger.fn = params->log;
     c->logger.opaque = params->log_opaque;
     c->graph_ok = !getenv("AJI_NO_GRAPH");  // debug/benchmark escape hatch
+    const char *rife_graph = getenv("AJI_RIFE_GRAPH");
+    if (rife_graph && *rife_graph) {
+        if (!strcmp(rife_graph, "engine"))
+            c->rife_graph_mode = 1;
+        else if (!strcmp(rife_graph, "chain"))
+            c->rife_graph_mode = 2;
+        else
+            c->logger.log(nvinfer1::ILogger::Severity::kWARNING,
+                "Ignoring invalid AJI_RIFE_GRAPH; expected engine or chain, or unset");
+    }
 
     if (cuInit(0) != CUDA_SUCCESS) {
         c->set_error("cuInit failed");
@@ -2345,10 +2349,18 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
     const size_t py = prow * R.ph;
     const size_t plane = (size_t)R.pw * R.ph;          // fp16 elements
 
-    if (R.graph_mode && !stream) {
-        c->set_error("RIFE CUDA graphs require an explicit CUDA stream");
-        return AJI_ERR_CUDA;
-    }
+    auto disable_graph = [&](const char *reason) {
+        c->rife_graph_disabled = true;
+        R.graph_mode = 0;
+        if (R.graph_exec) {
+            cudaGraphExecDestroy(R.graph_exec);
+            R.graph_exec = nullptr;
+        }
+        cudaGetLastError(); // clear sticky capture/launch errors before fallback
+        c->verbose("RIFE CUDA graphs disabled (%s); using per-call launches", reason);
+    };
+    if (R.graph_mode && !stream)
+        disable_graph("default stream cannot be captured");
     // A chain capture references format-specific padding and filter tables,
     // and bakes the color-range arguments. Retire it BEFORE freeing tables.
     if (R.graph_mode == 2 && R.graph_exec &&
@@ -2471,8 +2483,8 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         if (R.graph_exec) {
             cudaError_t e = cudaGraphLaunch(R.graph_exec, stream);
             if (e != cudaSuccess) {
-                c->set_error("RIFE graph launch failed: %s", cudaGetErrorString(e));
-                return AJI_ERR_CUDA;
+                disable_graph(cudaGetErrorString(e));
+                return compute(); // this frame still needs its normal submission
             }
             return AJI_OK;
         }
@@ -2482,22 +2494,28 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         if (status != AJI_OK)
             return status;
         cudaError_t e = cudaStreamSynchronize(stream);
-        if (e == cudaSuccess)
-            e = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+        if (e != cudaSuccess) {
+            c->set_error("RIFE warmup sync failed: %s", cudaGetErrorString(e));
+            return AJI_ERR_CUDA; // no valid warmup output to preserve
+        }
+        e = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
         cudaGraph_t graph = nullptr;
         if (e == cudaSuccess) {
             status = compute();
+            // End capture even when a captured operation fails: the stream
+            // must leave capture before output copies or normal launches.
             e = cudaStreamEndCapture(stream, &graph);
-            if (status == AJI_OK && e == cudaSuccess)
+            if (status == AJI_OK && e == cudaSuccess && graph)
                 e = cudaGraphInstantiate(&R.graph_exec, graph, 0);
+            else if (e == cudaSuccess)
+                e = cudaErrorStreamCaptureInvalidated;
         }
         if (graph)
             cudaGraphDestroy(graph);
-        if (status != AJI_OK)
-            return status;
-        if (e != cudaSuccess) {
-            c->set_error("RIFE graph capture failed: %s", cudaGetErrorString(e));
-            return AJI_ERR_CUDA;
+        if (status != AJI_OK || e != cudaSuccess) {
+            disable_graph(cudaGetErrorString(e));
+            c->errbuf[0] = '\0'; // a capture-only error does not invalidate warmup
+            return AJI_OK; // keep warmup; engine mode must still post-process it
         }
         R.graph_format = fmt;
         R.graph_range = a->range;

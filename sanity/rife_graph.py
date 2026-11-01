@@ -21,24 +21,33 @@ p.add_argument('--cuda-runtime', type=Path, required=True)
 p.add_argument('--rife-dir', type=Path, required=True)
 p.add_argument('--frames', type=Path, nargs=3, required=True)
 p.add_argument('--output', type=Path, required=True)
-p.add_argument('--worker', choices=['off', 'engine', 'chain'])
+p.add_argument('--worker', choices=['off', 'engine', 'chain', 'invalid'])
+p.add_argument('--fault', choices=['begin', 'body', 'end', 'instantiate', 'launch'],
+               help='Requires a test backend forced-including rife_graph_faults.h')
+p.add_argument('--default-stream', action='store_true',
+               help='Verify ordinary submission when graphs cannot capture the null stream')
 a = p.parse_args()
 
 if not a.worker:
     a.output.mkdir(parents=True, exist_ok=False)
-    for mode in ['off', 'engine', 'chain']:
+    modes = ['off', 'engine', 'chain', 'invalid']
+    for mode in modes:
         env = os.environ.copy()
         env.pop('AJI_RIFE_GRAPH', None)
+        env.pop('AJI_TEST_RIFE_GRAPH_FAULT', None)
+        env['AJI_NO_GRAPH'] = '1'
         if mode != 'off':
-            env['AJI_RIFE_GRAPH'] = mode
+            env['AJI_RIFE_GRAPH'] = 'bogus' if mode == 'invalid' else mode
+        if a.fault and mode in ('engine', 'chain'):
+            env['AJI_TEST_RIFE_GRAPH_FAULT'] = a.fault
         subprocess.run([sys.executable, __file__, *sys.argv[1:], '--worker', mode],
                        env=env, check=True)
     records = {mode: json.loads((a.output / (mode + '.json')).read_text())
-               for mode in ['off', 'engine', 'chain']}
-    for mode in ['engine', 'chain']:
+               for mode in modes}
+    for mode in modes[1:]:
         if records[mode]['frames'] != records['off']['frames']:
             raise RuntimeError(f'{mode}: output or scene decision differs')
-    print(f'PASS: {len(records["off"]["frames"])} calls match in all three modes')
+    print(f'PASS: {len(records["off"]["frames"])} calls match in all four modes')
     sys.exit(0)
 
 cookies = []
@@ -103,6 +112,8 @@ params = Params(api=9, conf=str(conf.resolve()).encode(),
 ctx = C.c_void_p(create(C.byref(params)))
 if not ctx:
     raise RuntimeError('aji_create failed')
+# Reconfigure must use the creation-time choice, not a changed environment.
+os.environ['AJI_RIFE_GRAPH'] = 'engine' if a.worker == 'invalid' else 'bogus'
 
 def setup():
     w, h, num, den = C.c_int(), C.c_int(), C.c_int(), C.c_int()
@@ -133,11 +144,17 @@ def run(label, left, right, t=.5, fmt=1, color_range=1):
               for ptr in buffers]
     for i, image in enumerate(images):
         ck(copy(buffers[i], image.ctypes.data, size * bpp, 1))
+    call_stream = None if a.default_stream else stream
     rc = infer(ctx, C.byref(frames[0]), C.byref(frames[1]), t,
-               C.byref(frames[2]), stream)
+               C.byref(frames[2]), call_stream)
     if rc not in (0, 1):
         raise RuntimeError(last_error(ctx))
-    ck(sync(stream))
+    if a.fault:
+        if bind(backend, 'aji_test_graph_last_error', [])() != 0:
+            raise RuntimeError('Graph failure left a sticky CUDA error')
+        if last_error(ctx):
+            raise RuntimeError('Graph fallback left an error on a successful frame')
+    ck(sync(call_stream))
     row = dict(label=label, time=t, format=fmt, range=color_range, status=rc)
     if rc == 0:
         output = np.empty(size * bpp, dtype=np.uint8)
@@ -160,7 +177,9 @@ run('before-reset', clip[8], clip[9])
 setup()
 run('after-reset', clip[8], clip[9])
 if rows[-1].get('sha256') != rows[-2].get('sha256'):
-    raise RuntimeError('Reset changed the output')
+    (a.output / (a.worker + '-reset-failure.json')).write_text(json.dumps(
+        dict(frames=rows, logs=logs), indent=2))
+    raise RuntimeError(f'Reset changed the output: {rows[-2:]}')
 
 # Reuse caller addresses while changing format/range and then frame contents.
 for index, (fmt, color_range) in enumerate([(1, 2), (2, 1), (2, 2), (1, 1), (1, 2)]):
@@ -169,7 +188,21 @@ for index, (fmt, color_range) in enumerate([(1, 2), (2, 1), (2, 2), (1, 1), (1, 
             fmt=fmt, color_range=color_range)
 
 captures = sum('RIFE CUDA graph captured:' in message for message in logs)
-expected = {'off': 0, 'engine': 2, 'chain': 7}[a.worker]
+expected = {'off': 0, 'engine': 2, 'chain': 7, 'invalid': 0}[a.worker]
+if a.default_stream:
+    expected = 0
+    if a.worker in ('engine', 'chain') and sum('RIFE CUDA graphs disabled' in m for m in logs) != 1:
+        raise RuntimeError('Default-stream fallback must disable graphs once')
+if a.fault and a.worker in ('engine', 'chain'):
+    expected = 1 if a.fault == 'launch' else 0
+    if bind(backend, 'aji_test_graph_failures', [])() != 1:
+        raise RuntimeError('The requested graph failure was not exercised')
+    if bind(backend, 'aji_test_graph_begins', [])() != 1:
+        raise RuntimeError('A disabled graph was retried, including after reset')
+    if sum('RIFE CUDA graphs disabled' in message for message in logs) != 1:
+        raise RuntimeError('Expected one graph-disable diagnostic')
+if a.worker == 'invalid' and not any('Ignoring invalid AJI_RIFE_GRAPH' in m for m in logs):
+    raise RuntimeError('Missing invalid-setting warning')
 if captures != expected:
     raise RuntimeError(f'{a.worker}: expected {expected} captures, got {captures}: {logs}')
 (a.output / (a.worker + '.json')).write_text(json.dumps(
