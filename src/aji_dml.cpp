@@ -48,6 +48,7 @@
 
 #include "aji.h"
 #include "aji_conf.h"
+#include "span_models.h"
 #include "dml_shaders.h"
 #include "onnx_shape.h"
 #include "resample.h"
@@ -1861,7 +1862,12 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     bool any_model = false;
 
     for (size_t mi = 0; mi < chain->models.size(); mi++) {
-        const auto &m = chain->models[mi];
+        auto m = chain->models[mi];
+        if (const char *stock = span_stock_model(m.name)) {
+            c->log_steps.push_back("Using stock model for " + m.name +
+                                  ": experimental SPAN requires classic TensorRT");
+            m.name = stock;
+        }
         // model[0]'s explicit "resize before upscale" is hoisted ahead of RIFE
         // (rife-first) and applied by the filter via aji_resize; suppress it
         // here so it isn't re-applied as an upscale step.

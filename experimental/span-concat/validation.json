@@ -381,5 +381,104 @@
       }
     ],
     "interpretation": "Finite workload; two rounds. Small differences may be within run-to-run variation."
+  },
+  "review_followup_2026_11_01": {
+    "upstream_base": "a120c32c7aaf3877ad36dfdd99c2bab6d271538e",
+    "build": "CMake classic TensorRT 11.3 / CUDA 13.3, SM89 + SM120; experimental-span component installed from original models",
+    "runtime_gpu": "RTX 5090",
+    "checks": {
+      "missing-dll-async": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "missing-dll-blocking": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "missing-export": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "unsupported-shape-async": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.3987407780.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.3987407780.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "unsupported-shape-blocking": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.3987407780.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.3987407780.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "custom-settings": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-fe7e1e3e66c25df8.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-46e10c569752a02b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "changed-binary": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-3b7fc0acaa41a3aa.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-fe7e1e3e66c25df8.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-2c10c0ee8c24a89b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-46e10c569752a02b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "failed-registration-lifetime": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-3b7fc0acaa41a3aa.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-fe7e1e3e66c25df8.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-2c10c0ee8c24a89b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-46e10c569752a02b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "failed-build-async": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "failed-build-blocking": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      }
+    },
+    "cpu_policy_test": "passed: supported GPU/shape, stock aliases, explicit options, binary identity",
+    "limits": "No Linux, DirectML or TensorRT-RTX execution for these follow-up fallback changes. Original profiles/defaults unchanged."
   }
 }
