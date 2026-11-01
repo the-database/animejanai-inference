@@ -1,0 +1,143 @@
+{
+  "date": "2026-11-01",
+  "source_base": "4848d1357407e4d87a8d24f3d4f87794cb61f4a2",
+  "platform": "Windows x64; classic TensorRT 11.3; CUDA 13.3",
+  "plugin_architectures": [
+    "SM89",
+    "SM120"
+  ],
+  "output_scope": "Finite real-video samples. Learned weights unchanged; output equality to stock is not guaranteed.",
+  "untested": [
+    "Fresh 4090 native-display timing",
+    "Linux",
+    "DirectML runtime",
+    "TensorRT-RTX runtime",
+    "Other drivers/content"
+  ],
+  "clean_cache_builds": "All four 1080p models on both GPUs; both optimized models at the other five supported sizes on 5090.",
+  "direct_api": {
+    "RTX 5090": {
+      "width": 1920,
+      "height": 1080,
+      "slots": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "output_frames": 48,
+      "switching_identical": true,
+      "metric": "direct planar YUV444P16; peak=65535; all three planes",
+      "comparisons": [
+        {
+          "baseline_slot": 1,
+          "candidate_slot": 2,
+          "aggregate_psnr_db": 73.00612301987253,
+          "worst_psnr_db": 72.43079123339723,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 270
+        },
+        {
+          "baseline_slot": 3,
+          "candidate_slot": 4,
+          "aggregate_psnr_db": 71.65411596917957,
+          "worst_psnr_db": 70.71929414492018,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 155
+        }
+      ]
+    },
+    "RTX 4090": {
+      "width": 1920,
+      "height": 1080,
+      "slots": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "output_frames": 48,
+      "switching_identical": true,
+      "metric": "direct planar YUV444P16; peak=65535; all three planes",
+      "comparisons": [
+        {
+          "baseline_slot": 1,
+          "candidate_slot": 2,
+          "aggregate_psnr_db": 78.99551134358583,
+          "worst_psnr_db": 77.61497677235947,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 118
+        },
+        {
+          "baseline_slot": 3,
+          "candidate_slot": 4,
+          "aggregate_psnr_db": 70.82148143826562,
+          "worst_psnr_db": 70.02455692047089,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 264
+        }
+      ]
+    }
+  },
+  "playback": {
+    "gpu": "RTX 5090",
+    "input_size": [
+      1920,
+      1080
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "vulkan_queues": 3,
+    "render_drops": 0,
+    "decoder_drops": 0,
+    "interpretation": "Playback integration only: unstable controls; no new speedup claim.",
+    "samples": [
+      {
+        "profile": "balanced-original",
+        "round": 1,
+        "fps": 111.01850900582146
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 1,
+        "fps": 110.14110576208147
+      },
+      {
+        "profile": "performance-original",
+        "round": 1,
+        "fps": 165.77392024877813
+      },
+      {
+        "profile": "performance-concat",
+        "round": 1,
+        "fps": 191.88529019276885
+      },
+      {
+        "profile": "performance-concat",
+        "round": 2,
+        "fps": 192.15676695209297
+      },
+      {
+        "profile": "performance-original",
+        "round": 2,
+        "fps": 167.8400399199233
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 2,
+        "fps": 79.63197462677189
+      },
+      {
+        "profile": "balanced-original",
+        "round": 2,
+        "fps": 111.21558686449906
+      }
+    ]
+  }
+}
