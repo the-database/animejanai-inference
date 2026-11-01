@@ -8,7 +8,6 @@
   ],
   "output_scope": "Finite real-video samples. Learned weights unchanged; output equality to stock is not guaranteed.",
   "untested": [
-    "Fresh 4090 native-display timing",
     "Linux",
     "DirectML runtime",
     "TensorRT-RTX runtime",
@@ -71,5 +70,98 @@
         "fps": 49.26919256761875
       }
     ]
+  },
+  "playback_4090": {
+    "all_samples_passed": true,
+    "input_size": [
+      1920,
+      1080
+    ],
+    "model_output_size": [
+      3840,
+      2160
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "display_hz": 60,
+    "hwdec": "nvdec",
+    "vo": "gpu-next",
+    "vulkan_queues": 3,
+    "dropped_frames": 0,
+    "decoder_dropped_frames": 0,
+    "gpu": "RTX 4090",
+    "driver": "610.88",
+    "source": "Bundled 1920x1080 benchmark MP4",
+    "backend": "#36",
+    "warmup_seconds": 10,
+    "measurement_seconds": 20,
+    "rounds": 2,
+    "method": "Native end video-flip trace events; forward then reverse order; no concurrent mpv process.",
+    "samples": [
+      {
+        "profile": "rife-stock",
+        "round": 1,
+        "fps": 60.54540563383563,
+        "frames": 1209,
+        "seconds": 19.9684846
+      },
+      {
+        "profile": "rife-warp",
+        "round": 1,
+        "fps": 62.80533688350168,
+        "frames": 1256,
+        "seconds": 19.9983005
+      },
+      {
+        "profile": "rife-warp",
+        "round": 2,
+        "fps": 63.130205347639034,
+        "frames": 1261,
+        "seconds": 19.9745905
+      },
+      {
+        "profile": "rife-stock",
+        "round": 2,
+        "fps": 60.94068430880282,
+        "frames": 1217,
+        "seconds": 19.9702385
+      }
+    ],
+    "profiles": {
+      "rife-stock": {
+        "samples": [
+          60.54540563383563,
+          60.94068430880282
+        ],
+        "median_fps": 60.74304497131922,
+        "min_fps": 60.54540563383563,
+        "max_fps": 60.94068430880282,
+        "spread_percent": 0.6507389860910519
+      },
+      "rife-warp": {
+        "samples": [
+          62.80533688350168,
+          63.130205347639034
+        ],
+        "median_fps": 62.96777111557036,
+        "min_fps": 62.80533688350168,
+        "max_fps": 63.130205347639034,
+        "spread_percent": 0.5159281619498536
+      }
+    },
+    "comparisons": [
+      {
+        "baseline": "rife-stock",
+        "candidate": "rife-warp",
+        "median_change_percent": 3.6625199564848554,
+        "paired_round_change_percent": [
+          3.7326221965273243,
+          3.5928724195831485
+        ]
+      }
+    ],
+    "interpretation": "Finite workload; two rounds. Small differences may be within run-to-run variation."
   }
 }

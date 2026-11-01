@@ -100,9 +100,25 @@ python sanity\rife_profiles.py --backend "C:\test\aji_trt.dll" --runtime "C:\tes
 Fresh 5090 native 3840x2160 playback completed for both profiles with RIFE 2x
 before original Balanced, three Vulkan queues and no recorded drops. The two
 stock timings were 79.58 and 49.27 fps; warp was 79.51 and 79.11 fps. That unstable
-control prevents a meaningful new speedup claim. Playback testing is currently
-paused; new 4090 native-display timing and wider content/driver coverage remain
-outstanding. DirectML, TensorRT-RTX and Linux execution were not tested.
+control prevents a meaningful new 5090 speedup claim.
+
+The completed 4090 check used driver 610.88, the bundled 1920x1080 benchmark
+MP4 and the static engines from the clean-cache checks. RIFE 2x ran before
+Original Balanced; output and native display were both 3840x2160 (60 Hz).
+Two forward/reverse rounds used 10 seconds warmup and 20 seconds measurement
+per profile, NVDEC/gpu-next, three Vulkan queues and no dropped frames or
+concurrent mpv sessions. FPS is uncapped whole-chain `end video-flip`
+throughput (`--untimed=yes`, immediate Vulkan presentation).
+
+| Profile | Median FPS | Versus stock RIFE |
+| --- | ---: | ---: |
+| Stock RIFE + Original Balanced | 60.743 | reference |
+| FP16 warp + Original Balanced | 62.968 | +3.663% |
+
+Both paired rounds were positive (+3.733%, +3.593%). This is finite evidence
+for this workload, driver and saved engines, not a universal speedup or a
+change to the numerical-output differences above. Wider content/driver
+coverage, DirectML, TensorRT-RTX and Linux execution remain untested.
 
 Use identical source frames, renderer, interpolation phase, warmup and display
 dimensions when comparing. Keep Vulkan queues at three and reject overlapping
