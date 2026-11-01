@@ -860,10 +860,19 @@ int run_build_inprocess(const BuildSpec &spec, std::atomic<intptr_t> *cancel)
     // Warm the new engine here, on the build thread, so the kernels it
     // compiles at first use land in the JIT caches before anyone plays it.
     // A failure here fails the build: the engine would not run anyway.
+    // Release the builder first (its memory is no longer needed). TensorRT
+    // requires everything a builder created to be destroyed before it, so
+    // keep a copy of the plan and release the rest in reverse order.
+    std::vector<char> engine((const char *)plan->data(),
+                             (const char *)plan->data() + plan->size());
+    plan.reset();
+    cfg.reset();
+    parser.reset();
+    net.reset();
     builder.reset();
     std::string werr;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!warm_built_plan(log, plan->data(), plan->size(),
+    if (!warm_built_plan(log, engine.data(), engine.size(),
                          spec.engine_path + JIT_CACHE_EXT, &werr))
         return fail("warm-up of the built engine failed: " + werr);
     char msg[96];
