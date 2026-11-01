@@ -25,6 +25,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -47,6 +48,8 @@
 
 #include "aji.h"
 #include "aji_conf.h"
+#include "span_models.h"
+#include "core/plugin_cache.h"
 #include "kernels.h"
 #include "onnx_shape.h"
 #include "core/fileio.h"
@@ -63,6 +66,58 @@ namespace {
 const char *DEFAULT_TRT_ENGINE_SETTINGS =
     "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% "
     "--skipInference";
+
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+std::string span_plugin_path(int kind)
+{
+    HMODULE self = nullptr;
+    wchar_t filename[32768];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&span_plugin_path), &self))
+        return {};
+    DWORD n = GetModuleFileNameW(self, filename, 32768);
+    if (!n || n >= 32768)
+        return {};
+    return (fs::path(filename).parent_path() /
+            (kind == 2 ? "performance-plugin.dll" : "balanced-next-plugin.dll")).u8string();
+}
+
+bool ensure_span_plugin(int kind, std::string *identity)
+{
+    static std::mutex mutex;
+    static bool ready[3] = {};
+    static HMODULE modules[3] = {};
+    static std::string ids[3];
+    std::lock_guard<std::mutex> lock(mutex);
+    const std::string path = span_plugin_path(kind);
+    const std::string disk_id = ajicore::plugin_binary_id(path);
+    if (modules[kind]) {
+        *identity = ids[kind];
+        return ready[kind] && !disk_id.empty() && disk_id == ids[kind];
+    }
+    if (disk_id.empty())
+        return false;
+    HMODULE mod = LoadLibraryExW(fs::u8path(path).c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!mod)
+        return false;
+    modules[kind] = mod;
+    ids[kind] = disk_id;
+    auto init = mod ? reinterpret_cast<int(*)()>(GetProcAddress(mod,
+        kind == 2 ? "initPerformancePlugin" : "initBalancedPlugin")) : nullptr;
+    if (!init || !init()) {
+        // Registration may already have installed creators. Their code must
+        // remain mapped, even when initialization only partially succeeds.
+        return false;
+    }
+    // The process-wide TensorRT registry keeps the creator pointer. Keep its
+    // library loaded across filter/profile replacement.
+    ready[kind] = true;
+    *identity = disk_id;
+    return true;
+}
+#endif
 
 using ajicore::BuildSpec;
 using ajicore::CtxGuard;
@@ -302,6 +357,10 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
         c->set_error("%s", err.c_str());
         return false;
     }
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+    if (int kind = span_plugin_kind(onnx_name))
+        spec->cmdline += " --dynamicPlugins=\"" + span_plugin_path(kind) + "\"";
+#endif
     return true;
 }
 
@@ -485,11 +544,12 @@ bool defer_to_warm_up(aji_ctx *c, const std::string &name,
 int ensure_engine(aji_ctx *c, const std::string &name,
                   const std::string &settings, const std::string &epath,
                   ModelEngine *me, int w, int h, int ch,
-                  const std::string *dir = nullptr, int rank5_t = 0)
+                  const std::string *dir = nullptr, int rank5_t = 0,
+                  const std::string &plugin_id = {})
 {
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath =
-        short_engine_path_for(model_dir, name, settings, c->cuda_dev);
+        short_engine_path_for(model_dir, name, settings, c->cuda_dev, plugin_id);
 #ifdef AJI_TRTRTX
     // a failure already reported (and not replaced by the TensorRT
     // fallback): passthrough, as aji_trt does for a failed build
@@ -1161,7 +1221,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     bool any_model = false;
 
     for (size_t mi = 0; mi < chain->models.size(); mi++) {
-        const auto &m = chain->models[mi];
+        auto m = chain->models[mi];
         // model[0]'s explicit "resize before upscale" is hoisted ahead of RIFE
         // (rife-first) and applied by the filter via aji_resize; suppress it
         // here so it isn't re-applied as an upscale step. The maxShapes cap
@@ -1242,11 +1302,57 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         while ((pos = settings.find("%video_resolution%")) != std::string::npos)
             settings.replace(pos, strlen("%video_resolution%"), dims);
 
-        const std::string epath =
-            engine_path_for(c->model_dir, m.name, settings, c->cuda_dev);
+        const std::string stock_settings = settings;
+        std::string plugin_id;
+        if (int kind = span_plugin_kind(m.name)) {
+            const char *reason = nullptr;
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+            cudaDeviceProp prop = {};
+            if (cudaGetDeviceProperties(&prop, c->cuda_dev) != cudaSuccess) {
+                c->set_error("Cannot query the CUDA device for SPAN selection");
+                return AJI_ERR_CUDA;
+            }
+            reason = span_unsupported_reason(kind, bw, bh, prop.major * 10 + prop.minor);
+            if (!reason && (t != 1 || span_has_option(settings, "--minShapes") ||
+                            span_has_option(settings, "--maxShapes")))
+                reason = "experimental SPAN requires a single-frame static engine";
+            if (!reason && !file_exists((fs::path(c->model_dir) / (m.name + ".onnx")).string()))
+                reason = "experimental ONNX is not installed";
+            if (!reason && !ensure_span_plugin(kind, &plugin_id))
+                reason = "plugin unavailable or changed; restart after installing it";
+#else
+            reason = "experimental SPAN requires Windows and classic TensorRT 11";
+#endif
+            if (reason) {
+                c->log_steps.push_back("Using stock model for " + m.name + ": " + reason);
+                m.name = span_stock_model(m.name);
+                plugin_id.clear();
+            } else {
+                settings = span_build_settings(settings, kind, bw, bh);
+            }
+        }
+
+        std::string epath =
+            engine_path_for(c->model_dir, m.name, settings, c->cuda_dev, plugin_id);
         ModelEngine me;
-        int er = ensure_engine(c, m.name, settings, epath, &me, bw, bh, 3 * t,
-                               nullptr, rank5 ? t : 0);
+        const std::string failed_path = plugin_id.empty() ? std::string() :
+            short_engine_path_for(c->model_dir, m.name, settings, c->cuda_dev, plugin_id);
+        int er = !failed_path.empty() && c->failed_builds.count(failed_path) ? 0 :
+            ensure_engine(c, m.name, settings, epath, &me, bw, bh, 3 * t,
+                          nullptr, rank5 ? t : 0, plugin_id);
+        if (!plugin_id.empty()) {
+            if (er < 0 || (er == 0 && c->failed_builds.count(failed_path))) {
+                c->failed_builds.insert(failed_path);
+                c->log_steps.push_back("Using stock model for " + m.name +
+                    ": experimental engine failed (see " + failed_path + ".build.log)");
+                m.name = span_stock_model(m.name);
+                settings = stock_settings;
+                me = ModelEngine{};
+                epath = engine_path_for(c->model_dir, m.name, settings, c->cuda_dev);
+                er = ensure_engine(c, m.name, settings, epath, &me, bw, bh, 3 * t,
+                                   nullptr, rank5 ? t : 0);
+            }
+        }
         if (er < 0) {
             finalize_log(c);
             return AJI_ERR_ENGINE;

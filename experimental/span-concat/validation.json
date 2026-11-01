@@ -1,0 +1,495 @@
+{
+  "date": "2026-11-01",
+  "source_base": "4848d1357407e4d87a8d24f3d4f87794cb61f4a2",
+  "platform": "Windows x64; classic TensorRT 11.3; CUDA 13.3",
+  "plugin_architectures": [
+    "SM89",
+    "SM120"
+  ],
+  "output_scope": "Finite real-video samples. Learned weights unchanged; output equality to stock is not guaranteed.",
+  "untested": [
+    "Linux",
+    "DirectML runtime",
+    "TensorRT-RTX runtime",
+    "Other drivers/content"
+  ],
+  "clean_cache_builds": "All four 1080p models on both GPUs; both optimized models at the other five supported sizes on 5090.",
+  "direct_api": {
+    "RTX 5090": {
+      "width": 1920,
+      "height": 1080,
+      "slots": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "output_frames": 48,
+      "switching_identical": true,
+      "metric": "direct planar YUV444P16; peak=65535; all three planes",
+      "comparisons": [
+        {
+          "baseline_slot": 1,
+          "candidate_slot": 2,
+          "aggregate_psnr_db": 73.00612301987253,
+          "worst_psnr_db": 72.43079123339723,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 270
+        },
+        {
+          "baseline_slot": 3,
+          "candidate_slot": 4,
+          "aggregate_psnr_db": 71.65411596917957,
+          "worst_psnr_db": 70.71929414492018,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 155
+        }
+      ]
+    },
+    "RTX 4090": {
+      "width": 1920,
+      "height": 1080,
+      "slots": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "output_frames": 48,
+      "switching_identical": true,
+      "metric": "direct planar YUV444P16; peak=65535; all three planes",
+      "comparisons": [
+        {
+          "baseline_slot": 1,
+          "candidate_slot": 2,
+          "aggregate_psnr_db": 78.99551134358583,
+          "worst_psnr_db": 77.61497677235947,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 118
+        },
+        {
+          "baseline_slot": 3,
+          "candidate_slot": 4,
+          "aggregate_psnr_db": 70.82148143826562,
+          "worst_psnr_db": 70.02455692047089,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 264
+        }
+      ]
+    }
+  },
+  "playback": {
+    "gpu": "RTX 5090",
+    "input_size": [
+      1920,
+      1080
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "vulkan_queues": 3,
+    "render_drops": 0,
+    "decoder_drops": 0,
+    "interpretation": "Playback integration only: unstable controls; no new speedup claim.",
+    "samples": [
+      {
+        "profile": "balanced-original",
+        "round": 1,
+        "fps": 111.01850900582146
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 1,
+        "fps": 110.14110576208147
+      },
+      {
+        "profile": "performance-original",
+        "round": 1,
+        "fps": 165.77392024877813
+      },
+      {
+        "profile": "performance-concat",
+        "round": 1,
+        "fps": 191.88529019276885
+      },
+      {
+        "profile": "performance-concat",
+        "round": 2,
+        "fps": 192.15676695209297
+      },
+      {
+        "profile": "performance-original",
+        "round": 2,
+        "fps": 167.8400399199233
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 2,
+        "fps": 79.63197462677189
+      },
+      {
+        "profile": "balanced-original",
+        "round": 2,
+        "fps": 111.21558686449906
+      }
+    ]
+  },
+  "playback_540p": {
+    "all_samples_passed": true,
+    "input_size": [
+      960,
+      540
+    ],
+    "model_output_size": [
+      1920,
+      1080
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "display_hz": 143.997,
+    "hwdec": "nvdec",
+    "vo": "gpu-next",
+    "vulkan_queues": 3,
+    "dropped_frames": 0,
+    "decoder_dropped_frames": 0,
+    "gpu": "RTX 5090",
+    "driver": "616.92",
+    "source": "24-frame real-video 960x540 fixture, lossless H.264, looped",
+    "backend": "#37, including #35",
+    "warmup_seconds": 10,
+    "measurement_seconds": 20,
+    "rounds": 2,
+    "method": "Native end video-flip trace events; forward then reverse order; no concurrent mpv process.",
+    "samples": [
+      {
+        "profile": "balanced-original",
+        "round": 1,
+        "fps": 416.440865342116,
+        "frames": 8328,
+        "seconds": 19.9980374
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 1,
+        "fps": 416.73425533174293,
+        "frames": 8333,
+        "seconds": 19.9959564
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 2,
+        "fps": 417.51144006602516,
+        "frames": 8348,
+        "seconds": 19.9946617
+      },
+      {
+        "profile": "balanced-original",
+        "round": 2,
+        "fps": 418.4077946686776,
+        "frames": 8367,
+        "seconds": 19.9972374
+      }
+    ],
+    "profiles": {
+      "balanced-original": {
+        "samples": [
+          416.440865342116,
+          418.4077946686776
+        ],
+        "median_fps": 417.42433000539677,
+        "min_fps": 416.440865342116,
+        "max_fps": 418.4077946686776,
+        "spread_percent": 0.47120620078281955
+      },
+      "balanced-concat": {
+        "samples": [
+          416.73425533174293,
+          417.51144006602516
+        ],
+        "median_fps": 417.122847698884,
+        "min_fps": 416.73425533174293,
+        "max_fps": 417.51144006602516,
+        "spread_percent": 0.18632034628879168
+      }
+    },
+    "comparisons": [
+      {
+        "baseline": "balanced-original",
+        "candidate": "balanced-concat",
+        "median_change_percent": -0.07222442125232043,
+        "paired_round_change_percent": [
+          0.07045177696138882,
+          -0.2142299006074211
+        ]
+      }
+    ],
+    "interpretation": "Finite workload; two rounds. Small differences may be within run-to-run variation."
+  },
+  "playback_4090": {
+    "all_samples_passed": true,
+    "input_size": [
+      1920,
+      1080
+    ],
+    "model_output_size": [
+      3840,
+      2160
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "display_hz": 60,
+    "hwdec": "nvdec",
+    "vo": "gpu-next",
+    "vulkan_queues": 3,
+    "dropped_frames": 0,
+    "decoder_dropped_frames": 0,
+    "gpu": "RTX 4090",
+    "driver": "610.88",
+    "source": "Bundled 1920x1080 benchmark MP4",
+    "backend": "#37, including #35",
+    "warmup_seconds": 10,
+    "measurement_seconds": 20,
+    "rounds": 2,
+    "method": "Native end video-flip trace events; forward then reverse order; no concurrent mpv process.",
+    "samples": [
+      {
+        "profile": "balanced-original",
+        "round": 1,
+        "fps": 84.82400052682907,
+        "frames": 1696,
+        "seconds": 19.9943411
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 1,
+        "fps": 86.45895124741443,
+        "frames": 1727,
+        "seconds": 19.974797
+      },
+      {
+        "profile": "performance-original",
+        "round": 1,
+        "fps": 113.97038474301513,
+        "frames": 2279,
+        "seconds": 19.9964228
+      },
+      {
+        "profile": "performance-concat",
+        "round": 1,
+        "fps": 118.16769886551855,
+        "frames": 2362,
+        "seconds": 19.9885419
+      },
+      {
+        "profile": "performance-concat",
+        "round": 2,
+        "fps": 118.2705584411076,
+        "frames": 2364,
+        "seconds": 19.9880683
+      },
+      {
+        "profile": "performance-original",
+        "round": 2,
+        "fps": 114.00018345075594,
+        "frames": 2279,
+        "seconds": 19.9911959
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 2,
+        "fps": 87.56256651846728,
+        "frames": 1750,
+        "seconds": 19.9857093
+      },
+      {
+        "profile": "balanced-original",
+        "round": 2,
+        "fps": 84.0257438073877,
+        "frames": 1680,
+        "seconds": 19.9938724
+      }
+    ],
+    "profiles": {
+      "balanced-original": {
+        "samples": [
+          84.82400052682907,
+          84.0257438073877
+        ],
+        "median_fps": 84.42487216710839,
+        "min_fps": 84.0257438073877,
+        "max_fps": 84.82400052682907,
+        "spread_percent": 0.9455231603564889
+      },
+      "balanced-concat": {
+        "samples": [
+          86.45895124741443,
+          87.56256651846728
+        ],
+        "median_fps": 87.01075888294085,
+        "min_fps": 86.45895124741443,
+        "max_fps": 87.56256651846728,
+        "spread_percent": 1.2683664471167118
+      },
+      "performance-original": {
+        "samples": [
+          113.97038474301513,
+          114.00018345075594
+        ],
+        "median_fps": 113.98528409688554,
+        "min_fps": 113.97038474301513,
+        "max_fps": 114.00018345075594,
+        "spread_percent": 0.02614259198185716
+      },
+      "performance-concat": {
+        "samples": [
+          118.16769886551855,
+          118.2705584411076
+        ],
+        "median_fps": 118.21912865331308,
+        "min_fps": 118.16769886551855,
+        "max_fps": 118.2705584411076,
+        "spread_percent": 0.08700755686560209
+      }
+    },
+    "comparisons": [
+      {
+        "baseline": "balanced-original",
+        "candidate": "balanced-concat",
+        "median_change_percent": 3.062944188667549,
+        "paired_round_change_percent": [
+          1.9274624050162004,
+          4.209213213496854
+        ]
+      },
+      {
+        "baseline": "performance-original",
+        "candidate": "performance-concat",
+        "median_change_percent": 3.714378211163516,
+        "paired_round_change_percent": [
+          3.682811225010507,
+          3.745936945966677
+        ]
+      }
+    ],
+    "interpretation": "Finite workload; two rounds. Small differences may be within run-to-run variation."
+  },
+  "review_followup_2026_11_01": {
+    "upstream_base": "a120c32c7aaf3877ad36dfdd99c2bab6d271538e",
+    "build": "CMake classic TensorRT 11.3 / CUDA 13.3, SM89 + SM120; experimental-span component installed from original models",
+    "runtime_gpu": "RTX 5090",
+    "checks": {
+      "missing-dll-async": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "missing-dll-blocking": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "missing-export": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "unsupported-shape-async": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.3987407780.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.3987407780.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "unsupported-shape-blocking": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.3987407780.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.3987407780.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "custom-settings": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-fe7e1e3e66c25df8.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-46e10c569752a02b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "changed-binary": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-3b7fc0acaa41a3aa.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-fe7e1e3e66c25df8.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-2c10c0ee8c24a89b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-46e10c569752a02b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "failed-registration-lifetime": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-3b7fc0acaa41a3aa.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-a211336b.2050444531.plugin-fe7e1e3e66c25df8.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-2c10c0ee8c24a89b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-e9f5bd64.2050444531.plugin-46e10c569752a02b.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "failed-build-async": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      },
+      "failed-build-blocking": {
+        "passed": true,
+        "enginenames": [
+          "aji-8fdbda36.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+          "aji-daf17ec9.1709619676.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+        ],
+        "switching_identical": true
+      }
+    },
+    "cpu_policy_test": "passed: supported GPU/shape, stock aliases, explicit options, binary identity",
+    "limits": "No TensorRT-RTX or Linux execution for the fallback changes; default profiles unchanged.",
+    "directml_check": {
+      "backend": "#37 superset; shared fallback code",
+      "runtime": "ORT DirectML 1.24.4 / DirectML 1.15.4",
+      "concat_aliases_stock_identical": true,
+      "input_size": [
+        960,
+        540
+      ],
+      "frames_per_profile": 2
+    },
+    "tiling_control": "ablation-4090-20261101.json"
+  }
+}
