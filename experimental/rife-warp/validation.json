@@ -163,5 +163,75 @@
       }
     ],
     "interpretation": "Finite workload; two rounds. Small differences may be within run-to-run variation."
+  },
+  "review_followup_set2": {
+    "upstream_base": "a120c32",
+    "source_sha256": "77700a2395ac91d88bf1b886fb144e14cfbca9daf9312f2a460ddd2e7e0d0f8e",
+    "graph_difference": "Serialized protobuf equals set 1 after normalizing only input dimension names 2 and 3. Initializers unchanged.",
+    "build": "Complete CMake experimental-rife-warp component, classic TensorRT 11.3 / CUDA 13.3; native SM89 and SM120",
+    "gpu": "RTX 5090",
+    "api_check": {
+      "warp_frames": 71,
+      "aggregate_psnr_db": 69.9894449006601,
+      "worst_psnr_db": 65.88434158085443,
+      "switching_identical": true,
+      "engines": [
+        "aji-cd8b6ef2.615520695.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine",
+        "aji-f8e72df9.615520695.plugin-83a00c658921544e.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-5090-sm12.engine"
+      ],
+      "calls": 149,
+      "scene_decisions_match": true,
+      "configure_seconds": {
+        "stock": 35.38999999999942,
+        "warp": 34.65600000000086,
+        "stock-reloaded": 0.07799999999951979
+      }
+    },
+    "fallback_checks": {
+      "unsupported-720-async": {
+        "passed": true,
+        "calls": 57,
+        "stock_identical": true,
+        "scene_decisions_match": true,
+        "explicit_no_overrides_legacy_env": true
+      },
+      "unsupported-720-blocking": {
+        "passed": true,
+        "calls": 57,
+        "stock_identical": true,
+        "scene_decisions_match": true,
+        "explicit_no_overrides_legacy_env": true
+      },
+      "missing-dll": {
+        "passed": true,
+        "calls": 57,
+        "stock_identical": true,
+        "scene_decisions_match": true,
+        "explicit_no_overrides_legacy_env": true
+      },
+      "missing-export": {
+        "passed": true,
+        "calls": 57,
+        "stock_identical": true,
+        "scene_decisions_match": true,
+        "explicit_no_overrides_legacy_env": true
+      },
+      "failed-build-async": {
+        "passed": true,
+        "calls": 57,
+        "stock_identical": true,
+        "scene_decisions_match": true,
+        "explicit_no_overrides_legacy_env": true
+      },
+      "failed-build-blocking": {
+        "passed": true,
+        "calls": 57,
+        "stock_identical": true,
+        "scene_decisions_match": true,
+        "explicit_no_overrides_legacy_env": true
+      }
+    },
+    "manager_pr": "https://github.com/the-database/AnimeJaNaiManager/pull/21",
+    "limits": "No new set-2 playback FPS claim; DirectML/TRT-RTX/Linux fallback execution not tested locally."
   }
 }

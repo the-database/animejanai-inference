@@ -75,6 +75,7 @@ target_include_directories(aji_trt
     PRIVATE ${AJI_TRT_INCLUDE})
 target_link_directories(aji_trt PRIVATE ${AJI_TRT_LIB})
 target_link_libraries(aji_trt PRIVATE ${AJI_NVINFER} CUDA::cuda_driver CUDA::cudart)
+include(cmake/RifeWarp.cmake)
 set_target_properties(aji_trt PROPERTIES
     BUILD_RPATH "${AJI_TRT_LIB}"
     INSTALL_RPATH "${AJI_TRT_LIB}"

@@ -10,9 +10,9 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--model', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True, help='directory for the distinct experimental ONNX')
 args = parser.parse_args()
-digest = '7fdb67dcf02d23cd573b5269bb41c600b7d4241cfda366099e736938d8f7abc6'
+digest = '77700a2395ac91d88bf1b886fb144e14cfbca9daf9312f2a460ddd2e7e0d0f8e'
 if hashlib.sha256(args.model.read_bytes()).hexdigest() != digest:
-    raise ValueError('Expected the tested non-ensemble RIFE 4.22 FP16 model; SHA-256 differs')
+    raise ValueError('Expected non-ensemble RIFE 4.22 from models-rife-fp16-2; SHA-256 differs')
 model = onnx.load(args.model)
 weights = [t.SerializeToString() for t in model.graph.initializer]
 producer = {o: n for n in model.graph.node for o in n.output}
@@ -48,6 +48,6 @@ model.opset_import.append(helper.make_opsetid('com.astra', 1))
 assert count == 4 and weights == [t.SerializeToString() for t in model.graph.initializer]
 onnx.checker.check_model(model)
 args.output.mkdir(parents=True, exist_ok=True)
-target = args.output / 'rife_v4.22_fp16_warp_v1.onnx'
+target = args.output / 'rife_v4.22_fp16_warp_v2.onnx'
 onnx.save(model, target)
 print(target)

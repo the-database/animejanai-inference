@@ -10,11 +10,13 @@ This is an opt-in experiment, not a default model replacement. Select it per
 profile with `chain_1_rife_fp16_warp=yes` (default: `no`).
 The accompanying `profiles.conf` provides Original and Warp profiles, both with
 RIFE 2x before original Balanced. They can switch in one player process.
-`AJI_RIFE_WARP=1` remains a whole-process override set before launch; leave it
-unset when comparing the two profiles.
+The former `AJI_RIFE_WARP` environment override is removed. A profile's `no`
+always keeps stock RIFE, even if that legacy variable remains in the environment.
 Selection requires non-ensemble RIFE 4.22 with 1920x1080 input, Windows and
 classic TensorRT 11. For 4K upscaling, set RIFE **before** the spatial model.
-Other shapes, models and backends are not enabled by this experiment.
+The backend checks SM89/SM120 before selecting the plugin. Other shapes, models,
+architectures and backends log the reason and use stock RIFE. Missing DLLs/exports
+and failed optional engine builds also fall back in blocking/asynchronous modes.
 
 ## Reproduce
 
@@ -26,7 +28,10 @@ python experimental\rife-warp\prepare.py --model "C:\models\rife_v4.22.onnx" --o
 python experimental\rife-warp\build.py --cuda "C:\CUDA" --trt-include "C:\TensorRT\include" --cccl-include "C:\CCCL\include" --output "C:\rife-warp-build"
 ```
 
-The transform verifies the exact tested source SHA-256, checks all four sampling
+Use `rife_v4.22.onnx` from the current
+[models-rife-fp16-2 release](https://github.com/the-database/animejanai-inference/releases/tag/models-rife-fp16-2),
+SHA-256 `77700a2395ac91d88bf1b886fb144e14cfbca9daf9312f2a460ddd2e7e0d0f8e`.
+The transform verifies this source SHA-256, checks all four sampling
 patterns, preserves initializer bytes and runs the ONNX checker. Build from a
 CUDA-supported compiler, or explicitly pass `--allow-unsupported-compiler` for
 a local compiler needing NVCC's override. Keep `--fmad=false`; the kernel's
@@ -36,19 +41,58 @@ current integration also has clean-build and switching checks on a 4090.
 
 Build this branch's `aji_trt` normally. In an isolated test install, put
 `rife-warp-plugin.dll` beside `aji_trt.dll` and the generated
-`rife_v4.22_fp16_warp_v1.onnx` beside the original RIFE ONNX. Use the supplied
+`rife_v4.22_fp16_warp_v2.onnx` beside the original RIFE ONNX. Use the supplied
 configuration in that isolated install, or add `chain_1_rife_fp16_warp=yes` to
 a non-ensemble RIFE 4.22 profile. Normal profiles omit the key or set it to `no`.
 The named-model path loads the plugin before deserialization and supplies it to
 trtexec for a new static 1x11x1088x1920 engine. The distinct ONNX/cache name
-prevents stock/experimental cache collisions. Do not rename this export over
+and plugin-binary fingerprint prevent stock/experimental cache collisions. A
+replaced DLL selects a new cache; restart the player to load it. Failed plugin
+registration retains the module because the registry can keep creator pointers.
+Do not rename this export over
 the original ONNX or reuse the old same-name engine cache from early prototypes.
 
 The normal builder runs once when the new cache entry is absent. Its default
 settings are preserved; optimization-level-5 RIFE was slower in the experiment
 and is not enabled. Spatial-model settings are unaffected.
 
+Alternatively, add `-DAJI_BUILD_RIFE_WARP=ON -DAJI_RIFE_MODEL_DIR=C:/models` to the
+normal TensorRT 11 CMake configuration, build `aji_trt`, then install with
+`cmake --install <build> --component experimental-rife-warp --prefix <test>/animejanai`.
+This builds the plugin and transformed ONNX and installs both alongside stock
+RIFE. Python needs ONNX; CUDA needs its matching CCCL headers. The Windows release
+script stages the component when `AJI_RIFE_MODEL_DIR` is supplied. Defaults stay
+off, and neither weights nor runtime binaries are committed.
+
+The per-chain checkbox is supplied by
+[AnimeJaNaiManager #21](https://github.com/the-database/AnimeJaNaiManager/pull/21).
+
+## Review follow-up with set 2
+
+The downloaded release archive and RIFE model passed their published SHA-256
+checks. After normalizing only input dimension names, set 2's serialized model
+equals set 1 exactly. The exporter preserves those named dimensions and every
+initializer while replacing the same four sampling sequences.
+
+The full optional CMake component builds/installs with TensorRT 11.3 / CUDA 13.3.
+Fresh stock/warp engines on the 5090 pass 149 API calls: 71 generated frames,
+matching scene-cut decisions, multiple timesteps and exact stock reloads.
+Direct NV12 aggregate/worst PSNR is 69.989445 / 65.884342 dB. This is a fresh
+engine search, so the numbers need not equal the historical set-1 results below.
+
+Additional real-clip checks pass for 720p in both build modes, missing DLL/export,
+and failed optional engine builds in both modes. Fallback output is byte-identical
+to stock, scene decisions agree, and explicit `no` remains stock with the legacy
+environment variable set. Unsupported backend routes are implemented, but
+DirectML, TensorRT-RTX and Linux execution of these follow-up changes was not
+tested locally. There is no new set-2 playback speed claim; the positive and
+negative historical results below remain specific to their measured setups.
+
 ## Evidence and limits
+
+The following measurements used set 1. The reviewer's separate TensorRT 11.4 /
+CUDA 13.4 run found no resolved speed gain; retain that negative evidence when
+deciding whether this opt-in experiment merits inclusion.
 
 Historical 5090 native-4K playback with RIFE 2x before optimized Balanced:
 

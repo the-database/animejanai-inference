@@ -14,6 +14,8 @@ if not defined VSDIR (echo Visual Studio 18 with the C++ tools not found & exit 
 call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo || exit /b 1
 set "CUDA_PATH=%AJI_WIN%\cuda134"
 set "PATH=%CUDA_PATH%\bin;%PATH%"
+set "AJI_RIFE_BUILD=OFF"
+if defined AJI_RIFE_MODEL_DIR set "AJI_RIFE_BUILD=ON"
 cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ^
   "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_PATH%" ^
@@ -22,6 +24,10 @@ cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DAJI_ORT_ROOT=%AJI_WIN%/ort/Microsoft.ML.OnnxRuntime.DirectML ^
   -DAJI_DML_ROOT=%AJI_WIN%/ort/Microsoft.AI.DirectML ^
   -DAJI_FFMPEG_ROOT=%AJI_WIN%/ffmpeg-shared/ffmpeg-9.0.2-full_build-shared ^
-  "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler" || exit /b 1
+  "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler" ^
+  -DAJI_BUILD_RIFE_WARP=%AJI_RIFE_BUILD% "-DAJI_RIFE_MODEL_DIR=%AJI_RIFE_MODEL_DIR%" || exit /b 1
 cmake --build "%BLD%" --clean-first || exit /b 1
+if defined AJI_RIFE_MODEL_DIR (
+  cmake --install "%BLD%" --component experimental-rife-warp --prefix "%BLD%/rife-warp-package/animejanai" || exit /b 1
+)
 echo AJI-RELEASE-BUILD-OK
