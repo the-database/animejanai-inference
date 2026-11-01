@@ -25,6 +25,7 @@ p.add_argument('--slots',default='1,2,3,4')
 p.add_argument('--width',type=int,default=1920)
 p.add_argument('--height',type=int,default=1080)
 p.add_argument('--clean-cache',action='store_true')
+p.add_argument('--blocking',action='store_true',help='Build synchronously instead of polling the async builder')
 a=p.parse_args()
 slots=[int(s) for s in a.slots.split(',')]
 a.output.mkdir(parents=True,exist_ok=False)
@@ -54,6 +55,7 @@ set_slot=bind(aji,'aji_set_slot',[C.c_void_p,C.c_int])
 poll=bind(aji,'aji_poll',[C.c_void_p])
 infer=bind(aji,'aji_infer',[C.c_void_p,C.POINTER(Frame),C.POINTER(Frame),C.c_void_p])
 error=bind(aji,'aji_last_error',[C.c_void_p],C.c_char_p)
+current_log=bind(aji,'aji_current_log',[C.c_void_p],C.c_char_p)
 destroy=bind(aji,'aji_destroy',[C.POINTER(C.c_void_p)],None)
 messages=[]
 @C.CFUNCTYPE(None,C.c_void_p,C.c_int,C.c_char_p)
@@ -64,7 +66,7 @@ def ck(rc):
 def ajck(rc):
     if rc<0: raise RuntimeError(error(ctx))
 params=Params(api=9,conf=os.fsencode(a.conf.resolve()),models=os.fsencode(a.models.resolve()),
-    trtexec=os.fsencode((a.runtime/'trtexec.exe').resolve()),slot=slots[0],async_build=1,
+    trtexec=os.fsencode((a.runtime/'trtexec.exe').resolve()),slot=slots[0],async_build=0 if a.blocking else 1,
     log=C.cast(logger,C.c_void_p))
 ctx=C.c_void_p(create(C.byref(params)))
 if not ctx: raise RuntimeError('aji_create failed')
@@ -91,7 +93,8 @@ def setup(slot):
             rc=configure(ctx,w,h,24000/1001,C.byref(ow),C.byref(oh));ajck(rc)
         else: time.sleep(.25)
     if (ow.value,oh.value)!=(w*2,h*2): raise RuntimeError('Expected 2x output')
-    timings.append(dict(slot=slot,seconds=time.monotonic()-start))
+    timings.append(dict(slot=slot,seconds=time.monotonic()-start,
+                        configuration=(current_log(ctx) or b'').decode('utf-8','replace')))
 for slot in slots:
     print('Configuring slot',slot,flush=True)
     setup(slot)

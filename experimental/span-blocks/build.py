@@ -30,7 +30,7 @@ subprocess.run([*nvcc, '-fatbin', str(source.parent/'span-concat/balanced/kernel
 data = (output/'kernels.fatbin').read_bytes()
 (output/'kernel_ptx.h').write_text('alignas(8) static const unsigned char kPtx[] = {\n' +
     '\n'.join(','.join(str(b) for b in data[i:i+32])+',' for i in range(0,len(data),32)) + '\n};\n')
-cmd = [*nvcc, '--shared', '-std=c++17', '-DAJ_CONV_720_M256', '-Xcompiler', '/Zc:preprocessor',
+cmd = [*nvcc, '--shared', '--cudart', 'shared', '-std=c++17', '-DAJ_CONV_720_M256', '-Xcompiler', '/Zc:preprocessor',
        '-I'+str(args.trt_include.resolve()), '-I'+str(args.cutlass_include.resolve()),
        '-I'+str(args.cccl_include.resolve()), '-I'+str(args.cccl_include.resolve()/'cccl'),
        '-I'+str(output), str(source/'plugin.cu'), '-L'+str(args.cuda/'lib/x64'), '-lcuda',

@@ -11,7 +11,8 @@ stock tactics. It does not replace the default profiles or quantize the models.
 Currently supported: Windows x64, TensorRT 11, CUDA 13.x, RTX 4090 (SM89) and
 5090 (SM120). The shipped kernel source produces native code for both GPUs.
 TensorRT-RTX, DirectML, Linux and other architectures are outside this experiment.
-Use the regular models on those backends.
+Named experimental profiles automatically use their corresponding regular model
+on those backends/architectures. Keep the original ONNX files installed.
 
 From an x64 MSVC developer prompt with Python, `onnx` and `numpy` installed:
 
@@ -31,22 +32,45 @@ an **isolated test installation**. Copy the generated ONNX files into its ONNX
 directory alongside the original models. Use the accompanying `profiles.conf`
 as a separate test configuration, preserving your regular configuration.
 
+The same bundle can be built and installed with CMake (Python must have `onnx`
+and `numpy`): add `-DAJI_BUILD_SPAN_PLUGINS=ON -DAJI_SPAN_MODEL_DIR=C:/models`
+to the normal TensorRT 11 configure command, build `aji_trt`, then run
+`cmake --install <build> --component experimental-span --prefix <test>/animejanai`.
+This stages the backend, both plugin DLLs, both exports and both stock models.
+The Windows release script accepts `AJI_SPAN_MODEL_DIR` and stages that optional
+component in `build-win-release/span-package/animejanai`. Normal releases keep
+the option off; no model files are downloaded or added to source control.
+
 The backend registers the matching plugin before engine loading and supplies
 `--dynamicPlugins` to the ordinary asynchronous trtexec builder. Original models
 continue to use the global/Manager builder settings and work without either
-plugin DLL. Transformed model names give the engine cache a separate identity.
+plugin DLL. Transformed model names and the plugin binary's content fingerprint
+give the engine cache a separate identity. Rebuilding/replacing a DLL selects a
+new cache; restart the player to load that binary. Loaded modules remain resident
+even after failed registration because TensorRT can retain creator pointers.
 Direct engine-file mode is a low-level API: callers must register the plugin
 themselves; the automatic registration here is for named configuration models.
 
 Supported batch-one static inputs:
-480x360, 640x480, 768x576, 960x540, 1280x720 and 1920x1080. Other shapes fail
-explicitly; switch to an Original profile for those. Engines use optimization
-level 5, `--optShapes=input:1x3xHxW`, and skip inference during building. Balanced
-uses tiling level 3 at every supported shape; Performance uses it at 1080p.
-Both use a 64 MiB tiling L2 budget at 1080p. These are the tested shared presets,
+480x360, 640x480, 768x576, 960x540, 1280x720 and 1920x1080. Unsupported shapes,
+dynamic profiles, missing DLLs/exports and failed optional engine builds log a
+reason and fall back to the matching stock model, in blocking and asynchronous
+build modes. A failed optional build is not retried on every profile switch.
+Stock builds use the user's unchanged builder settings. Experimental builds also
+preserve those settings, adding tiling level 3 for Balanced (or Performance at
+1080p) and a 64 MiB L2 budget at 1080p only when the user has not set that option.
+The accompanying profiles use builder optimization level 5 and static optShapes.
+These are the tested shared presets,
 not a claim that the same cache budget is optimal for every GPU.
 
 ## Measurement and quality scope
+
+The combined recipe includes both TensorRT tiling settings and the concat plugin.
+Historical stock-to-concat gains below do not isolate the plugin's contribution.
+The review's 5090 control found stock + tiling already reduced engine time by
+about 5–6.5%; concat then reduced it by another 6–7%. Those are device-latency
+reductions, not playback FPS percentages. Do not enable tiling globally from
+those results alone: gains depend on GPU and resolution.
 
 Historical controlled 5090 native-4K-rendered Balanced throughput improved
 135.359 -> 157.052 fps with the tuned concat engine (+16.02%). Separate direct
@@ -73,6 +97,16 @@ playback FPS. The five public benchmark input sizes exclude 540p; 540p remains
 an additional supported development shape.
 
 ## Review status
+
+The review follow-up builds the complete optional CMake install component from
+the original ONNX files. Focused runtime regressions on a 5090 pass for missing
+DLL/export, unsupported 1918x1078 input, failed plugin registration and failed
+optional engine builds, including blocking/asynchronous operation and reverse
+profile switching. Fallback outputs match stock byte-for-byte. Explicit custom
+builder flags survive; a changed plugin binary gets a distinct engine cache;
+a failed registration leaves its DLL loaded and is attempted only once.
+The SM and option policy also has a CPU regression. The non-classic backends'
+fallback routes are source changes; their execution was not validated locally.
 
 The kernel bodies are the versions exercised in the 4090/5090 experiments.
 The source packaging and named-model builder integration were compiled with
