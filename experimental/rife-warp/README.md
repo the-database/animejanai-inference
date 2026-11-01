@@ -83,9 +83,10 @@ engine search, so the numbers need not equal the historical set-1 results below.
 Additional real-clip checks pass for 720p in both build modes, missing DLL/export,
 and failed optional engine builds in both modes. Fallback output is byte-identical
 to stock, scene decisions agree, and explicit `no` remains stock with the legacy
-environment variable set. Unsupported backend routes are implemented, but
-DirectML, TensorRT-RTX and Linux execution of these follow-up changes was not
-tested locally. There is no new set-2 playback speed claim; the positive and
+environment variable set. A separate production DirectML harness check (ORT
+1.24.4 / DirectML 1.15.4, 720p input) passes with the option off and on: all five
+output frames match exactly. TensorRT-RTX and Linux execution of the fallback
+changes was not tested locally. There is no new set-2 playback speed claim; the positive and
 negative historical results below remain specific to their measured setups.
 
 ## Evidence and limits

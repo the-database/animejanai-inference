@@ -232,6 +232,15 @@
       }
     },
     "manager_pr": "https://github.com/the-database/AnimeJaNaiManager/pull/21",
-    "limits": "No new set-2 playback FPS claim; DirectML/TRT-RTX/Linux fallback execution not tested locally."
+    "limits": "No new set-2 playback FPS claim; TensorRT-RTX/Linux fallback execution not tested locally.",
+    "directml_check": {
+      "runtime": "ORT DirectML 1.24.4 / DirectML 1.15.4",
+      "input_size": [
+        1280,
+        720
+      ],
+      "output_frames_per_profile": 5,
+      "enabled_option_stock_identical": true
+    }
   }
 }
