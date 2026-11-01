@@ -25,6 +25,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -63,6 +64,57 @@ namespace {
 const char *DEFAULT_TRT_ENGINE_SETTINGS =
     "--builderOptimizationLevel=5 --optShapes=input:%video_resolution% "
     "--skipInference";
+
+// Experimental, fixed-weight exports; ordinary models retain their builder settings.
+const char *BALANCED_CONCAT_MODEL =
+    "2x_AnimeJaNai_HD_V3.1_Balanced_FP16_Concat_Tiled3_v2";
+const char *PERFORMANCE_CONCAT_MODEL =
+    "2x_AnimeJaNai_HD_V3.1_Performance_FP16_Concat_v1";
+
+int span_plugin_kind(const std::string &name)
+{
+    return name == BALANCED_CONCAT_MODEL ? 1 :
+           name == PERFORMANCE_CONCAT_MODEL ? 2 : 0;
+}
+
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+std::string span_plugin_path(int kind)
+{
+    HMODULE self = nullptr;
+    wchar_t filename[32768];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&span_plugin_path), &self))
+        return {};
+    DWORD n = GetModuleFileNameW(self, filename, 32768);
+    if (!n || n >= 32768)
+        return {};
+    return (fs::path(filename).parent_path() /
+            (kind == 2 ? "performance-plugin.dll" : "balanced-next-plugin.dll")).u8string();
+}
+
+bool ensure_span_plugin(int kind)
+{
+    static std::mutex mutex;
+    static bool ready[3] = {};
+    std::lock_guard<std::mutex> lock(mutex);
+    if (ready[kind])
+        return true;
+    const auto path = fs::u8path(span_plugin_path(kind));
+    HMODULE mod = LoadLibraryExW(path.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    auto init = mod ? reinterpret_cast<int(*)()>(GetProcAddress(mod,
+        kind == 2 ? "initPerformancePlugin" : "initBalancedPlugin")) : nullptr;
+    if (!init || !init()) {
+        if (mod) FreeLibrary(mod);
+        return false;
+    }
+    // The process-wide TensorRT registry keeps the creator pointer. Keep its
+    // library loaded across filter/profile replacement.
+    ready[kind] = true;
+    return true;
+}
+#endif
 
 using ajicore::BuildSpec;
 using ajicore::CtxGuard;
@@ -302,6 +354,10 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
         c->set_error("%s", err.c_str());
         return false;
     }
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+    if (int kind = span_plugin_kind(onnx_name))
+        spec->cmdline += " --dynamicPlugins=\"" + span_plugin_path(kind) + "\"";
+#endif
     return true;
 }
 
@@ -1241,6 +1297,31 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         size_t pos;
         while ((pos = settings.find("%video_resolution%")) != std::string::npos)
             settings.replace(pos, strlen("%video_resolution%"), dims);
+
+        if (int kind = span_plugin_kind(m.name)) {
+#if defined(_WIN32) && !defined(AJI_TRTRTX) && NV_TENSORRT_MAJOR == 11
+            if (t != 1 || !((bw == 480 && bh == 360) || (bw == 640 && bh == 480) ||
+                  (bw == 768 && bh == 576) || (bw == 960 && bh == 540) ||
+                  (bw == 1280 && bh == 720) || (bw == 1920 && bh == 1080))) {
+                c->set_error("Optimized SPAN models require a supported static resolution; "
+                             "see experimental/span-concat/README.md");
+                return AJI_ERR_ENGINE;
+            }
+            if (!ensure_span_plugin(kind)) {
+                c->set_error("Cannot register the optimized SPAN model plugin");
+                return AJI_ERR_ENGINE;
+            }
+            settings = "--builderOptimizationLevel=5 --optShapes=input:" + std::string(dims);
+            if (kind == 1 || (bw == 1920 && bh == 1080))
+                settings += " --tilingOptimizationLevel=3";
+            if (bw == 1920 && bh == 1080)
+                settings += " --l2LimitForTiling=67108864";
+            settings += " --skipInference";
+#else
+            c->set_error("Optimized SPAN plugins currently require Windows and TensorRT 11");
+            return AJI_ERR_ENGINE;
+#endif
+        }
 
         const std::string epath =
             engine_path_for(c->model_dir, m.name, settings, c->cuda_dev);
