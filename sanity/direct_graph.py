@@ -19,28 +19,42 @@ p.add_argument('--backend', type=Path, required=True)
 p.add_argument('--engine', type=Path, required=True)
 p.add_argument('--cuda-runtime', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
-p.add_argument('--worker', choices=['staged', 'direct'])
+p.add_argument('--fault-backend', type=Path,
+               help='test-only backend built with direct_graph_faults.h forced-included')
+p.add_argument('--worker', choices=['staged', 'direct', 'capacity', 'begin', 'body',
+                                   'end', 'instantiate', 'warmup', 'launch'])
 a = p.parse_args()
 
 if not a.worker:
     a.output.mkdir(parents=True, exist_ok=False)
-    for mode in ['staged', 'direct']:
+    modes = ['staged', 'direct', 'capacity']
+    if a.fault_backend:
+        modes += ['begin', 'body', 'end', 'instantiate', 'warmup', 'launch']
+    for mode in modes:
         env = os.environ.copy()
         env.pop('AJI_NO_GRAPH', None)
         env.pop('AJI_DIRECT_GRAPH', None)
-        if mode == 'direct':
+        env.pop('AJI_TEST_DIRECT_GRAPH_FAULT', None)
+        if mode != 'staged':
             env['AJI_DIRECT_GRAPH'] = '1'
+        if mode not in ['staged', 'direct', 'capacity']:
+            env['AJI_TEST_DIRECT_GRAPH_FAULT'] = mode
         subprocess.run([sys.executable, __file__, *sys.argv[1:], '--worker', mode],
                        env=env, check=True)
     results = {mode: json.loads((a.output / (mode + '.json')).read_text())
-               for mode in ['staged', 'direct']}
-    if results['staged'] != results['direct']:
-        raise RuntimeError('Output differs across capture/replay or a format transition')
-    print(f'PASS: {len(results["direct"])} exact capture/replay outputs')
+               for mode in modes}
+    for mode in modes:
+        if mode not in ['warmup', 'launch'] and results['staged'] != results[mode]:
+            raise RuntimeError(f'Output differs for {mode}')
+    print('PASS: capture/replay parity, bounded cache fallback' +
+          (', capture fault recovery and real-error propagation' if a.fault_backend else ''))
     sys.exit(0)
 
 # Keep handles alive for Windows dependency resolution; Linux uses its library path.
 directories = []
+fault = a.worker in ['begin', 'body', 'end', 'instantiate', 'warmup', 'launch']
+if fault:
+    a.backend = a.fault_backend
 if os.name == 'nt':
     directories = [os.add_dll_directory(str(path.resolve()))
                    for path in {a.backend.parent, a.cuda_runtime.parent}]
@@ -101,7 +115,7 @@ if (ow.value, oh.value) != (3840, 2160):
 inp, out = C.c_void_p(), C.c_void_p()
 ck(cuda.cudaMalloc(C.byref(inp), 1920 * 1080 * 3))
 plane = 3840 * 2160 * 2
-ck(cuda.cudaMalloc(C.byref(out), plane * 3))
+ck(cuda.cudaMalloc(C.byref(out), plane * 3 + 130 * 256))
 output = Frame(3840, 2160, 3, 2, 1, 1,
                (C.c_void_p * 3)(out.value, out.value + plane, out.value + 2 * plane),
                (C.c_ssize_t * 3)(7680, 7680, 7680))
@@ -117,14 +131,43 @@ for case, (fmt, siting) in enumerate([(1, 1), (2, 3), (1, 1), (1, 2)]):
         data = rng.integers(16, 236, 1920 * 1080 * 3 // 2, dtype=np.uint16)
         data = (data << 8).astype(np.uint16) if bpp == 2 else data.astype(np.uint8)
         ck(cuda.cudaMemcpy(inp, C.c_void_p(data.ctypes.data), data.nbytes, 1))
-        if backend.aji_infer(ctx, C.byref(frame), C.byref(output), stream):
+        status = backend.aji_infer(ctx, C.byref(frame), C.byref(output), stream)
+        if a.worker in ['warmup', 'launch'] and status:
+            assert backend.aji_test_graph_failures() == 1
+            assert backend.aji_last_error(ctx)
+            (a.output / (a.worker + '.json')).write_text(json.dumps({'error_propagated': True}))
+            print(a.worker, ': genuine execution error propagated')
+            sys.exit(0)
+        if status:
             raise RuntimeError(backend.aji_last_error(ctx))
+        if fault and backend.aji_test_graph_last_error():
+            raise RuntimeError('Optional capture left a CUDA error pending')
         ck(cuda.cudaStreamSynchronize(stream))
         ck(cuda.cudaMemcpy(C.c_void_p(host_out.ctypes.data), out, host_out.nbytes, 2))
         records.append(dict(input_format=fmt, siting=siting, replay=replay,
                             sha256=hashlib.sha256(host_out).hexdigest()))
 if a.worker == 'direct' and sum('direct CUDA graph cached' in m for m in messages) != 4:
     raise RuntimeError('Expected four direct-graph captures, each followed by replay')
+if a.worker == 'capacity':
+    # Distinct overlapping views of one allocation avoid allocating 130 full
+    # output frames. Calls are ordered, so these buffers are never concurrent.
+    for i in range(260):
+        offset = (i % 130 + 1) * 256
+        for j in range(3):
+            output.planes[j] = out.value + offset + plane * j
+        if backend.aji_infer(ctx, C.byref(frame), C.byref(output), stream):
+            raise RuntimeError(backend.aji_last_error(ctx))
+        ck(cuda.cudaStreamSynchronize(stream))
+        if i in (0, 126, 127, 128, 129, 259):
+            ck(cuda.cudaMemcpy(C.c_void_p(host_out.ctypes.data), out.value + offset, host_out.nbytes, 2))
+            assert hashlib.sha256(host_out).hexdigest() == records[-1]['sha256']
+    assert sum('cache limit reached' in m for m in messages) == 1
+    assert sum('direct CUDA graph cached' in m for m in messages) == 131
+if fault:
+    assert backend.aji_test_graph_failures() == 1
+    assert a.worker not in ['warmup', 'launch'], 'Expected execution failure was masked'
+    assert sum('direct CUDA graphs disabled: capture unavailable' in m for m in messages) == 1
+    assert not any('direct CUDA graph cached' in m for m in messages)
 backend.aji_destroy(C.byref(ctx))
 ck(cuda.cudaFree(inp))
 ck(cuda.cudaFree(out))

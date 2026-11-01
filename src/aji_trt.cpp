@@ -196,6 +196,7 @@ struct aji_ctx {
     };
     std::vector<DirectGraph> direct_graphs;
     bool direct_graph_mode = getenv("AJI_DIRECT_GRAPH") != nullptr;
+    bool direct_graph_ok = true;
     bool graph_ok = true;
     cudaGraphExec_t graph_exec = nullptr;
     int graph_key[9] = {0};
@@ -1425,34 +1426,52 @@ static int infer_via_direct_graph(aji_ctx *c, const aji_frame *in,
         }
         return AJI_OK;
     }
+    // A cyclic working set larger than this cache would miss forever with
+    // either FIFO or LRU. Stop capturing and use the staged path thereafter.
+    if (c->direct_graphs.size() == 128) {
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            c->set_error("direct CUDA graph cache drain failed");
+            return AJI_ERR_CUDA;
+        }
+        for (auto &g : c->direct_graphs) cudaGraphExecDestroy(g.exec);
+        c->direct_graphs.clear();
+        c->direct_graph_ok = false;
+        c->verbose("direct CUDA graphs disabled: buffer-pair cache limit reached");
+        return run_chain(c, in, out, stream);
+    }
     // The warmup initializes TensorRT and conversion plans and produces this
     // frame. Capture records the same operations for subsequent buffer reuse.
     int status = run_chain(c, in, out, stream);
     if (status != AJI_OK) return status;
-    if (cudaStreamSynchronize(stream) != cudaSuccess ||
-        cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        c->set_error("direct CUDA graph capture could not start");
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        c->set_error("direct CUDA graph warmup failed");
         return AJI_ERR_CUDA;
     }
+    // The warmup frame is complete. Only the optional capture may fail now;
+    // retain that frame, clear the capture error, and don't retry each frame.
+    auto capture_failed = [&]() {
+        cudaGetLastError();
+        c->errbuf[0] = '\0';
+        c->direct_graph_ok = false;
+        c->verbose("direct CUDA graphs disabled: capture unavailable");
+        return AJI_OK;
+    };
+    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+        return capture_failed();
     status = run_chain(c, in, out, stream);
     cudaGraph_t graph = nullptr;
     cudaError_t ended = cudaStreamEndCapture(stream, &graph);
     if (status != AJI_OK || ended != cudaSuccess || !graph) {
         if (graph) cudaGraphDestroy(graph);
-        c->set_error("direct CUDA graph capture failed");
-        return AJI_ERR_CUDA;
+        return capture_failed();
     }
     aji_ctx::DirectGraph entry;
     entry.input = *in; entry.output = *out;
     cudaError_t built = cudaGraphInstantiate(&entry.exec, graph, 0);
     cudaGraphDestroy(graph);
     if (built != cudaSuccess) {
-        c->set_error("direct CUDA graph instantiation failed");
-        return AJI_ERR_CUDA;
-    }
-    if (c->direct_graphs.size() == 128) {
-        cudaGraphExecDestroy(c->direct_graphs.front().exec);
-        c->direct_graphs.erase(c->direct_graphs.begin());
+        if (entry.exec) cudaGraphExecDestroy(entry.exec);
+        return capture_failed();
     }
     c->direct_graphs.push_back(entry);
     c->verbose("direct CUDA graph cached (%zu buffer pairs)", c->direct_graphs.size());
@@ -1620,7 +1639,8 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
 
     // Graph replay needs a non-default stream (capture restriction).
     if (c->graph_ok && stream) {
-        if (c->direct_graph_mode) return infer_via_direct_graph(c, in, out, stream);
+        if (c->direct_graph_mode && c->direct_graph_ok)
+            return infer_via_direct_graph(c, in, out, stream);
         int ret;
         if (infer_via_graph(c, in, out, stream, &ret))
             return ret;
