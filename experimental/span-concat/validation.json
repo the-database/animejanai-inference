@@ -479,6 +479,17 @@
       }
     },
     "cpu_policy_test": "passed: supported GPU/shape, stock aliases, explicit options, binary identity",
-    "limits": "No Linux, DirectML or TensorRT-RTX execution for these follow-up fallback changes. Original profiles/defaults unchanged."
+    "limits": "No TensorRT-RTX or Linux execution for the fallback changes; default profiles unchanged.",
+    "directml_check": {
+      "backend": "#37 superset; shared fallback code",
+      "runtime": "ORT DirectML 1.24.4 / DirectML 1.15.4",
+      "concat_aliases_stock_identical": true,
+      "input_size": [
+        960,
+        540
+      ],
+      "frames_per_profile": 2
+    },
+    "tiling_control": "ablation-4090-20261101.json"
   }
 }
