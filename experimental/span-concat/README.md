@@ -105,7 +105,26 @@ playback testing was paused. Vulkan queue count remained three, output was 2x,
 and the checks recorded no decoder/render drops. Timing was not stable across
 rounds (Balanced concat: 110.14 then 79.63 fps), so these runs establish playback
 integration, not a new speedup. Historical gains above remain separate evidence.
-New 4090 native-display timing and wider content/driver coverage are outstanding.
+
+The completed 4090 check used the bundled 1920x1080 benchmark MP4, driver
+610.88, and the static engines from the clean-cache integration checks. Two
+forward/reverse rounds used 10 seconds warmup and 20 seconds measurement per
+profile. The 3840x2160 model output rendered to the native 3840x2160, 60 Hz
+display through NVDEC/gpu-next with three Vulkan queues and no dropped frames
+or concurrent mpv sessions. FPS is uncapped native `end video-flip` throughput
+(`--untimed=yes`, immediate Vulkan presentation), not the panel refresh rate.
+
+| Profile | Median FPS | Versus corresponding Original |
+| --- | ---: | ---: |
+| Original Balanced | 84.425 | reference |
+| Balanced concat | 87.011 | +3.063% |
+| Original Performance | 113.985 | reference |
+| Performance concat | 118.219 | +3.714% |
+
+Both paired rounds were positive: Balanced +1.927%/+4.209%, Performance
++3.683%/+3.746%. These are two-round, workload-specific results; broader
+content/driver coverage remains outstanding. Output differences documented
+above still apply. The additional grouped-convolution result is in #37.
 
 A completed 5090 540p check used a looped 24-frame real-video fixture, 10 seconds
 warmup and 20 seconds measurement in each of two reversed-order rounds. The 2x
