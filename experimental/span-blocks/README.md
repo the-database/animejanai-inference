@@ -145,8 +145,31 @@ switching check. Different model basenames and settings isolate each engine.
 
 Fresh 5090 native 3840x2160 playback completed for block-concat and Cache48 with
 three Vulkan queues and no recorded drops. The controls varied considerably
-across the 1080p suite; it does not establish a new speedup. New 4090
-native-display timing is not included yet.
+across the 1080p suite; it does not establish a new 5090 speedup.
+
+The completed 4090 check used driver 610.88, the bundled 1920x1080 benchmark
+MP4 and the static engines from the clean-cache integration checks. Two
+forward/reverse rounds used 10 seconds warmup and 20 seconds measurement per
+profile. Model output and native display were both 3840x2160 (60 Hz), with
+NVDEC/gpu-next, three Vulkan queues and no dropped frames or concurrent mpv
+sessions. FPS is uncapped native `end video-flip` throughput (`--untimed=yes`,
+immediate Vulkan presentation).
+
+| Profile | Median FPS | Versus corresponding Original |
+| --- | ---: | ---: |
+| Original Balanced | 84.425 | reference |
+| Balanced concat | 87.011 | +3.063% |
+| Balanced block-concat | 88.792 | +5.173% |
+| Original Performance | 113.985 | reference |
+| Performance concat | 118.219 | +3.714% |
+| Performance Cache48 | 118.243 | +3.735% |
+
+Block-concat added +2.047% over Balanced concat, positive in both paired
+rounds (+2.445%, +1.654%). Cache48 added only +0.020% over Performance concat,
+with opposite paired signs (-0.041%, +0.081%): this run does not reproduce a
+meaningful extra cache-preset gain. Keep that negative result separate from
+the historical improvement above. All values are specific to this workload,
+driver and saved engines; the numerical-output differences still apply.
 
 The completed 5090 540p comparison used a looped 24-frame real-video fixture,
 10 seconds warmup and 20 seconds measurement, with two reversed-order rounds.
