@@ -1,0 +1,146 @@
+[
+  {
+    "name": "balanced-original",
+    "width": 1920,
+    "height": 1080,
+    "rounds": 3,
+    "fps": [
+      90.97842282007694,
+      90.40718017828246,
+      90.06288866358156
+    ],
+    "median_fps": 90.40718017828246,
+    "median_gain_vs_previous": -3.8804148917615744,
+    "paired_gains_vs_previous": [
+      -3.986083251844208,
+      -2.2776762360563807,
+      -4.246460569594657
+    ],
+    "median_gain_vs_original": 0.0,
+    "paired_gains_vs_original": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "name": "balanced-optimized",
+    "width": 1920,
+    "height": 1080,
+    "rounds": 3,
+    "fps": [
+      94.75545410642195,
+      92.51435771898804,
+      94.05698128687995
+    ],
+    "median_fps": 94.05698128687995,
+    "median_gain_vs_previous": 0.0,
+    "paired_gains_vs_previous": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "median_gain_vs_original": 4.0370699555058565,
+    "paired_gains_vs_original": [
+      4.15156821724052,
+      2.330763482004672,
+      4.43478183141317
+    ]
+  },
+  {
+    "name": "performance-original",
+    "width": 1920,
+    "height": 1080,
+    "rounds": 3,
+    "fps": [
+      125.9342071130995,
+      125.397564055602,
+      124.58233958278876
+    ],
+    "median_fps": 125.397564055602,
+    "median_gain_vs_previous": -4.177563246395599,
+    "paired_gains_vs_previous": [
+      -3.754085522342865,
+      -4.177563246395599,
+      -4.922541895356092
+    ],
+    "median_gain_vs_original": 0.0,
+    "paired_gains_vs_original": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "name": "performance-optimized",
+    "width": 1920,
+    "height": 1080,
+    "rounds": 3,
+    "fps": [
+      130.84628869346378,
+      130.86451180327046,
+      131.03246770193547
+    ],
+    "median_fps": 130.86451180327046,
+    "median_gain_vs_previous": 0.0,
+    "paired_gains_vs_previous": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "median_gain_vs_original": 4.359692143018323,
+    "paired_gains_vs_original": [
+      3.900514159709445,
+      4.359692143018323,
+      5.177401661220538
+    ]
+  },
+  {
+    "name": "performance-cache48",
+    "width": 1920,
+    "height": 1080,
+    "rounds": 3,
+    "fps": [
+      131.92176818998755,
+      131.7727393294022,
+      131.9568185241082
+    ],
+    "median_fps": 131.92176818998755,
+    "median_gain_vs_previous": 0.8079015251334587,
+    "paired_gains_vs_previous": [
+      0.8219411549710287,
+      0.694021254209165,
+      0.7054364756950093
+    ],
+    "median_gain_vs_original": 5.202815687466367,
+    "paired_gains_vs_original": [
+      4.754515245814583,
+      5.083970587318132,
+      5.91936141672702
+    ]
+  },
+  {
+    "name": "balanced-block-concat",
+    "width": 1920,
+    "height": 1080,
+    "rounds": 3,
+    "fps": [
+      96.3794609077021,
+      95.68740292427537,
+      94.25815441682826
+    ],
+    "median_fps": 95.68740292427537,
+    "median_gain_vs_previous": 1.7334403199934068,
+    "paired_gains_vs_previous": [
+      1.7138926899724183,
+      3.429786774205845,
+      0.21388431480138248
+    ],
+    "median_gain_vs_original": 5.840490473854332,
+    "paired_gains_vs_original": [
+      5.9366143314074415,
+      5.840490473854332,
+      4.658151448947612
+    ]
+  }
+]

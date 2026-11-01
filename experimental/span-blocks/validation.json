@@ -1,0 +1,781 @@
+{
+  "date": "2026-11-01",
+  "source_base": "4848d1357407e4d87a8d24f3d4f87794cb61f4a2",
+  "platform": "Windows x64; classic TensorRT 11.3; CUDA 13.3",
+  "plugin_architectures": [
+    "SM89",
+    "SM120"
+  ],
+  "output_scope": "Finite real-video samples. Learned weights unchanged; output equality to stock is not guaranteed.",
+  "untested": [
+    "Linux",
+    "DirectML runtime",
+    "TensorRT-RTX runtime",
+    "Other drivers/content"
+  ],
+  "clean_cache_builds": "New block-concat and Cache48 engines built on both GPUs; NativeTail7 built on 5090 at 960x540.",
+  "direct_api": {
+    "RTX 5090": {
+      "width": 1920,
+      "height": 1080,
+      "slots": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        7
+      ],
+      "output_frames": 72,
+      "switching_identical": true,
+      "metric": "direct planar YUV444P16; peak=65535; all three planes",
+      "comparisons": [
+        {
+          "baseline_slot": 1,
+          "candidate_slot": 2,
+          "aggregate_psnr_db": 73.00612301987253,
+          "worst_psnr_db": 72.43079123339723,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 270
+        },
+        {
+          "baseline_slot": 3,
+          "candidate_slot": 4,
+          "aggregate_psnr_db": 71.65411596917957,
+          "worst_psnr_db": 70.71929414492018,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 155
+        },
+        {
+          "baseline_slot": 2,
+          "candidate_slot": 5,
+          "aggregate_psnr_db": 75.58294752243134,
+          "worst_psnr_db": 75.07008209001653,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 233
+        },
+        {
+          "baseline_slot": 4,
+          "candidate_slot": 7,
+          "aggregate_psnr_db": 71.65489387546964,
+          "worst_psnr_db": 70.72433374392509,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 152
+        }
+      ]
+    },
+    "RTX 4090": {
+      "width": 1920,
+      "height": 1080,
+      "slots": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        7
+      ],
+      "output_frames": 72,
+      "switching_identical": true,
+      "metric": "direct planar YUV444P16; peak=65535; all three planes",
+      "comparisons": [
+        {
+          "baseline_slot": 1,
+          "candidate_slot": 2,
+          "aggregate_psnr_db": 78.99551134358583,
+          "worst_psnr_db": 77.61497677235947,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 118
+        },
+        {
+          "baseline_slot": 3,
+          "candidate_slot": 4,
+          "aggregate_psnr_db": 70.82148144710358,
+          "worst_psnr_db": 70.02455692047089,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 264
+        },
+        {
+          "baseline_slot": 2,
+          "candidate_slot": 5,
+          "aggregate_psnr_db": 70.65550205102178,
+          "worst_psnr_db": 70.03433252511317,
+          "sampled_frames": 12,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 337
+        },
+        {
+          "baseline_slot": 4,
+          "candidate_slot": 7,
+          "aggregate_psnr_db": "infinite",
+          "worst_psnr_db": "infinite",
+          "sampled_frames": 12,
+          "identical_frames": 12,
+          "max_abs_sample_difference": 0
+        }
+      ]
+    }
+  },
+  "native7_direct_api": {
+    "RTX 5090": {
+      "width": 960,
+      "height": 540,
+      "slots": [
+        1,
+        2,
+        4,
+        6
+      ],
+      "output_frames": 16,
+      "switching_identical": true,
+      "metric": "direct planar YUV444P16; peak=65535; all three planes",
+      "comparisons": [
+        {
+          "baseline_slot": 1,
+          "candidate_slot": 6,
+          "aggregate_psnr_db": 69.77994385899186,
+          "worst_psnr_db": 69.15591065656923,
+          "sampled_frames": 4,
+          "identical_frames": 0,
+          "max_abs_sample_difference": 474
+        }
+      ]
+    }
+  },
+  "playback": {
+    "gpu": "RTX 5090",
+    "input_size": [
+      1920,
+      1080
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "vulkan_queues": 3,
+    "render_drops": 0,
+    "decoder_drops": 0,
+    "interpretation": "Playback integration only: unstable controls; no new speedup claim.",
+    "samples": [
+      {
+        "profile": "balanced-concat",
+        "round": 1,
+        "fps": 110.14110576208147
+      },
+      {
+        "profile": "performance-concat",
+        "round": 1,
+        "fps": 191.88529019276885
+      },
+      {
+        "profile": "balanced-blocks",
+        "round": 1,
+        "fps": 111.3861817165177
+      },
+      {
+        "profile": "performance-cache48",
+        "round": 1,
+        "fps": 186.93691259478442
+      },
+      {
+        "profile": "performance-cache48",
+        "round": 2,
+        "fps": 186.86965522258348
+      },
+      {
+        "profile": "balanced-blocks",
+        "round": 2,
+        "fps": 111.36391732034602
+      },
+      {
+        "profile": "performance-concat",
+        "round": 2,
+        "fps": 192.15676695209297
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 2,
+        "fps": 79.63197462677189
+      }
+    ]
+  },
+  "playback_540p": {
+    "all_samples_passed": true,
+    "input_size": [
+      960,
+      540
+    ],
+    "model_output_size": [
+      1920,
+      1080
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "display_hz": 143.997,
+    "hwdec": "nvdec",
+    "vo": "gpu-next",
+    "vulkan_queues": 3,
+    "dropped_frames": 0,
+    "decoder_dropped_frames": 0,
+    "gpu": "RTX 5090",
+    "driver": "616.92",
+    "source": "24-frame real-video 960x540 fixture, lossless H.264, looped",
+    "backend": "#37, including #35",
+    "warmup_seconds": 10,
+    "measurement_seconds": 20,
+    "rounds": 2,
+    "method": "Native end video-flip trace events; forward then reverse order; no concurrent mpv process.",
+    "samples": [
+      {
+        "profile": "balanced-original",
+        "round": 1,
+        "fps": 416.440865342116,
+        "frames": 8328,
+        "seconds": 19.9980374
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 1,
+        "fps": 416.73425533174293,
+        "frames": 8333,
+        "seconds": 19.9959564
+      },
+      {
+        "profile": "balanced-native7",
+        "round": 1,
+        "fps": 422.6878281903805,
+        "frames": 8452,
+        "seconds": 19.9958443
+      },
+      {
+        "profile": "balanced-native7",
+        "round": 2,
+        "fps": 422.72939914939525,
+        "frames": 8453,
+        "seconds": 19.9962435
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 2,
+        "fps": 417.51144006602516,
+        "frames": 8348,
+        "seconds": 19.9946617
+      },
+      {
+        "profile": "balanced-original",
+        "round": 2,
+        "fps": 418.4077946686776,
+        "frames": 8367,
+        "seconds": 19.9972374
+      }
+    ],
+    "profiles": {
+      "balanced-original": {
+        "samples": [
+          416.440865342116,
+          418.4077946686776
+        ],
+        "median_fps": 417.42433000539677,
+        "min_fps": 416.440865342116,
+        "max_fps": 418.4077946686776,
+        "spread_percent": 0.47120620078281955
+      },
+      "balanced-concat": {
+        "samples": [
+          416.73425533174293,
+          417.51144006602516
+        ],
+        "median_fps": 417.122847698884,
+        "min_fps": 416.73425533174293,
+        "max_fps": 417.51144006602516,
+        "spread_percent": 0.18632034628879168
+      },
+      "balanced-native7": {
+        "samples": [
+          422.6878281903805,
+          422.72939914939525
+        ],
+        "median_fps": 422.7086136698879,
+        "min_fps": 422.6878281903805,
+        "max_fps": 422.72939914939525,
+        "spread_percent": 0.009834424393158694
+      }
+    },
+    "comparisons": [
+      {
+        "baseline": "balanced-original",
+        "candidate": "balanced-concat",
+        "median_change_percent": -0.07222442125232043,
+        "paired_round_change_percent": [
+          0.07045177696138882,
+          -0.2142299006074211
+        ]
+      },
+      {
+        "baseline": "balanced-original",
+        "candidate": "balanced-native7",
+        "median_change_percent": 1.2659261295149715,
+        "paired_round_change_percent": [
+          1.5000840138809313,
+          1.0328690181643951
+        ]
+      },
+      {
+        "baseline": "balanced-concat",
+        "candidate": "balanced-native7",
+        "median_change_percent": 1.3391177207910054,
+        "paired_round_change_percent": [
+          1.4286257446962658,
+          1.249776313325679
+        ]
+      }
+    ],
+    "interpretation": "Finite workload; two rounds. Small differences may be within run-to-run variation."
+  },
+  "playback_4090": {
+    "all_samples_passed": true,
+    "input_size": [
+      1920,
+      1080
+    ],
+    "model_output_size": [
+      3840,
+      2160
+    ],
+    "display_size": [
+      3840,
+      2160
+    ],
+    "display_hz": 60,
+    "hwdec": "nvdec",
+    "vo": "gpu-next",
+    "vulkan_queues": 3,
+    "dropped_frames": 0,
+    "decoder_dropped_frames": 0,
+    "gpu": "RTX 4090",
+    "driver": "610.88",
+    "source": "Bundled 1920x1080 benchmark MP4",
+    "backend": "#37, including #35",
+    "warmup_seconds": 10,
+    "measurement_seconds": 20,
+    "rounds": 2,
+    "method": "Native end video-flip trace events; forward then reverse order; no concurrent mpv process.",
+    "samples": [
+      {
+        "profile": "balanced-original",
+        "round": 1,
+        "fps": 84.82400052682907,
+        "frames": 1696,
+        "seconds": 19.9943411
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 1,
+        "fps": 86.45895124741443,
+        "frames": 1727,
+        "seconds": 19.974797
+      },
+      {
+        "profile": "balanced-blocks",
+        "round": 1,
+        "fps": 88.57318182001515,
+        "frames": 1770,
+        "seconds": 19.9834754
+      },
+      {
+        "profile": "performance-original",
+        "round": 1,
+        "fps": 113.97038474301513,
+        "frames": 2279,
+        "seconds": 19.9964228
+      },
+      {
+        "profile": "performance-concat",
+        "round": 1,
+        "fps": 118.16769886551855,
+        "frames": 2362,
+        "seconds": 19.9885419
+      },
+      {
+        "profile": "performance-cache48",
+        "round": 1,
+        "fps": 118.11923867099854,
+        "frames": 2362,
+        "seconds": 19.9967425
+      },
+      {
+        "profile": "performance-cache48",
+        "round": 2,
+        "fps": 118.36687970888087,
+        "frames": 2367,
+        "seconds": 19.9971479
+      },
+      {
+        "profile": "performance-concat",
+        "round": 2,
+        "fps": 118.2705584411076,
+        "frames": 2364,
+        "seconds": 19.9880683
+      },
+      {
+        "profile": "performance-original",
+        "round": 2,
+        "fps": 114.00018345075594,
+        "frames": 2279,
+        "seconds": 19.9911959
+      },
+      {
+        "profile": "balanced-blocks",
+        "round": 2,
+        "fps": 89.01124774946393,
+        "frames": 1779,
+        "seconds": 19.9862382
+      },
+      {
+        "profile": "balanced-concat",
+        "round": 2,
+        "fps": 87.56256651846728,
+        "frames": 1750,
+        "seconds": 19.9857093
+      },
+      {
+        "profile": "balanced-original",
+        "round": 2,
+        "fps": 84.0257438073877,
+        "frames": 1680,
+        "seconds": 19.9938724
+      }
+    ],
+    "profiles": {
+      "balanced-original": {
+        "samples": [
+          84.82400052682907,
+          84.0257438073877
+        ],
+        "median_fps": 84.42487216710839,
+        "min_fps": 84.0257438073877,
+        "max_fps": 84.82400052682907,
+        "spread_percent": 0.9455231603564889
+      },
+      "balanced-concat": {
+        "samples": [
+          86.45895124741443,
+          87.56256651846728
+        ],
+        "median_fps": 87.01075888294085,
+        "min_fps": 86.45895124741443,
+        "max_fps": 87.56256651846728,
+        "spread_percent": 1.2683664471167118
+      },
+      "balanced-blocks": {
+        "samples": [
+          88.57318182001515,
+          89.01124774946393
+        ],
+        "median_fps": 88.79221478473954,
+        "min_fps": 88.57318182001515,
+        "max_fps": 89.01124774946393,
+        "spread_percent": 0.4933607417168198
+      },
+      "performance-original": {
+        "samples": [
+          113.97038474301513,
+          114.00018345075594
+        ],
+        "median_fps": 113.98528409688554,
+        "min_fps": 113.97038474301513,
+        "max_fps": 114.00018345075594,
+        "spread_percent": 0.02614259198185716
+      },
+      "performance-concat": {
+        "samples": [
+          118.16769886551855,
+          118.2705584411076
+        ],
+        "median_fps": 118.21912865331308,
+        "min_fps": 118.16769886551855,
+        "max_fps": 118.2705584411076,
+        "spread_percent": 0.08700755686560209
+      },
+      "performance-cache48": {
+        "samples": [
+          118.11923867099854,
+          118.36687970888087
+        ],
+        "median_fps": 118.24305918993971,
+        "min_fps": 118.11923867099854,
+        "max_fps": 118.36687970888087,
+        "spread_percent": 0.20943388946367972
+      }
+    },
+    "comparisons": [
+      {
+        "baseline": "balanced-original",
+        "candidate": "balanced-concat",
+        "median_change_percent": 3.062944188667549,
+        "paired_round_change_percent": [
+          1.9274624050162004,
+          4.209213213496854
+        ]
+      },
+      {
+        "baseline": "balanced-concat",
+        "candidate": "balanced-blocks",
+        "median_change_percent": 2.0473972697966802,
+        "paired_round_change_percent": [
+          2.445357643248003,
+          1.6544526829180173
+        ]
+      },
+      {
+        "baseline": "balanced-original",
+        "candidate": "balanced-blocks",
+        "median_change_percent": 5.173052094158392,
+        "paired_round_change_percent": [
+          4.419953397506005,
+          5.933305337355321
+        ]
+      },
+      {
+        "baseline": "performance-original",
+        "candidate": "performance-concat",
+        "median_change_percent": 3.714378211163516,
+        "paired_round_change_percent": [
+          3.682811225010507,
+          3.745936945966677
+        ]
+      },
+      {
+        "baseline": "performance-concat",
+        "candidate": "performance-cache48",
+        "median_change_percent": 0.020242524961266994,
+        "paired_round_change_percent": [
+          -0.04100967945153133,
+          0.08144145850232931
+        ]
+      },
+      {
+        "baseline": "performance-original",
+        "candidate": "performance-cache48",
+        "median_change_percent": 3.735372620061317,
+        "paired_round_change_percent": [
+          3.640291236480775,
+          3.83042915015237
+        ]
+      }
+    ],
+    "interpretation": "Finite workload; two rounds. Small differences may be within run-to-run variation."
+  },
+  "review_followup_2026_11_01": {
+    "parent_fixes": "#35 at e965242",
+    "selection": {
+      "block_concat": "SM89, 1920x1080 only",
+      "native_tail7": "SM120, 960x540 only",
+      "cache48": "SM89, 1920x1080 only; explicit experiment, no new gain established"
+    },
+    "unsupported": "corresponding stock model",
+    "build": "Complete CMake experimental-span component, TensorRT 11.3 / CUDA 13.3, CUTLASS e13f5cd4142c43efc37c2f6339923eb4a57afb99; block DLL uses shared CUDA runtime mode",
+    "cpu_policy": "passed",
+    "local_5090": {
+      "gpu": "RTX 5090 / sm_120",
+      "gated_profiles_stock_identical": true,
+      "native7_quality": [
+        {
+          "frame": 0,
+          "mse": 0.0,
+          "psnr_db": "infinite"
+        },
+        {
+          "frame": 1,
+          "mse": 0.0,
+          "psnr_db": "infinite"
+        },
+        {
+          "frame": 2,
+          "mse": 0.0,
+          "psnr_db": "infinite"
+        },
+        {
+          "frame": 3,
+          "mse": 0.0,
+          "psnr_db": "infinite"
+        }
+      ],
+      "failed_registration": "stock output, module retained, initialization attempted once",
+      "profile_switching_identical": true
+    },
+    "theater_4090": {
+      "gpu": "RTX 4090 / SM89",
+      "backend_sha256": "0c61c06a7ace210f5dc2a7594c415d846d0fa068a62ad24528cc238d0f31acfc",
+      "comparisons": [
+        {
+          "baseline": 1,
+          "candidate": 5,
+          "frames": [
+            {
+              "frame": 0,
+              "mse": 180.03381819862398,
+              "psnr_db": 73.77592515329809
+            },
+            {
+              "frame": 1,
+              "mse": 180.22196244855968,
+              "psnr_db": 73.7713889309046
+            },
+            {
+              "frame": 2,
+              "mse": 180.0444401443544,
+              "psnr_db": 73.77566892830743
+            },
+            {
+              "frame": 3,
+              "mse": 179.59651700745886,
+              "psnr_db": 73.78648697577324
+            },
+            {
+              "frame": 4,
+              "mse": 93.33091306584362,
+              "psnr_db": 76.6292109293413
+            },
+            {
+              "frame": 5,
+              "mse": 95.49698716403034,
+              "psnr_db": 76.52956937294151
+            },
+            {
+              "frame": 6,
+              "mse": 96.57060060603138,
+              "psnr_db": 76.48101675088938
+            },
+            {
+              "frame": 7,
+              "mse": 97.51651033629115,
+              "psnr_db": 76.43868456027734
+            },
+            {
+              "frame": 8,
+              "mse": 171.06949761284721,
+              "psnr_db": 73.9977402755897
+            },
+            {
+              "frame": 9,
+              "mse": 171.1248847013246,
+              "psnr_db": 73.99633439002596
+            },
+            {
+              "frame": 10,
+              "mse": 171.184976329411,
+              "psnr_db": 73.99480960410972
+            },
+            {
+              "frame": 11,
+              "mse": 171.32927155671297,
+              "psnr_db": 73.99115039138638
+            }
+          ],
+          "worst_psnr_db": 73.7713889309046
+        },
+        {
+          "baseline": 3,
+          "candidate": 7,
+          "frames": [
+            {
+              "frame": 0,
+              "mse": 398.60391597543725,
+              "psnr_db": 70.32405046537407
+            },
+            {
+              "frame": 1,
+              "mse": 396.0054226546425,
+              "psnr_db": 70.35245474602804
+            },
+            {
+              "frame": 2,
+              "mse": 394.8115797405478,
+              "psnr_db": 70.36556725580338
+            },
+            {
+              "frame": 3,
+              "mse": 402.54262076421037,
+              "psnr_db": 70.28134737776253
+            },
+            {
+              "frame": 4,
+              "mse": 248.32898976015946,
+              "psnr_db": 72.37919185769086
+            },
+            {
+              "frame": 5,
+              "mse": 248.28107795621142,
+              "psnr_db": 72.38002985246743
+            },
+            {
+              "frame": 6,
+              "mse": 253.89846121077676,
+              "psnr_db": 72.28286538754821
+            },
+            {
+              "frame": 7,
+              "mse": 246.74568797421554,
+              "psnr_db": 72.40697035673595
+            },
+            {
+              "frame": 8,
+              "mse": 424.32139117959105,
+              "psnr_db": 70.0525168126215
+            },
+            {
+              "frame": 9,
+              "mse": 422.4234284979424,
+              "psnr_db": 70.0719861044506
+            },
+            {
+              "frame": 10,
+              "mse": 433.30943114229683,
+              "psnr_db": 69.96148465810958
+            },
+            {
+              "frame": 11,
+              "mse": 431.97813693576387,
+              "psnr_db": 69.97484840457322
+            }
+          ],
+          "worst_psnr_db": 69.96148465810958
+        }
+      ],
+      "native7_stock_fallback_identical": true,
+      "profile_switching_identical": true,
+      "engines": [
+        "aji-10c1305d.3883146591.plugin-8e2088d19cfad01d.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-4090-sm8.engine",
+        "aji-8fdbda36.780037328.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-4090-sm8.engine",
+        "aji-daf17ec9.780037328.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-4090-sm8.engine",
+        "aji-dfac8b75.1518972660.plugin-08e9bd236217e0ec.trt-11.3.0.gpu-NVIDIA-GeForce-RTX-4090-sm8.engine"
+      ],
+      "output_frames": 60,
+      "metric": "direct YUV444P16, all planes, peak=65535"
+    },
+    "directml": {
+      "runtime": "ORT DirectML 1.24.4 / DirectML 1.15.4",
+      "all_seven_profiles_passed": true,
+      "all_experimental_aliases_stock_identical": true,
+      "input_size": [
+        960,
+        540
+      ],
+      "output_size": [
+        1920,
+        1080
+      ],
+      "frames_per_profile": 2
+    },
+    "limits": "No new playback FPS claim for the rebuilt recipe engines; previous positive and negative results remain separate. TensorRT-RTX/Linux execution untested locally."
+  }
+}

@@ -88,6 +88,9 @@ if(NOT WIN32)
     target_link_options(aji_trt PRIVATE -Wl,-Bsymbolic)
 endif()
 
+include(cmake/SpanPlugins.cmake)
+include(cmake/SpanBlocks.cmake)
+
 # aji_trtrtx: the same backend sources built against TensorRT for RTX
 # (AJI_TRTRTX): engines build in-process through the builder API (no
 # trtexec) and cache under their own names. Optional: skipped unless
@@ -243,6 +246,17 @@ endif()
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
+
+add_executable(aji_span_policy_test sanity/span_policy_test.cpp src/core/fileio.cpp)
+target_include_directories(aji_span_policy_test PRIVATE src)
+target_link_libraries(aji_span_policy_test PRIVATE ${CMAKE_DL_LIBS})
+if(WIN32)
+    add_library(aji_span_failed_registration SHARED EXCLUDE_FROM_ALL
+        sanity/span_failed_registration.cpp)
+    set_target_properties(aji_span_failed_registration PROPERTIES
+        OUTPUT_NAME balanced-next-plugin
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-plugins/failed-registration")
+endif()
 
 # Image-ABI conversion and tiling checks: CPU only, no GPU or models.
 add_executable(aji_half_test sanity/half_array_test.cpp ${AJI_HALF_SOURCES})

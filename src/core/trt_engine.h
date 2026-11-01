@@ -128,12 +128,14 @@ std::string gpu_token(int dev);
 std::string engine_suffix(int dev);
 std::string engine_path_for(const std::string &model_dir,
                             const std::string &onnx_name,
-                            const std::string &settings, int dev);
+                            const std::string &settings, int dev,
+                            const std::string &plugin_id = {});
 // Short form for new builds: aji-{crc32(onnx)}.{crc32(settings)}{suffix},
 // avoiding MAX_PATH failures in deep portable installs.
 std::string short_engine_path_for(const std::string &model_dir,
                                   const std::string &onnx_name,
-                                  const std::string &settings, int dev);
+                                  const std::string &settings, int dev,
+                                  const std::string &plugin_id = {});
 
 // Deletes *.engine files in `dir` built for a TensorRT version or GPU not
 // in this system (engines of every present GPU are kept, so moving work

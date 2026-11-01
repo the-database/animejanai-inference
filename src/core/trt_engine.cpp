@@ -125,22 +125,26 @@ std::string engine_suffix(int dev)
 
 std::string engine_path_for(const std::string &model_dir,
                             const std::string &onnx_name,
-                            const std::string &settings, int dev)
+                            const std::string &settings, int dev,
+                            const std::string &plugin_id)
 {
     return (fs::path(model_dir) /
-            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix(dev)))
+            (onnx_name + "." + std::to_string(crc32_z(settings)) +
+             (plugin_id.empty() ? "" : ".plugin-" + plugin_id) + engine_suffix(dev)))
         .string();
 }
 
 std::string short_engine_path_for(const std::string &model_dir,
                                   const std::string &onnx_name,
-                                  const std::string &settings, int dev)
+                                  const std::string &settings, int dev,
+                                  const std::string &plugin_id)
 {
     char model_hash[9];
     snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
     return (fs::path(model_dir) /
             ("aji-" + std::string(model_hash) + "." +
-             std::to_string(crc32_z(settings)) + engine_suffix(dev)))
+             std::to_string(crc32_z(settings)) +
+             (plugin_id.empty() ? "" : ".plugin-" + plugin_id) + engine_suffix(dev)))
         .string();
 }
 
