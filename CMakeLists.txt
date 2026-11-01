@@ -49,8 +49,18 @@ set_target_properties(aji PROPERTIES
 # shape probing, file I/O, image tiling, the CUDA kernels), compiled once
 # and linked into both aji_trt and aji_trtrtx. Nothing in it depends on
 # the TensorRT flavour (AJI_TRTRTX) or includes TensorRT headers.
+set(AJI_HALF_SOURCES src/core/half_array.cpp)
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+    list(APPEND AJI_HALF_SOURCES src/core/half_f16c.cpp)
+    # Keep AVX instructions out of the baseline CPU-dispatch translation unit.
+    set_source_files_properties(src/core/half_array.cpp PROPERTIES
+        COMPILE_DEFINITIONS AJI_HAVE_F16C=1)
+    set_source_files_properties(src/core/half_f16c.cpp PROPERTIES
+        COMPILE_OPTIONS /arch:AVX)
+endif()
 add_library(aji_trt_common OBJECT src/aji_conf.cpp src/onnx_shape.cpp
-    src/core/fileio.cpp src/core/tiling.cpp src/kernels.cu)
+    src/core/fileio.cpp src/core/tiling.cpp src/kernels.cu ${AJI_HALF_SOURCES})
 target_include_directories(aji_trt_common PRIVATE include)
 set_target_properties(aji_trt_common PROPERTIES
     POSITION_INDEPENDENT_CODE ON
@@ -234,7 +244,15 @@ add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
 
-# Image-ABI tiling/blending checks: CPU only, no GPU or models.
+# Image-ABI conversion and tiling checks: CPU only, no GPU or models.
+add_executable(aji_half_test sanity/half_array_test.cpp ${AJI_HALF_SOURCES})
+target_include_directories(aji_half_test PRIVATE src)
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+    add_executable(aji_half_benchmark EXCLUDE_FROM_ALL
+        experimental/image-half/half-profile.cpp ${AJI_HALF_SOURCES})
+    target_include_directories(aji_half_benchmark PRIVATE src)
+endif()
 add_executable(aji_tiling_test sanity/tiling_test.cpp src/core/tiling.cpp)
 target_include_directories(aji_tiling_test PRIVATE include src)
 
