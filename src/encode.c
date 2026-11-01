@@ -46,7 +46,9 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #ifdef _WIN32
+#define COBJMACROS      /* C-style DXGI calls (amf_pick_adapter) */
 #include <windows.h>
+#include <dxgi.h>
 #include <fcntl.h>
 #include <io.h>
 #include <libavutil/hwcontext_d3d11va.h>
@@ -559,6 +561,29 @@ fail:
     return -1;
 }
 
+static int is_nvenc(const char *name)
+{
+    return name && strstr(name, "nvenc") != NULL;
+}
+
+static int is_amf(const char *name)
+{
+    return name && strstr(name, "_amf") != NULL;
+}
+
+static int is_qsv(const char *name)
+{
+    return name && strstr(name, "_qsv") != NULL;
+}
+
+/* GPU encoders (NVENC, AMD AMF, Intel QSV): they take the semi-planar 4:2:0
+ * host formats (nv12/p010le) and no 4:4:4 here. Only NVENC also takes the
+ * engine's CUDA/D3D11 frames zero-copy. */
+static int is_hw_encoder(const char *name)
+{
+    return is_nvenc(name) || is_amf(name) || is_qsv(name);
+}
+
 /* Resolve the output chroma + bit depth from --pix-fmt. Sets the final
  * encoder pix_fmt + flags, then picks the libaji output format and CUDA pool
  * sw_format.
@@ -571,19 +596,20 @@ fail:
  * intermediate and downconvert to the target with swscale on the host. */
 static void resolve_pixfmt(enc_ctx *c)
 {
-    int nvenc = c->o.vcodec && strstr(c->o.vcodec, "nvenc");
+    int hwenc = is_hw_encoder(c->o.vcodec);
     switch (c->o.pix_fmt) {
     case OUT_420P8:  c->ten_bit=0; c->is_444=0; break;
     case OUT_420P10: c->ten_bit=1; c->is_444=0; break;
     case OUT_444P8:  c->ten_bit=0; c->is_444=1; break;
     case OUT_444P10: c->ten_bit=1; c->is_444=1; break;
     }
-    /* Encoder-input (and swscale-target) format. NVENC accepts only the
-     * semi-planar 4:2:0 host formats (nv12/p010le), not planar yuv420p*;
-     * software encoders take the planar forms. 4:4:4 is software-only. */
+    /* Encoder-input (and swscale-target) format. The GPU encoders accept
+     * only the semi-planar 4:2:0 host formats (nv12/p010le), not planar
+     * yuv420p10le (QSV not even yuv420p); software encoders take the planar
+     * forms. 4:4:4 is software-only. */
     if (c->is_444)
         c->out_pixfmt = c->ten_bit ? AV_PIX_FMT_YUV444P10LE : AV_PIX_FMT_YUV444P;
-    else if (nvenc)
+    else if (hwenc)
         c->out_pixfmt = c->ten_bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
     else
         c->out_pixfmt = c->ten_bit ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
@@ -1088,11 +1114,6 @@ fail:
 
 /* ---- output: encoder, muxer, streams ------------------------------------- */
 
-static int is_nvenc(const char *name)
-{
-    return name && strstr(name, "nvenc") != NULL;
-}
-
 /* Parse the raw --vquality arg string ("-preset p7 -b:v 50M") into a dict.
  * Keys map to AVOptions on the encoder context (incl. private opts), which
  * avcodec_open2 parses for us (size suffixes, profile names, ...). */
@@ -1148,9 +1169,129 @@ static void inject_profile(const char *vcodec, enum out_pixfmt pf,
         p = pf == OUT_420P10 ? "main10" : NULL;   /* nvenc is 4:2:0 only here */
     } else if (!strcmp(vcodec, "h264_nvenc")) {
         p = pf == OUT_420P10 ? "high10" : NULL;
-    }   /* av1_nvenc: its "main" profile covers 10-bit */
+    } else if (!strcmp(vcodec, "hevc_amf") || !strcmp(vcodec, "hevc_qsv")) {
+        p = pf == OUT_420P10 ? "main10" : NULL;
+    }   /* av1_*: the "main" profile covers 10-bit; h264_amf/h264_qsv have no
+         * 10-bit (rejected in main) */
     if (p)
         av_dict_set(opts, "profile", p, 0);
+}
+
+#ifdef _WIN32
+/* An indirect-display adapter: a virtual monitor (Parsec, Meta Quest Link,
+ * any IddCx driver). DXGI lists one per virtual display, each describing the
+ * GPU that renders for it, so one card would show up several times. The
+ * kernel adapter type tells them apart; a failed lookup keeps the adapter.
+ * Same check as aji_img_dml.cpp; the D3DKMT structs mirror d3dkmthk.h and
+ * the calls resolve from gdi32 at runtime. */
+static int is_indirect_display(LUID luid)
+{
+    typedef struct { LUID luid; UINT handle; } OpenFromLuid;
+    typedef struct { UINT handle; UINT type; void *data; UINT size; } QueryInfo;
+    typedef struct { UINT handle; } CloseAdapter;
+    typedef LONG(APIENTRY *OpenFn)(OpenFromLuid *);
+    typedef LONG(APIENTRY *QueryFn)(const QueryInfo *);
+    typedef LONG(APIENTRY *CloseFn)(const CloseAdapter *);
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi) gdi = LoadLibraryW(L"gdi32.dll");
+    if (!gdi) return 0;
+    OpenFn  open  = (OpenFn)(void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid");
+    QueryFn query = (QueryFn)(void *)GetProcAddress(gdi, "D3DKMTQueryAdapterInfo");
+    CloseFn close = (CloseFn)(void *)GetProcAddress(gdi, "D3DKMTCloseAdapter");
+    if (!open || !query || !close) return 0;
+    OpenFromLuid o = {luid, 0};
+    if (open(&o) != 0) return 0;
+    UINT type = 0;
+    QueryInfo q = {o.handle, 15 /* KMTQAITYPE_ADAPTERTYPE */, &type, sizeof type};
+    int ok = query(&q) == 0;
+    CloseAdapter cl = {o.handle};
+    close(&cl);
+    return ok && (type & (1u << 6) /* IndirectDisplayDevice */);
+}
+
+typedef struct {
+    int  index;                 /* DXGI adapter index (libav D3D11VA device string) */
+    UINT vendor;                /* PCI vendor id */
+    char name[128];             /* UTF-8 */
+} gpu_adapter;
+
+/* Hardware GPUs in DXGI order, without software adapters or the
+ * virtual-display duplicates. Returns the count (at most max). */
+static int list_gpus(gpu_adapter *out, int max)
+{
+    IDXGIFactory1 *f = NULL;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f)))
+        return 0;
+    int n = 0;
+    IDXGIAdapter1 *a = NULL;
+    for (UINT i = 0; n < max &&
+         IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 d;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d)) &&
+            !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            !is_indirect_display(d.AdapterLuid)) {
+            out[n].index  = (int)i;
+            out[n].vendor = d.VendorId;
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, out[n].name,
+                                sizeof out[n].name, NULL, NULL);
+            out[n].name[sizeof out[n].name - 1] = 0;
+            n++;
+        }
+        IDXGIAdapter1_Release(a);
+    }
+    IDXGIFactory1_Release(f);
+    return n;
+}
+
+static const char *vendor_name(UINT v)
+{
+    return v == 0x10de ? "nvidia" : v == 0x1002 ? "amd" :
+           v == 0x8086 ? "intel"  : "other";
+}
+
+/* The vendor of DXGI adapter 0: the GPU libav's D3D11VA device opens on
+ * with no index, so the one --backend directml runs on. (Adapter 0 may be a
+ * virtual-display entry; it still names the GPU that renders for it.) */
+static UINT default_gpu_vendor(void)
+{
+    IDXGIFactory1 *f = NULL;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f)))
+        return 0;
+    UINT v = 0;
+    IDXGIAdapter1 *a = NULL;
+    if (IDXGIFactory1_EnumAdapters1(f, 0, &a) != DXGI_ERROR_NOT_FOUND) {
+        DXGI_ADAPTER_DESC1 d;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d))) v = d.VendorId;
+        IDXGIAdapter1_Release(a);
+    }
+    IDXGIFactory1_Release(f);
+    return v;
+}
+#endif
+
+/* AMF opens on the default adapter (DXGI adapter 0) unless handed a device,
+ * so with an NVIDIA card as the default and an AMD iGPU beside it, it would
+ * fail. Point it at the first AMD adapter (libav derives its AMF device from
+ * the D3D11VA one). No AMD adapter: leave it alone and let AMF report that.
+ * QSV needs none of this: the oneVPL dispatcher finds the Intel GPU itself. */
+static void amf_pick_adapter(AVCodecContext *enc)
+{
+#ifdef _WIN32
+    gpu_adapter g[16];
+    int n = list_gpus(g, 16), idx = -1;
+    for (int i = 0; i < n && idx < 0; i++)
+        if (g[i].vendor == 0x1002) idx = g[i].index;
+    if (idx <= 0)       /* none, or already the default */
+        return;
+    char s[16];
+    snprintf(s, sizeof s, "%d", idx);
+    AVBufferRef *dev = NULL;
+    if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, s, NULL, 0) < 0)
+        return;
+    enc->hw_device_ctx = dev;       /* the codec context owns the ref */
+#else
+    (void)enc;
+#endif
 }
 
 static int open_encoder(enc_ctx *c, AVFrame *first)
@@ -1184,12 +1325,19 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     } else {
         c->enc->pix_fmt = c->out_pixfmt;
     }
+    if (is_amf(c->o.vcodec))
+        amf_pick_adapter(c->enc);
     if (c->ofmt && (c->ofmt->oformat->flags & AVFMT_GLOBALHEADER))
         c->enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     AVDictionary *opts = NULL;
     parse_vquality(c->o.vquality, &opts);
     inject_profile(c->o.vcodec, c->o.pix_fmt, &opts);
+    /* libavcodec defaults thread_count to 1 (the ffmpeg CLI sets "auto"
+     * itself), which leaves ffv1/libx264/libx265 on a single core: ~8x
+     * slower for ffv1, ~13x for x264. Hardware encoders ignore it. An
+     * explicit -threads in --vquality wins. */
+    av_dict_set(&opts, "threads", "auto", AV_DICT_DONT_OVERWRITE);
 
     int r = avcodec_open2(c->enc, codec, &opts);
     AVDictionaryEntry *e = NULL;
@@ -1197,10 +1345,70 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
         loge("warning: --vquality option '%s=%s' not recognized by %s",
              e->key, e->value, c->o.vcodec);
     av_dict_free(&opts);
+    if (r < 0 && is_hw_encoder(c->o.vcodec))
+        loge("%s could not be opened: this GPU or its driver may not support "
+             "it at this bit depth (aji_encode --probe-encoders lists what "
+             "works here)", c->o.vcodec);
     if (r < 0) { AV(r); }
     return 0;
 fail:
     return -1;
+}
+
+/* --probe-encoders: list the GPUs, then open each GPU encoder at 8- and
+ * 10-bit 4:2:0. One machine-readable line each, e.g.
+ *   GPU index=0 vendor=nvidia default=1 name=NVIDIA GeForce RTX 5090
+ *   ENCODER name=hevc_qsv yuv420p=1 yuv420p10=1
+ * default=1 marks the vendor of DXGI adapter 0, the GPU --backend directml
+ * runs on (TensorRT is always the NVIDIA card). name= is last and runs to
+ * the end of the line. Opening is what fails on a missing GPU, driver, codec
+ * or bit depth (all three vendors create their hardware session in init).
+ * Software encoders are always available and not listed. */
+static void probe_encoders(void)
+{
+#ifdef _WIN32
+    gpu_adapter g[16];
+    int ng = list_gpus(g, 16);
+    UINT def = default_gpu_vendor();
+    int def_marked = 0;
+    for (int i = 0; i < ng; i++) {
+        int is_def = !def_marked && g[i].vendor == def;
+        def_marked |= is_def;
+        printf("GPU index=%d vendor=%s default=%d name=%s\n", g[i].index,
+               vendor_name(g[i].vendor), is_def, g[i].name);
+    }
+#endif
+    static const char *const names[] = {
+        "hevc_nvenc", "h264_nvenc", "av1_nvenc",
+        "hevc_amf",   "h264_amf",   "av1_amf",
+        "hevc_qsv",   "h264_qsv",   "av1_qsv",
+    };
+    int level = av_log_get_level();
+    av_log_set_level(AV_LOG_QUIET);     /* failures here are the expected case */
+    for (size_t n = 0; n < sizeof names / sizeof *names; n++) {
+        const AVCodec *codec = avcodec_find_encoder_by_name(names[n]);
+        int ok[2] = {0, 0};
+        for (int ten = 0; codec && ten < 2; ten++) {
+            AVCodecContext *e = avcodec_alloc_context3(codec);
+            if (!e) continue;
+            e->width     = 1920;
+            e->height    = 1080;
+            e->time_base = (AVRational){1, 24};
+            e->framerate = (AVRational){24, 1};
+            e->pix_fmt   = ten ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+            if (is_amf(names[n]))
+                amf_pick_adapter(e);
+            AVDictionary *opts = NULL;
+            inject_profile(names[n], ten ? OUT_420P10 : OUT_420P8, &opts);
+            ok[ten] = avcodec_open2(e, codec, &opts) >= 0;
+            av_dict_free(&opts);
+            avcodec_free_context(&e);
+        }
+        printf("ENCODER name=%s yuv420p=%d yuv420p10=%d\n",
+               names[n], ok[0], ok[1]);
+    }
+    fflush(stdout);
+    av_log_set_level(level);
 }
 
 /* Add the output muxer, the video stream, and stream-copy aux streams. */
@@ -2664,10 +2872,12 @@ static void usage(void)
     fprintf(stderr,
 "aji_encode --input <f> --output <f> --conf <c> --slot <N> "
 "--model-dir <d> [--rife-model-dir <d>] [--trtexec <p>]\n"
-"           [--vcodec hevc_nvenc|h264_nvenc|hevc_amf|hevc_qsv|libx265|libx264|ffv1]"
+"           [--vcodec hevc_nvenc|h264_nvenc|av1_nvenc|hevc_amf|h264_amf|av1_amf|\n"
+"                     hevc_qsv|h264_qsv|av1_qsv|libx265|libx264|ffv1]"
 " [--vquality \"<args>\"]\n"
 "           [--pix-fmt yuv420p|yuv420p10|yuv444p|yuv444p10]"
 " (default yuv420p10; 4:4:4 = software encoder)\n"
+"aji_encode --probe-encoders   (which GPU encoders open on this machine)\n"
 "           [--final-resize-height H | --final-resize-factor PCT]"
 " [--overwrite]\n"
 "           [--no-audio] [--no-subs] [--no-chapters]"
@@ -2719,6 +2929,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--build-only")) c.o.build_only = 1;
         else if (!strcmp(a, "--preview-session")) c.o.session = 1;
         else if (!strcmp(a, "--no-zerocopy")) c.o.no_zerocopy = 1;
+        else if (!strcmp(a, "--probe-encoders")) { probe_encoders(); return 0; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (i >= argc - 1) { usage(); return 2; }
         else if (!strcmp(a, "--input")) c.o.input = argv[++i];
@@ -2814,9 +3025,15 @@ int main(int argc, char **argv)
         loge("--final-resize-height and --final-resize-factor are exclusive");
         return 2;
     }
-    if (c.o.pix_fmt >= OUT_444P8 && is_nvenc(c.o.vcodec)) {
+    if (c.o.pix_fmt >= OUT_444P8 && is_hw_encoder(c.o.vcodec)) {
         loge("4:4:4 output needs a software encoder (libx265 main444 / "
-             "libx264 high444); %s 4:4:4 not supported in v1", c.o.vcodec);
+             "libx264 high444); %s 4:4:4 not supported", c.o.vcodec);
+        return 2;
+    }
+    if (c.o.pix_fmt == OUT_420P10 &&
+        (!strcmp(c.o.vcodec, "h264_amf") || !strcmp(c.o.vcodec, "h264_qsv"))) {
+        loge("%s has no 10-bit mode; use --pix-fmt yuv420p, or HEVC/AV1 "
+             "for 10-bit", c.o.vcodec);
         return 2;
     }
     c.ring_depth = c.o.pipeline_depth;
