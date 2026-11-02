@@ -1,0 +1,140 @@
+{
+  "rows": [
+    {
+      "model": "balanced",
+      "mode": "staged",
+      "frames": 400,
+      "device_ms_per_frame": 6.371119995117187,
+      "round": 1
+    },
+    {
+      "model": "balanced",
+      "mode": "direct",
+      "frames": 400,
+      "device_ms_per_frame": 6.346397705078125,
+      "round": 1
+    },
+    {
+      "model": "performance",
+      "mode": "staged",
+      "frames": 400,
+      "device_ms_per_frame": 3.2445794677734376,
+      "round": 1
+    },
+    {
+      "model": "performance",
+      "mode": "direct",
+      "frames": 400,
+      "device_ms_per_frame": 3.1970730590820313,
+      "round": 1
+    },
+    {
+      "model": "balanced",
+      "mode": "direct",
+      "frames": 400,
+      "device_ms_per_frame": 6.3421923828125,
+      "round": 2
+    },
+    {
+      "model": "balanced",
+      "mode": "staged",
+      "frames": 400,
+      "device_ms_per_frame": 6.420550537109375,
+      "round": 2
+    },
+    {
+      "model": "performance",
+      "mode": "direct",
+      "frames": 400,
+      "device_ms_per_frame": 3.085030822753906,
+      "round": 2
+    },
+    {
+      "model": "performance",
+      "mode": "staged",
+      "frames": 400,
+      "device_ms_per_frame": 3.202980651855469,
+      "round": 2
+    },
+    {
+      "model": "balanced",
+      "mode": "staged",
+      "frames": 400,
+      "device_ms_per_frame": 6.2807073974609375,
+      "round": 3
+    },
+    {
+      "model": "balanced",
+      "mode": "direct",
+      "frames": 400,
+      "device_ms_per_frame": 6.1708935546875,
+      "round": 3
+    },
+    {
+      "model": "performance",
+      "mode": "staged",
+      "frames": 400,
+      "device_ms_per_frame": 3.160511474609375,
+      "round": 3
+    },
+    {
+      "model": "performance",
+      "mode": "direct",
+      "frames": 400,
+      "device_ms_per_frame": 3.0901898193359374,
+      "round": 3
+    }
+  ],
+  "summary": {
+    "balanced": {
+      "median_ms": {
+        "staged": 6.371119995117187,
+        "direct": 6.3421923828125
+      },
+      "throughput_change_percent": 0.456113762538668,
+      "paired_throughput_change_percent": [
+        0.3895483893056273,
+        1.2355057930634183,
+        1.7795452441408788
+      ]
+    },
+    "performance": {
+      "median_ms": {
+        "staged": 3.202980651855469,
+        "direct": 3.0901898193359374
+      },
+      "throughput_change_percent": 3.649964536604733,
+      "paired_throughput_change_percent": [
+        1.4859344098019145,
+        3.8232949969774666,
+        2.275641930907324
+      ]
+    }
+  },
+  "method": {
+    "device": "NVIDIA GeForce RTX 5090, 616.92",
+    "runtime": "TensorRT 11.3, CUDA 13.3",
+    "input": "one real 1920x1080 NV12 frame from the saved 60.nv12 fixture",
+    "output": "3840x2160 YUV444P16",
+    "warmup_calls": 60,
+    "calls_per_sample": 400,
+    "order": "staged/direct, direct/staged, staged/direct",
+    "metric": "CUDA events around pre/model/post device chain; no decode or rendering",
+    "engines": "same saved static stock engine per model; no rebuild between graph modes"
+  },
+  "regressions": {
+    "capture_replay_formats_sitings": "byte-identical to staged",
+    "rotating_pool": "130 pairs, 260 calls; disabled once at capacity",
+    "forced_capture_faults": [
+      "begin",
+      "body",
+      "end",
+      "instantiate"
+    ],
+    "fault_output": "byte-identical; pending CUDA errors cleared; direct capture latched off",
+    "real_errors_propagate": [
+      "warmup synchronization",
+      "graph launch"
+    ]
+  }
+}
