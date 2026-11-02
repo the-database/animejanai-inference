@@ -236,11 +236,19 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
             // cache or a variant currently being built in another process.
             const auto prefix = path.filename().u8string() + ".model-";
             const auto suffix = key.substr(key.find(".gpu-")) + ".analysisengine";
-            for (const auto &entry : std::filesystem::directory_iterator(path.parent_path())) {
+            // Cache housekeeping must not reject an already loaded engine if
+            // a directory or entry becomes inaccessible during enumeration.
+            std::error_code scan_error;
+            for (auto it = std::filesystem::directory_iterator(path.parent_path(), scan_error);
+                 !scan_error && it != std::filesystem::directory_iterator(); it.increment(scan_error)) {
+                const auto &entry = *it;
                 auto name = entry.path().filename().u8string();
-                if (entry.path() == cached || entry.is_symlink() || !entry.is_regular_file() ||
+                if (entry.path() == cached ||
                     name.compare(0, prefix.size(), prefix) != 0 || name.size() < suffix.size() ||
                     name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+                std::error_code status_error;
+                const auto status = entry.symlink_status(status_error);
+                if (status_error || !std::filesystem::is_regular_file(status)) continue;
 #ifdef _WIN32
                 auto old_lock = entry.path(); old_lock += ".lock";
                 HANDLE handle = CreateFileW(old_lock.c_str(), GENERIC_READ|GENERIC_WRITE, 0, nullptr,
