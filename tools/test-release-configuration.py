@@ -25,7 +25,8 @@ with tempfile.TemporaryDirectory(prefix="aji-release-") as temporary:
     (root / "CMakeLists.txt").write_text('cmake_minimum_required(VERSION 3.24)\nproject(Check NONE)\nset(WIN32 TRUE)\n' +
         block + '\nfile(WRITE "${CMAKE_BINARY_DIR}/selected.txt" "${AJI_TRT_LIB}")\n')
     for sdk in ("old-sdk", "new-sdk"):
+        library = (root / sdk).as_posix()
         subprocess.run(["cmake", "-S", str(root), "-B", str(root / "build"), "-G", "Ninja",
-                        "-DAJI_TRT_ROOT=" + sdk], check=True, stdout=subprocess.DEVNULL)
-        assert (root / "build/selected.txt").read_text() == sdk
+                        "-DAJI_TRT_ROOT=" + library], check=True, stdout=subprocess.DEVNULL)
+        assert (root / "build/selected.txt").read_text() == library
     print("PASS TensorRT library follows reconfigured SDK root")
