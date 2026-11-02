@@ -8,8 +8,13 @@ stock tactics. It does not replace the default profiles or quantize the models.
 
 ## Build and try
 
-Currently supported: Windows x64, TensorRT 11, CUDA 13.x, RTX 4090 (SM89) and
-5090 (SM120). The shipped kernel source produces native code for both GPUs.
+The runtime requires Windows x64, TensorRT 11, CUDA 13.x and SM89 or SM120.
+**Performance has been measured only on the RTX 4090 and RTX 5090**, as the
+experimental profile names indicate. The architecture gate also permits other
+cards sharing those SM versions; it does not establish a speed gain on them.
+Their different L2 sizes can change the effect of the 64 MiB tiling budget,
+and the recipe may be slower than stock. The shipped kernel source produces
+native code for both architectures.
 TensorRT-RTX, DirectML, Linux and other architectures are outside this experiment.
 Named experimental profiles automatically use their corresponding regular model
 on those backends/architectures. Keep the original ONNX files installed.
