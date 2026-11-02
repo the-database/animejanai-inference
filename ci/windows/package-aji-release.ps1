@@ -44,7 +44,7 @@ if ($analysisEnabled) {
     $libraryDirectory = if (Test-Path -LiteralPath (Join-Path $TrtRoot 'lib')) { Join-Path $TrtRoot 'lib' } else { $TrtRoot }
     foreach ($pattern in 'nvonnxparser_*.dll', 'nvinfer_builder_resource_*.dll', 'nvinfer_lean_*.dll') {
         $matches = @(Get-ChildItem -LiteralPath $libraryDirectory -Filter $pattern -File)
-        if (!$matches.Count) { throw "Analysis runtime dependency missing: $pattern in $TrtRoot/lib" }
+        if (!$matches.Count) { throw "Analysis runtime dependency missing: $pattern in $libraryDirectory" }
         $engine += $matches.FullName
     }
 }

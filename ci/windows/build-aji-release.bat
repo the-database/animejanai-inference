@@ -16,6 +16,7 @@ call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo || exit /b 1
 for /f "tokens=1,2 delims==" %%a in ('powershell -NoProfile -Command "$p=Get-Content '%~dp0dependencies.json' -Raw | ConvertFrom-Json; 'CUDA_DIR='+$p.cudaDirectory; 'TRT_DIR='+$p.tensorRTDirectory; 'TRT_LIB='+$p.tensorRTLibrary"') do set "%%a=%%b"
 if not defined CUDA_DIR exit /b 1
 if not defined TRT_DIR exit /b 1
+if not defined TRT_LIB exit /b 1
 set "CUDA_PATH=%AJI_WIN%\%CUDA_DIR%"
 set "PATH=%CUDA_PATH%\bin;%PATH%"
 cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_BUILD_ANALYSIS=%AJI_BUILD_ANALYSIS% ^
