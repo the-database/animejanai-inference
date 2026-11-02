@@ -10,6 +10,10 @@ This is an opt-in experiment, not a default model replacement. Select it per
 profile with `chain_1_rife_fp16_warp=yes` (default: `no`).
 The accompanying `profiles.conf` provides Original and Warp profiles, both with
 RIFE 2x before original Balanced. They can switch in one player process.
+**Performance has been measured only on the RTX 4090 and RTX 5090**, as the
+Warp profile name indicates. Results are mixed even on those cards; the
+SM89/SM120 gate also permits other GPUs, whose performance has not been measured.
+Selecting this profile does not guarantee a speed gain.
 The former `AJI_RIFE_WARP` environment override is removed. A profile's `no`
 always keeps stock RIFE, even if that legacy variable remains in the environment.
 Selection requires non-ensemble RIFE 4.22 with 1920x1080 input, Windows and
