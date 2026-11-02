@@ -10,9 +10,15 @@ Recipe selection is now gated before plugin loading/building: block-concat and
 Cache48 require SM89 at 1920x1080; NativeTail7 requires SM120 at 960x540. Other
 GPU/shape/backend combinations automatically use the corresponding stock model
 and log the reason. These architecture gates establish kernel/recipe eligibility,
-not a speed claim for every GPU sharing that SM. Measurements are from the 4090
-and 5090. Cache48 remains an explicit experiment; the latest paired measurements
-did not establish an additional gain over concat.
+not a speed claim for every GPU sharing that SM. The profile names identify the
+measured GPU for each selected recipe: **RTX 4090 only for block-concat and
+Cache48 at 1080p; RTX 5090 only for NativeTail7 at 540p**. The inherited concat
+profiles were measured on both the RTX 4090 and RTX 5090. Other cards with the
+same SM remain eligible, but their different L2 sizes can change performance;
+the Cache48 budget in particular has not been measured on those cards. The
+selected recipes may be slower than stock there. Cache48 remains an explicit
+experiment; the latest paired measurements did not establish an additional
+gain over concat.
 
 The plugin groups each selected three-convolution block behind one TensorRT
 plugin boundary, using CUTLASS FP16 NHWC convolutions with the original FP16
