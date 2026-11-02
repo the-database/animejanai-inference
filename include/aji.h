@@ -111,8 +111,10 @@ typedef struct aji_create_params {
                                  passthrough until aji_poll requests a
                                  reconfigure; 2: cached-only, no builds,
                                  cache writes/deletes or backend fallback.
-                                 Query aji_stream_policy_version before
-                                 requesting 2 from an older library. */
+                                 Query aji_stream_policy_version_for_config
+                                 on the dispatcher, or the fixed
+                                 aji_stream_policy_version on a backend,
+                                 before requesting 2. */
     void *d3d11_device;       /* ID3D11Device* of the caller (the device
                                  the frame textures live on). Required by
                                  the DirectML backend; ignored by
@@ -142,6 +144,10 @@ typedef struct aji_frame {
 /* Additive policy capability. async_build=2 checks cached engines without
  * starting a builder or deleting incompatible engines. Query before use. */
 AJI_EXPORT int aji_stream_policy_version(void);
+/* Dispatcher query for the selected configuration (NULL = direct TensorRT).
+ * Reports policy support, not runtime/engine availability. No GPU work or
+ * backend fallback is performed. The dispatcher's no-argument probe is 0. */
+AJI_EXPORT int aji_stream_policy_version_for_config(const char *conf_path);
 AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params);
 
 /* Select the slot used by the next aji_configure() (conf mode). */

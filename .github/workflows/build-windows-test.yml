@@ -27,6 +27,12 @@ jobs:
       - name: Check cached-only dispatch without a GPU
         shell: pwsh
         run: python tools/test-stream-policy-dispatch.py build/Release/aji.dll
+      - name: Check release configuration and optional packaging
+        shell: pwsh
+        run: |
+          python tools/test-release-configuration.py
+          if ($LASTEXITCODE) { throw 'Release configuration checks failed' }
+          ./tools/test-release-packaging.ps1 -OutputDirectory ./release-packaging-check
       - uses: actions/upload-artifact@v4
         with:
           name: aji-windows-scene-test
