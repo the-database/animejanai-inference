@@ -34,6 +34,15 @@ with tempfile.TemporaryDirectory(prefix="ajn-stream-policy-") as temporary:
     conf = root / "animejanai.conf"
     conf.write_text("[global]\nconfig_version=3\nbackend=TensorRT-RTX\n", encoding="utf-8")
     dll = c.CDLL(str(library))
+    dll.aji_stream_policy_version_for_config.argtypes = [c.c_char_p]
+    dll.aji_stream_policy_version_for_config.restype = c.c_int
+    assert dll.aji_stream_policy_version() == 0, "Stateless dispatcher probe claimed a selected backend"
+    assert dll.aji_stream_policy_version_for_config(None) == 1
+    for backend, expected in (("TensorRT", 1), ("DirectML", 1), ("TensorRT-RTX", 0), ("trtrtx", 0)):
+        conf.write_text(f"[global]\nconfig_version=3\nbackend={backend}\n", encoding="utf-8")
+        assert dll.aji_stream_policy_version_for_config(str(conf).encode()) == expected, backend
+    conf.write_text("[global]\nconfig_version=3\nbackend=TensorRT-RTX\n", encoding="utf-8")
+    print("PASS configuration-specific policy query")
     dll.aji_create.argtypes = [c.POINTER(Params)]
     dll.aji_create.restype = c.c_void_p
     lines = []

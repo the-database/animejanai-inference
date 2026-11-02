@@ -137,6 +137,7 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
     void *opaque, char *error, size_t error_size)
 {
     try {
+        require(context != nullptr, "Analysis requires a CUDA context.");
         require(width > 0 && width <= 320 && height > 0 && height <= 180, "Invalid analysis sample dimensions.");
         Current current((CUcontext)context);
         auto p = std::make_unique<aji_observer>((CUcontext)context, width, height);
@@ -230,6 +231,26 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
                 p->engine->getTensorDataType("img")==nvinfer1::DataType::kFLOAT && p->engine->getTensorDataType("mask")==nvinfer1::DataType::kFLOAT,
                 "Character-mask engine must have static float RGB input and one-channel float output.");
             p->execution.reset(p->engine->createExecutionContext()); require(bool(p->execution),"Could not create the character-mask execution context.");
+            // Retire prior driver/TRT/model variants for this model and GPU
+            // after the replacement has loaded. Do not touch another GPU's
+            // cache or a variant currently being built in another process.
+            const auto prefix = path.filename().u8string() + ".model-";
+            const auto suffix = key.substr(key.find(".gpu-")) + ".analysisengine";
+            for (const auto &entry : std::filesystem::directory_iterator(path.parent_path())) {
+                auto name = entry.path().filename().u8string();
+                if (entry.path() == cached || entry.is_symlink() || !entry.is_regular_file() ||
+                    name.compare(0, prefix.size(), prefix) != 0 || name.size() < suffix.size() ||
+                    name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+#ifdef _WIN32
+                auto old_lock = entry.path(); old_lock += ".lock";
+                HANDLE handle = CreateFileW(old_lock.c_str(), GENERIC_READ|GENERIC_WRITE, 0, nullptr,
+                    OPEN_ALWAYS, FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+                if (handle == INVALID_HANDLE_VALUE) continue;
+                Unlock release_old{handle};
+#endif
+                std::error_code error;
+                std::filesystem::remove(entry.path(), error);
+            }
             check(cudaMalloc(&p->input,3*1024*1024*sizeof(float)));check(cudaMalloc(&p->mask,1024*1024*sizeof(float)));
             check(cudaMalloc(&p->small_mask,width*height*2));
             require(p->execution->setTensorAddress("img",p->input)&&p->execution->setTensorAddress("mask",p->mask),"Could not bind character-mask tensors.");

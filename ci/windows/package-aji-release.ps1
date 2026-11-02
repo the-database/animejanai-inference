@@ -14,11 +14,17 @@ param(
     [Parameter(Mandatory)][string]$Tag,
     [string]$BuildDir = (Join-Path $PSScriptRoot '..\..\build-win-release'),
     [string]$OutDir = (Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) 'dist'),
-    [string]$TrtRoot = (Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) 'trt114'),
+    [string]$TrtRoot,
     [string]$TrtRtxRoot = ($env:AJI_TRTRTX_ROOT ??
         (Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) 'trtrtx171'))
 )
 $ErrorActionPreference = 'Stop'
+$dependencies = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'dependencies.json') -Raw | ConvertFrom-Json
+if (-not $TrtRoot) {
+    $TrtRoot = Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) $dependencies.tensorRTDirectory
+}
+$cache = Get-Content -LiteralPath (Join-Path $BuildDir 'CMakeCache.txt')
+$analysisEnabled = @($cache | Where-Object { $_ -match '^AJI_BUILD_ANALYSIS:BOOL=(ON|TRUE|YES|1)$' }).Count -eq 1
 
 function Get-Artifact([string]$name) {
     $p = Join-Path $BuildDir $name
@@ -33,10 +39,11 @@ $engine = foreach ($f in 'aji.dll', 'aji_dml.dll', 'aji_trt.dll', 'aji_encode.ex
 $trtrtx = @(Get-Artifact 'aji_trtrtx.dll')
 # The observation module is optional. A build that enables it must also ship
 # its parser and builder resources, including the lean runtime they require.
-if (Test-Path -LiteralPath (Join-Path $BuildDir 'aji_analysis.dll')) {
+if ($analysisEnabled) {
     $engine += Get-Artifact 'aji_analysis.dll'
+    $libraryDirectory = if (Test-Path -LiteralPath (Join-Path $TrtRoot 'lib')) { Join-Path $TrtRoot 'lib' } else { $TrtRoot }
     foreach ($pattern in 'nvonnxparser_*.dll', 'nvinfer_builder_resource_*.dll', 'nvinfer_lean_*.dll') {
-        $matches = @(Get-ChildItem -LiteralPath (Join-Path $TrtRoot 'lib') -Filter $pattern -File)
+        $matches = @(Get-ChildItem -LiteralPath $libraryDirectory -Filter $pattern -File)
         if (!$matches.Count) { throw "Analysis runtime dependency missing: $pattern in $TrtRoot/lib" }
         $engine += $matches.FullName
     }

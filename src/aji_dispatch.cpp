@@ -476,5 +476,21 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **c)
 
 extern "C" AJI_EXPORT int aji_stream_policy_version(void)
 {
-    return 1;
+    // No backend has been selected. Callers of the dispatcher must use the
+    // config-aware query; backend libraries retain the original fixed probe.
+    return 0;
+}
+
+extern "C" AJI_EXPORT int aji_stream_policy_version_for_config(const char *path)
+{
+    std::string backend = "TensorRT";
+    if (path) {
+        AjiConf conf;
+        std::string error;
+        if (!aji_conf_load(path, &conf, &error)) return 0;
+        backend = conf.backend;
+    }
+    for (char &ch : backend) ch = (char)tolower((unsigned char)ch);
+    return backend == "tensorrt-rtx" || backend == "tensorrt_rtx" ||
+           backend == "trt-rtx" || backend == "trtrtx" ? 0 : 1;
 }

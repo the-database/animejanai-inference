@@ -13,7 +13,7 @@ set "BLD=%SRC%\build-win-release"
 for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -version [18.0^,19.0^) -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
 if not defined VSDIR (echo Visual Studio 18 with the C++ tools not found & exit /b 1)
 call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -no_logo || exit /b 1
-for /f "tokens=1,2 delims==" %%a in ('powershell -NoProfile -Command "$p=Get-Content '%~dp0dependencies.json' -Raw ^| ConvertFrom-Json; 'CUDA_DIR='+$p.cudaDirectory; 'TRT_DIR='+$p.tensorRTDirectory; 'TRT_LIB='+$p.tensorRTLibrary"') do set "%%a=%%b"
+for /f "tokens=1,2 delims==" %%a in ('powershell -NoProfile -Command "$p=Get-Content '%~dp0dependencies.json' -Raw | ConvertFrom-Json; 'CUDA_DIR='+$p.cudaDirectory; 'TRT_DIR='+$p.tensorRTDirectory; 'TRT_LIB='+$p.tensorRTLibrary"') do set "%%a=%%b"
 if not defined CUDA_DIR exit /b 1
 if not defined TRT_DIR exit /b 1
 set "CUDA_PATH=%AJI_WIN%\%CUDA_DIR%"
@@ -21,7 +21,7 @@ set "PATH=%CUDA_PATH%\bin;%PATH%"
 cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_BUILD_ANALYSIS=%AJI_BUILD_ANALYSIS% ^
   "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" ^
   "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_PATH%" ^
-  -DAJI_TRT_ROOT=%AJI_WIN%/%TRT_DIR% -DAJI_NVINFER=%TRT_LIB% ^
+  "-DAJI_TRT_ROOT=%AJI_WIN%/%TRT_DIR%" "-DAJI_TRT_LIB=%AJI_WIN%/%TRT_DIR%" -DAJI_NVINFER=%TRT_LIB% ^
   "-DAJI_TRTRTX_ROOT:PATH=%AJI_TRTRTX_ROOT%" ^
   -DAJI_ORT_ROOT=%AJI_WIN%/ort/Microsoft.ML.OnnxRuntime.DirectML ^
   -DAJI_DML_ROOT=%AJI_WIN%/ort/Microsoft.AI.DirectML ^
