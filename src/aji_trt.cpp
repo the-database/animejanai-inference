@@ -488,6 +488,12 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                   ModelEngine *me, int w, int h, int ch,
                   const std::string *dir = nullptr, int rank5_t = 0)
 {
+#ifdef AJI_TRTRTX
+    if (c->check_engines_only) {
+        c->set_error("AJN_ENGINE_POLICY_UNSUPPORTED: TensorRT-RTX does not support cached-only engines");
+        return -1;
+    }
+#endif
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath =
         short_engine_path_for(model_dir, name, settings, c->cuda_dev);
@@ -556,8 +562,7 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     };
 
     int cached = try_cached(epath);
-    if (cached < 0 && c->check_engines_only)
-        return -1;
+    int legacy_cached = cached;
     if (cached == 1)
         return 1;
     if (cached == -2)
@@ -576,6 +581,7 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     // portable installs while keeping the model/settings/GPU/TRT cache key.
     const std::string &build_epath = short_epath;
     if (c->check_engines_only) {
+        if (legacy_cached < 0) return -1;
         c->set_error("AJN_ENGINE_MISSING: model=%s; expected=%s", name.c_str(), build_epath.c_str());
         return -1;
     }
