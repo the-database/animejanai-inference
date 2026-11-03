@@ -5,7 +5,7 @@
  *   aji_image --list-devices [--backend trt|trtrtx|dml]
  *   aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID] [--tile N]
  *             [--overlap N] [--cache DIR] [--trtexec PATH] [--gray]
- *             [--repeat N] [--async] IN.(pgm|ppm) OUT.(pgm|ppm)
+ *             [--repeat N] [--async] [--even] IN.(pgm|ppm) OUT.(pgm|ppm)
  *
  * Images are binary PNM (P5 gray / P6 RGB, 8-bit). --gray feeds a P6
  * input as luma (1 channel), exercising the gray path. The model loads
@@ -109,7 +109,7 @@ int usage()
             "usage: aji_image --list-devices [--backend trt|trtrtx|dml]\n"
             "       aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID]\n"
             "                 [--tile N] [--overlap N] [--cache DIR] [--trtexec PATH]\n"
-            "                 [--gray] [--repeat N] [--async] IN.(pgm|ppm) OUT.(pgm|ppm)\n");
+            "                 [--gray] [--repeat N] [--async] [--even] IN.(pgm|ppm) OUT.(pgm|ppm)\n");
     return 2;
 }
 
@@ -122,13 +122,14 @@ int main(int argc, char **argv)
     const char *in_path = nullptr, *out_path = nullptr;
     uint64_t device = 0;
     int tile = 0, overlap = 0, repeat = 1;
-    bool list = false, gray = false, async = false;
+    bool list = false, gray = false, async = false, even = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : nullptr; };
         if (a == "--list-devices") list = true;
         else if (a == "--gray") gray = true;
         else if (a == "--async") async = true;
+        else if (a == "--even") even = true;
         else if (a == "--backend") {
             const char *v = next();
             if (!v) return usage();
@@ -197,7 +198,8 @@ int main(int argc, char **argv)
     mp.onnx_path = model;
     mp.tile_w = mp.tile_h = tile;
     mp.overlap = overlap;
-    mp.flags = async ? AJI_IMG_LOAD_ASYNC_BUILD : 0;
+    mp.flags = (async ? AJI_IMG_LOAD_ASYNC_BUILD : 0) |
+               (even ? AJI_IMG_LOAD_EVEN_TILES : 0);
     double t0 = now_ms();
     aji_img_model *m = aji_img_load(c, &mp);
     if (!m) {

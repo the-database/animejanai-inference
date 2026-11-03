@@ -131,6 +131,30 @@ int main()
         }
     }
 
+    // even tiles: one aligned size within [MIN_TILE, max], covering the axis
+    // with at least the requested overlap, the last flush with the far edge
+    for (int n : {1, 15, 16, 17, 31, 100, 511, 512, 513, 764, 1200, 1500, 4000})
+        for (int mx : {256, 500, 512, 768, 1024})
+            for (int ov : {0, 32, 96, 128}) {
+                int t = 0;
+                const std::vector<int> o = even_origins(n, mx, ov, &t);
+                bool ok = !o.empty() && o[0] == 0 && t >= MIN_TILE &&
+                          t % TILE_ALIGN == 0 && t <= std::max(mx, MIN_TILE);
+                if (o.size() == 1) {
+                    ok = ok && t >= n && t - n < std::max(TILE_ALIGN, MIN_TILE);
+                } else {
+                    ok = ok && o.back() == n - t;
+                    const int need = std::min(ov, (mx / TILE_ALIGN * TILE_ALIGN) / 2);
+                    for (size_t i = 1; i < o.size(); i++)
+                        ok = ok && o[i] > o[i - 1] && o[i - 1] + t - o[i] >= need;
+                }
+                if (!ok) {
+                    failures++;
+                    fprintf(stderr, "FAIL even_origins n=%d max=%d ov=%d: tile %d, %zu origins\n",
+                            n, mx, ov, t, o.size());
+                }
+            }
+
     // cancellation stops early with AJI_IMG_CANCELLED
     {
         std::vector<uint8_t> inb(300 * 300), outb(600 * 600);
