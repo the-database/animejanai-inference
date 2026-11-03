@@ -60,7 +60,8 @@ if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
         COMPILE_OPTIONS /arch:AVX)
 endif()
 add_library(aji_trt_common OBJECT src/aji_conf.cpp src/onnx_shape.cpp
-    src/core/fileio.cpp src/core/tiling.cpp src/kernels.cu ${AJI_HALF_SOURCES})
+    src/core/fileio.cpp src/core/tiling.cpp src/core/tiling_gpu.cu src/kernels.cu
+    ${AJI_HALF_SOURCES})
 target_include_directories(aji_trt_common PRIVATE include)
 set_target_properties(aji_trt_common PROPERTIES
     POSITION_INDEPENDENT_CODE ON
@@ -225,7 +226,7 @@ if(WIN32)
         "Microsoft.AI.DirectML package root")
     add_library(aji_dml SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp
         src/core/fileio.cpp src/core/ort_dml.cpp
-        src/aji_img_dml.cpp src/core/tiling.cpp)
+        src/aji_img_dml.cpp src/core/tiling.cpp ${AJI_HALF_SOURCES})
     target_include_directories(aji_dml
         PUBLIC include
         PRIVATE "${AJI_ORT_ROOT}/build/native/include"
