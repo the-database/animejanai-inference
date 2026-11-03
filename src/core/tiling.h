@@ -17,12 +17,38 @@
 #ifndef AJI_CORE_TILING_H
 #define AJI_CORE_TILING_H
 
+#include <algorithm>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "aji_image.h"
 
 namespace ajicore {
+
+// Run fn(begin, end) over [0, n) split across a few threads (the calling
+// thread included), for the host path's per-element passes. Each element
+// is computed exactly as it would be on one thread, so results don't
+// depend on the split. Small jobs stay on the calling thread; at most half
+// the hardware threads (and 8) are used, leaving the rest to the caller's
+// own decode/encode workers.
+template <typename F> void parallel_for(size_t n, size_t min_per_thread, F &&fn)
+{
+    static const size_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const size_t k = std::min<size_t>(
+        {std::max<size_t>(1, hw / 2), 8, n / std::max<size_t>(1, min_per_thread)});
+    if (k <= 1) {
+        fn((size_t)0, n);
+        return;
+    }
+    std::vector<std::thread> ts;
+    ts.reserve(k - 1);
+    for (size_t t = 1; t < k; t++)
+        ts.emplace_back([&, t] { fn(n * t / k, n * (t + 1) / k); });
+    fn((size_t)0, n / k);
+    for (auto &th : ts)
+        th.join();
+}
 
 // Defaults for aji_img_model_params. 32 px of overlap keeps tile seams
 // below visibility for ESRGAN-class receptive fields (16 leaves faint

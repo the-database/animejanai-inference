@@ -169,20 +169,26 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
                 if (P.on)
                     t0 = clk::now();
 
-                const int ux0 = ox[i] * s;
+                // The band is a ring of rows: image row Y lives at band row
+                // Y % band_rows, so finished rows are reused without moving
+                // the still-open ones.
+                const int ux0 = ox[i] * s, uy0 = oy[j] * s;
                 const std::vector<float> &wxi = wx[i], &wyj = wy[j];
-                for (int c = 0; c < Co; c++) {
-                    const int mc = (m.out_ch == 1 || Co == 1) ? 0 : c;
-                    const float *src = tout.data() + mc * out_plane;
-                    for (int v = 0; v < sph * s; v++) {
+                const int vrows = sph * s, cols = spw * s;
+                parallel_for((size_t)Co * vrows, 64, [&](size_t b, size_t e) {
+                    for (size_t k = b; k < e; k++) {
+                        const int c = (int)(k / vrows), v = (int)(k % vrows);
+                        const int mc = (m.out_ch == 1 || Co == 1) ? 0 : c;
+                        const float *srow =
+                            tout.data() + mc * out_plane + (size_t)v * tow;
                         const float wv = wyj[v];
-                        const float *srow = src + (size_t)v * tow;
+                        const int r = (uy0 + v) % band_rows;
                         float *brow = band.data() +
-                                      ((size_t)c * band_rows + v) * OW + ux0;
-                        for (int u = 0; u < spw * s; u++)
+                                      ((size_t)c * band_rows + r) * OW + ux0;
+                        for (int u = 0; u < cols; u++)
                             brow[u] += wv * wxi[u] * srow[u];
                     }
-                }
+                });
 
                 if (P.on) {
                     P.blend += ms(t0, clk::now());
@@ -196,29 +202,33 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
             }
 
             // Rows above the next tile row's top are final: write them out
-            // and slide the still-open overlap rows to the top of the band.
+            // (each output row front to back) and zero their ring rows.
             if (P.on)
                 t0 = clk::now();
             const int next_y0 = j + 1 < oy.size() ? oy[j + 1] * s : OH;
-            const int nflush = next_y0 - band_y0;
-            for (int r = 0; r < nflush; r++) {
-                uint8_t *orow = out->data + (ptrdiff_t)(band_y0 + r) * out->stride;
-                for (int c = 0; c < Co; c++) {
-                    const float *brow =
-                        band.data() + ((size_t)c * band_rows + r) * OW;
-                    for (int X = 0; X < OW; X++)
-                        orow[(size_t)X * Co + c] = to_u8(brow[X]);
+            const int y_first = band_y0;
+            parallel_for((size_t)(next_y0 - y_first), 32, [&](size_t b, size_t e) {
+                for (int Y = y_first + (int)b; Y < y_first + (int)e; Y++) {
+                    uint8_t *orow = out->data + (ptrdiff_t)Y * out->stride;
+                    const int r = Y % band_rows;
+                    float *b0 = band.data() + (size_t)r * OW;
+                    if (Co == 3) {
+                        float *b1 = b0 + (size_t)band_rows * OW;
+                        float *b2 = b1 + (size_t)band_rows * OW;
+                        for (int X = 0; X < OW; X++) {
+                            orow[3 * (size_t)X] = to_u8(b0[X]);
+                            orow[3 * (size_t)X + 1] = to_u8(b1[X]);
+                            orow[3 * (size_t)X + 2] = to_u8(b2[X]);
+                        }
+                        std::fill(b1, b1 + OW, 0.0f);
+                        std::fill(b2, b2 + OW, 0.0f);
+                    } else {
+                        for (int X = 0; X < OW; X++)
+                            orow[X] = to_u8(b0[X]);
+                    }
+                    std::fill(b0, b0 + OW, 0.0f);
                 }
-            }
-            const int keep = band_rows - nflush;
-            for (int c = 0; c < Co; c++) {
-                float *b = band.data() + (size_t)c * band_rows * OW;
-                if (keep > 0)
-                    memmove(b, b + (size_t)nflush * OW,
-                            (size_t)keep * OW * sizeof(float));
-                std::fill(b + (size_t)keep * OW, b + (size_t)band_rows * OW,
-                          0.0f);
-            }
+            });
             band_y0 = next_y0;
             if (P.on)
                 P.flush += ms(t0, clk::now());

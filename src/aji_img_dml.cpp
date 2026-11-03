@@ -18,6 +18,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -30,6 +31,7 @@
 #include "onnx_shape.h"
 #include "core/fileio.h"
 #include "core/half.h"
+#include "core/half_array.h"
 #include "core/ort_dml.h"
 #include "core/tiling.h"
 
@@ -179,17 +181,26 @@ struct aji_img_model : TileModel {
         const int64_t idims[4] = {1, in_ch, tile_h, tile_w};
         const int64_t odims[4] = {1, out_ch, (int64_t)tile_h * scale,
                                   (int64_t)tile_w * scale};
+        using clk = std::chrono::steady_clock;
+        const auto ms = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        auto t0 = clk::now();
         void *ip, *op;
         size_t ib, ob;
         if (fp16) {
-            for (size_t i = 0; i < ni; i++)
-                in16[i] = f32_to_f16(in[i]);
+            f32_to_f16_array(in, in16.data(), ni);  // F16C where available
             ip = in16.data(); op = out16.data();
             ib = ni * 2; ob = no * 2;
         } else {
             memcpy(in32.data(), in, ni * 4);
             ip = in32.data(); op = out32.data();
             ib = ni * 4; ob = no * 4;
+        }
+        if (prof.on) {
+            const auto t1 = clk::now();
+            prof.pack += ms(t0, t1);
+            t0 = t1;
         }
         const ONNXTensorElementDataType et = fp16
             ? ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
@@ -216,12 +227,20 @@ struct aji_img_model : TileModel {
             g_ort->ReleaseValue(ov);
         if (rc != AJI_IMG_OK)
             return rc;
+        if (prof.on) {
+            const auto t1 = clk::now();
+            prof.wait += ms(t0, t1);  // ORT Run: upload, inference, download
+            t0 = t1;
+        }
         if (fp16) {
-            for (size_t i = 0; i < no; i++)
-                out[i] = f16_to_f32(out16[i]);
+            parallel_for(no, (size_t)1 << 18, [&](size_t b, size_t e) {
+                f16_to_f32_array(out16.data() + b, out + b, e - b);
+            });
         } else {
             memcpy(out, out32.data(), no * 4);
         }
+        if (prof.on)
+            prof.unpack += ms(t0, clk::now());
         return AJI_IMG_OK;
     }
 };
