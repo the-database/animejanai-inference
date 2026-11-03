@@ -4,16 +4,22 @@
  *
  * One static engine per (model, tile, GPU, TensorRT version), cached via
  * the core's engine naming; missing engines build with trtexec, inside
- * aji_img_load unless AJI_IMG_LOAD_ASYNC_BUILD. Tiles travel through pinned
- * host staging in the engine's own I/O dtype (fp32/fp16/bf16) on a
- * per-model stream; core/tiling does the cover/pad/blend on the host.
+ * aji_img_load unless AJI_IMG_LOAD_ASYNC_BUILD. Tiling runs on the GPU
+ * (upscale_gpu + core/tiling_gpu): the image is uploaded once, and tiles
+ * are cut out, run and blended on the model's stream in the engine's own
+ * I/O dtype (fp32/fp16/bf16), so the GPU is not left waiting on the host.
+ * The output is bit-identical to core/tiling's host path, which
+ * AJI_IMG_CPU_TILING=1 selects instead (pinned staging, one tile at a time).
+ * AJI_IMG_PROFILE=1 prints a timing line per image to stderr.
  *
  * Also built into aji_trtrtx (AJI_TRTRTX) as the AJI_IMG_TENSORRT_RTX
  * backend: engines then build in-process (core/trt_engine).
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -33,6 +39,7 @@
 #include "core/half.h"
 #include "core/half_array.h"
 #include "core/tiling.h"
+#include "core/tiling_gpu.h"
 #include "core/trt_engine.h"
 
 namespace fs = std::filesystem;
@@ -141,20 +148,45 @@ struct aji_img_model : TileModel {
     void *h_in = nullptr, *h_out = nullptr;  // pinned staging
     size_t in_elems = 0, out_elems = 0;
 
+    cudaEvent_t prof_ev[4] = {};  // AJI_IMG_PROFILE: h2d / infer / d2h edges
+    GpuTileScratch gpu;           // upscale_gpu's device buffers
+    std::vector<cudaEvent_t> tile_ev;  // AJI_IMG_PROFILE on the GPU path
+
     int run_tile(const float *in, float *out, std::string *err) override
     {
+        using clk = std::chrono::steady_clock;
+        const auto ms = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const bool P = prof.on;
+        if (P && !prof_ev[0])
+            for (auto &ev : prof_ev)
+                cudaEventCreate(&ev);
+        auto t0 = clk::now();
         pack(in, h_in, in_elems, in_dt);
+        if (P) {
+            const auto t1 = clk::now();
+            prof.pack += ms(t0, t1);
+            t0 = t1;
+            cudaEventRecord(prof_ev[0], stream);
+        }
         const size_t in_bytes = in_elems * dtype_size(in_dt);
         const size_t out_bytes = out_elems * dtype_size(out_dt);
         cudaError_t e = cudaMemcpyAsync(d_in, h_in, in_bytes,
                                         cudaMemcpyHostToDevice, stream);
+        if (P)
+            cudaEventRecord(prof_ev[1], stream);
         if (e == cudaSuccess && !me.exec->enqueueV3(stream)) {
             *err = AJI_TRT_PRODUCT " enqueue failed for " + name;
             return AJI_IMG_ERR;
         }
+        if (P)
+            cudaEventRecord(prof_ev[2], stream);
         if (e == cudaSuccess)
             e = cudaMemcpyAsync(h_out, d_out, out_bytes,
                                 cudaMemcpyDeviceToHost, stream);
+        if (P)
+            cudaEventRecord(prof_ev[3], stream);
         if (e == cudaSuccess)
             e = cudaStreamSynchronize(stream);
         if (e != cudaSuccess) {
@@ -162,12 +194,35 @@ struct aji_img_model : TileModel {
                    cudaGetErrorString(e);
             return AJI_IMG_ERR;
         }
+        if (P) {
+            const auto t1 = clk::now();
+            prof.wait += ms(t0, t1);
+            t0 = t1;
+            float a = 0, b = 0, c = 0;
+            cudaEventElapsedTime(&a, prof_ev[0], prof_ev[1]);
+            cudaEventElapsedTime(&b, prof_ev[1], prof_ev[2]);
+            cudaEventElapsedTime(&c, prof_ev[2], prof_ev[3]);
+            prof.gpu_h2d += a;
+            prof.gpu_infer += b;
+            prof.gpu_d2h += c;
+        }
         unpack(h_out, out, out_elems, out_dt);
+        if (P)
+            prof.unpack += ms(t0, clk::now());
         return AJI_IMG_OK;
     }
 
     void free_buffers()
     {
+        for (auto &ev : prof_ev)
+            if (ev) {
+                cudaEventDestroy(ev);
+                ev = nullptr;
+            }
+        for (cudaEvent_t ev : tile_ev)
+            cudaEventDestroy(ev);
+        tile_ev.clear();
+        gpu.release();
         cudaFree(d_in);
         cudaFree(d_out);
         cudaFreeHost(h_in);
@@ -522,6 +577,202 @@ extern "C" AJI_IMG_EXPORT int aji_img_model_info_get(aji_img_model *m,
     return AJI_IMG_OK;
 }
 
+namespace {
+
+const char *dtype_name(nvinfer1::DataType t)
+{
+    return t == nvinfer1::DataType::kFLOAT  ? "fp32"
+           : t == nvinfer1::DataType::kHALF ? "fp16"
+                                            : "bf16";
+}
+
+GpuDtype gpu_dtype(nvinfer1::DataType t)
+{
+    return t == nvinfer1::DataType::kFLOAT  ? GpuDtype::F32
+           : t == nvinfer1::DataType::kHALF ? GpuDtype::F16
+                                            : GpuDtype::BF16;
+}
+
+// Make a device buffer hold at least `need` bytes (grow only).
+template <typename T> bool grow(T **p, size_t *cap, size_t need)
+{
+    if (need <= *cap)
+        return true;
+    cudaFree(*p);
+    *p = nullptr;
+    *cap = 0;
+    if (cudaMalloc((void **)p, need) != cudaSuccess) {
+        *p = nullptr;
+        return false;
+    }
+    *cap = need;
+    return true;
+}
+
+// upscale_tiled's cover / pad / blend with the image data on the GPU (see
+// core/tiling_gpu.h): one upload, then per tile extract -> infer -> blend
+// queued on the model's stream with no host round trip, and per tile row
+// one flush to 8-bit plus a copy of those rows into `out`. Context pushed,
+// run_mu held. Bit-identical to upscale_tiled.
+int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
+                const aji_img_buffer *out, aji_img_progress_fn progress,
+                void *opaque, std::string *err)
+{
+    if (!in || !out || !in->data || !out->data) {
+        *err = "null image buffer";
+        return AJI_IMG_ERR_ARGS;
+    }
+    const int W = in->width, H = in->height, s = m.scale;
+    const int Ci = in->channels, Co = out->channels;
+    if (W < 1 || H < 1 || (Ci != 1 && Ci != 3) || Co != Ci) {
+        *err = "image must be 1 or 3 channels, same on both sides";
+        return AJI_IMG_ERR_ARGS;
+    }
+    if (out->width != W * s || out->height != H * s) {
+        *err = "output must be " + std::to_string(W * s) + "x" +
+               std::to_string(H * s) + " (scale " + std::to_string(s) + ")";
+        return AJI_IMG_ERR_ARGS;
+    }
+    if (in->stride < (ptrdiff_t)W * Ci || out->stride < (ptrdiff_t)W * s * Co) {
+        *err = "stride smaller than a row";
+        return AJI_IMG_ERR_ARGS;
+    }
+
+    using clk = std::chrono::steady_clock;
+    const bool prof = std::getenv("AJI_IMG_PROFILE") != nullptr;
+    const auto t_start = clk::now();
+
+    const int Tw = m.tile_w, Th = m.tile_h;
+    const std::vector<int> ox = tile_origins(W, Tw, m.overlap);
+    const std::vector<int> oy = tile_origins(H, Th, m.overlap);
+    const int spw = std::min(Tw, W), sph = std::min(Th, H);
+    const int OW = W * s, OH = H * s;
+    const int tow = Tw * s, toh = Th * s;
+    const int cols = spw * s, band_rows = sph * s;
+    const int total = (int)(ox.size() * oy.size());
+    const GpuDtype in_t = gpu_dtype(m.in_dt), out_t = gpu_dtype(m.out_dt);
+    cudaStream_t st = m.stream;
+    GpuTileScratch &g = m.gpu;
+
+    std::vector<float> wxf, wyf;
+    try {
+        for (const auto &w : axis_weights(ox, W, Tw, s))
+            wxf.insert(wxf.end(), w.begin(), w.end());
+        for (const auto &w : axis_weights(oy, H, Th, s))
+            wyf.insert(wyf.end(), w.begin(), w.end());
+    } catch (const std::bad_alloc &) {
+        *err = "out of host memory for tiling buffers";
+        return AJI_IMG_ERR_NO_MEM;
+    }
+    const size_t band_bytes = (size_t)Co * band_rows * OW * sizeof(float);
+    if (!grow(&g.img, &g.img_cap, (size_t)W * H * Ci) ||
+        !grow(&g.band, &g.band_cap, band_bytes) ||
+        !grow(&g.rows, &g.rows_cap, (size_t)band_rows * OW * Co) ||
+        !grow(&g.wx, &g.wx_cap, wxf.size() * sizeof(float)) ||
+        !grow(&g.wy, &g.wy_cap, wyf.size() * sizeof(float))) {
+        *err = m.name + ": out of GPU memory for a " + std::to_string(W) +
+               "x" + std::to_string(H) + " image";
+        return AJI_IMG_ERR_NO_MEM;
+    }
+    if (prof)
+        while (m.tile_ev.size() < (size_t)total * 2) {
+            cudaEvent_t ev;
+            cudaEventCreate(&ev);
+            m.tile_ev.push_back(ev);
+        }
+
+    // Any failure past this point waits out what's queued, so the scratch
+    // and the caller's buffers are not in use when it returns.
+    const auto cuda_fail = [&](cudaError_t e, const char *what) {
+        cudaStreamSynchronize(st);
+        *err = std::string("CUDA error (") + what + ") running " + m.name +
+               ": " + cudaGetErrorString(e);
+        return AJI_IMG_ERR;
+    };
+    cudaError_t e = cudaMemcpy2DAsync(g.img, (size_t)W * Ci, in->data,
+                                      in->stride, (size_t)W * Ci, H,
+                                      cudaMemcpyHostToDevice, st);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(g.wx, wxf.data(), wxf.size() * sizeof(float),
+                            cudaMemcpyHostToDevice, st);
+    if (e == cudaSuccess)
+        e = cudaMemcpyAsync(g.wy, wyf.data(), wyf.size() * sizeof(float),
+                            cudaMemcpyHostToDevice, st);
+    if (e == cudaSuccess)
+        e = cudaMemsetAsync(g.band, 0, band_bytes, st);
+    if (e != cudaSuccess)
+        return cuda_fail(e, "upload");
+
+    const float inv255 = 1.0f / 255.0f;
+    int done = 0;
+    int band_y0 = 0;  // first image row not yet flushed
+    for (size_t j = 0; j < oy.size(); j++) {
+        for (size_t i = 0; i < ox.size(); i++) {
+            e = gpu_tile_extract(g.img, W, H, Ci, ox[i], oy[j], Tw, Th,
+                                 m.in_ch, inv255, m.d_in, in_t, st);
+            if (e != cudaSuccess)
+                return cuda_fail(e, "tile extract");
+            if (prof)
+                cudaEventRecord(m.tile_ev[2 * done], st);
+            if (!m.me.exec->enqueueV3(st)) {
+                cudaStreamSynchronize(st);
+                *err = AJI_TRT_PRODUCT " enqueue failed for " + m.name;
+                return AJI_IMG_ERR;
+            }
+            if (prof)
+                cudaEventRecord(m.tile_ev[2 * done + 1], st);
+            e = gpu_tile_blend(m.d_out, out_t, m.out_ch, tow, toh,
+                               g.wx + i * cols, g.wy + j * band_rows, cols,
+                               band_rows, ox[i] * s, oy[j] * s, g.band, Co,
+                               band_rows, OW, st);
+            if (e != cudaSuccess)
+                return cuda_fail(e, "tile blend");
+            done++;
+            if (progress && progress(opaque, done, total)) {
+                cudaStreamSynchronize(st);
+                *err = "cancelled";
+                return AJI_IMG_CANCELLED;
+            }
+        }
+        // Rows above the next tile row's top are final.
+        const int next_y0 = j + 1 < oy.size() ? oy[j + 1] * s : OH;
+        const int n = next_y0 - band_y0;
+        e = gpu_band_flush(g.band, Co, band_rows, OW, band_y0, n, g.rows, st);
+        if (e == cudaSuccess)
+            e = cudaMemcpy2DAsync(out->data + (ptrdiff_t)band_y0 * out->stride,
+                                  out->stride, g.rows, (size_t)OW * Co,
+                                  (size_t)OW * Co, n, cudaMemcpyDeviceToHost,
+                                  st);
+        if (e != cudaSuccess)
+            return cuda_fail(e, "band flush");
+        band_y0 = next_y0;
+    }
+    e = cudaStreamSynchronize(st);
+    if (e != cudaSuccess)
+        return cuda_fail(e, "finish");
+
+    if (prof) {
+        double infer = 0;
+        for (int t = 0; t < done; t++) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, m.tile_ev[2 * t], m.tile_ev[2 * t + 1]);
+            infer += ms;
+        }
+        const double total_ms =
+            std::chrono::duration<double, std::milli>(clk::now() - t_start).count();
+        std::fprintf(stderr,
+                     "aji-profile %dx%d x%d tiles=%d tile=%dx%d total=%.1fms | "
+                     "gpu tiling, image %dch, engine %dch %s -> %dch %s | "
+                     "gpu: infer=%.1f (%.0f%% of total)\n",
+                     W, H, s, done, Tw, Th, total_ms, Ci, m.in_ch,
+                     dtype_name(m.in_dt), m.out_ch, dtype_name(m.out_dt),
+                     infer, 100.0 * infer / total_ms);
+    }
+    return AJI_IMG_OK;
+}
+
+} // namespace
+
 extern "C" AJI_IMG_EXPORT int aji_img_upscale(aji_img_model *m,
                                               const aji_img_buffer *in,
                                               const aji_img_buffer *out,
@@ -537,7 +788,10 @@ extern "C" AJI_IMG_EXPORT int aji_img_upscale(aji_img_model *m,
     int rc;
     {
         CtxGuard guard(m->c->cu_ctx);
-        rc = upscale_tiled(*m, m->overlap, in, out, progress, opaque, &e);
+        // AJI_IMG_CPU_TILING=1: the host tiling path, for comparison.
+        rc = std::getenv("AJI_IMG_CPU_TILING")
+                 ? upscale_tiled(*m, m->overlap, in, out, progress, opaque, &e)
+                 : upscale_gpu(*m, in, out, progress, opaque, &e);
     }
     if (rc != AJI_IMG_OK && rc != AJI_IMG_CANCELLED) {
         std::lock_guard<std::mutex> lock(m->c->mu);

@@ -107,7 +107,8 @@ visibility (an internal static "library", no ABI of its own):
 | `core/fileio` | UTF-8/long-path file helpers, `own_dir()` |
 | `core/trt_engine` | engine cache naming, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading; under `AJI_TRTRTX` the in-process builder and the runtime (JIT) cache |
 | `core/ort_dml` | ORT + DirectML loading (DirectML.dll before onnxruntime.dll) |
-| `core/tiling` | the image path's tile cover / reflect pad / overlap blend (backend-agnostic) |
+| `core/tiling` | the image path's tile cover / reflect pad / overlap blend on the host (backend-agnostic; DirectML uses it, and the CUDA backends with `AJI_IMG_CPU_TILING=1`). The band is a ring of rows; blend and flush are split across a few threads with `parallel_for`, per element, so the result doesn't depend on the split |
+| `core/tiling_gpu` | the same tiling on the GPU for the CUDA backends (`upscale_gpu` in `aji_img_trt.cpp`): one upload, tile extract / blend / 8-bit flush kernels on the model's stream. **Bit-identical to `core/tiling`**: every multiply and add is `__fmul_rn`/`__fadd_rn` (never fused) in the host's order, with the host's fp16/bf16 rounding. Keep it that way, or the md5 gate below stops working |
 | `core/half` | fp16/bf16 conversions |
 
 Core functions take explicit paths/devices and return errors as strings; each front-end reports
@@ -228,7 +229,9 @@ image-ABI change never touches the mpv fork. Its consumers (e.g. yosh's upscalin
 **Regression gate for core changes:** the video harnesses must stay byte-identical — run
 `aji_harness` / `aji_harness_dml` (slots 1 and 3, `--output`) before and after, with cached
 *and* freshly built engines, and compare md5s. Image path: `aji_tiling_test`, then `aji_image`
-on a test page with both backends.
+on a test page with both backends; for a tiling change, also run each CUDA backend with and without
+`AJI_IMG_CPU_TILING=1` and compare md5s. They must match, on a set that covers 1- and 3-channel
+images and engines, fp32/fp16/bf16 engine I/O, and images smaller than a tile.
 
 ## Temporal models
 
