@@ -6,6 +6,15 @@
  * with overlapping tiles, reflect-pads images smaller than a tile,
  * blends overlaps with separable linear ramps and writes 8-bit output.
  *
+ * Seams: near a tile's edge a model sees less context, and what it
+ * generates there (e.g. a halftone's phase) can drift from what the
+ * neighbouring tile generates. So overlaps are wide (DEFAULT_OVERLAP)
+ * and blended only across a narrow band at their centre (BLEND_WIDTH),
+ * where both tiles have half the overlap of context: each pixel outside
+ * that band comes from the tile that sees more around it. A wide linear
+ * ramp instead mixes the two drifted versions, which on generated
+ * screentone shows as interference patches.
+ *
  * Blending is exact at any overlap: each tile's 1-D ramp weights are
  * normalized by the per-axis weight sums, so the 2-D weights of all
  * tiles covering a pixel sum to one (corners included) — including the
@@ -54,7 +63,16 @@ template <typename F> void parallel_for(size_t n, size_t min_per_thread, F &&fn)
 // below visibility for ESRGAN-class receptive fields (16 leaves faint
 // differences against a whole-image run on screentone).
 const int DEFAULT_TILE = 512;
-const int DEFAULT_OVERLAP = 32;
+// Input pixels. 128 keeps generated screentone seamless with MangaJaNai's
+// ESRGAN models at 2x and 4x (96 is enough at 4x only); 32, the former
+// default, left visible interference patches at seams.
+const int DEFAULT_OVERLAP = 128;
+// Input pixels of linear ramp at the centre of each overlap.
+const int BLEND_WIDTH = 16;
+// Even tiles (AJI_IMG_LOAD_EVEN_TILES): sides are multiples of TILE_ALIGN
+// (what window-attention models need) and at least MIN_TILE.
+const int TILE_ALIGN = 16;
+const int MIN_TILE = 32;
 
 // Per-image phase timings (milliseconds), filled when AJI_IMG_PROFILE is
 // set: host phases by upscale_tiled, the run_tile breakdown by a backend
@@ -84,6 +102,13 @@ public:
 // step tile-overlap, the last tile flush with the far edge; a single
 // origin 0 when the axis fits in one tile.
 std::vector<int> tile_origins(int len, int tile, int overlap);
+
+// Even tiles along one axis of length `n`: the fewest tiles of at most
+// `max_tile` that overlap by at least `overlap`, all one size (*tile: a
+// multiple of TILE_ALIGN, at least MIN_TILE) and evenly spaced, the last
+// flush with the far edge. An axis that fits in one tile gets one tile of
+// its own length rounded up to TILE_ALIGN (reflect-padded).
+std::vector<int> even_origins(int n, int max_tile, int overlap, int *tile);
 
 // Mirror an index into [0, n) without repeating the edge sample
 // (numpy "reflect"), for any distance past the edge.
