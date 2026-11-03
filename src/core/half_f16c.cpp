@@ -1,6 +1,5 @@
 // Compiled separately with AVX, called only after CPU/OS capability checks.
 #include "half_array.h"
-#include "half.h"
 #include <immintrin.h>
 
 namespace ajicore {
@@ -32,11 +31,13 @@ void pack_f16c(const float *src, uint16_t *dst, size_t n)
             // Canonicalize NaNs exactly like half.h, including their sign.
             for (unsigned lane = 0; lane < 8; ++lane)
                 if (!(mask & (1u << lane)))
-                    dst[i + lane] = f32_to_f16(src[i + lane]);
+                    f32_to_f16_array(src + i + lane, dst + i + lane, 1);
         }
     }
-    for (; i < n; ++i)
-        dst[i] = f32_to_f16(src[i]);
+    // Keep scalar helpers in the baseline translation unit. Including half.h
+    // here could let the linker select an AVX COMDAT for a scalar caller.
+    if (i < n)
+        f32_to_f16_array(src + i, dst + i, n - i);
 }
 
 void unpack_f16c(const uint16_t *src, float *dst, size_t n)
@@ -53,10 +54,10 @@ void unpack_f16c(const uint16_t *src, float *dst, size_t n)
             // Preserve the payload and signaling bit instead of quieting NaNs.
             for (unsigned lane = 0; lane < 8; ++lane)
                 if (mask & (1u << (2 * lane)))
-                    dst[i + lane] = f16_to_f32(src[i + lane]);
+                    f16_to_f32_array(src + i + lane, dst + i + lane, 1);
         }
     }
-    for (; i < n; ++i)
-        dst[i] = f16_to_f32(src[i]);
+    if (i < n)
+        f16_to_f32_array(src + i, dst + i, n - i);
 }
 } // namespace ajicore
