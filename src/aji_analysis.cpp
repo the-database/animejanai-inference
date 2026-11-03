@@ -164,6 +164,7 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
 #ifdef _WIN32
             auto lock_path = cached; lock_path += ".lock";
             HANDLE lock = INVALID_HANDLE_VALUE;
+            unsigned access_denied_retries = 0;
             auto wait_started = std::chrono::steady_clock::now();
             while (lock == INVALID_HANDLE_VALUE) {
                 require(!cancelled || !cancelled(opaque), "Analysis setup cancelled.");
@@ -172,13 +173,18 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
                 lock = CreateFileW(lock_path.c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr);
                 if (lock == INVALID_HANDLE_VALUE) {
                     DWORD code = GetLastError();
-                    if (code != ERROR_SHARING_VIOLATION) windows_error("Cannot lock the analysis engine cache directory", code);
+                    // A delete-on-close lock can briefly be delete-pending.
+                    // Do not turn a permanent directory permission error into
+                    // the full ten-minute sharing-violation wait.
+                    if (code == ERROR_ACCESS_DENIED && access_denied_retries++ < 10) { }
+                    else if (code == ERROR_SHARING_VIOLATION) access_denied_retries = 0;
+                    else windows_error("Cannot lock the analysis engine cache directory", code);
                     if(state)state(opaque,9); Sleep(100);
                 }
             }
             struct Unlock { HANDLE handle; ~Unlock(){CloseHandle(handle);} } unlock{lock};
 #endif
-            if(std::filesystem::exists(cached)) {
+            if(std::filesystem::exists(cached) && std::filesystem::file_size(cached) > 0) {
                 auto bytes=read(cached); p->engine.reset(p->runtime->deserializeCudaEngine(bytes.data(),bytes.size()));
             }
             if(!p->engine) {
