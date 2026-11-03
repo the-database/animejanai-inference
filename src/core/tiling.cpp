@@ -5,7 +5,10 @@
 #include "tiling.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 
@@ -26,10 +29,6 @@ std::vector<int> tile_origins(int len, int tile, int overlap)
     return o;
 }
 
-namespace {
-
-// Mirror an index into [0, n) without repeating the edge sample
-// (numpy "reflect"), for any distance past the edge.
 int reflect(int i, int n)
 {
     if (n == 1)
@@ -41,10 +40,6 @@ int reflect(int i, int n)
     return i < n ? i : period - i;
 }
 
-// Normalized 1-D blend weights per tile along one axis, in output pixels:
-// w[t][u] for u in [0, span*scale), span = min(tile, len). Linear ramps
-// across each actual overlap (none at the image border), divided by the
-// per-position sum so the tiles covering any position sum to one.
 std::vector<std::vector<float>> axis_weights(const std::vector<int> &org,
                                              int len, int tile, int scale)
 {
@@ -73,6 +68,8 @@ std::vector<std::vector<float>> axis_weights(const std::vector<int> &org,
             w[t][u] /= sum[(size_t)org[t] * scale + u];
     return w;
 }
+
+namespace {
 
 inline uint8_t to_u8(float v)
 {
@@ -115,6 +112,16 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
     const int band_rows = sph * s;
     const size_t in_plane = (size_t)Tw * Th, out_plane = (size_t)tow * toh;
 
+    using clk = std::chrono::steady_clock;
+    const auto ms = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    TileProfile &P = m.prof;
+    P = TileProfile{};
+    P.on = std::getenv("AJI_IMG_PROFILE") != nullptr;
+    const auto t_start = clk::now();
+    auto t0 = t_start;
+
     try {
         const auto wx = axis_weights(ox, W, Tw, s);
         const auto wy = axis_weights(oy, H, Th, s);
@@ -128,6 +135,8 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
 
         for (size_t j = 0; j < oy.size(); j++) {
             for (size_t i = 0; i < ox.size(); i++) {
+                if (P.on)
+                    t0 = clk::now();
                 for (int x = 0; x < Tw; x++)
                     xs[x] = reflect(ox[i] + x, W);
                 for (int y = 0; y < Th; y++) {
@@ -149,9 +158,16 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
                     }
                 }
 
+                if (P.on) {
+                    const auto t1 = clk::now();
+                    P.prep += ms(t0, t1);
+                    t0 = t1;
+                }
                 const int rc = m.run_tile(tin.data(), tout.data(), err);
                 if (rc != AJI_IMG_OK)
                     return rc;
+                if (P.on)
+                    t0 = clk::now();
 
                 const int ux0 = ox[i] * s;
                 const std::vector<float> &wxi = wx[i], &wyj = wy[j];
@@ -168,6 +184,10 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
                     }
                 }
 
+                if (P.on) {
+                    P.blend += ms(t0, clk::now());
+                    P.tiles++;
+                }
                 done++;
                 if (progress && progress(opaque, done, total)) {
                     *err = "cancelled";
@@ -177,6 +197,8 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
 
             // Rows above the next tile row's top are final: write them out
             // and slide the still-open overlap rows to the top of the band.
+            if (P.on)
+                t0 = clk::now();
             const int next_y0 = j + 1 < oy.size() ? oy[j + 1] * s : OH;
             const int nflush = next_y0 - band_y0;
             for (int r = 0; r < nflush; r++) {
@@ -198,10 +220,26 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
                           0.0f);
             }
             band_y0 = next_y0;
+            if (P.on)
+                P.flush += ms(t0, clk::now());
         }
     } catch (const std::bad_alloc &) {
         *err = "out of host memory for tiling buffers";
         return AJI_IMG_ERR_NO_MEM;
+    }
+    if (P.on) {
+        const double total_ms = ms(t_start, clk::now());
+        const double gpu = P.gpu_h2d + P.gpu_infer + P.gpu_d2h;
+        const double host = P.prep + P.pack + P.unpack + P.blend + P.flush;
+        std::fprintf(stderr,
+                     "aji-profile %dx%d x%d tiles=%d tile=%dx%d total=%.1fms | "
+                     "host: prep=%.1f pack=%.1f unpack=%.1f blend=%.1f "
+                     "flush=%.1f (sum %.1f, %.0f%%) | wait=%.1f | gpu: "
+                     "h2d=%.1f infer=%.1f d2h=%.1f (sum %.1f, %.0f%% busy)\n",
+                     W, H, s, P.tiles, Tw, Th, total_ms, P.prep, P.pack,
+                     P.unpack, P.blend, P.flush, host,
+                     100.0 * host / total_ms, P.wait, P.gpu_h2d, P.gpu_infer,
+                     P.gpu_d2h, gpu, 100.0 * gpu / total_ms);
     }
     return AJI_IMG_OK;
 }

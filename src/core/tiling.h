@@ -30,11 +30,23 @@ namespace ajicore {
 const int DEFAULT_TILE = 512;
 const int DEFAULT_OVERLAP = 32;
 
+// Per-image phase timings (milliseconds), filled when AJI_IMG_PROFILE is
+// set: host phases by upscale_tiled, the run_tile breakdown by a backend
+// that reports it (gpu_* from CUDA events, wait = host time blocked on
+// the stream).
+struct TileProfile {
+    bool on = false;
+    int tiles = 0;
+    double prep = 0, pack = 0, wait = 0, unpack = 0, blend = 0, flush = 0;
+    double gpu_h2d = 0, gpu_infer = 0, gpu_d2h = 0;
+};
+
 class TileModel {
 public:
     int tile_w = 0, tile_h = 0;  // input pixels
     int scale = 0;
     int in_ch = 3, out_ch = 3;
+    TileProfile prof;
 
     virtual ~TileModel() = default;
     // in: in_ch planes of tile_h x tile_w; out: out_ch planes of
@@ -46,6 +58,17 @@ public:
 // step tile-overlap, the last tile flush with the far edge; a single
 // origin 0 when the axis fits in one tile.
 std::vector<int> tile_origins(int len, int tile, int overlap);
+
+// Mirror an index into [0, n) without repeating the edge sample
+// (numpy "reflect"), for any distance past the edge.
+int reflect(int i, int n);
+
+// Normalized 1-D blend weights per tile along one axis, in output pixels:
+// w[t][u] for u in [0, span*scale), span = min(tile, len). Linear ramps
+// across each actual overlap (none at the image border), divided by the
+// per-position sum so the tiles covering any position sum to one.
+std::vector<std::vector<float>> axis_weights(const std::vector<int> &org,
+                                             int len, int tile, int scale);
 
 int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
                   const aji_img_buffer *out, aji_img_progress_fn progress,
