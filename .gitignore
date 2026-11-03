@@ -1,4 +1,5 @@
 build/
+build-deps/
 models/
 fixtures/*.raw
 fixtures/*.png
