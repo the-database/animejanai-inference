@@ -29,6 +29,31 @@ std::vector<int> tile_origins(int len, int tile, int overlap)
     return o;
 }
 
+std::vector<int> even_origins(int n, int max_tile, int overlap, int *tile)
+{
+    const auto up = [](int v) { return (v + TILE_ALIGN - 1) / TILE_ALIGN * TILE_ALIGN; };
+    const int T = max_tile / TILE_ALIGN * TILE_ALIGN;  // largest aligned tile
+    if (T < MIN_TILE) {  // too small to align: plain fixed tiles
+        *tile = max_tile;
+        return tile_origins(n, max_tile, overlap);
+    }
+    if (n <= T) {
+        *tile = std::max(MIN_TILE, up(n));
+        return {0};
+    }
+    const int O = std::max(0, std::min(overlap, T / 2));
+    for (int k = std::max(2, (n - O + (T - O) - 1) / (T - O));; k++) {
+        const int t = std::max(MIN_TILE, up((n + (k - 1) * O + k - 1) / k));
+        if (t > T)
+            continue;
+        std::vector<int> o;
+        for (int i = 0; i < k; i++)
+            o.push_back((int)((long long)i * (n - t) / (k - 1)));
+        *tile = t;
+        return o;
+    }
+}
+
 int reflect(int i, int n)
 {
     if (n == 1)
@@ -47,16 +72,24 @@ std::vector<std::vector<float>> axis_weights(const std::vector<int> &org,
     const int n = (int)org.size();
     const int S = span * scale;
     std::vector<std::vector<float>> w(n, std::vector<float>(S, 1.0f));
+    // The ramp covers only BLEND_WIDTH at the centre of each overlap (see
+    // tiling.h); outside it, each pixel comes from the tile that has more
+    // context there.
     for (int t = 0; t < n; t++) {
         const int ol = t > 0 ? (org[t - 1] + span - org[t]) * scale : 0;
         const int orr = t + 1 < n ? (org[t] + span - org[t + 1]) * scale : 0;
+        const int bl = std::min(ol, BLEND_WIDTH * scale);
+        const int br = std::min(orr, BLEND_WIDTH * scale);
+        const int l0 = (ol - bl) / 2, r0 = (orr - br) / 2;
         for (int u = 0; u < S; u++) {
             float v = 1.0f;
             if (u < ol)
-                v = std::min(v, (u + 0.5f) / ol);
-            if (u >= S - orr)
-                v = std::min(v, (S - u - 0.5f) / orr);
-            w[t][u] = v;
+                v = std::min(v, u < l0 ? 0.0f : (u - l0 + 0.5f) / bl);
+            if (u >= S - orr) {
+                const int d = S - u - 1;  // distance from the far edge
+                v = std::min(v, d < r0 ? 0.0f : (d - r0 + 0.5f) / br);
+            }
+            w[t][u] = std::min(v, 1.0f);
         }
     }
     std::vector<float> sum((size_t)len * scale, 0.0f);

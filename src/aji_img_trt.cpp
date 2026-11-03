@@ -4,7 +4,11 @@
  *
  * One static engine per (model, tile, GPU, TensorRT version), cached via
  * the core's engine naming; missing engines build with trtexec, inside
- * aji_img_load unless AJI_IMG_LOAD_ASYNC_BUILD. Tiling runs on the GPU
+ * aji_img_load unless AJI_IMG_LOAD_ASYNC_BUILD. With
+ * AJI_IMG_LOAD_EVEN_TILES the engine takes any tile shape from MIN_TILE up
+ * to the tile, and each image is split into even tiles (core/tiling's
+ * even_origins), its shape set on the context per image; the host path
+ * (AJI_IMG_CPU_TILING) still runs fixed full-size tiles. Tiling runs on the GPU
  * (upscale_gpu + core/tiling_gpu): the image is uploaded once, and tiles
  * are cut out, run and blended on the model's stream in the engine's own
  * I/O dtype (fp32/fp16/bf16), so the GPU is not left waiting on the host.
@@ -150,6 +154,8 @@ struct aji_img_model : TileModel {
 
     cudaEvent_t prof_ev[4] = {};  // AJI_IMG_PROFILE: h2d / infer / d2h edges
     GpuTileScratch gpu;           // upscale_gpu's device buffers
+    bool even = false;  // AJI_IMG_LOAD_EVEN_TILES: engine for any tile shape
+    int cur_w = 0, cur_h = 0;     // the input shape last set on the context
     std::vector<cudaEvent_t> tile_ev;  // AJI_IMG_PROFILE on the GPU path
 
     int run_tile(const float *in, float *out, std::string *err) override
@@ -263,6 +269,8 @@ bool finalize(aji_img_model *m, std::string *err, bool *keep = nullptr)
         return false;
     }
     m->scale = m->me.out_w / m->tile_w;
+    m->cur_w = m->tile_w;  // load_engine set the full tile shape
+    m->cur_h = m->tile_h;
     m->in_dt = m->me.engine->getTensorDataType(m->me.in_name);
     m->out_dt = m->me.engine->getTensorDataType(m->me.out_name);
     if (!dtype_size(m->in_dt) || !dtype_size(m->out_dt)) {
@@ -475,8 +483,16 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
         const std::string shape = oin.name + ":1x" + std::to_string(m->in_ch) +
                                   "x" + std::to_string(m->tile_h) + "x" +
                                   std::to_string(m->tile_w);
-        m->settings += " --minShapes=" + shape + " --optShapes=" + shape +
-                       " --maxShapes=" + shape;
+        // AJI_IMG_LOAD_EVEN_TILES: one engine for any tile shape from
+        // MIN_TILE up to the tile size, so each image is split into even
+        // tiles instead of fixed ones pushed flush against its edges.
+        m->even = (p->flags & AJI_IMG_LOAD_EVEN_TILES) != 0;
+        const std::string min_shape =
+            oin.name + ":1x" + std::to_string(m->in_ch) + "x" +
+            std::to_string(std::min(m->tile_h, MIN_TILE)) + "x" +
+            std::to_string(std::min(m->tile_w, MIN_TILE));
+        m->settings += " --minShapes=" + (m->even ? min_shape : shape) +
+                       " --optShapes=" + shape + " --maxShapes=" + shape;
     }
     m->overlap = std::min(m->overlap, std::min(m->tile_w, m->tile_h) / 2);
 
@@ -642,9 +658,25 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
     const bool prof = std::getenv("AJI_IMG_PROFILE") != nullptr;
     const auto t_start = clk::now();
 
-    const int Tw = m.tile_w, Th = m.tile_h;
-    const std::vector<int> ox = tile_origins(W, Tw, m.overlap);
-    const std::vector<int> oy = tile_origins(H, Th, m.overlap);
+    int Tw = m.tile_w, Th = m.tile_h;
+    std::vector<int> ox, oy;
+    if (m.even) {
+        ox = even_origins(W, m.tile_w, m.overlap, &Tw);
+        oy = even_origins(H, m.tile_h, m.overlap, &Th);
+        if (Tw != m.cur_w || Th != m.cur_h) {
+            if (!m.me.exec->setInputShape(m.me.in_name,
+                                          nvinfer1::Dims4{1, m.in_ch, Th, Tw})) {
+                *err = m.name + ": setInputShape " + std::to_string(Tw) + "x" +
+                       std::to_string(Th) + " failed";
+                return AJI_IMG_ERR;
+            }
+            m.cur_w = Tw;
+            m.cur_h = Th;
+        }
+    } else {
+        ox = tile_origins(W, Tw, m.overlap);
+        oy = tile_origins(H, Th, m.overlap);
+    }
     const int spw = std::min(Tw, W), sph = std::min(Th, H);
     const int OW = W * s, OH = H * s;
     const int tow = Tw * s, toh = Th * s;
@@ -788,10 +820,20 @@ extern "C" AJI_IMG_EXPORT int aji_img_upscale(aji_img_model *m,
     int rc;
     {
         CtxGuard guard(m->c->cu_ctx);
-        // AJI_IMG_CPU_TILING=1: the host tiling path, for comparison.
-        rc = std::getenv("AJI_IMG_CPU_TILING")
-                 ? upscale_tiled(*m, m->overlap, in, out, progress, opaque, &e)
-                 : upscale_gpu(*m, in, out, progress, opaque, &e);
+        // AJI_IMG_CPU_TILING=1: the host tiling path, for comparison. It
+        // runs fixed full-size tiles.
+        if (std::getenv("AJI_IMG_CPU_TILING")) {
+            if ((m->cur_w != m->tile_w || m->cur_h != m->tile_h) &&
+                m->me.exec->setInputShape(
+                    m->me.in_name,
+                    nvinfer1::Dims4{1, m->in_ch, m->tile_h, m->tile_w})) {
+                m->cur_w = m->tile_w;
+                m->cur_h = m->tile_h;
+            }
+            rc = upscale_tiled(*m, m->overlap, in, out, progress, opaque, &e);
+        } else {
+            rc = upscale_gpu(*m, in, out, progress, opaque, &e);
+        }
     }
     if (rc != AJI_IMG_OK && rc != AJI_IMG_CANCELLED) {
         std::lock_guard<std::mutex> lock(m->c->mu);
