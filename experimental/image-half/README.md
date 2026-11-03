@@ -6,6 +6,10 @@ reports AVX, F16C and OSXSAVE and XGETBV confirms XMM/YMM state support.
 Other CPUs and builds use the original scalar helpers in `src/core/half.h`.
 The AVX implementation is a separate translation unit; CPU detection and the
 scalar implementation are compiled without an AVX requirement.
+Nonfinite lanes and short tails call the baseline array functions with fewer
+than eight elements. The AVX translation unit does not include `half.h`, so it
+cannot emit AVX-compiled external copies of the scalar inline helpers for the
+linker to select in Debug builds or when inlining is disabled.
 
 This accelerates host staging in the still-image TensorRT path. FP32 and BF16
 staging, model math, engine building, video inference and Vulkan settings are
@@ -87,6 +91,20 @@ Run the resulting `aji_half_test.exe` and `aji_half_benchmark.exe` (under
 They do not execute GPU work. The benchmark is excluded from the default build.
 Its JSON lines report CPU, nonfinite parity and separate pack/unpack medians.
 On a machine without F16C, the dispatched measurements exercise scalar code.
+
+To check that the baseline helpers cannot be replaced by AVX COMDAT definitions,
+run the following against `half_f16c.cpp.obj` (or `half_f16c.obj`) from both
+Release and Debug (`/Od /Ob0`) builds, with Visual Studio `dumpbin` on PATH:
+
+```text
+python sanity/half_isa_check.py <path-to-half_f16c-object>
+```
+
+The symbol regression rejects the original Debug object and passes the fixed
+Release and Debug objects. Both fixed builds also pass the conversion/MXCSR
+regression in dispatched and scalar-only configurations. A physical non-AVX
+CPU was not available; the object check verifies that the offending external
+definitions are absent.
 
 A scalar-only comparison can also be built from the repository root in an
 x64 Native Tools Command Prompt, without the F16C object or feature definition:
