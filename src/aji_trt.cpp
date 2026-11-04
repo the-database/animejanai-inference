@@ -98,6 +98,7 @@ struct aji_ctx {
     // API ordinal: it names engines and is trtexec's --device.
     CUdevice cu_dev = 0;
     int cuda_dev = 0;
+    std::string gpu_name;   // cu_dev's name, for the "GPU:" line of the log
 
     std::unique_ptr<nvinfer1::IRuntime> runtime;
 
@@ -884,6 +885,9 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
                 cuDevicePrimaryCtxRelease(c->cu_dev);
             return nullptr;
         }
+        char name[256];
+        if (cuDeviceGetName(name, sizeof(name), c->cu_dev) == CUDA_SUCCESS)
+            c->gpu_name = name;
     }
 
     c->runtime.reset(nvinfer1::createInferRuntime(c->logger));
@@ -1025,6 +1029,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     else if (c->slot < 10)
         profile = std::to_string(c->slot) + ". " + profile;
     c->log_info.push_back("Upscale Profile: " + profile);
+    if (!c->gpu_name.empty())
+        c->log_info.push_back("GPU: " + c->gpu_name);
     {
         char buf[128];
         snprintf(buf, sizeof(buf),
