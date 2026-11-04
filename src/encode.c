@@ -49,6 +49,7 @@
 #define COBJMACROS      /* C-style DXGI calls (GPU listing, amf_pick_adapter) */
 #include <windows.h>
 #include <dxgi1_6.h>
+#include <d3d12.h>
 #include <fcntl.h>
 #include <io.h>
 #include <libavutil/hwcontext_d3d11va.h>
@@ -534,6 +535,39 @@ static int list_gpus(gpu_adapter *out, int max)
     }
     IDXGIFactory1_Release(f);
     return n;
+}
+
+/* Whether the adapter `luid` is integrated graphics: Direct3D 12 reports a
+ * unified memory architecture (UMA) for GPUs that share system memory. -1 if
+ * it can't tell (no d3d12.dll, or no Direct3D 12 device on the adapter).
+ * d3d12.dll loads at runtime, so aji_encode doesn't depend on it. */
+static int gpu_integrated(LUID luid)
+{
+    typedef HRESULT(WINAPI *CreateFn)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+    static CreateFn create;
+    static int loaded;
+    if (!loaded) {
+        loaded = 1;
+        HMODULE m = LoadLibraryW(L"d3d12.dll");
+        if (m) create = (CreateFn)(void *)GetProcAddress(m, "D3D12CreateDevice");
+    }
+    IDXGIFactory4 *f = NULL;
+    if (!create || FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void **)&f)))
+        return -1;
+    int r = -1;
+    IDXGIAdapter1 *a = NULL;
+    ID3D12Device *dev = NULL;
+    if (SUCCEEDED(IDXGIFactory4_EnumAdapterByLuid(f, luid, &IID_IDXGIAdapter1, (void **)&a)) &&
+        SUCCEEDED(create((IUnknown *)a, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&dev))) {
+        D3D12_FEATURE_DATA_ARCHITECTURE arch = {0};
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_ARCHITECTURE,
+                                                       &arch, sizeof arch)))
+            r = arch.UMA != 0;
+        ID3D12Device_Release(dev);
+    }
+    if (a) IDXGIAdapter1_Release(a);
+    IDXGIFactory4_Release(f);
+    return r;
 }
 
 static const char *vendor_name(UINT v)
@@ -1504,9 +1538,11 @@ fail:
 
 /* --probe-encoders: list the GPUs, then open each GPU encoder at 8- and
  * 10-bit 4:2:0. One machine-readable line each, e.g.
- *   GPU index=0 vendor=nvidia default=1 id=9223372036854808576 name=NVIDIA GeForce RTX 5090
+ *   GPU index=0 vendor=nvidia default=1 integrated=0 id=9223372036854808576 name=NVIDIA GeForce RTX 5090
  *   ENCODER name=hevc_qsv yuv420p=1 yuv420p10=1
- * id= is what --device takes. On Windows the GPUs are DXGI's, index= is the
+ * id= is what --device takes. integrated=1 marks integrated graphics (shared
+ * system memory), which upscale far slower than a graphics card; the key is
+ * left out when that can't be told. On Windows the GPUs are DXGI's, index= is the
  * DXGI adapter index, and default=1 marks the GPU --backend directml runs on
  * without --device (default_gpu; TensorRT takes CUDA device 0). On Linux they
  * are the CUDA devices, index= is the CUDA ordinal, and default=1 marks
@@ -1520,10 +1556,15 @@ static void probe_encoders(void)
     gpu_adapter g[16];
     int ng = list_gpus(g, 16);
     int def = ng > 0 ? default_gpu(g, ng) : -1;
-    for (int i = 0; i < ng; i++)
-        printf("GPU index=%d vendor=%s default=%d id=%llu name=%s\n", g[i].index,
-               vendor_name(g[i].vendor), i == def, (unsigned long long)g[i].id,
+    for (int i = 0; i < ng; i++) {
+        int integrated = gpu_integrated(g[i].luid);
+        char flag[16] = "";
+        if (integrated >= 0)
+            snprintf(flag, sizeof flag, " integrated=%d", integrated);
+        printf("GPU index=%d vendor=%s default=%d%s id=%llu name=%s\n", g[i].index,
+               vendor_name(g[i].vendor), i == def, flag, (unsigned long long)g[i].id,
                g[i].name);
+    }
 #else
     int nc = 0;
     if (cuInit(0) == CUDA_SUCCESS && cuDeviceGetCount(&nc) == CUDA_SUCCESS) {
@@ -1533,8 +1574,10 @@ static void probe_encoders(void)
             if (cuDeviceGet(&d, i) != CUDA_SUCCESS ||
                 cuDeviceGetName(name, sizeof name, d) != CUDA_SUCCESS)
                 continue;
-            printf("GPU index=%d vendor=nvidia default=%d id=%llu name=%s\n", i,
-                   i == 0, (unsigned long long)cuda_device_id(d), name);
+            int integrated = 0;
+            cuDeviceGetAttribute(&integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, d);
+            printf("GPU index=%d vendor=nvidia default=%d integrated=%d id=%llu name=%s\n", i,
+                   i == 0, integrated != 0, (unsigned long long)cuda_device_id(d), name);
         }
     }
 #endif
