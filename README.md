@@ -1,6 +1,6 @@
 # animejanai-inference
 
-The GPU inference engine behind the JaNai suite. `libaji` runs ONNX upscaling models, plus RIFE
+A GPU inference engine for upscaling. `libaji` runs ONNX upscaling models, plus RIFE
 interpolation and temporal models, entirely on the GPU, with three backends: TensorRT and
 TensorRT-RTX (NVIDIA, through CUDA) and DirectML (Windows, any DirectX 12 GPU). Callers load it at
 runtime through one of two C ABIs, so they never link TensorRT:
@@ -18,8 +18,7 @@ Used by [mpv-AnimeJaNai](https://github.com/the-database/mpv-AnimeJaNai) (real-t
 [VideoJaNai](https://github.com/the-database/VideoJaNai) (video files, through `aji_encode`),
 [MangaJaNai GUI](https://github.com/the-database/MangaJaNaiGUI) and
 [MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI) (manga and images), and
-[yosh](https://github.com/the-database/yosh)'s AI upscaling add-on. See
-[animejan.ai](https://animejan.ai) for an overview of the JaNai suite.
+[yosh](https://github.com/the-database/yosh)'s AI upscaling add-on.
 
 ## Build (Linux)
 
