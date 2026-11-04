@@ -141,6 +141,7 @@ struct aji_ctx {
     int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
     std::string current_log;
     std::vector<std::string> log_info, log_steps;
+    std::string gpu_name;   // the adapter's name, for the "GPU:" line of the log
 
     // D3D11 side (caller's device)
     ComPtr<ID3D11Device> dev11;
@@ -1642,6 +1643,10 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         return nullptr;
     }
     c->verbose("DirectML on %ls", ad.Description);
+    char name[256];
+    if (WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof(name),
+                            nullptr, nullptr) > 0)
+        c->gpu_name = name;
 
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -1732,6 +1737,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     else if (c->slot < 10)
         profile = std::to_string(c->slot) + ". " + profile;
     c->log_info.push_back("Upscale Profile: " + profile);
+    if (!c->gpu_name.empty())
+        c->log_info.push_back("GPU: " + c->gpu_name);
     {
         char buf[128];
         snprintf(buf, sizeof(buf),
