@@ -251,6 +251,8 @@ typedef struct {
                                         textures (libav D3D11 frames), and no
                                         CUDA call is ever made */
     void            *d3d11_dev;      /* ID3D11Device* of the D3D11VA hwdevice */
+    int              gpu_index;      /* DirectML: the upscaling GPU's DXGI index, -1 if unknown */
+    unsigned         gpu_vendor;     /* ... and its PCI vendor id (AMF/QSV follow it) */
 
     /* libaji */
     aji_ctx        *aji;
@@ -634,8 +636,11 @@ static int setup_d3d11(enc_ctx *c)
         k = default_gpu(g, n);
     }
     char dev[16];
-    if (k >= 0)
+    if (k >= 0) {
         snprintf(dev, sizeof dev, "%d", g[k].index);
+        c->gpu_index  = g[k].index;
+        c->gpu_vendor = g[k].vendor;
+    }
     if (av_hwdevice_ctx_create(&c->hw_device, AV_HWDEVICE_TYPE_D3D11VA,
                                k >= 0 ? dev : NULL, NULL, 0) < 0) {
         loge("av_hwdevice_ctx_create(D3D11VA) failed");
@@ -1380,16 +1385,19 @@ static void inject_profile(const char *vcodec, enum out_pixfmt pf,
 
 /* AMF opens on the default adapter (DXGI adapter 0) unless handed a device,
  * so with an NVIDIA card as the default and an AMD iGPU beside it, it would
- * fail. Point it at the first AMD adapter (libav derives its AMF device from
- * the D3D11VA one). No AMD adapter: leave it alone and let AMF report that.
- * QSV needs none of this: the oneVPL dispatcher finds the Intel GPU itself. */
-static void amf_pick_adapter(AVCodecContext *enc)
+ * fail. Point it at the upscaling GPU when that is AMD (`prefer`, a DXGI index,
+ * -1 for none), else the first AMD adapter (libav derives its AMF device from
+ * the D3D11VA one): on an AMD laptop the first is the iGPU, while DirectML
+ * upscales on the dGPU. No AMD adapter: leave it alone and let AMF report that. */
+static void amf_pick_adapter(AVCodecContext *enc, int prefer)
 {
 #ifdef _WIN32
     gpu_adapter g[16];
     int n = list_gpus(g, 16), idx = -1;
     for (int i = 0; i < n && idx < 0; i++)
         if (g[i].vendor == 0x1002) idx = g[i].index;
+    if (prefer >= 0)
+        idx = prefer;
     if (idx <= 0)       /* none, or already the default */
         return;
     char s[16];
@@ -1399,7 +1407,34 @@ static void amf_pick_adapter(AVCodecContext *enc)
         return;
     enc->hw_device_ctx = dev;       /* the codec context owns the ref */
 #else
-    (void)enc;
+    (void)enc; (void)prefer;
+#endif
+}
+
+/* QSV: the oneVPL dispatcher finds an Intel GPU itself, the first one, which
+ * with an Intel iGPU and an Arc card is usually the iGPU. When DirectML
+ * upscales on an Intel GPU (`prefer`, a DXGI index), open QSV on that one,
+ * through a D3D11VA child device on its adapter; otherwise leave it alone. */
+static void qsv_pick_adapter(AVCodecContext *enc, int prefer)
+{
+#ifdef _WIN32
+    if (prefer < 0)
+        return;
+    char s[16];
+    snprintf(s, sizeof s, "%d", prefer);
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "child_device_type", "d3d11va", 0);
+    av_dict_set(&opts, "child_device", s, 0);
+    AVBufferRef *dev = NULL;
+    int r = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_QSV, "hw", opts, 0);
+    av_dict_free(&opts);
+    if (r < 0) {
+        loge("QSV device on adapter %d failed; letting QSV choose", prefer);
+        return;
+    }
+    enc->hw_device_ctx = dev;       /* the codec context owns the ref */
+#else
+    (void)enc; (void)prefer;
 #endif
 }
 
@@ -1434,8 +1469,11 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     } else {
         c->enc->pix_fmt = c->out_pixfmt;
     }
+    /* the encoder runs on the upscaling GPU when it's the same vendor */
     if (is_amf(c->o.vcodec))
-        amf_pick_adapter(c->enc);
+        amf_pick_adapter(c->enc, c->gpu_vendor == 0x1002 ? c->gpu_index : -1);
+    if (is_qsv(c->o.vcodec))
+        qsv_pick_adapter(c->enc, c->gpu_vendor == 0x8086 ? c->gpu_index : -1);
     if (c->ofmt && (c->ofmt->oformat->flags & AVFMT_GLOBALHEADER))
         c->enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
@@ -1519,7 +1557,7 @@ static void probe_encoders(void)
             e->framerate = (AVRational){24, 1};
             e->pix_fmt   = ten ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
             if (is_amf(names[n]))
-                amf_pick_adapter(e);
+                amf_pick_adapter(e, -1);
             AVDictionary *opts = NULL;
             inject_profile(names[n], ten ? OUT_420P10 : OUT_420P8, &opts);
             ok[ten] = avcodec_open2(e, codec, &opts) >= 0;
@@ -3036,6 +3074,7 @@ int main(int argc, char **argv)
     disable_power_throttling();
     enc_ctx c = {0};
     c.o.slot = 1;
+    c.gpu_index = -1;
     c.o.vcodec = "hevc_nvenc";
     c.o.backend = "tensorrt";
     c.o.progress = PROG_LINE;
