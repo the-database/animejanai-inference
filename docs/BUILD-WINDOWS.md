@@ -399,6 +399,12 @@ gh release upload v0.11.2 %AJI_WIN%/dist/v0.11.2/aji-windows-x64.zip \
 **Both platform assets must sit on the same tag** — the package assembler derives both URLs
 from one `AjiVersion`.
 
+The release is then complete, so ask the repos that pin libaji for their bump PRs:
+
+```bash
+gh workflow run notify-downstream.yml -R the-database/animejanai-inference -f tag=v0.11.2
+```
+
 To test the zip in a package build before releasing it, point the assembler at it with
 `AJI_LOCAL_ZIP` instead of uploading.
 
