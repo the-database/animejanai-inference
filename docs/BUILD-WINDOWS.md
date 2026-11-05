@@ -1,7 +1,7 @@
 # Building libaji on Windows
 
-**There is no Windows CI for this repo.** `.github/workflows/` contains exactly one workflow,
-`build-linux.yml`. The `aji-windows-x64.zip` release asset that
+The manually dispatched `build-windows-test.yml` workflow builds Windows test artifacts
+and runs configuration/packaging checks. It does not publish a release. The `aji-windows-x64.zip` release asset that
 `the-database/mpv-AnimeJaNai` downloads is built and uploaded **by hand**, with the two scripts
 in [`ci/windows/`](../ci/windows/):
 
@@ -333,6 +333,12 @@ For iterating on one machine, configure a separate directory with
 single-arch build can never pollute the release cache, and be clear which TRT root a dev
 artifact was built against before comparing it to a release.
 
+For a fresh direct CMake configuration, the full release architecture list is selected
+before `project()` enables CUDA. An explicit `-DCMAKE_CUDA_ARCHITECTURES=...` or
+`CUDAARCHS` environment value takes precedence. Existing build directories retain their
+cached choice; changing the source default does not repair an old single-architecture
+cache. The release script therefore continues to pass the complete list explicitly.
+
 ## Packaging and release
 
 **Choosing the tag.** The tag is whatever value `AjiVersion` will hold in the package assembler
@@ -404,12 +410,32 @@ To test the zip in a package build before releasing it, point the assembler at i
 
 ## Testing
 
-Nothing automates validation and nothing gates a release. The practical check is to play
+The Windows test workflow covers build and CPU checks, not playback on a physical GPU.
+The practical GPU check is to play
 content through an installed package with the new engine dropped in: copy `aji.dll`,
 `aji_trt.dll` and `aji_dml.dll` into a copy of an install's `animejanai\inference\`, run its
 `mpv.exe --config-dir=<copy>\portable_config`, and confirm in the log (`--msg-level=all=v`)
 that `[animejanai] Configured slot ...` reports the upscaled size. First play of each model and
 resolution builds a TensorRT engine, which takes a few seconds to a minute.
+
+### Concurrent CUDA loader regression
+
+The optional analysis DLL and the upscaler can first load CUDA concurrently. Their
+process-scoped Windows mutex serializes the loader setup in the context-creation paths;
+it is not held during inference or analysis frames. An addon-enabled package needs
+`AJI_BUILD_ANALYSIS=ON` and matching rebuilt `aji_trt.dll` and `aji_analysis.dll`.
+
+From the configured Ninja build, run the two-DLL regression in a fresh process:
+
+```bat
+cmake --build "%REPO%\build-win-release" --target aji_cuda_init_test
+"%REPO%\build-win-release\aji_cuda_init_test.exe" "%REPO%\build-win-release\aji_cuda_init_a.dll" "%REPO%\build-win-release\aji_cuda_init_b.dll"
+```
+
+These test targets are excluded from the normal build and release package. Also check
+video replacement while analysis is active: both observation samples and upscaling must
+continue after switching between 8-bit and 10-bit inputs. Passing the loader test alone
+does not establish playback or physical-light correctness on other GPUs.
 
 > The previous build workstation also carried a set of unversioned test rigs in its working
 > area (engine prebuild, benchmark, screenshot A/B, installer simulation, and `run-mock.cmd`,
