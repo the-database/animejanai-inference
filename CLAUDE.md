@@ -204,6 +204,10 @@ for now (mpv's background builds start each play with a short warm-up passthroug
 TensorRT-RTX); VideoJaNai, MangaJaNaiConverterGui and yosh are the intended takers. Without
 `aji_trtrtx.dll`, `backend=TensorRT-RTX` falls back to TensorRT.
 
+Once all four assets are on the tag, `gh workflow run notify-downstream.yml -f tag=<tag>` asks
+MangaJaNaiCLI, VideoJaNai, MangaJaNaiGUI and mpv-AnimeJaNai to open PRs that pin it (their
+`bump-pins.yml`; needs the `JANAI_BUMP_TOKEN` secret). It refuses while an asset is missing.
+
 RIFE model weights ship from this repo too, under a separate tag
 (`RifeModelsVersion`, currently `models-rife-fp16-2`), converted with
 `tools/convert_rife_fp16.py`. Set 2 differs from set 1 only in naming the input's H/W dims,

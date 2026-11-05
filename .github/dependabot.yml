@@ -1,0 +1,10 @@
+# Dependabot: monthly, grouped, to keep the noise down.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
