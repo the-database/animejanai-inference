@@ -46,6 +46,7 @@
 #include <NvInfer.h>
 
 #include "aji.h"
+#include "aji_cuda_init.h"
 #include "aji_conf.h"
 #include "kernels.h"
 #include "onnx_shape.h"
@@ -876,6 +877,11 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         c->set_error("cuInit failed");
         return nullptr;
     }
+    cudaError_t initialized = aji_initialize_cuda_runtime();
+    if (initialized != cudaSuccess) {
+        c->set_error("failed to initialize CUDA runtime (error %d)", (int)initialized);
+        return nullptr;
+    }
     if (params->cuda_context) {
         c->cu_ctx = (CUcontext)params->cuda_context;
     } else {
@@ -893,9 +899,12 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         // cudaGetDevice reports the current (pushed) context's device as a
         // runtime ordinal, the numbering cudaGetDeviceProperties and
         // trtexec --device use
-        if (!guard.ok || cuCtxGetDevice(&c->cu_dev) != CUDA_SUCCESS ||
-            cudaGetDevice(&c->cuda_dev) != cudaSuccess) {
-            c->set_error("failed to query the CUDA context's device");
+        int driver_query = guard.ok ? (int)cuCtxGetDevice(&c->cu_dev) : -1;
+        int runtime_query = driver_query == CUDA_SUCCESS ? (int)cudaGetDevice(&c->cuda_dev) : -1;
+        if (!guard.ok || driver_query != CUDA_SUCCESS || runtime_query != cudaSuccess) {
+            const char *message = runtime_query >= 0 ? cudaGetErrorString((cudaError_t)runtime_query) : "not called";
+            c->set_error("failed to query the CUDA context's device: driver=%d, runtime=%d (%s)",
+                driver_query, runtime_query, message ? message : "unavailable");
             if (c->owns_primary)
                 cuDevicePrimaryCtxRelease(c->cu_dev);
             return nullptr;
