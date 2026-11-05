@@ -51,7 +51,7 @@ jobs:
       contents: write
       packages: read
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install TensorRT ${{ env.TRT_VERSION }} from NVIDIA
       # Unpacked over the container's own /usr (it is a throwaway), replacing
