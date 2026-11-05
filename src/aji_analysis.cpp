@@ -18,6 +18,7 @@
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
 #include "aji_analysis.h"
+#include "aji_cuda_init.h"
 #include "analysis_kernels.h"
 #ifdef _WIN32
 #define NOMINMAX
@@ -139,6 +140,9 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
     try {
         require(context != nullptr, "Analysis requires a CUDA context.");
         require(width > 0 && width <= 320 && height > 0 && height <= 180, "Invalid analysis sample dimensions.");
+        cudaError_t initialized = aji_initialize_cuda_runtime();
+        if (initialized != cudaSuccess)
+            throw std::runtime_error("Could not initialize CUDA runtime (error " + std::to_string((int)initialized) + ").");
         Current current((CUcontext)context);
         auto p = std::make_unique<aji_observer>((CUcontext)context, width, height);
         check(cudaStreamCreateWithFlags(&p->stream, cudaStreamNonBlocking));
