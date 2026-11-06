@@ -228,7 +228,8 @@ writes `aji-runtime.json` beside `aji.dll` / `libaji.so`:
 ```
 
 `core/runtime_packs` reads it once per library (keys optional; relative paths are relative to the
-file; any other `format` is an error):
+file; unknown keys, like aji-runtime's `models` for the app, are skipped; any other `format` is an
+error):
 
 - Before loading `aji_trt`, both dispatchers load cudart + nvinfer from `trt` by full path (Linux:
   `RTLD_GLOBAL`), so the backend's imports bind to them. Before `aji_trtrtx`: cudart (from
