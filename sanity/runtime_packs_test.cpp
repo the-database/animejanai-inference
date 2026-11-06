@@ -4,6 +4,7 @@
  */
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "core/runtime_packs.h"
@@ -82,6 +83,36 @@ int main()
           "unterminated string is an error");
     check(!parse_runtime_packs("", DIR).error.empty(), "empty file is an error");
     check(parse_runtime_packs("", DIR).present, "a broken file still counts as present");
+
+    {
+        // AJI_RUNTIME_JSON names the file (an AppImage's libaji folder is read-only); relative
+        // paths in it resolve against its own folder. runtime_packs() reads it once per process.
+        std::string dir = std::string(getenv(
+#ifdef _WIN32
+            "TEMP"
+#else
+            "HOME"
+#endif
+            ));
+        std::string file = dir + "/aji-runtime-test.json";
+        FILE *f = fopen(file.c_str(), "wb");
+        fputs("{\"format\": 1, \"trt\": \"packs/trt\"}", f);
+        fclose(f);
+#ifdef _WIN32
+        _putenv_s("AJI_RUNTIME_JSON", file.c_str());
+#else
+        setenv("AJI_RUNTIME_JSON", file.c_str(), 1);
+#endif
+        const RuntimePacks &r = runtime_packs();
+        check(r.present && r.error.empty(), "AJI_RUNTIME_JSON is read");
+        check(r.file == file, "the file AJI_RUNTIME_JSON names");
+#ifdef _WIN32
+        check(r.trt == dir + "\\packs\\trt", "relative to the named file's folder");
+#else
+        check(r.trt == dir + "/packs/trt", "relative to the named file's folder");
+#endif
+        remove(file.c_str());
+    }
 
     if (failures) {
         printf("%d failure(s)\n", failures);
