@@ -45,7 +45,9 @@ struct RuntimePacks {
     std::string trtrtx;     // TensorRT-RTX runtime pack folder
 };
 
-// Parses <own_dir>/aji-runtime.json once per library and process.
+// Parses <own_dir>/aji-runtime.json once per library and process; the AJI_RUNTIME_JSON environment
+// variable names another file instead (for a read-only libaji folder, such as an AppImage's), whose
+// own folder then resolves relative paths. A missing file means no packs, as without the variable.
 const RuntimePacks &runtime_packs();
 
 // Parses aji-runtime.json text (`dir` resolves relative paths). Exposed
