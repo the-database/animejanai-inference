@@ -70,3 +70,28 @@ jobs:
 
           packs-<platform>.json lists each pack's version, kind, SHA-256, size and files. TensorRT and TensorRT for RTX are NVIDIA proprietary software, redistributed under their licenses; NVIDIA's and Microsoft's notices ship in the packs.
           NOTES
+
+  # Ask the apps that pin the shared runtime packs to open bump PRs (their bump-pins.yml,
+  # `scripts/bump_pins.py runtime-packs <tag>`). Add each app here once its bump_pins.py knows the
+  # runtime-packs source: MangaJaNaiCLI (yosh gets the packs through it) and MangaJaNai GUI;
+  # VideoJaNai and mpv-AnimeJaNai when they move to the pack store. Needs JANAI_BUMP_TOKEN, as
+  # notify-downstream.yml does; without it this only warns.
+  notify:
+    needs: publish
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Request the bump PRs
+        env:
+          GH_TOKEN: ${{ secrets.JANAI_BUMP_TOKEN }}
+        run: |
+          tag=$(python3 scripts/runtime_packs.py --print-tag)
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::JANAI_BUMP_TOKEN isn't set, so no bump PRs were requested for $tag"
+            exit 0
+          fi
+          for repo in the-database/MangaJaNaiCLI the-database/MangaJaNaiGUI; do
+            gh api "repos/$repo/dispatches" -f event_type=upstream-release \
+              -f "client_payload[source]=runtime-packs" -f "client_payload[tag]=$tag"
+            echo "Asked $repo to re-pin the runtime packs to $tag" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
