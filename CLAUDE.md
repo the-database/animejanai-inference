@@ -208,6 +208,16 @@ Once all four assets are on the tag, `gh workflow run notify-downstream.yml -f t
 MangaJaNaiCLI, VideoJaNai, MangaJaNaiGUI and mpv-AnimeJaNai to open PRs that pin it (their
 `bump-pins.yml`; needs the `JANAI_BUMP_TOKEN` secret). It refuses while an asset is missing.
 
+**Shared runtime packs** ship from this repo too, under their own tag (`runtime-<n>`, `TAG` in
+`scripts/runtime_packs.py`), published by `.github/workflows/runtime-packs.yml` (manual dispatch):
+TensorRT split into `trt-runtime` + one builder pack per GPU generation, the TensorRT-RTX runtime,
+ONNX Runtime + DirectML, and index entries for the MangaJaNai model archives. Each platform's
+`packs-<platform>.json` (format 1: version, kind, SHA-256 and per-file SHA-256s) is what apps pin
+by SHA-256 and install with [aji-runtime](https://github.com/the-database/aji-runtime) into the
+per-user pack store; libaji then loads from it through `aji-runtime.json`. To change a pinned
+version: bump it and `TAG`, run the script locally (`--platform windows|linux --out DIR`), then the
+workflow. (`runtime-1` is MangaJaNaiCLI's older, CLI-only release.)
+
 RIFE model weights ship from this repo too, under a separate tag
 (`RifeModelsVersion`, currently `models-rife-fp16-2`), converted with
 `tools/convert_rife_fp16.py`. Set 2 differs from set 1 only in naming the input's H/W dims,
