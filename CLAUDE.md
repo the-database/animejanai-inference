@@ -107,7 +107,8 @@ visibility (an internal static "library", no ABI of its own):
 | `core/fileio` | UTF-8/long-path file helpers, `own_dir()` |
 | `core/trt_engine` | engine cache naming, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading; under `AJI_TRTRTX` the in-process builder and the runtime (JIT) cache |
 | `core/ort_dml` | ORT + DirectML loading (DirectML.dll before onnxruntime.dll) |
-| `core/tiling` | the image path's tile cover / reflect pad / overlap blend (backend-agnostic) |
+| `core/tiling` | the image path's tile cover / reflect pad / overlap blend on the host (backend-agnostic; DirectML uses it, and the CUDA backends with `AJI_IMG_CPU_TILING=1`). The band is a ring of rows; blend and flush are split across a few threads with `parallel_for`, per element, so the result doesn't depend on the split. **Seams:** overlaps default to 128 px and blend only across a 16 px band at their centre (`DEFAULT_OVERLAP`, `BLEND_WIDTH`). MangaJaNai's ESRGAN models generate screentone whose phase drifts near a tile's edge; the former 32 px linear ramp mixed the drifted patterns into visible interference patches. Torture test: `bwgradient_autolevels.png` (flat gradient, so the model invents all halftones) against a single-tile run. Also `even_origins`, the layout for `AJI_IMG_LOAD_EVEN_TILES` |
+| `core/tiling_gpu` | the same tiling on the GPU for the CUDA backends (`upscale_gpu` in `aji_img_trt.cpp`): one upload, tile extract / blend / 8-bit flush kernels on the model's stream. **Bit-identical to `core/tiling`**: every multiply and add is `__fmul_rn`/`__fadd_rn` (never fused) in the host's order, with the host's fp16/bf16 rounding. Keep it that way, or the md5 gate below stops working |
 | `core/half` | fp16/bf16 conversions |
 
 Core functions take explicit paths/devices and return errors as strings; each front-end reports
@@ -194,7 +195,7 @@ compile — the release list builds eight architectures.
 | Platform | Built by | Asset |
 |---|---|---|
 | Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
-| Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip`, `aji-trtrtx-windows-x64.zip` (opt-in: `aji_trtrtx.dll` + TensorRT-RTX runtime, ~91 MB) |
+| Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip`, `aji-trtrtx-windows-x64.zip` (opt-in: `aji_trtrtx.dll` + TensorRT-RTX runtime, ~91 MB), `aji-trtrtx-backend-windows-x64.zip` (`aji_trtrtx.dll` alone, for apps that take the runtime from a shared pack) |
 
 All are attached to the **same release tag**, because the consumer derives every URL from one
 `AjiVersion` constant. `the-database/mpv-AnimeJaNai`'s assembler downloads them in `InstallAji`
@@ -203,11 +204,67 @@ for now (mpv's background builds start each play with a short warm-up passthroug
 TensorRT-RTX); VideoJaNai, MangaJaNaiConverterGui and yosh are the intended takers. Without
 `aji_trtrtx.dll`, `backend=TensorRT-RTX` falls back to TensorRT.
 
+Once all four assets are on the tag, `gh workflow run notify-downstream.yml -f tag=<tag>` asks
+MangaJaNaiCLI, VideoJaNai, MangaJaNaiGUI and mpv-AnimeJaNai to open PRs that pin it (their
+`bump-pins.yml`; needs the `JANAI_BUMP_TOKEN` secret). It refuses while an asset is missing.
+
+**Shared runtime packs** ship from this repo too, under their own tag (`runtime-<n>`, `TAG` in
+`scripts/runtime_packs.py`), published by `.github/workflows/runtime-packs.yml` (manual dispatch):
+TensorRT split into `trt-runtime` + one builder pack per GPU generation, the TensorRT-RTX runtime,
+ONNX Runtime + DirectML, and index entries for the MangaJaNai model archives. Each platform's
+`packs-<platform>.json` (format 1: version, kind, SHA-256 and per-file SHA-256s) is what apps pin
+by SHA-256 and install with [aji-runtime](https://github.com/the-database/aji-runtime) into the
+per-user pack store; libaji then loads from it through `aji-runtime.json`. To change a pinned
+version (a new TensorRT, say):
+
+1. Bump it and `TAG` (`runtime-<n+1>`).
+2. Run the script locally (`--platform windows|linux --out DIR`).
+3. Run the workflow. Its last job asks the apps that pin the packs for bump PRs (an
+   `upstream-release` dispatch, `source=runtime-packs`; MangaJaNaiCLI, MangaJaNai GUI, VideoJaNai and mpv-AnimeJaNai). Add an app there once
+   its `bump_pins.py` knows that source.
+
+Packs whose contents didn't change keep their version, so the stores keep them. A libaji release
+built against the new TensorRT usually goes with it. (`runtime-1` is MangaJaNaiCLI's older,
+CLI-only release.)
+
 RIFE model weights ship from this repo too, under a separate tag
 (`RifeModelsVersion`, currently `models-rife-fp16-2`), converted with
 `tools/convert_rife_fp16.py`. Set 2 differs from set 1 only in naming the input's H/W dims,
 which the DirectML backend needs to pin them (~10% faster RIFE there); outputs are
 bit-identical, and TensorRT reuses existing engines (cache names come from the file name).
+
+## Shared runtime packs (`aji-runtime.json`)
+
+Apps can keep the TensorRT / TensorRT-RTX runtimes in a per-user store shared between apps
+(design: `plans/shared-runtime-packs.md` in `the-database/animejan.ai`). The app's installer then
+writes `aji-runtime.json` beside `aji.dll` / `libaji.so`:
+
+```json
+{ "format": 1,
+  "trt": "C:\\...\\packs\\trt-runtime\\11.4.0.106-cuda13.4",
+  "trt_builder": ["C:\\...\\packs\\trt-sm120\\11.4.0.106"],
+  "trtrtx": "C:\\...\\packs\\trtrtx-runtime\\1.7.1.116-cuda13.4" }
+```
+
+`core/runtime_packs` reads it once per library. Where libaji's folder is read-only (an AppImage), the
+`AJI_RUNTIME_JSON` environment variable names the file instead. Keys are optional, and relative
+paths are relative to the file; unknown keys, like aji-runtime's `models` for the app, are skipped; any other `format` is an
+error):
+
+- Before loading `aji_trt`, both dispatchers load cudart + nvinfer from `trt` by full path (Linux:
+  `RTLD_GLOBAL`), so the backend's imports bind to them. Before `aji_trtrtx`: cudart (from
+  `trtrtx`, else `trt`) + the TensorRT-RTX runtime. The names come from the SDKs at configure time
+  (`AJI_PACK_*` in `CMakeLists.txt`). `aji_dml` ignores the file.
+- `aji_trt` runs `trt`'s trtexec, **ignoring the host's `trtexec`**, with the `trt_builder`
+  folders on its search path: Windows prepends them to the child's `PATH` (environment block);
+  Linux appends `LD_LIBRARY_PATH='<trt>:<builders>'` after the host's `trtexec_env`. nvinfer loads
+  the per-GPU builder resource by file name, which preloading can't satisfy on Linux, and which
+  only builds need.
+- A file that names a missing pack makes `aji_trt` / `aji_trtrtx` fail to load with a clear error.
+  Without the file, everything loads from libaji's own folder as before.
+
+Tests: `aji_runtime_packs_test` (parser, CPU-only). Hosts' own executables (`aji_harness`,
+`aji_encode`) still import cudart themselves.
 
 ## The ABI contract
 
@@ -228,7 +285,9 @@ image-ABI change never touches the mpv fork. Its consumers (e.g. yosh's upscalin
 **Regression gate for core changes:** the video harnesses must stay byte-identical — run
 `aji_harness` / `aji_harness_dml` (slots 1 and 3, `--output`) before and after, with cached
 *and* freshly built engines, and compare md5s. Image path: `aji_tiling_test`, then `aji_image`
-on a test page with both backends.
+on a test page with both backends; for a tiling change, also run each CUDA backend with and without
+`AJI_IMG_CPU_TILING=1` and compare md5s. They must match, on a set that covers 1- and 3-channel
+images and engines, fp32/fp16/bf16 engine I/O, and images smaller than a tile.
 
 ## Temporal models
 

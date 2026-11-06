@@ -352,12 +352,13 @@ built.
 pwsh %REPO%\ci\windows\package-aji-release.ps1 -Tag v0.11.2
 ```
 
-It builds two zips, **throwing `missing build artifact: <path>` if any artifact is absent**,
+It builds three zips, **throwing `missing build artifact: <path>` if any artifact is absent**,
 and prints each one's entry list and size:
 
 | Asset | Contents | Size |
 |---|---|---|
 | `aji-windows-x64.zip` | `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_encode.exe`, `aji_harness.exe`, `aji_harness_dml.exe`, `aji_kernel_test.exe` | ~0.8 MB |
+| `aji-trtrtx-backend-windows-x64.zip` | `aji_trtrtx.dll` alone, for apps whose TensorRT-RTX runtime comes from a shared `trtrtx-runtime` pack (`aji-runtime.json`, see `CLAUDE.md`) | ~0.2 MB |
 | `aji-trtrtx-windows-x64.zip` | `aji_trtrtx.dll` plus the TensorRT-RTX runtime from `-TrtRtxRoot` (default `%AJI_TRTRTX_ROOT%`, else `%AJI_WIN%\trtrtx171`): exactly one `tensorrt_rtx_*.dll` and one `tensorrt_onnxparser_rtx_*.dll`, or it throws; plus `TensorRT-RTX-NOTICE.txt` and `TensorRT-RTX-Acknowledgements.txt` (the SDK's `doc\Acknowledgements.txt`; throws if absent) | ~91 MB |
 
 Output:
@@ -365,6 +366,7 @@ Output:
 ```
 %AJI_WIN%\dist\<tag>\aji-windows-x64.zip
 %AJI_WIN%\dist\<tag>\aji-trtrtx-windows-x64.zip
+%AJI_WIN%\dist\<tag>\aji-trtrtx-backend-windows-x64.zip
 ```
 
 The contents are flat because consumers extract them straight into their inference directory
@@ -394,16 +396,23 @@ against — it never ships them.
 
 `-BuildDir` and `-OutDir` are overridable.
 
-Then attach both to the release that the Linux CI job created for the same tag:
+Then attach all three to the release that the Linux CI job created for the same tag:
 
 ```bash
 gh release upload v0.11.2 %AJI_WIN%/dist/v0.11.2/aji-windows-x64.zip \
   %AJI_WIN%/dist/v0.11.2/aji-trtrtx-windows-x64.zip \
+  %AJI_WIN%/dist/v0.11.2/aji-trtrtx-backend-windows-x64.zip \
   -R the-database/animejanai-inference
 ```
 
 **Both platform assets must sit on the same tag** — the package assembler derives both URLs
 from one `AjiVersion`.
+
+The release is then complete, so ask the repos that pin libaji for their bump PRs:
+
+```bash
+gh workflow run notify-downstream.yml -R the-database/animejanai-inference -f tag=v0.11.2
+```
 
 To test the zip in a package build before releasing it, point the assembler at it with
 `AJI_LOCAL_ZIP` instead of uploading.
