@@ -425,11 +425,38 @@ RuntimePacks parse_runtime_packs(const std::string &text, const std::string &dir
     return v;
 }
 
+// AJI_RUNTIME_JSON names the file instead (UTF-8), for a libaji whose own folder can't be
+// written, such as inside an AppImage. Empty: not set.
+static std::string runtime_json_env()
+{
+#ifdef _WIN32
+    const wchar_t *w = _wgetenv(L"AJI_RUNTIME_JSON");
+    if (!w || !*w)
+        return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s(len > 0 ? len - 1 : 0, '\0');
+    if (len > 1)
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], len, nullptr, nullptr);
+    return s;
+#else
+    const char *e = getenv("AJI_RUNTIME_JSON");
+    return e ? e : "";
+#endif
+}
+
 const RuntimePacks &runtime_packs()
 {
     static const RuntimePacks packs = [] {
-        const std::string dir = own_dir_utf8();
-        const std::string file = dir + SEP + "aji-runtime.json";
+        std::string file = runtime_json_env();
+        std::string dir;
+        if (file.empty()) {
+            dir = own_dir_utf8();
+            file = dir + SEP + "aji-runtime.json";
+        } else {
+            // relative paths in it are relative to its own folder
+            const size_t slash = file.find_last_of("/\\");
+            dir = slash == std::string::npos ? "." : file.substr(0, slash);
+        }
         RuntimePacks r;
         std::vector<char> bytes;
         if (!file_exists(file) || !read_file_bytes(file, &bytes))

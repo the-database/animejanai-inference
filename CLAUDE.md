@@ -246,8 +246,9 @@ writes `aji-runtime.json` beside `aji.dll` / `libaji.so`:
   "trtrtx": "C:\\...\\packs\\trtrtx-runtime\\1.7.1.116-cuda13.4" }
 ```
 
-`core/runtime_packs` reads it once per library (keys optional; relative paths are relative to the
-file; unknown keys, like aji-runtime's `models` for the app, are skipped; any other `format` is an
+`core/runtime_packs` reads it once per library. Where libaji's folder is read-only (an AppImage), the
+`AJI_RUNTIME_JSON` environment variable names the file instead. Keys are optional, and relative
+paths are relative to the file; unknown keys, like aji-runtime's `models` for the app, are skipped; any other `format` is an
 error):
 
 - Before loading `aji_trt`, both dispatchers load cudart + nvinfer from `trt` by full path (Linux:
