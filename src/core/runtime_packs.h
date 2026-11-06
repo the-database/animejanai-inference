@@ -12,7 +12,8 @@
  *     "trtrtx": "C:\\...\\packs\\trtrtx-runtime\\1.7.1.116-cuda13.4" }
  *
  * Every key but "format" is optional; a relative path is relative to the
- * file's folder. Without the file everything loads from libaji's own
+ * file's folder. Keys this reader doesn't know are skipped (aji-runtime also
+ * writes "models", the app's model pack folders, for the app itself). Without the file everything loads from libaji's own
  * folder, as before.
  *
  * - The dispatchers preload what a backend imports (cudart + nvinfer for
