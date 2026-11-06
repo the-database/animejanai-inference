@@ -1,5 +1,5 @@
 # Stage the release artifacts of build-aji-release.bat and zip them flat into
-# two assets under <OutDir>\<tag>\ (see docs\BUILD-WINDOWS.md):
+# three assets under <OutDir>\<tag>\ (see docs\BUILD-WINDOWS.md):
 #   aji-windows-x64.zip         the engine: dispatcher, aji_trt, aji_dml, tools
 #   aji-trtrtx-windows-x64.zip  the opt-in TensorRT for RTX backend: aji_trtrtx.dll
 #                               and the two runtime DLLs it needs (never
@@ -8,6 +8,9 @@
 #                               the SDK's third-party notices as
 #                               TensorRT-RTX-Acknowledgements.txt. Extracted
 #                               flat on top of the first.
+#   aji-trtrtx-backend-windows-x64.zip  aji_trtrtx.dll alone, for apps that take
+#                               the TensorRT-RTX runtime from a shared
+#                               trtrtx-runtime pack (aji-runtime.json) instead
 # A consumer that never offers backend=TensorRT-RTX skips the second (~91 MB);
 # with it missing, the dispatcher falls back to TensorRT.
 param(
@@ -63,3 +66,4 @@ function New-FlatZip([string]$name, [string[]]$paths, [hashtable]$renamed = @{})
 
 New-FlatZip 'aji-windows-x64.zip' $engine
 New-FlatZip 'aji-trtrtx-windows-x64.zip' $trtrtx $trtrtxRenamed
+New-FlatZip 'aji-trtrtx-backend-windows-x64.zip' @($trtrtx[0])

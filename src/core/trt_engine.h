@@ -153,6 +153,9 @@ struct BuildSpec {
     std::string cmdline;      // "trtexec" --onnx=... --saveEngine=...
                               // (TensorRT-RTX: a description for logs)
     std::string env_prefix;   // POSIX only, e.g. "LD_LIBRARY_PATH=..."
+    std::string path_prefix;  // Windows only: dirs put in front of the
+                              // child's PATH (runtime packs' builder
+                              // resources; see core/runtime_packs.h)
     std::string engine_path;
     std::string tmp_path;     // what trtexec writes; renamed to engine_path
                               // only once the build has succeeded
