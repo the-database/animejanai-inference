@@ -13,8 +13,8 @@
  *
  * Every key but "format" is optional; a relative path is relative to the
  * file's folder. Keys this reader doesn't know are skipped (aji-runtime also
- * writes "models", the app's model pack folders, for the app itself). Without the file everything loads from libaji's own
- * folder, as before.
+ * writes "models", the app's model pack folders, for the app itself).
+ * Without the file everything loads from libaji's own folder, as before.
  *
  * - The dispatchers preload what a backend imports (cudart + nvinfer for
  *   aji_trt; cudart + the TensorRT-RTX runtime for aji_trtrtx) by full
