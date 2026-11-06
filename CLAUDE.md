@@ -215,8 +215,17 @@ ONNX Runtime + DirectML, and index entries for the MangaJaNai model archives. Ea
 `packs-<platform>.json` (format 1: version, kind, SHA-256 and per-file SHA-256s) is what apps pin
 by SHA-256 and install with [aji-runtime](https://github.com/the-database/aji-runtime) into the
 per-user pack store; libaji then loads from it through `aji-runtime.json`. To change a pinned
-version: bump it and `TAG`, run the script locally (`--platform windows|linux --out DIR`), then the
-workflow. (`runtime-1` is MangaJaNaiCLI's older, CLI-only release.)
+version (a new TensorRT, say):
+
+1. Bump it and `TAG` (`runtime-<n+1>`).
+2. Run the script locally (`--platform windows|linux --out DIR`).
+3. Run the workflow. Its last job asks the apps that pin the packs for bump PRs (an
+   `upstream-release` dispatch, `source=runtime-packs`; today MangaJaNaiCLI). Add an app there once
+   its `bump_pins.py` knows that source.
+
+Packs whose contents didn't change keep their version, so the stores keep them. A libaji release
+built against the new TensorRT usually goes with it. (`runtime-1` is MangaJaNaiCLI's older,
+CLI-only release.)
 
 RIFE model weights ship from this repo too, under a separate tag
 (`RifeModelsVersion`, currently `models-rife-fp16-2`), converted with
