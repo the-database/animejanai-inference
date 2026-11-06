@@ -220,7 +220,7 @@ version (a new TensorRT, say):
 1. Bump it and `TAG` (`runtime-<n+1>`).
 2. Run the script locally (`--platform windows|linux --out DIR`).
 3. Run the workflow. Its last job asks the apps that pin the packs for bump PRs (an
-   `upstream-release` dispatch, `source=runtime-packs`; today MangaJaNaiCLI). Add an app there once
+   `upstream-release` dispatch, `source=runtime-packs`; MangaJaNaiCLI and MangaJaNai GUI). Add an app there once
    its `bump_pins.py` knows that source.
 
 Packs whose contents didn't change keep their version, so the stores keep them. A libaji release
