@@ -34,11 +34,37 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
+# Library names the TensorRT backends import, for preloading them from the
+# shared runtime packs that aji-runtime.json names (core/runtime_packs).
+# They follow the SDKs this build uses.
+if(WIN32)
+    set(_pack_cudart "cudart64_${CUDAToolkit_VERSION_MAJOR}.dll")
+    set(_pack_nvinfer "${AJI_NVINFER}.dll")
+else()
+    set(_pack_cudart "libcudart.so.${CUDAToolkit_VERSION_MAJOR}")
+    set(_trt_major "")
+    if(EXISTS "${AJI_TRT_INCLUDE}/NvInferVersion.h")
+        file(STRINGS "${AJI_TRT_INCLUDE}/NvInferVersion.h" _trt_ver
+             REGEX "#define (NV_TENSORRT_MAJOR|TRT_MAJOR_ENTERPRISE) +[0-9]+")
+        string(REGEX MATCH "(NV_TENSORRT_MAJOR|TRT_MAJOR_ENTERPRISE) +([0-9]+)" _m "${_trt_ver}")
+        set(_trt_major "${CMAKE_MATCH_2}")
+    endif()
+    if(_trt_major STREQUAL "")
+        message(WARNING "TensorRT major version not found in ${AJI_TRT_INCLUDE}/NvInferVersion.h; "
+                        "aji-runtime.json can't preload nvinfer")
+        set(_pack_nvinfer "")
+    else()
+        set(_pack_nvinfer "lib${AJI_NVINFER}.so.${_trt_major}")
+    endif()
+endif()
+set(AJI_PACK_DEFS AJI_PACK_CUDART="${_pack_cudart}" AJI_PACK_NVINFER="${_pack_nvinfer}")
+
 # aji: thin dispatcher (what the mpv filter loads as lib=). Parses the
 # conf's [global] backend key and forwards the C ABI to the sibling
 # backend library. No CUDA/TRT/ORT dependencies of its own.
 add_library(aji SHARED src/aji_dispatch.cpp src/aji_conf.cpp src/core/fileio.cpp
-    src/aji_img_dispatch.cpp)
+    src/core/runtime_packs.cpp src/aji_img_dispatch.cpp)
+target_compile_definitions(aji PRIVATE ${AJI_PACK_DEFS})
 target_include_directories(aji PUBLIC include)
 target_link_libraries(aji PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(aji PROPERTIES
@@ -60,7 +86,7 @@ if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
         COMPILE_OPTIONS /arch:AVX)
 endif()
 add_library(aji_trt_common OBJECT src/aji_conf.cpp src/onnx_shape.cpp
-    src/core/fileio.cpp src/core/tiling.cpp src/core/tiling_gpu.cu src/kernels.cu
+    src/core/fileio.cpp src/core/runtime_packs.cpp src/core/tiling.cpp src/core/tiling_gpu.cu src/kernels.cu
     ${AJI_HALF_SOURCES})
 target_include_directories(aji_trt_common PRIVATE include)
 set_target_properties(aji_trt_common PROPERTIES
@@ -121,6 +147,15 @@ if(AJI_TRTRTX_ROOT)
     else()
         set(AJI_TRTRTX_LIB "${_rtx_root}/lib")
         set(_rtx_libs tensorrt_rtx tensorrt_onnxparser_rtx)
+    endif()
+    if(WIN32)
+        target_compile_definitions(aji PRIVATE
+            AJI_PACK_TRTRTX="tensorrt_rtx_${_rtx_major}_${_rtx_minor}.dll"
+            AJI_PACK_TRTRTX_PARSER="tensorrt_onnxparser_rtx_${_rtx_major}_${_rtx_minor}.dll")
+    else()
+        target_compile_definitions(aji PRIVATE
+            AJI_PACK_TRTRTX="libtensorrt_rtx.so.${_rtx_major}"
+            AJI_PACK_TRTRTX_PARSER="libtensorrt_onnxparser_rtx.so.${_rtx_major}")
     endif()
     message(STATUS "aji_trtrtx: TensorRT-RTX ${_rtx_major}.${_rtx_minor} "
                    "(${_rtx_libs})")
@@ -262,6 +297,11 @@ if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
 endif()
 add_executable(aji_tiling_test sanity/tiling_test.cpp src/core/tiling.cpp)
 target_include_directories(aji_tiling_test PRIVATE include src)
+
+add_executable(aji_runtime_packs_test sanity/runtime_packs_test.cpp
+    src/core/runtime_packs.cpp src/core/fileio.cpp)
+target_include_directories(aji_runtime_packs_test PRIVATE include src)
+target_link_libraries(aji_runtime_packs_test PRIVATE ${CMAKE_DL_LIBS})
 
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
 target_include_directories(aji_msb444_test PRIVATE include src)
