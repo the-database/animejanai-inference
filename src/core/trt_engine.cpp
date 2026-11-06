@@ -4,6 +4,7 @@
 
 #include "trt_engine.h"
 #include "fileio.h"
+#include "runtime_packs.h"
 
 #include <cctype>
 #include <cstdio>
@@ -243,6 +244,35 @@ bool parse_shape_wh(const std::string &settings, const char *key, int *w, int *h
     return true;
 }
 
+#if defined(_WIN32) && !defined(AJI_TRTRTX)
+// This process's environment block with `prefix` put in front of PATH
+// (double-NUL terminated, for CreateProcessW).
+static std::wstring child_env_with_path(const std::wstring &prefix)
+{
+    std::wstring out;
+    bool have_path = false;
+    if (wchar_t *block = GetEnvironmentStringsW()) {
+        for (const wchar_t *e = block; *e; e += wcslen(e) + 1) {
+            std::wstring var(e);
+            if (var.size() >= 5 && _wcsnicmp(var.c_str(), L"PATH=", 5) == 0) {
+                var = L"PATH=" + prefix +
+                      (var.size() > 5 ? L";" + var.substr(5) : L"");
+                have_path = true;
+            }
+            out += var;
+            out.push_back(L'\0');
+        }
+        FreeEnvironmentStringsW(block);
+    }
+    if (!have_path) {
+        out += L"PATH=" + prefix;
+        out.push_back(L'\0');
+    }
+    out.push_back(L'\0');
+    return out;
+}
+#endif
+
 int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
 #ifdef AJI_TRTRTX
@@ -291,9 +321,16 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
     // representable there. Widen and spawn wide, so the child gets the real
     // path whatever the system locale is.
     std::wstring cmd = widen_utf8(spec.cmdline);  // CreateProcess may modify it
+    // Runtime packs: trtexec finds its DLLs beside it, but nvinfer loads the
+    // per-GPU builder resource by name, so its pack goes on the child's PATH.
+    std::wstring env;
+    if (!spec.path_prefix.empty())
+        env = child_env_with_path(widen_utf8(spec.path_prefix));
     BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
-                             nullptr, nullptr, &si.StartupInfo, &pi);
+                             CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT |
+                                 (env.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT),
+                             env.empty() ? nullptr : (LPVOID)env.data(), nullptr,
+                             &si.StartupInfo, &pi);
     DeleteProcThreadAttributeList(si.lpAttributeList);
     CloseHandle(input);
     if (log != INVALID_HANDLE_VALUE)
@@ -445,6 +482,7 @@ bool make_build_spec_paths(const std::string &trtexec,
     // built in-process: no trtexec, no timing cache (TensorRT-RTX has no
     // autotuning to cache); the command line is only a log description
     (void)trtexec;
+    (void)trtexec_env;
     (void)tcache;
     (void)cmd_settings;
     spec->cmdline = "in-process TensorRT-RTX build of \"" + onnx_path +
@@ -452,7 +490,13 @@ bool make_build_spec_paths(const std::string &trtexec,
     if (dev != 0)
         spec->cmdline += " on device " + std::to_string(dev);
 #else
-    spec->cmdline = "\"" + trtexec + "\" --onnx=\"" + onnx_path +
+    // aji-runtime.json: the TensorRT pack's trtexec, with the packs on its
+    // library search path (else the host's trtexec and environment)
+    std::string exe, env_prefix, path_prefix;
+    resolve_trtexec(trtexec, trtexec_env, &exe, &env_prefix, &path_prefix);
+    spec->env_prefix = env_prefix;
+    spec->path_prefix = path_prefix;
+    spec->cmdline = "\"" + exe + "\" --onnx=\"" + onnx_path +
                     "\" --saveEngine=\"" + engine_path + ".tmp\" " +
                     cmd_settings +
                     " --timingCacheFile=\"" + tcache + "\"";
@@ -461,7 +505,6 @@ bool make_build_spec_paths(const std::string &trtexec,
     if (dev != 0)
         spec->cmdline += " --device=" + std::to_string(dev);
 #endif
-    spec->env_prefix = trtexec_env;
     spec->engine_path = engine_path;
     spec->tmp_path = engine_path + ".tmp";
     spec->log_path = engine_path + ".build.log";

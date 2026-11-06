@@ -46,9 +46,10 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #ifdef _WIN32
-#define COBJMACROS      /* C-style DXGI calls (amf_pick_adapter) */
+#define COBJMACROS      /* C-style DXGI calls (GPU listing, amf_pick_adapter) */
 #include <windows.h>
-#include <dxgi.h>
+#include <dxgi1_6.h>
+#include <d3d12.h>
 #include <fcntl.h>
 #include <io.h>
 #include <libavutil/hwcontext_d3d11va.h>
@@ -111,6 +112,7 @@ typedef struct {
     const char *trtexec, *trtexec_env;
     int slot;
     const char *backend;
+    uint64_t device;        /* --device: a GPU id from --probe-encoders; 0 = default */
     const char *vcodec;
     const char *vquality;
     enum out_pixfmt pix_fmt;
@@ -250,6 +252,8 @@ typedef struct {
                                         textures (libav D3D11 frames), and no
                                         CUDA call is ever made */
     void            *d3d11_dev;      /* ID3D11Device* of the D3D11VA hwdevice */
+    int              gpu_index;      /* DirectML: the upscaling GPU's DXGI index, -1 if unknown */
+    unsigned         gpu_vendor;     /* ... and its PCI vendor id (AMF/QSV follow it) */
 
     /* libaji */
     aji_ctx        *aji;
@@ -400,12 +404,228 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
     return AV_PIX_FMT_NONE;
 }
 
+/* ---- GPUs ---------------------------------------------------------------- */
+
+/* --device takes the id the image ABI gives a GPU (aji_img_device.id): its PCI
+ * location, (1 << 63) | domain << 32 | bus << 8 | device, so a card keeps its
+ * id across reboots and has the same one on both backends. DirectML falls
+ * back to the adapter LUID (bit 63 clear) if Windows reports no address. */
+#define GPU_ID_PCI    (1ull << 63)
+#define GPU_ID_DOMAIN 0x7fffffff00000000ull
+
+/* D3DKMT reports no PCI domain, so a DirectML id has domain 0: PCI ids
+ * compare without it unless both carry one. */
+static int same_gpu(uint64_t a, uint64_t b)
+{
+    if ((a & GPU_ID_PCI) && (b & GPU_ID_PCI) &&
+        (!(a & GPU_ID_DOMAIN) || !(b & GPU_ID_DOMAIN))) {
+        a &= ~GPU_ID_DOMAIN;
+        b &= ~GPU_ID_DOMAIN;
+    }
+    return a == b;
+}
+
+/* A CUDA device's id, as aji_img_trt.cpp's pci_id computes it. */
+static uint64_t cuda_device_id(CUdevice d)
+{
+    int dom = 0, bus = 0, dev = 0;
+    cuDeviceGetAttribute(&dom, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, d);
+    cuDeviceGetAttribute(&bus, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, d);
+    cuDeviceGetAttribute(&dev, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, d);
+    return GPU_ID_PCI | ((uint64_t)(uint32_t)dom << 32) |
+           ((uint64_t)(uint32_t)bus << 8) | (uint64_t)(dev & 0xff);
+}
+
+/* The CUDA device ordinal (libav's CUDA device string) of the GPU with id
+ * `want`, or -1. */
+static int cuda_ordinal(uint64_t want)
+{
+    int n = 0;
+    if (cuInit(0) != CUDA_SUCCESS || cuDeviceGetCount(&n) != CUDA_SUCCESS)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        CUdevice d;
+        if (cuDeviceGet(&d, i) == CUDA_SUCCESS && same_gpu(want, cuda_device_id(d)))
+            return i;
+    }
+    return -1;
+}
+
+#ifdef _WIN32
+/* D3DKMTQueryAdapterInfo for the adapter `luid`; 0 if anything fails. The
+ * D3DKMT structs mirror d3dkmthk.h and the calls resolve from gdi32 at
+ * runtime. Same helpers as aji_img_dml.cpp. */
+static int kmt_query(LUID luid, UINT type, void *data, UINT size)
+{
+    typedef struct { LUID luid; UINT handle; } OpenFromLuid;
+    typedef struct { UINT handle; UINT type; void *data; UINT size; } QueryInfo;
+    typedef struct { UINT handle; } CloseAdapter;
+    typedef LONG(APIENTRY *OpenFn)(OpenFromLuid *);
+    typedef LONG(APIENTRY *QueryFn)(const QueryInfo *);
+    typedef LONG(APIENTRY *CloseFn)(const CloseAdapter *);
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi) gdi = LoadLibraryW(L"gdi32.dll");
+    if (!gdi) return 0;
+    OpenFn  open  = (OpenFn)(void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid");
+    QueryFn query = (QueryFn)(void *)GetProcAddress(gdi, "D3DKMTQueryAdapterInfo");
+    CloseFn close = (CloseFn)(void *)GetProcAddress(gdi, "D3DKMTCloseAdapter");
+    if (!open || !query || !close) return 0;
+    OpenFromLuid o = {luid, 0};
+    if (open(&o) != 0) return 0;
+    QueryInfo q = {o.handle, type, data, size};
+    int ok = query(&q) == 0;
+    CloseAdapter cl = {o.handle};
+    close(&cl);
+    return ok;
+}
+
+/* An indirect-display adapter: a virtual monitor (Parsec, Meta Quest Link,
+ * any IddCx driver). DXGI lists one per virtual display, each describing the
+ * GPU that renders for it, so one card would show up several times. The
+ * kernel adapter type tells them apart; a failed lookup keeps the adapter. */
+static int is_indirect_display(LUID luid)
+{
+    UINT type = 0;
+    return kmt_query(luid, 15 /* KMTQAITYPE_ADAPTERTYPE */, &type, sizeof type) &&
+           (type & (1u << 6) /* IndirectDisplayDevice */);
+}
+
+/* An adapter's id, as aji_img_dml.cpp's device_id computes it. */
+static uint64_t adapter_id(LUID luid)
+{
+    struct { UINT bus, device, function; } addr = {0, 0, 0}; /* D3DKMT_ADAPTERADDRESS */
+    if (kmt_query(luid, 6 /* KMTQAITYPE_ADAPTERADDRESS */, &addr, sizeof addr))
+        return GPU_ID_PCI | ((uint64_t)addr.bus << 8) | (uint64_t)(addr.device & 0xff);
+    return ((uint64_t)(uint32_t)luid.HighPart << 32) | (uint64_t)luid.LowPart;
+}
+
+typedef struct {
+    int  index;                 /* DXGI adapter index (libav D3D11VA device string) */
+    UINT vendor;                /* PCI vendor id */
+    uint64_t id;                /* what --device takes */
+    LUID luid;
+    char name[128];             /* UTF-8 */
+} gpu_adapter;
+
+/* Hardware GPUs in DXGI order, without software adapters or the
+ * virtual-display duplicates. Returns the count (at most max). */
+static int list_gpus(gpu_adapter *out, int max)
+{
+    IDXGIFactory1 *f = NULL;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f)))
+        return 0;
+    int n = 0;
+    IDXGIAdapter1 *a = NULL;
+    for (UINT i = 0; n < max &&
+         IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 d;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d)) &&
+            !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            !is_indirect_display(d.AdapterLuid)) {
+            out[n].index  = (int)i;
+            out[n].vendor = d.VendorId;
+            out[n].id     = adapter_id(d.AdapterLuid);
+            out[n].luid   = d.AdapterLuid;
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, out[n].name,
+                                sizeof out[n].name, NULL, NULL);
+            out[n].name[sizeof out[n].name - 1] = 0;
+            n++;
+        }
+        IDXGIAdapter1_Release(a);
+    }
+    IDXGIFactory1_Release(f);
+    return n;
+}
+
+/* Whether the adapter `luid` is integrated graphics: Direct3D 12 reports a
+ * unified memory architecture (UMA) for GPUs that share system memory. -1 if
+ * it can't tell (no d3d12.dll, or no Direct3D 12 device on the adapter).
+ * d3d12.dll loads at runtime, so aji_encode doesn't depend on it. */
+static int gpu_integrated(LUID luid)
+{
+    typedef HRESULT(WINAPI *CreateFn)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+    static CreateFn create;
+    static int loaded;
+    if (!loaded) {
+        loaded = 1;
+        HMODULE m = LoadLibraryW(L"d3d12.dll");
+        if (m) create = (CreateFn)(void *)GetProcAddress(m, "D3D12CreateDevice");
+    }
+    IDXGIFactory4 *f = NULL;
+    if (!create || FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void **)&f)))
+        return -1;
+    int r = -1;
+    IDXGIAdapter1 *a = NULL;
+    ID3D12Device *dev = NULL;
+    if (SUCCEEDED(IDXGIFactory4_EnumAdapterByLuid(f, luid, &IID_IDXGIAdapter1, (void **)&a)) &&
+        SUCCEEDED(create((IUnknown *)a, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&dev))) {
+        D3D12_FEATURE_DATA_ARCHITECTURE arch = {0};
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_ARCHITECTURE,
+                                                       &arch, sizeof arch)))
+            r = arch.UMA != 0;
+        ID3D12Device_Release(dev);
+    }
+    if (a) IDXGIAdapter1_Release(a);
+    IDXGIFactory4_Release(f);
+    return r;
+}
+
+static const char *vendor_name(UINT v)
+{
+    return v == 0x10de ? "nvidia" : v == 0x1002 ? "amd" :
+           v == 0x8086 ? "intel"  : "other";
+}
+
+/* The GPU --backend directml runs on without --device, as an index into
+ * g[]: the first one Windows ranks for high performance, so the dedicated
+ * GPU. DXGI adapter 0 is the GPU driving the main display, which on a laptop,
+ * or a desktop with its monitor on the motherboard, is the integrated one.
+ * 0 (DXGI order) if Windows has no ranking (before Windows 10 1803) or it
+ * names none of g[]. */
+static int default_gpu(const gpu_adapter *g, int n)
+{
+    IDXGIFactory6 *f = NULL;
+    if (n <= 1 || FAILED(CreateDXGIFactory1(&IID_IDXGIFactory6, (void **)&f)))
+        return 0;
+    int pick = -1;
+    IDXGIAdapter1 *a = NULL;
+    for (UINT i = 0; pick < 0 &&
+         SUCCEEDED(IDXGIFactory6_EnumAdapterByGpuPreference(f, i,
+             DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, &IID_IDXGIAdapter1,
+             (void **)&a)); i++) {
+        DXGI_ADAPTER_DESC1 d;
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d)))
+            for (int k = 0; k < n && pick < 0; k++)
+                if (g[k].luid.LowPart == d.AdapterLuid.LowPart &&
+                    g[k].luid.HighPart == d.AdapterLuid.HighPart)
+                    pick = k;
+        IDXGIAdapter1_Release(a);
+    }
+    IDXGIFactory6_Release(f);
+    return pick < 0 ? 0 : pick;
+}
+#endif
+
 /* ---- CUDA hwdevice + shared context -------------------------------------- */
 
 static int setup_cuda(enc_ctx *c)
 {
+    /* No --device: CUDA device 0, the fastest unless CUDA_DEVICE_ORDER says
+     * otherwise. */
+    char dev[16];
+    const char *devp = NULL;
+    if (c->o.device) {
+        int ord = cuda_ordinal(c->o.device);
+        if (ord < 0) {
+            loge("--device %llu: no CUDA GPU has that id (aji_encode "
+                 "--probe-encoders lists them)", (unsigned long long)c->o.device);
+            return -1;
+        }
+        snprintf(dev, sizeof dev, "%d", ord);
+        devp = dev;
+    }
     if (av_hwdevice_ctx_create(&c->hw_device, AV_HWDEVICE_TYPE_CUDA,
-                               NULL, NULL, 0) < 0) {
+                               devp, NULL, 0) < 0) {
         loge("av_hwdevice_ctx_create(CUDA) failed");
         return -1;
     }
@@ -430,13 +650,33 @@ static int setup_cuda(enc_ctx *c)
 
 /* DirectML: a D3D11 device for libaji (aji_dml opens the shared frame
  * textures on a D3D12 device on the same adapter) and for libav's D3D11
- * frame pools, uploads and readbacks. Decoding stays on the CPU: hardware
- * decoder textures can't be shared to D3D12. */
+ * frame pools, uploads and readbacks, on --device's GPU, else default_gpu's.
+ * Decoding stays on the CPU: hardware decoder textures can't be shared to
+ * D3D12. */
 static int setup_d3d11(enc_ctx *c)
 {
 #ifdef _WIN32
+    gpu_adapter g[16];
+    int n = list_gpus(g, 16), k = -1;
+    if (c->o.device) {
+        for (int i = 0; i < n && k < 0; i++)
+            if (same_gpu(g[i].id, c->o.device)) k = i;
+        if (k < 0) {
+            loge("--device %llu: no GPU has that id (aji_encode "
+                 "--probe-encoders lists them)", (unsigned long long)c->o.device);
+            return -1;
+        }
+    } else if (n > 0) {
+        k = default_gpu(g, n);
+    }
+    char dev[16];
+    if (k >= 0) {
+        snprintf(dev, sizeof dev, "%d", g[k].index);
+        c->gpu_index  = g[k].index;
+        c->gpu_vendor = g[k].vendor;
+    }
     if (av_hwdevice_ctx_create(&c->hw_device, AV_HWDEVICE_TYPE_D3D11VA,
-                               NULL, NULL, 0) < 0) {
+                               k >= 0 ? dev : NULL, NULL, 0) < 0) {
         loge("av_hwdevice_ctx_create(D3D11VA) failed");
         return -1;
     }
@@ -1177,110 +1417,21 @@ static void inject_profile(const char *vcodec, enum out_pixfmt pf,
         av_dict_set(opts, "profile", p, 0);
 }
 
-#ifdef _WIN32
-/* An indirect-display adapter: a virtual monitor (Parsec, Meta Quest Link,
- * any IddCx driver). DXGI lists one per virtual display, each describing the
- * GPU that renders for it, so one card would show up several times. The
- * kernel adapter type tells them apart; a failed lookup keeps the adapter.
- * Same check as aji_img_dml.cpp; the D3DKMT structs mirror d3dkmthk.h and
- * the calls resolve from gdi32 at runtime. */
-static int is_indirect_display(LUID luid)
-{
-    typedef struct { LUID luid; UINT handle; } OpenFromLuid;
-    typedef struct { UINT handle; UINT type; void *data; UINT size; } QueryInfo;
-    typedef struct { UINT handle; } CloseAdapter;
-    typedef LONG(APIENTRY *OpenFn)(OpenFromLuid *);
-    typedef LONG(APIENTRY *QueryFn)(const QueryInfo *);
-    typedef LONG(APIENTRY *CloseFn)(const CloseAdapter *);
-    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
-    if (!gdi) gdi = LoadLibraryW(L"gdi32.dll");
-    if (!gdi) return 0;
-    OpenFn  open  = (OpenFn)(void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid");
-    QueryFn query = (QueryFn)(void *)GetProcAddress(gdi, "D3DKMTQueryAdapterInfo");
-    CloseFn close = (CloseFn)(void *)GetProcAddress(gdi, "D3DKMTCloseAdapter");
-    if (!open || !query || !close) return 0;
-    OpenFromLuid o = {luid, 0};
-    if (open(&o) != 0) return 0;
-    UINT type = 0;
-    QueryInfo q = {o.handle, 15 /* KMTQAITYPE_ADAPTERTYPE */, &type, sizeof type};
-    int ok = query(&q) == 0;
-    CloseAdapter cl = {o.handle};
-    close(&cl);
-    return ok && (type & (1u << 6) /* IndirectDisplayDevice */);
-}
-
-typedef struct {
-    int  index;                 /* DXGI adapter index (libav D3D11VA device string) */
-    UINT vendor;                /* PCI vendor id */
-    char name[128];             /* UTF-8 */
-} gpu_adapter;
-
-/* Hardware GPUs in DXGI order, without software adapters or the
- * virtual-display duplicates. Returns the count (at most max). */
-static int list_gpus(gpu_adapter *out, int max)
-{
-    IDXGIFactory1 *f = NULL;
-    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f)))
-        return 0;
-    int n = 0;
-    IDXGIAdapter1 *a = NULL;
-    for (UINT i = 0; n < max &&
-         IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
-        DXGI_ADAPTER_DESC1 d;
-        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d)) &&
-            !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-            !is_indirect_display(d.AdapterLuid)) {
-            out[n].index  = (int)i;
-            out[n].vendor = d.VendorId;
-            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, out[n].name,
-                                sizeof out[n].name, NULL, NULL);
-            out[n].name[sizeof out[n].name - 1] = 0;
-            n++;
-        }
-        IDXGIAdapter1_Release(a);
-    }
-    IDXGIFactory1_Release(f);
-    return n;
-}
-
-static const char *vendor_name(UINT v)
-{
-    return v == 0x10de ? "nvidia" : v == 0x1002 ? "amd" :
-           v == 0x8086 ? "intel"  : "other";
-}
-
-/* The vendor of DXGI adapter 0: the GPU libav's D3D11VA device opens on
- * with no index, so the one --backend directml runs on. (Adapter 0 may be a
- * virtual-display entry; it still names the GPU that renders for it.) */
-static UINT default_gpu_vendor(void)
-{
-    IDXGIFactory1 *f = NULL;
-    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f)))
-        return 0;
-    UINT v = 0;
-    IDXGIAdapter1 *a = NULL;
-    if (IDXGIFactory1_EnumAdapters1(f, 0, &a) != DXGI_ERROR_NOT_FOUND) {
-        DXGI_ADAPTER_DESC1 d;
-        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &d))) v = d.VendorId;
-        IDXGIAdapter1_Release(a);
-    }
-    IDXGIFactory1_Release(f);
-    return v;
-}
-#endif
-
 /* AMF opens on the default adapter (DXGI adapter 0) unless handed a device,
  * so with an NVIDIA card as the default and an AMD iGPU beside it, it would
- * fail. Point it at the first AMD adapter (libav derives its AMF device from
- * the D3D11VA one). No AMD adapter: leave it alone and let AMF report that.
- * QSV needs none of this: the oneVPL dispatcher finds the Intel GPU itself. */
-static void amf_pick_adapter(AVCodecContext *enc)
+ * fail. Point it at the upscaling GPU when that is AMD (`prefer`, a DXGI index,
+ * -1 for none), else the first AMD adapter (libav derives its AMF device from
+ * the D3D11VA one): on an AMD laptop the first is the iGPU, while DirectML
+ * upscales on the dGPU. No AMD adapter: leave it alone and let AMF report that. */
+static void amf_pick_adapter(AVCodecContext *enc, int prefer)
 {
 #ifdef _WIN32
     gpu_adapter g[16];
     int n = list_gpus(g, 16), idx = -1;
     for (int i = 0; i < n && idx < 0; i++)
         if (g[i].vendor == 0x1002) idx = g[i].index;
+    if (prefer >= 0)
+        idx = prefer;
     if (idx <= 0)       /* none, or already the default */
         return;
     char s[16];
@@ -1290,7 +1441,34 @@ static void amf_pick_adapter(AVCodecContext *enc)
         return;
     enc->hw_device_ctx = dev;       /* the codec context owns the ref */
 #else
-    (void)enc;
+    (void)enc; (void)prefer;
+#endif
+}
+
+/* QSV: the oneVPL dispatcher finds an Intel GPU itself, the first one, which
+ * with an Intel iGPU and an Arc card is usually the iGPU. When DirectML
+ * upscales on an Intel GPU (`prefer`, a DXGI index), open QSV on that one,
+ * through a D3D11VA child device on its adapter; otherwise leave it alone. */
+static void qsv_pick_adapter(AVCodecContext *enc, int prefer)
+{
+#ifdef _WIN32
+    if (prefer < 0)
+        return;
+    char s[16];
+    snprintf(s, sizeof s, "%d", prefer);
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "child_device_type", "d3d11va", 0);
+    av_dict_set(&opts, "child_device", s, 0);
+    AVBufferRef *dev = NULL;
+    int r = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_QSV, "hw", opts, 0);
+    av_dict_free(&opts);
+    if (r < 0) {
+        loge("QSV device on adapter %d failed; letting QSV choose", prefer);
+        return;
+    }
+    enc->hw_device_ctx = dev;       /* the codec context owns the ref */
+#else
+    (void)enc; (void)prefer;
 #endif
 }
 
@@ -1325,8 +1503,11 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
     } else {
         c->enc->pix_fmt = c->out_pixfmt;
     }
+    /* the encoder runs on the upscaling GPU when it's the same vendor */
     if (is_amf(c->o.vcodec))
-        amf_pick_adapter(c->enc);
+        amf_pick_adapter(c->enc, c->gpu_vendor == 0x1002 ? c->gpu_index : -1);
+    if (is_qsv(c->o.vcodec))
+        qsv_pick_adapter(c->enc, c->gpu_vendor == 0x8086 ? c->gpu_index : -1);
     if (c->ofmt && (c->ofmt->oformat->flags & AVFMT_GLOBALHEADER))
         c->enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
@@ -1357,25 +1538,47 @@ fail:
 
 /* --probe-encoders: list the GPUs, then open each GPU encoder at 8- and
  * 10-bit 4:2:0. One machine-readable line each, e.g.
- *   GPU index=0 vendor=nvidia default=1 name=NVIDIA GeForce RTX 5090
+ *   GPU index=0 vendor=nvidia default=1 integrated=0 id=9223372036854808576 name=NVIDIA GeForce RTX 5090
  *   ENCODER name=hevc_qsv yuv420p=1 yuv420p10=1
- * default=1 marks the vendor of DXGI adapter 0, the GPU --backend directml
- * runs on (TensorRT is always the NVIDIA card). name= is last and runs to
- * the end of the line. Opening is what fails on a missing GPU, driver, codec
- * or bit depth (all three vendors create their hardware session in init).
- * Software encoders are always available and not listed. */
+ * id= is what --device takes. integrated=1 marks integrated graphics (shared
+ * system memory), which upscale far slower than a graphics card; the key is
+ * left out when that can't be told. On Windows the GPUs are DXGI's, index= is the
+ * DXGI adapter index, and default=1 marks the GPU --backend directml runs on
+ * without --device (default_gpu; TensorRT takes CUDA device 0). On Linux they
+ * are the CUDA devices, index= is the CUDA ordinal, and default=1 marks
+ * device 0. name= is last and runs to the end of the line. Opening is what
+ * fails on a missing GPU, driver, codec or bit depth (all three vendors
+ * create their hardware session in init). Software encoders are always
+ * available and not listed. */
 static void probe_encoders(void)
 {
 #ifdef _WIN32
     gpu_adapter g[16];
     int ng = list_gpus(g, 16);
-    UINT def = default_gpu_vendor();
-    int def_marked = 0;
+    int def = ng > 0 ? default_gpu(g, ng) : -1;
     for (int i = 0; i < ng; i++) {
-        int is_def = !def_marked && g[i].vendor == def;
-        def_marked |= is_def;
-        printf("GPU index=%d vendor=%s default=%d name=%s\n", g[i].index,
-               vendor_name(g[i].vendor), is_def, g[i].name);
+        int integrated = gpu_integrated(g[i].luid);
+        char flag[16] = "";
+        if (integrated >= 0)
+            snprintf(flag, sizeof flag, " integrated=%d", integrated);
+        printf("GPU index=%d vendor=%s default=%d%s id=%llu name=%s\n", g[i].index,
+               vendor_name(g[i].vendor), i == def, flag, (unsigned long long)g[i].id,
+               g[i].name);
+    }
+#else
+    int nc = 0;
+    if (cuInit(0) == CUDA_SUCCESS && cuDeviceGetCount(&nc) == CUDA_SUCCESS) {
+        for (int i = 0; i < nc; i++) {
+            CUdevice d;
+            char name[128];
+            if (cuDeviceGet(&d, i) != CUDA_SUCCESS ||
+                cuDeviceGetName(name, sizeof name, d) != CUDA_SUCCESS)
+                continue;
+            int integrated = 0;
+            cuDeviceGetAttribute(&integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, d);
+            printf("GPU index=%d vendor=nvidia default=%d integrated=%d id=%llu name=%s\n", i,
+                   i == 0, integrated != 0, (unsigned long long)cuda_device_id(d), name);
+        }
     }
 #endif
     static const char *const names[] = {
@@ -1397,7 +1600,7 @@ static void probe_encoders(void)
             e->framerate = (AVRational){24, 1};
             e->pix_fmt   = ten ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
             if (is_amf(names[n]))
-                amf_pick_adapter(e);
+                amf_pick_adapter(e, -1);
             AVDictionary *opts = NULL;
             inject_profile(names[n], ten ? OUT_420P10 : OUT_420P8, &opts);
             ok[ten] = avcodec_open2(e, codec, &opts) >= 0;
@@ -2884,6 +3087,8 @@ static void usage(void)
 " [--progress none|line|json]\n"
 "           [--build-only] [--log <f>] [--decoder auto|nvdec|cpu]"
 " [--backend tensorrt|tensorrt-rtx|directml]\n"
+"           [--device <id>] (a GPU id= from --probe-encoders; default: on\n"
+"                           DirectML the high-performance GPU, on TensorRT CUDA device 0)\n"
 "           [--deinterlace off|ivtc|bwdif] [--square-pixels off|before|after]\n"
 "           [--preview <f.jpg> [--preview-width W]]\n"
 "           [--preview-session] (no --output: frames for a GUI's player)\n"
@@ -2912,6 +3117,7 @@ int main(int argc, char **argv)
     disable_power_throttling();
     enc_ctx c = {0};
     c.o.slot = 1;
+    c.gpu_index = -1;
     c.o.vcodec = "hevc_nvenc";
     c.o.backend = "tensorrt";
     c.o.progress = PROG_LINE;
@@ -2941,6 +3147,14 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--trtexec")) c.o.trtexec = argv[++i];
         else if (!strcmp(a, "--trtexec-env")) c.o.trtexec_env = argv[++i];
         else if (!strcmp(a, "--backend")) c.o.backend = argv[++i];
+        else if (!strcmp(a, "--device")) {
+            char *end = NULL;
+            c.o.device = strtoull(argv[++i], &end, 0);
+            if (!end || *end || !c.o.device) {
+                loge("--device '%s': expected a GPU id from --probe-encoders", argv[i]);
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--vcodec")) c.o.vcodec = argv[++i];
         else if (!strcmp(a, "--vquality")) c.o.vquality = argv[++i];
         else if (!strcmp(a, "--pix-fmt")) {

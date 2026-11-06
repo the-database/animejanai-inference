@@ -117,14 +117,32 @@ enum aji_img_load_flags {
      * stall on a first-use build; the counterpart of the video ABI's
      * aji_create_params.async_build. No effect on DirectML. */
     AJI_IMG_LOAD_ASYNC_BUILD = 1,
+    /* TensorRT / TensorRT-RTX, dynamic-shape models: build the engine for
+     * any tile shape up to tile_w x tile_h, and split each image into the
+     * fewest even tiles of at most that size (sides multiples of 16)
+     * instead of fixed full-size tiles pushed flush against the image's
+     * edges, which often re-infer most of their area. Infers fewer pixels,
+     * but a shape-range engine can run slower per pixel than a fixed-shape
+     * one (on an RTX 5090: none on TensorRT, ~30% on TensorRT-RTX), so it
+     * is opt-in. The engine is cached separately from the fixed-tile one.
+     * Ignored by DirectML and by fixed-shape models. libaji builds before
+     * this flag ignore it. */
+    AJI_IMG_LOAD_EVEN_TILES = 2,
 };
 
 typedef struct aji_img_model_params {
     const char *onnx_path;
-    int tile_w, tile_h;  /* input-pixel tile size; 0 = 512. Ignored for
-                            fixed-shape models (their shape is the tile) */
-    int overlap;         /* input-pixel overlap between neighbouring
-                            tiles, blended linearly; 0 = 32 */
+    int tile_w, tile_h;  /* input-pixel tile size (with EVEN_TILES, the
+                            largest); 0 = 512. Ignored for fixed-shape
+                            models (their shape is the tile) */
+    int overlap;         /* minimum input-pixel overlap between
+                            neighbouring tiles; 0 = 128. Tiles blend
+                            across a 16-pixel band at the centre of each
+                            overlap, so each output pixel comes from a
+                            tile with at least half the overlap of context
+                            around it. Below ~128, models that generate
+                            texture (e.g. MangaJaNai's screentone) can
+                            show seams. */
     int flags;           /* enum aji_img_load_flags */
 } aji_img_model_params;
 

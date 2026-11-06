@@ -15,6 +15,7 @@
 #include "aji.h"
 #include "aji_conf.h"
 #include "core/fileio.h"
+#include "core/runtime_packs.h"
 
 #include <cctype>
 #include <cstdarg>
@@ -147,8 +148,15 @@ static void lib_close(aji_lib lib)
 }
 
 static bool load_backend(const char *stem, aji_backend *be,
-                         std::string *err)
+                         std::string *err, std::string *packs = nullptr)
 {
+    /* aji-runtime.json: the backend's TensorRT runtime comes from the
+     * shared runtime packs; load it first, by full path */
+    std::string loaded;
+    if (!ajicore::preload_backend_deps(stem, err, &loaded))
+        return false;
+    if (packs)
+        *packs = loaded;
 #ifdef _WIN32
     std::string path = own_dir() + "\\" + stem + ".dll";
 #else
@@ -239,10 +247,14 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     aji_backend be = {};
     std::string err;
     aji_ctx *inner = nullptr;
-    if (!load_backend(stem, &be, &err)) {
+    std::string packs;
+    if (!load_backend(stem, &be, &err, &packs)) {
         logf_to(params->log, params->log_opaque, rtx ? 2 : 0,
                 "backend %s (%s): %s", backend.c_str(), stem, err.c_str());
     } else {
+        if (!packs.empty())
+            logf_to(params->log, params->log_opaque, 3,
+                    "runtime packs (aji-runtime.json): %s", packs.c_str());
         logf_to(params->log, params->log_opaque, 3,
                 "backend: %s (%s)", backend.c_str(), stem);
         if (params->async_build == 2) {

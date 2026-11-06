@@ -1,0 +1,58 @@
+name: Notify downstream
+
+# Asks the repos that pin this repo's releases to re-pin: a repository_dispatch (event_type
+# upstream-release, client_payload {source: libaji, tag}) to each, whose bump-pins.yml then opens
+# a bump PR there. Run it by hand once the release has all its assets (the Windows zips are
+# uploaded after the Linux run publishes the tag):
+#   gh workflow run notify-downstream.yml -R the-database/animejanai-inference -f tag=v0.22.3
+#
+# Needs the JANAI_BUMP_TOKEN secret: a fine-grained PAT with Contents write on the repos below.
+# Without it this only warns, so a release never fails over it.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.22.3'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          [ -n "$TAG" ] || TAG="$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "::error::not a tag: $TAG"; exit 1; }
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Release: $TAG"
+      # The Linux workflow publishes the tag; the Windows zips are uploaded by hand afterwards.
+      # Every downstream repo downloads some of these, so wait for all four.
+      - name: Check the release is complete
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          have="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')"
+          missing=0
+          for a in aji-windows-x64.zip aji-trtrtx-windows-x64.zip aji-trtrtx-backend-windows-x64.zip aji-linux-x64.tar.zst aji-encode-linux-x64.tar.zst; do
+            grep -qxF "$a" <<< "$have" || { echo "::error::$TAG has no $a yet: upload it, then run this again"; missing=1; }
+          done
+          exit $missing
+      - name: Dispatch
+        env:
+          GH_TOKEN: ${{ secrets.JANAI_BUMP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::JANAI_BUMP_TOKEN isn't set, so no bump PRs were requested for $TAG"
+            exit 0
+          fi
+          for repo in the-database/MangaJaNaiCLI the-database/VideoJaNai the-database/MangaJaNaiGUI the-database/mpv-AnimeJaNai; do
+            gh api "repos/$repo/dispatches" -f event_type=upstream-release \
+              -f "client_payload[source]=libaji" -f "client_payload[tag]=$TAG"
+            echo "Asked $repo to re-pin libaji $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
+          done

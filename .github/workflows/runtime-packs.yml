@@ -1,0 +1,97 @@
+name: Runtime packs
+
+# The shared runtime packs every libaji app installs into the per-user pack store
+# (the-database/aji-runtime): NVIDIA's TensorRT split into trt-runtime plus one builder-resource
+# pack per GPU generation (Windows and Linux), the TensorRT-RTX runtime and ONNX Runtime + DirectML
+# (Windows), with packs-<platform>.json: versions, kinds, SHA-256s, sizes and per-file SHA-256s,
+# and entries for the MangaJaNai model archives (not re-uploaded). See scripts/runtime_packs.py.
+# Published on their own tag (TAG in the script, runtime-<n>). Run this only after bumping TAG
+# along with a pinned version; apps pin the tag and each index's SHA-256.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build packs
+        run: python scripts/runtime_packs.py --platform windows --out packs --work ${{ runner.temp }}/runtime-work --sevenzip "C:\Program Files\7-Zip\7z.exe"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: runtime-packs-windows
+          path: packs/*
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install 7-Zip
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+      - name: Build packs
+        run: python3 scripts/runtime_packs.py --platform linux --out packs --work ${{ runner.temp }}/runtime-work
+      - uses: actions/upload-artifact@v7
+        with:
+          name: runtime-packs-linux
+          path: packs/*
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: packs
+          merge-multiple: true
+      - name: Publish the runtime-<n> release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(python3 scripts/runtime_packs.py --print-tag)
+          ls -la packs
+          sha256sum packs/packs-*.json
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::$tag already exists; bump TAG in scripts/runtime_packs.py"
+            exit 1
+          fi
+          gh release create "$tag" packs/* --title "Runtime packs ($tag)" --latest=false --notes-file - <<'NOTES'
+          Shared runtime packs for libaji apps (installed into the per-user pack store by aji-runtime):
+          - NVIDIA TensorRT 11.4.0.106 (CUDA 13.4), split into trt-runtime plus one builder-resource pack per GPU generation (trt-sm75 … trt-sm120; trt-ptx is the fallback), for Windows and Linux.
+          - NVIDIA TensorRT for RTX 1.7.1.116 (CUDA 13.4) for Windows (trtrtx-runtime).
+          - ONNX Runtime 1.24.4 + DirectML 1.15.4 for Windows (dml-runtime; apps keep it in their own folder).
+          - The MangaJaNai and IllustrationJaNai models, from the-database/MangaJaNai's releases.
+
+          packs-<platform>.json lists each pack's version, kind, SHA-256, size and files. TensorRT and TensorRT for RTX are NVIDIA proprietary software, redistributed under their licenses; NVIDIA's and Microsoft's notices ship in the packs.
+          NOTES
+
+  # Ask the apps that pin the shared runtime packs to open bump PRs (their bump-pins.yml,
+  # `scripts/bump_pins.py runtime-packs <tag>`). Add each app here once its bump_pins.py knows the
+  # runtime-packs source: MangaJaNaiCLI (yosh gets the packs through it), MangaJaNai GUI,
+  # VideoJaNai and mpv-AnimeJaNai. Needs JANAI_BUMP_TOKEN, as
+  # notify-downstream.yml does; without it this only warns.
+  notify:
+    needs: publish
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Request the bump PRs
+        env:
+          GH_TOKEN: ${{ secrets.JANAI_BUMP_TOKEN }}
+        run: |
+          tag=$(python3 scripts/runtime_packs.py --print-tag)
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::JANAI_BUMP_TOKEN isn't set, so no bump PRs were requested for $tag"
+            exit 0
+          fi
+          for repo in the-database/MangaJaNaiCLI the-database/MangaJaNaiGUI the-database/VideoJaNai the-database/mpv-AnimeJaNai; do
+            gh api "repos/$repo/dispatches" -f event_type=upstream-release \
+              -f "client_payload[source]=runtime-packs" -f "client_payload[tag]=$tag"
+            echo "Asked $repo to re-pin the runtime packs to $tag" | tee -a "$GITHUB_STEP_SUMMARY"
+          done

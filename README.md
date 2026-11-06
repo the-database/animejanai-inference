@@ -2,17 +2,25 @@
 
 Optional addon interfaces are documented in [docs/ADDON-API.md](docs/ADDON-API.md), including build dependencies, inactive behavior and qualification limits.
 
-Inference shim for the native mpv AnimeJaNai pipeline. `libaji` exposes a
-strict C ABI (`include/aji.h`) that `vf_animejanai` in the
-[the-database/mpv](https://github.com/the-database/mpv) fork loads at
-runtime — mpv never links TensorRT, so the backend and TRT version can be
-swapped without rebuilding the player, and on Windows the MSVC-built shim
-coexists with a mingw-built mpv.
+A GPU inference engine for upscaling. `libaji` runs ONNX upscaling models, plus RIFE
+interpolation and temporal models, entirely on the GPU, with three backends: TensorRT and
+TensorRT-RTX (NVIDIA, through CUDA) and DirectML (Windows, any DirectX 12 GPU). Callers load it at
+runtime through one of two C ABIs, so they never link TensorRT:
 
-Current backend: TensorRT (`src/aji_trt.cpp`) with CUDA pre/post kernels
-(`src/kernels.cu`): NV12/P010 → fp16 NCHW RGB (BT.709 limited) → engine →
-NV12/P010, all device-side. Phase 0 spike scope; chain selection,
-engine building, colorspace metadata and CUDA graphs land here in phase 1.
+- **Video** (`include/aji.h`): GPU-resident YUV frames in, upscaled frames out, with chains,
+  RIFE and temporal models configured by `animejanai.conf`. `vf_animejanai` in the
+  [the-database/mpv](https://github.com/the-database/mpv) fork uses it for real-time playback, and
+  `aji_encode` uses it to upscale video files.
+- **Still images** (`include/aji_image.h`): 8-bit images of any size, tiled on the GPU.
+
+Because the player loads it at runtime, the backend and TensorRT version can change without
+rebuilding mpv, and on Windows the MSVC-built library coexists with a mingw-built mpv.
+
+Used by [mpv-AnimeJaNai](https://github.com/the-database/mpv-AnimeJaNai) (real-time playback),
+[VideoJaNai](https://github.com/the-database/VideoJaNai) (video files, through `aji_encode`),
+[MangaJaNai GUI](https://github.com/the-database/MangaJaNaiGUI) and
+[MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI) (manga and images), and
+[yosh](https://github.com/the-database/yosh)'s AI upscaling add-on.
 
 ## Build (Linux)
 
@@ -104,7 +112,7 @@ Things the header can't tell you:
 - **Threading**: a context works from any thread; calls on one model are
   serialized, different models may run concurrently.
 
-## mpv usage (spike)
+## mpv usage (single engine, for testing)
 
 ```sh
 mpv --hwdec=nvdec \
