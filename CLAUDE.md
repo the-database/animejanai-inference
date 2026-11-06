@@ -195,7 +195,7 @@ compile — the release list builds eight architectures.
 | Platform | Built by | Asset |
 |---|---|---|
 | Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
-| Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip`, `aji-trtrtx-windows-x64.zip` (opt-in: `aji_trtrtx.dll` + TensorRT-RTX runtime, ~91 MB) |
+| Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip`, `aji-trtrtx-windows-x64.zip` (opt-in: `aji_trtrtx.dll` + TensorRT-RTX runtime, ~91 MB), `aji-trtrtx-backend-windows-x64.zip` (`aji_trtrtx.dll` alone, for apps that take the runtime from a shared pack) |
 
 All are attached to the **same release tag**, because the consumer derives every URL from one
 `AjiVersion` constant. `the-database/mpv-AnimeJaNai`'s assembler downloads them in `InstallAji`
@@ -213,6 +213,38 @@ RIFE model weights ship from this repo too, under a separate tag
 `tools/convert_rife_fp16.py`. Set 2 differs from set 1 only in naming the input's H/W dims,
 which the DirectML backend needs to pin them (~10% faster RIFE there); outputs are
 bit-identical, and TensorRT reuses existing engines (cache names come from the file name).
+
+## Shared runtime packs (`aji-runtime.json`)
+
+Apps can keep the TensorRT / TensorRT-RTX runtimes in a per-user store shared between apps
+(design: `plans/shared-runtime-packs.md` in `the-database/animejan.ai`). The app's installer then
+writes `aji-runtime.json` beside `aji.dll` / `libaji.so`:
+
+```json
+{ "format": 1,
+  "trt": "C:\\...\\packs\\trt-runtime\\11.4.0.106-cuda13.4",
+  "trt_builder": ["C:\\...\\packs\\trt-sm120\\11.4.0.106"],
+  "trtrtx": "C:\\...\\packs\\trtrtx-runtime\\1.7.1.116-cuda13.4" }
+```
+
+`core/runtime_packs` reads it once per library (keys optional; relative paths are relative to the
+file; unknown keys, like aji-runtime's `models` for the app, are skipped; any other `format` is an
+error):
+
+- Before loading `aji_trt`, both dispatchers load cudart + nvinfer from `trt` by full path (Linux:
+  `RTLD_GLOBAL`), so the backend's imports bind to them. Before `aji_trtrtx`: cudart (from
+  `trtrtx`, else `trt`) + the TensorRT-RTX runtime. The names come from the SDKs at configure time
+  (`AJI_PACK_*` in `CMakeLists.txt`). `aji_dml` ignores the file.
+- `aji_trt` runs `trt`'s trtexec, **ignoring the host's `trtexec`**, with the `trt_builder`
+  folders on its search path: Windows prepends them to the child's `PATH` (environment block);
+  Linux appends `LD_LIBRARY_PATH='<trt>:<builders>'` after the host's `trtexec_env`. nvinfer loads
+  the per-GPU builder resource by file name, which preloading can't satisfy on Linux, and which
+  only builds need.
+- A file that names a missing pack makes `aji_trt` / `aji_trtrtx` fail to load with a clear error.
+  Without the file, everything loads from libaji's own folder as before.
+
+Tests: `aji_runtime_packs_test` (parser, CPU-only). Hosts' own executables (`aji_harness`,
+`aji_encode`) still import cudart themselves.
 
 ## The ABI contract
 
