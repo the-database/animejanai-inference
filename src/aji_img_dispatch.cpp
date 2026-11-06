@@ -9,6 +9,7 @@
 
 #include "aji_image.h"
 #include "core/fileio.h"
+#include "core/runtime_packs.h"
 
 #include <cstdio>
 #include <mutex>
@@ -69,6 +70,12 @@ ImgBackend *backend_for(int backend, std::string *err)
                                                     : g_dml;
     if (!b.tried) {
         b.tried = true;
+        // aji-runtime.json: load the backend's runtime from the shared
+        // runtime packs first, by full path
+        if (!ajicore::preload_backend_deps(stem, &b.err, nullptr)) {
+            *err = b.err;
+            return nullptr;
+        }
 #ifdef _WIN32
         const std::string path = ajicore::own_dir() + "\\" + stem + ".dll";
         // search-own-dir flags so nvinfer/onnxruntime/DirectML resolve
