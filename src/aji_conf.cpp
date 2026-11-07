@@ -19,6 +19,7 @@
  */
 
 #include "aji_conf.h"
+#include "span_models.h"
 
 #include <algorithm>
 #include <cctype>
@@ -343,8 +344,12 @@ std::string aji_chain_missing_model(const std::string &model_dir,
         if (m.name.empty())
             continue;
         if (!std::filesystem::exists(
-                std::filesystem::path(model_dir) / (m.name + ".onnx")))
-            return m.name;
+                std::filesystem::path(model_dir) / (m.name + ".onnx"))) {
+            const char *stock = span_stock_model(m.name);
+            if (!stock || !std::filesystem::exists(
+                    std::filesystem::path(model_dir) / (std::string(stock) + ".onnx")))
+                return m.name;
+        }
     }
     return std::string();
 }
