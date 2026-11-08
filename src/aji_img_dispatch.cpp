@@ -39,6 +39,8 @@ struct ImgBackend {
     void (*release)(aji_img_model **);
     const char *(*last_error)(aji_img_ctx *);
     void (*destroy)(aji_img_ctx **);
+    // optional (libaji 0.24.0): NULL in an older backend
+    int (*release_device)(int, uint64_t) = nullptr;
 };
 
 std::mutex g_mu;
@@ -108,6 +110,8 @@ ImgBackend *backend_for(int backend, std::string *err)
         SYM(last_error, "aji_img_last_error")
         SYM(destroy, "aji_img_destroy")
 #undef SYM
+        if (ok)
+            *(void **)&b.release_device = sym(b.lib, "aji_img_release_device");
         if (!ok)
             b.lib = nullptr;  // leaked handle is harmless; never retried
     }
@@ -137,6 +141,15 @@ extern "C" AJI_IMG_EXPORT int aji_img_enum_devices(int backend,
     std::string err;
     ImgBackend *be = backend_for(backend, &err);
     return be ? be->enum_devices(backend, out, max) : -1;
+}
+
+extern "C" AJI_IMG_EXPORT int aji_img_release_device(int backend, uint64_t device_id)
+{
+    std::string err;
+    ImgBackend *be = backend_for(backend, &err);
+    if (!be)
+        return -1;
+    return be->release_device ? be->release_device(backend, device_id) : -1;
 }
 
 extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_params *p,
