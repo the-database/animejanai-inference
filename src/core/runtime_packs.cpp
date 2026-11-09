@@ -27,6 +27,9 @@
 #ifndef AJI_PACK_NVINFER
 #  define AJI_PACK_NVINFER ""
 #endif
+#ifndef AJI_PACK_NVONNXPARSER
+#  define AJI_PACK_NVONNXPARSER ""
+#endif
 #ifndef AJI_PACK_TRTRTX
 #  define AJI_PACK_TRTRTX ""
 #endif
@@ -473,7 +476,8 @@ const RuntimePacks &runtime_packs()
 bool preload_backend_deps(const char *stem, std::string *err, std::string *what)
 {
     // aji_dml loads nothing from the packs, so the file can't break it
-    if (strcmp(stem, "aji_trt") != 0 && strcmp(stem, "aji_trtrtx") != 0)
+    const bool analysis = !strcmp(stem, "aji_analysis_trt");
+    if (strcmp(stem, "aji_trt") != 0 && strcmp(stem, "aji_trtrtx") != 0 && !analysis)
         return true;
     const RuntimePacks &rp = runtime_packs();
     if (!rp.present)
@@ -485,11 +489,14 @@ bool preload_backend_deps(const char *stem, std::string *err, std::string *what)
     // serialized: the video and image dispatchers may load concurrently
     static std::mutex mu;
     std::lock_guard<std::mutex> lock(mu);
-    if (!strcmp(stem, "aji_trt")) {
+    if (!strcmp(stem, "aji_trt") || analysis) {
         if (rp.trt.empty())
             return true;
+        // the observer builds its engine in-process, so it imports the ONNX
+        // parser too (aji_trt leaves parsing to trtexec)
         return load_from(rp.trt, AJI_PACK_CUDART, "trt", err, what) &&
-               load_from(rp.trt, AJI_PACK_NVINFER, "trt", err, what);
+               load_from(rp.trt, AJI_PACK_NVINFER, "trt", err, what) &&
+               (!analysis || load_from(rp.trt, AJI_PACK_NVONNXPARSER, "trt", err, what));
     }
     if (!strcmp(stem, "aji_trtrtx")) {
         if (rp.trtrtx.empty())
@@ -505,6 +512,17 @@ bool preload_backend_deps(const char *stem, std::string *err, std::string *what)
                load_from(rp.trtrtx, AJI_PACK_TRTRTX_PARSER, "trtrtx", err, what);
     }
     return true;
+}
+
+std::string trt_builder_dir(const std::string &file)
+{
+    const RuntimePacks &rp = runtime_packs();
+    if (!rp.present || !rp.error.empty())
+        return "";
+    for (const std::string &d : rp.trt_builder)
+        if (file_exists(d + SEP + file))
+            return d;
+    return "";
 }
 
 void resolve_trtexec(const std::string &host_trtexec,
