@@ -121,7 +121,9 @@ static aji_lib lib_open(const std::string &path)
 #ifdef _WIN32
     /* full path + search-own-dir flags so the backend's dependencies
      * (nvinfer_*, onnxruntime, DirectML) resolve from the same dir */
-    return LoadLibraryExA(path.c_str(), NULL,
+    /* wide: `path` is UTF-8, which the ANSI call would misread in a host
+     * without a UTF-8 manifest (mpv.net) on a non-ASCII install path */
+    return LoadLibraryExW(ajicore::widen_utf8(path).c_str(), NULL,
                           LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
                           LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 #else

@@ -88,7 +88,7 @@ struct IniFile {
 
 bool read_ini(const char *path, IniFile *out)
 {
-    std::ifstream f(path);
+    std::ifstream f(std::filesystem::u8path(path));  // UTF-8, also on Windows
     if (!f)
         return false;
     std::string line, cur;
@@ -342,8 +342,10 @@ std::string aji_chain_missing_model(const std::string &model_dir,
     for (const auto &m : chain.models) {
         if (m.name.empty())
             continue;
-        if (!std::filesystem::exists(
-                std::filesystem::path(model_dir) / (m.name + ".onnx")))
+        std::error_code ec;
+        if (!std::filesystem::exists(std::filesystem::u8path(model_dir) /
+                                         std::filesystem::u8path(m.name + ".onnx"),
+                                     ec))
             return m.name;
     }
     return std::string();

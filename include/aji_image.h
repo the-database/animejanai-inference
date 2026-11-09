@@ -88,7 +88,9 @@ typedef struct aji_img_device {
 /* Number of usable devices for `backend`, filling up to `max` entries
  * of `out` (which may be NULL). Negative if the backend or its runtime
  * cannot be loaded. Each physical GPU is listed once (DirectML skips the
- * adapters Windows adds for virtual displays). */
+ * adapters Windows adds for virtual displays). DirectML lists the
+ * high-performance GPU first (a hybrid laptop's discrete GPU), and that is
+ * the device id 0 picks. */
 AJI_IMG_EXPORT int aji_img_enum_devices(int backend, aji_img_device *out,
                                         int max);
 

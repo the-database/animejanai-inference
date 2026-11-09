@@ -19,6 +19,7 @@
 #else
 #include <dlfcn.h>
 #include <libgen.h>
+#include <sys/stat.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -77,6 +78,19 @@ long long file_size(const std::string &path)
                               &a))
         return -1;
     return ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+}
+
+bool file_stamp(const std::string &path, long long *size, long long *mtime)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a = {};
+    if (!GetFileAttributesExW(win_long_path(path).c_str(), GetFileExInfoStandard,
+                              &a) ||
+        (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return false;
+    *size = ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    *mtime = ((long long)a.ftLastWriteTime.dwHighDateTime << 32) |
+             a.ftLastWriteTime.dwLowDateTime;
+    return true;
 }
 
 bool move_file(const std::string &from, const std::string &to)
@@ -155,18 +169,33 @@ std::FILE *fopen_utf8(const std::string &path, const char *mode)
     return _wfopen(win_long_path(path).c_str(), widen_utf8(mode).c_str());
 }
 
+std::string narrow_utf8(const std::wstring &w)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr,
+                                0, nullptr, nullptr);
+    std::string s(n > 0 ? (size_t)n : 0, '\0');
+    if (n > 0)
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n,
+                            nullptr, nullptr);
+    return s;
+}
+
 std::string own_dir()
 {
+    // wide, then UTF-8: the ANSI calls return the path in the process code
+    // page, which mangles it in a host without a UTF-8 manifest (mpv.net,
+    // .NET apps) wherever it isn't representable there
     HMODULE self = NULL;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCSTR)&own_dir, &self);
-    char path[MAX_PATH] = {0};
-    GetModuleFileNameA(self, path, sizeof(path));
-    char *slash = strrchr(path, '\\');
-    if (slash)
-        *slash = 0;
-    return path;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&own_dir, &self);
+    std::wstring w(32768, L'\0');
+    DWORD n = GetModuleFileNameW(self, w.data(), (DWORD)w.size());
+    w.resize(n < w.size() ? n : 0);
+    size_t slash = w.find_last_of(L'\\');
+    if (slash != std::wstring::npos)
+        w.resize(slash);
+    return narrow_utf8(w);
 }
 #else
 bool file_exists(const std::string &path)
@@ -186,6 +215,16 @@ long long file_size(const std::string &path)
     std::error_code ec;
     auto n = fs::file_size(path, ec);
     return ec ? -1 : (long long)n;
+}
+
+bool file_stamp(const std::string &path, long long *size, long long *mtime)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+        return false;
+    *size = (long long)st.st_size;
+    *mtime = (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+    return true;
 }
 
 bool move_file(const std::string &from, const std::string &to)

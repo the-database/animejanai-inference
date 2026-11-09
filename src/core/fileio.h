@@ -18,6 +18,7 @@ namespace ajicore {
 
 #ifdef _WIN32
 std::wstring widen_utf8(const std::string &s);
+std::string narrow_utf8(const std::wstring &w);
 std::wstring win_long_path(const std::string &path);
 #endif
 
@@ -25,6 +26,9 @@ bool file_exists(const std::string &path);
 void remove_file(const std::string &path);
 // Size in bytes, or -1 if the file can't be stat'ed.
 long long file_size(const std::string &path);
+// Size and last-write time (Windows: FILETIME ticks; POSIX: ns since the
+// epoch) of a file; false if it can't be stat'ed.
+bool file_stamp(const std::string &path, long long *size, long long *mtime);
 // Rename over an existing file.
 bool move_file(const std::string &from, const std::string &to);
 bool read_file_bytes(const std::string &path, std::vector<char> *out);
@@ -35,7 +39,8 @@ bool write_file_bytes(const std::string &path, const void *data, size_t size);
 std::FILE *fopen_utf8(const std::string &path, const char *mode);
 
 // Directory of the library this code is compiled into (aji.dll,
-// aji_trt.dll, ...): backends resolve their runtime dependencies there.
+// aji_trt.dll, ...), UTF-8: backends resolve their runtime dependencies
+// there. Windows: load what's in it with LoadLibraryExW(widen_utf8(...)).
 std::string own_dir();
 
 } // namespace ajicore

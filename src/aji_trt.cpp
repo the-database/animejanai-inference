@@ -247,7 +247,7 @@ struct aji_ctx {
 
     // ONNX input frame counts, keyed by path, valid while size/mtime match
     struct OnnxFrames {
-        uintmax_t size = 0;
+        long long size = -1;
         int64_t mtime = 0;
         int frames = 1;
         bool rank5 = false;
@@ -287,10 +287,14 @@ aji_csp make_csp(const aji_frame *f)
     return aji_make_csp(f->format, f->matrix, f->range);
 }
 
+// Both engine directories: the models' and RIFE's (its own folder when
+// rife_model_dir is set), with the same rules.
 void clean_stale_engines(aji_ctx *c)
 {
     std::vector<std::string> removed;
     ajicore::clean_stale_engines(c->model_dir, c->cuda_dev, &removed);
+    if (!c->rife_model_dir.empty() && c->rife_model_dir != c->model_dir)
+        ajicore::clean_stale_engines(c->rife_model_dir, c->cuda_dev, &removed);
     for (const std::string &name : removed) {
         c->log_steps.push_back(
             "Removed stale " AJI_TRT_PRODUCT " engine (different GPU or "
@@ -506,6 +510,26 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath =
         short_engine_path_for(model_dir, name, settings, c->cuda_dev);
+    // A cached engine built from a different ONNX than the one under this
+    // name now (re-exported, or another model copied over it) is stale:
+    // removed, so it gets rebuilt. Returns true if it was.
+    const std::string onnx_path =
+        (fs::u8path(model_dir) / fs::u8path(name + ".onnx")).u8string();
+    auto drop_if_model_changed = [&](const std::string &path) -> bool {
+        // (cached-only checks report it in try_cached and delete nothing)
+        if (c->check_engines_only || !file_exists(path) ||
+            ajicore::engine_matches_onnx(path, onnx_path))
+            return false;
+        c->log_steps.push_back("Model " + name +
+                               " changed since its engine was built; rebuilding");
+        c->verbose("model changed since engine was built, removing: %s",
+                   path.c_str());
+        ajicore::remove_engine_files(path);
+        return true;
+    };
+    drop_if_model_changed(epath);
+    if (short_epath != epath)
+        drop_if_model_changed(short_epath);
 #ifdef AJI_TRTRTX
     // a failure already reported (and not replaced by the TensorRT
     // fallback): passthrough, as aji_trt does for a failed build
@@ -542,6 +566,13 @@ int ensure_engine(aji_ctx *c, const std::string &name,
             // print a TensorRT API error first)
             c->verbose("removing incomplete cached engine: %s", path.c_str());
             remove_file(path);
+            return -1;
+        }
+        if (c->check_engines_only &&
+            !ajicore::engine_matches_onnx(path, onnx_path)) {
+            c->set_error("AJN_ENGINE_INCOMPATIBLE: model=%s; path=%s; model "
+                         "changed since the engine was built",
+                         name.c_str(), path.c_str());
             return -1;
         }
 #ifdef AJI_TRTRTX
@@ -778,12 +809,9 @@ void finalize_log(aji_ctx *c)
 aji_ctx::OnnxFrames onnx_frames(aji_ctx *c, const std::string &name)
 {
     const std::string path =
-        (fs::path(c->model_dir) / (name + ".onnx")).string();
-    std::error_code ec;
-    const uintmax_t size = fs::file_size(path, ec);
-    const int64_t mtime =
-        ec ? 0
-           : (int64_t)fs::last_write_time(path, ec).time_since_epoch().count();
+        (fs::u8path(c->model_dir) / fs::u8path(name + ".onnx")).u8string();
+    long long size = -1, mtime = 0;
+    ajicore::file_stamp(path, &size, &mtime);
     auto it = c->onnx_frames.find(path);
     if (it != c->onnx_frames.end() && it->second.size == size &&
         it->second.mtime == mtime)

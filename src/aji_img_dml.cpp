@@ -14,7 +14,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -109,16 +109,28 @@ uint64_t device_id(const LUID &luid)
     return ((uint64_t)(uint32_t)luid.HighPart << 32) | (uint64_t)luid.LowPart;
 }
 
-// Hardware adapters that can create a D3D12 device, in DXGI order, without
-// the virtual-display duplicates (is_indirect_display).
+// Hardware adapters that can create a D3D12 device, without the
+// virtual-display duplicates (is_indirect_display), high-performance GPU
+// first (IDXGIFactory6, Windows 10 1803+; plain DXGI order before that).
+// Device id 0 takes the first, so a hybrid laptop runs on its discrete GPU
+// rather than whichever adapter DXGI lists first (usually the integrated
+// one), as aji_encode and mpv already do.
 std::vector<ComPtr<IDXGIAdapter1>> adapters()
 {
     std::vector<ComPtr<IDXGIAdapter1>> out;
     ComPtr<IDXGIFactory1> f;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f))))
         return out;
+    ComPtr<IDXGIFactory6> f6;
+    f.As(&f6);  // stays null where unsupported
+    auto enum_adapter = [&](UINT i, ComPtr<IDXGIAdapter1> *a) {
+        if (f6)
+            return f6->EnumAdapterByGpuPreference(
+                i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(a->ReleaseAndGetAddressOf()));
+        return f->EnumAdapters1(i, a->ReleaseAndGetAddressOf());
+    };
     ComPtr<IDXGIAdapter1> a;
-    for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+    for (UINT i = 0; SUCCEEDED(enum_adapter(i, &a)); i++) {
         DXGI_ADAPTER_DESC1 d = {};
         a->GetDesc1(&d);
         if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
@@ -368,6 +380,11 @@ extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_param
     auto c = std::make_unique<aji_img_ctx>();
     c->log = p->log;
     c->log_opaque = p->log_opaque;
+    if (c->log) {
+        DXGI_ADAPTER_DESC1 d = {};
+        adapter->GetDesc1(&d);
+        c->log(c->log_opaque, 3, ("DirectML adapter: " + narrow(d.Description)).c_str());
+    }
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     qd.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
