@@ -53,23 +53,30 @@ void TrtLogger::log(Severity sev, const char *msg) noexcept
         fprintf(stderr, "[aji-trt] %s\n", msg);
 }
 
+// Running zlib CRC-32: start from 0, feed the bytes in any number of calls.
+static uint32_t crc32_update(uint32_t crc, const unsigned char *p, size_t n)
+{
+    struct Table {
+        uint32_t t[256];
+        Table() {
+            for (uint32_t i = 0; i < 256; i++) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; k++)
+                    c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                t[i] = c;
+            }
+        }
+    };
+    static const Table table;  // thread-safe initialization
+    uint32_t c = crc ^ 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++)
+        c = table.t[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
 uint32_t crc32_z(const std::string &data)
 {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            table[i] = c;
-        }
-        init = true;
-    }
-    uint32_t c = 0xFFFFFFFFu;
-    for (unsigned char ch : data)
-        c = table[(c ^ ch) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+    return crc32_update(0, (const unsigned char *)data.data(), data.size());
 }
 
 std::string sanitize_token(std::string s)
@@ -128,9 +135,10 @@ std::string engine_path_for(const std::string &model_dir,
                             const std::string &onnx_name,
                             const std::string &settings, int dev)
 {
-    return (fs::path(model_dir) /
-            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix(dev)))
-        .string();
+    return (fs::u8path(model_dir) /
+            fs::u8path(onnx_name + "." + std::to_string(crc32_z(settings)) +
+                       engine_suffix(dev)))
+        .u8string();
 }
 
 std::string short_engine_path_for(const std::string &model_dir,
@@ -139,10 +147,10 @@ std::string short_engine_path_for(const std::string &model_dir,
 {
     char model_hash[9];
     snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
-    return (fs::path(model_dir) /
-            ("aji-" + std::string(model_hash) + "." +
-             std::to_string(crc32_z(settings)) + engine_suffix(dev)))
-        .string();
+    return (fs::u8path(model_dir) /
+            fs::u8path("aji-" + std::string(model_hash) + "." +
+                       std::to_string(crc32_z(settings)) + engine_suffix(dev)))
+        .u8string();
 }
 
 void clean_stale_engines(const std::string &dir, int fallback_dev,
@@ -164,13 +172,18 @@ void clean_stale_engines(const std::string &dir, int fallback_dev,
                s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
     };
     std::error_code ec;
-    for (const auto &e : fs::directory_iterator(dir, ec)) {
-        const std::string name = e.path().filename().string();
+    for (const auto &e : fs::directory_iterator(fs::u8path(dir), ec)) {
+        const std::string name = e.path().filename().u8string();
         std::string key = name;  // the engine name this file belongs to
+        // an engine's ONNX record (and JIT cache) goes with it
+        if (ends_with(key, ONNX_INFO_EXT))
+            key.resize(key.size() - strlen(ONNX_INFO_EXT));
 #ifdef AJI_TRTRTX
-        if (ends_with(key, JIT_CACHE_EXT))  // an engine's JIT cache goes with it
+        else if (ends_with(key, JIT_CACHE_EXT))
             key.resize(key.size() - strlen(JIT_CACHE_EXT));
 #endif
+        // only this backend's own files: ".rtxengine" does not end in
+        // ".engine", so TensorRT and TensorRT-RTX share a directory
         if (!ends_with(key, ENGINE_EXT))
             continue;
         bool current = false;
@@ -182,6 +195,93 @@ void clean_stale_engines(const std::string &dir, int fallback_dev,
         if (fs::remove(e.path(), rec))
             removed->push_back(name);
     }
+}
+
+const char *const ONNX_INFO_EXT = ".onnxinfo";
+
+bool read_onnx_info(const std::string &onnx_path, OnnxInfo *info)
+{
+    if (!file_stamp(onnx_path, &info->size, &info->mtime))
+        return false;
+    std::FILE *f = fopen_utf8(onnx_path, "rb");
+    if (!f)
+        return false;
+    std::vector<unsigned char> buf(1 << 20);
+    uint32_t crc = 0;
+    long long total = 0;
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        crc = crc32_update(crc, buf.data(), n);
+        total += (long long)n;
+    }
+    const bool ok = !ferror(f);
+    fclose(f);
+    if (!ok || total != info->size)  // changed while we read it
+        return false;
+    info->crc = crc;
+    return true;
+}
+
+void write_onnx_info(const std::string &engine_path, const OnnxInfo &info)
+{
+    char text[128];
+    const int n = snprintf(text, sizeof(text), "size=%lld\nmtime=%lld\ncrc32=%08x\n",
+                           info.size, info.mtime, (unsigned)info.crc);
+    const std::string path = engine_path + ONNX_INFO_EXT;
+    // via a temp file, so a crash never leaves a half-written record
+    if (!write_file_bytes(path + ".tmp", text, (size_t)n) ||
+        !move_file(path + ".tmp", path))
+        remove_file(path + ".tmp");
+}
+
+// false if absent or unparsable
+static bool load_onnx_info(const std::string &engine_path, OnnxInfo *info)
+{
+    std::vector<char> text;
+    if (!read_file_bytes(engine_path + ONNX_INFO_EXT, &text))
+        return false;
+    text.push_back('\0');
+    unsigned crc = 0;
+    if (sscanf(text.data(), "size=%lld mtime=%lld crc32=%x", &info->size,
+               &info->mtime, &crc) != 3)
+        return false;
+    info->crc = crc;
+    return true;
+}
+
+bool engine_matches_onnx(const std::string &engine_path,
+                         const std::string &onnx_path)
+{
+    OnnxInfo now;
+    if (!file_stamp(onnx_path, &now.size, &now.mtime))
+        return true;  // can't tell; the engine is all there is
+    OnnxInfo rec;
+    if (!load_onnx_info(engine_path, &rec)) {
+        // an engine from before these records: trust it, once
+        if (read_onnx_info(onnx_path, &now))
+            write_onnx_info(engine_path, now);
+        return true;
+    }
+    if (now.size != rec.size)
+        return false;
+    if (now.mtime == rec.mtime)
+        return true;
+    // same size, new time: a re-export, or the same file copied again
+    if (!read_onnx_info(onnx_path, &now))
+        return true;
+    if (now.crc != rec.crc)
+        return false;
+    write_onnx_info(engine_path, now);  // the same model: just a new time
+    return true;
+}
+
+void remove_engine_files(const std::string &engine_path)
+{
+    remove_file(engine_path);
+    remove_file(engine_path + ONNX_INFO_EXT);
+#ifdef AJI_TRTRTX
+    remove_file(engine_path + JIT_CACHE_EXT);
+#endif
 }
 
 std::string shapes_label(const std::string &settings)
@@ -376,6 +476,12 @@ bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
         return run_build_process(spec, child) == 0;
 #endif
     remove_file(spec.tmp_path);  // a previous build's leftover
+    remove_file(spec.engine_path + ONNX_INFO_EXT);
+    // the ONNX as the build reads it (taken first: it could change while
+    // the build runs, and the record must not claim the newer file)
+    OnnxInfo onnx;
+    const bool have_onnx =
+        !spec.onnx_path.empty() && read_onnx_info(spec.onnx_path, &onnx);
     int rc = run_build_process(spec, child);
     if (rc != 0 || file_size(spec.tmp_path) <= 0 ||
         !move_file(spec.tmp_path, spec.engine_path)) {
@@ -388,6 +494,8 @@ bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
         append_file_text(spec.log_path, msg);
         return false;
     }
+    if (have_onnx)
+        write_onnx_info(spec.engine_path, onnx);
     return true;
 }
 
@@ -444,6 +552,77 @@ std::string sanitize_settings_trt11(std::string s)
 } // namespace
 #endif
 
+#ifndef AJI_TRTRTX
+#ifdef _WIN32
+namespace {
+// The system ANSI code page: trtexec's, whatever this process's is (a host
+// with a UTF-8 manifest has CP_UTF8 here, trtexec does not).
+UINT system_acp()
+{
+    wchar_t buf[8] = {0};
+    if (GetLocaleInfoEx(LOCALE_NAME_SYSTEM_DEFAULT, LOCALE_IDEFAULTANSICODEPAGE |
+                                                        LOCALE_RETURN_NUMBER,
+                        buf, sizeof(buf) / sizeof(wchar_t)) > 0) {
+        UINT cp = *(DWORD *)buf;
+        if (cp)
+            return cp;
+    }
+    return GetACP();
+}
+
+bool acp_can_spell(UINT cp, const std::wstring &w)
+{
+    if (cp == CP_UTF8)
+        return true;
+    BOOL lossy = FALSE;
+    int n = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, w.c_str(), -1, nullptr,
+                                0, nullptr, &lossy);
+    return n > 0 && !lossy;
+}
+
+std::wstring short_path(const std::wstring &p)
+{
+    DWORD n = GetShortPathNameW(p.c_str(), nullptr, 0);
+    if (!n)
+        return L"";
+    std::wstring s(n, L'\0');
+    DWORD m = GetShortPathNameW(p.c_str(), s.data(), n);
+    if (!m || m >= n)
+        return L"";
+    s.resize(m);
+    return s;
+}
+} // namespace
+
+// trtexec has a narrow main(), so its arguments arrive through the system
+// ANSI code page however we spawn it: a path with characters that code page
+// can't spell (an é on a Japanese system, Japanese on a Western one) reaches
+// it as '?'s and the build fails. Such a path goes as its 8.3 short form,
+// which the file system spells in the OEM code page; a file that doesn't
+// exist yet (the engine trtexec writes) gets its folder's short form. Left
+// as it is where that doesn't help (8.3 names disabled).
+static std::string trtexec_path_arg(const std::string &path)
+{
+    const std::wstring w = widen_utf8(path);
+    const UINT cp = system_acp();
+    if (acp_can_spell(cp, w))
+        return path;
+    std::wstring s = short_path(w);
+    if (s.empty()) {
+        const size_t slash = w.find_last_of(L"\\/");
+        if (slash != std::wstring::npos && slash > 0) {
+            const std::wstring dir = short_path(w.substr(0, slash));
+            if (!dir.empty())
+                s = dir + w.substr(slash);
+        }
+    }
+    return !s.empty() && acp_can_spell(cp, s) ? narrow_utf8(s) : path;
+}
+#else
+static std::string trtexec_path_arg(const std::string &path) { return path; }
+#endif
+#endif
+
 bool make_build_spec(const std::string &trtexec, const std::string &trtexec_env,
                      const std::string &dir, const std::string &onnx_name,
                      const std::string &settings, const std::string &engine_path,
@@ -454,8 +633,10 @@ bool make_build_spec(const std::string &trtexec, const std::string &trtexec_env,
     // NVIDIA's mitigation for timing noise when the GPU isn't idle - our
     // background builds run alongside playback.
     return make_build_spec_paths(
-        trtexec, trtexec_env, (fs::path(dir) / (onnx_name + ".onnx")).string(),
-        (fs::path(dir) / (onnx_name + ".timing.cache")).string(), onnx_name,
+        trtexec, trtexec_env,
+        (fs::u8path(dir) / fs::u8path(onnx_name + ".onnx")).u8string(),
+        (fs::u8path(dir) / fs::u8path(onnx_name + ".timing.cache")).u8string(),
+        onnx_name,
         settings, engine_path, dev, spec, err);
 }
 
@@ -496,10 +677,10 @@ bool make_build_spec_paths(const std::string &trtexec,
     resolve_trtexec(trtexec, trtexec_env, &exe, &env_prefix, &path_prefix);
     spec->env_prefix = env_prefix;
     spec->path_prefix = path_prefix;
-    spec->cmdline = "\"" + exe + "\" --onnx=\"" + onnx_path +
-                    "\" --saveEngine=\"" + engine_path + ".tmp\" " +
-                    cmd_settings +
-                    " --timingCacheFile=\"" + tcache + "\"";
+    spec->cmdline = "\"" + exe + "\" --onnx=\"" + trtexec_path_arg(onnx_path) +
+                    "\" --saveEngine=\"" + trtexec_path_arg(engine_path + ".tmp") +
+                    "\" " + cmd_settings +
+                    " --timingCacheFile=\"" + trtexec_path_arg(tcache) + "\"";
     // trtexec builds on device 0 by default; build on the GPU that runs
     // the engine (left off for device 0 to keep the usual command line)
     if (dev != 0)

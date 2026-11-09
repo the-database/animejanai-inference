@@ -224,8 +224,11 @@ timing-cache file lock. Neither is needed now:
 - **Non-ASCII paths** — fixed on *our* side instead, which is where it belonged.
   `run_build_process` used to spawn with `CreateProcessA`, so the UTF-8 paths in the command
   line were reinterpreted through the process ANSI code page and trtexec received a mangled
-  path. It now widens the command line and calls `CreateProcessW`, so the child gets the real
-  path regardless of system locale — and regardless of which `trtexec` is in use.
+  path. It now widens the command line and calls `CreateProcessW`. trtexec itself still has a
+  narrow `main()`, so it reads its arguments in the *system* ANSI code page: a path that code
+  page can't spell (an `é` on a Japanese system, Japanese on a Western one) is passed as its
+  8.3 short form (`trtexec_path_arg` in `core/trt_engine.cpp`), which works wherever the volume
+  keeps 8.3 names (the default for the system drive).
 
 ### 4. ONNX Runtime DirectML + DirectML — NuGet packages
 
