@@ -552,6 +552,77 @@ std::string sanitize_settings_trt11(std::string s)
 } // namespace
 #endif
 
+#ifndef AJI_TRTRTX
+#ifdef _WIN32
+namespace {
+// The system ANSI code page: trtexec's, whatever this process's is (a host
+// with a UTF-8 manifest has CP_UTF8 here, trtexec does not).
+UINT system_acp()
+{
+    wchar_t buf[8] = {0};
+    if (GetLocaleInfoEx(LOCALE_NAME_SYSTEM_DEFAULT, LOCALE_IDEFAULTANSICODEPAGE |
+                                                        LOCALE_RETURN_NUMBER,
+                        buf, sizeof(buf) / sizeof(wchar_t)) > 0) {
+        UINT cp = *(DWORD *)buf;
+        if (cp)
+            return cp;
+    }
+    return GetACP();
+}
+
+bool acp_can_spell(UINT cp, const std::wstring &w)
+{
+    if (cp == CP_UTF8)
+        return true;
+    BOOL lossy = FALSE;
+    int n = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, w.c_str(), -1, nullptr,
+                                0, nullptr, &lossy);
+    return n > 0 && !lossy;
+}
+
+std::wstring short_path(const std::wstring &p)
+{
+    DWORD n = GetShortPathNameW(p.c_str(), nullptr, 0);
+    if (!n)
+        return L"";
+    std::wstring s(n, L'\0');
+    DWORD m = GetShortPathNameW(p.c_str(), s.data(), n);
+    if (!m || m >= n)
+        return L"";
+    s.resize(m);
+    return s;
+}
+} // namespace
+
+// trtexec has a narrow main(), so its arguments arrive through the system
+// ANSI code page however we spawn it: a path with characters that code page
+// can't spell (an é on a Japanese system, Japanese on a Western one) reaches
+// it as '?'s and the build fails. Such a path goes as its 8.3 short form,
+// which the file system spells in the OEM code page; a file that doesn't
+// exist yet (the engine trtexec writes) gets its folder's short form. Left
+// as it is where that doesn't help (8.3 names disabled).
+static std::string trtexec_path_arg(const std::string &path)
+{
+    const std::wstring w = widen_utf8(path);
+    const UINT cp = system_acp();
+    if (acp_can_spell(cp, w))
+        return path;
+    std::wstring s = short_path(w);
+    if (s.empty()) {
+        const size_t slash = w.find_last_of(L"\\/");
+        if (slash != std::wstring::npos && slash > 0) {
+            const std::wstring dir = short_path(w.substr(0, slash));
+            if (!dir.empty())
+                s = dir + w.substr(slash);
+        }
+    }
+    return !s.empty() && acp_can_spell(cp, s) ? narrow_utf8(s) : path;
+}
+#else
+static std::string trtexec_path_arg(const std::string &path) { return path; }
+#endif
+#endif
+
 bool make_build_spec(const std::string &trtexec, const std::string &trtexec_env,
                      const std::string &dir, const std::string &onnx_name,
                      const std::string &settings, const std::string &engine_path,
@@ -606,10 +677,10 @@ bool make_build_spec_paths(const std::string &trtexec,
     resolve_trtexec(trtexec, trtexec_env, &exe, &env_prefix, &path_prefix);
     spec->env_prefix = env_prefix;
     spec->path_prefix = path_prefix;
-    spec->cmdline = "\"" + exe + "\" --onnx=\"" + onnx_path +
-                    "\" --saveEngine=\"" + engine_path + ".tmp\" " +
-                    cmd_settings +
-                    " --timingCacheFile=\"" + tcache + "\"";
+    spec->cmdline = "\"" + exe + "\" --onnx=\"" + trtexec_path_arg(onnx_path) +
+                    "\" --saveEngine=\"" + trtexec_path_arg(engine_path + ".tmp") +
+                    "\" " + cmd_settings +
+                    " --timingCacheFile=\"" + trtexec_path_arg(tcache) + "\"";
     // trtexec builds on device 0 by default; build on the GPU that runs
     // the engine (left off for device 0 to keep the usual command line)
     if (dev != 0)
