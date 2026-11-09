@@ -349,6 +349,35 @@ std::string aji_chain_missing_model(const std::string &model_dir,
     return std::string();
 }
 
+const AjiChainConf *aji_select_chain(const AjiConf &conf, int slot,
+                                     const std::string &model_dir, int w,
+                                     int h, double fps,
+                                     std::vector<std::string> *skipped)
+{
+    auto sit = conf.slots.find(slot);
+    if (sit == conf.slots.end())
+        return nullptr;
+    const double px = (double)w * h;
+    for (const auto &ch : sit->second.chains) {
+        if (ch.min_px <= px && px <= ch.max_px &&
+            ch.min_fps <= fps && fps <= ch.max_fps) {
+            // Skip a matching chain whose model file is missing (e.g. a
+            // stale config reference after a model rename): degrade to the
+            // next chain / passthrough instead of failing playback.
+            std::string missing = aji_chain_missing_model(model_dir, ch);
+            if (!missing.empty()) {
+                if (skipped)
+                    skipped->push_back(
+                        "Chain " + std::to_string(ch.index) +
+                        " skipped: model not found: " + missing + ".onnx");
+                continue;
+            }
+            return &ch;
+        }
+    }
+    return nullptr;
+}
+
 bool aji_conf_load(const char *path, AjiConf *out, std::string *err)
 {
     *out = AjiConf();

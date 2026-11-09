@@ -314,6 +314,19 @@ Two chain keys add or remove steps without listing them as models (`parse_chain`
 and timing for chains without stacking, plus stacked-chain correctness. Run it before
 releasing any change to the temporal or chain code (environment variables in its header).
 
+## RIFE factors in `aji_encode`
+
+Any factor of 1 or more works, fractions included (`5/2` for 23.976 -> 59.94 fps, `3/2`); it
+is reduced first (`4/2` runs as `2/1`). The schedule is mpv's `vf_animejanai` accumulator:
+output frames sit on a grid `den/num` of a source frame apart from the first frame, source
+frames are put out where the grid lands on them, and the output time base is the source's
+divided by `num`, so a constant-rate source gets exact, evenly spaced timestamps. The stream
+ends at the last grid point at or before the last source frame: n frames give
+`floor((n-1)*num/den) + 1`, which for an integer factor is the old `(n-1)*F + 1`. The comment
+above `rife_step` in `src/encode.c` has the details. Unlike mpv, `aji_encode` has no 8x cap.
+A factor below 1 fails before any engine is built: `aji_rife_factor_for_config` (dispatcher
+only) reads the chain's factor from the conf without configuring.
+
 ## Conventions
 
 - Commits: author `the-database`, short imperative subject, no co-author trailers.
