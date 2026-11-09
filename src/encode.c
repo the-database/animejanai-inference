@@ -261,6 +261,7 @@ static int aji_siting_from_av(enum AVChromaLocation l)
 /* ---- pipeline context ---------------------------------------------------- */
 
 #define MAX_RING 32
+#define MAX_HELD 256    /* video packets kept until NVDEC is known to work */
 
 typedef struct {
     AVFrame  *out;       /* aji output (or decoded, passthrough) CUDA frame */
@@ -292,6 +293,14 @@ typedef struct {
     CUcontext        cuctx;          /* shared context (from libav) */
     int              ctx_pushed;
     int              nvdec;          /* decoding on the GPU */
+    int              dec_sw;         /* get_hw_format fell back to software */
+    int              dec_hw;         /* get_hw_format picked CUDA */
+    int              dec_hold;       /* keeping packets for a CPU decoder */
+    AVPacket        *dec_held[MAX_HELD];
+    int              dec_held_n;
+    AVFrame         *dec_pend[MAX_HELD];  /* frames it put out while being
+                                             given them again */
+    int              dec_pend_head, dec_pend_n;
     int              dml;            /* DirectML backend: frames are shared D3D11
                                         textures (libav D3D11 frames), and no
                                         CUDA call is ever made */
@@ -433,10 +442,12 @@ static enum AVPixelFormat g_hw_pixfmt = AV_PIX_FMT_CUDA;
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
                                         const enum AVPixelFormat *fmts)
 {
-    const enc_ctx *c = ctx->opaque;
+    enc_ctx *c = ctx->opaque;
     for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++)
-        if (*p == g_hw_pixfmt)
+        if (*p == g_hw_pixfmt) {
+            if (c) c->dec_hw = 1;
             return *p;
+        }
     /* NVDEC can't take this stream (libav drops cuda from the list once its
      * hwaccel init fails, e.g. 4:4:4 H.264): --decoder auto carries on in
      * software, and to_device uploads the frames */
@@ -445,6 +456,7 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
             const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(*p);
             if (d && !(d->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
                 loge("NVDEC can't decode this stream; decoding on the CPU");
+                c->dec_sw = 1;
                 return *p;
             }
         }
@@ -932,42 +944,182 @@ static void resolve_pixfmt(enc_ctx *c)
         c->src_aji_fmt = c->out_aji_fmt;
 }
 
-static int open_decoder(enc_ctx *c)
+static AVCodecContext *alloc_decoder(enc_ctx *c)
 {
-    AVStream *vst = c->ifmt->streams[c->vstream];
+    const AVStream *vst = c->ifmt->streams[c->vstream];
     const AVCodec *codec = avcodec_find_decoder(vst->codecpar->codec_id);
-    if (!codec) { loge("no decoder for video stream"); return -1; }
-
-    c->dec = avcodec_alloc_context3(codec);
-    if (!c->dec) { loge("avcodec_alloc_context3 failed"); return -1; }
-    AV(avcodec_parameters_to_context(c->dec, vst->codecpar));
-    c->dec->pkt_timebase = vst->time_base;
-
-    /* deinterlacing filters run on the CPU: decode there too */
-    int want_hw = (c->o.decoder != DEC_CPU) && !c->o.no_zerocopy && !c->dml &&
-                  !c->dgraph;
-    if (want_hw) {
-        c->dec->hw_device_ctx = av_buffer_ref(c->hw_device);
-        c->dec->get_format = get_hw_format;
-        c->dec->opaque = c;
+    if (!codec) { loge("no decoder for video stream"); return NULL; }
+    AVCodecContext *dec = avcodec_alloc_context3(codec);
+    if (!dec) { loge("avcodec_alloc_context3 failed"); return NULL; }
+    if (avcodec_parameters_to_context(dec, vst->codecpar) < 0) {
+        avcodec_free_context(&dec);
+        return NULL;
     }
-    int r = avcodec_open2(c->dec, codec, NULL);
-    if (r < 0 && want_hw && c->o.decoder == DEC_AUTO) {
-        loge("NVDEC open failed; falling back to CPU decode");
-        av_buffer_unref(&c->dec->hw_device_ctx);
-        c->dec->get_format = NULL;
-        avcodec_free_context(&c->dec);
-        c->dec = avcodec_alloc_context3(codec);
-        AV(avcodec_parameters_to_context(c->dec, vst->codecpar));
-        c->dec->pkt_timebase = vst->time_base;
-        want_hw = 0;
-        r = avcodec_open2(c->dec, codec, NULL);
-    }
-    if (r < 0) { AV(r); }
-    c->nvdec = want_hw;
+    dec->pkt_timebase = vst->time_base;
+    return dec;
+}
+
+/* Open c->dec as a CPU decoder. libavcodec defaults thread_count to 1 (the
+ * ffmpeg CLI sets "auto" itself), which held H.264/HEVC/AV1 decode to one
+ * core; take every core, by frame and by slice. Frame threading delays the
+ * output by a few frames, which the decode loops drain at the end
+ * (avcodec_send_packet(NULL)) and drop on a seek (avcodec_flush_buffers);
+ * the frames and their timestamps are the same. NVDEC is left as it is. */
+static int open_cpu_decoder(enc_ctx *c)
+{
+    avcodec_free_context(&c->dec);
+    if (!(c->dec = alloc_decoder(c))) return -1;
+    c->dec->thread_count = 0;
+    c->dec->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    AV(avcodec_open2(c->dec, c->dec->codec, NULL));
+    c->nvdec = 0;
     return 0;
 fail:
     return -1;
+}
+
+/* libavcodec has an NVDEC hwaccel for this codec (some profiles of it) */
+static int codec_has_cuda(const AVCodec *codec)
+{
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
+        if (!cfg) return 0;
+        if (cfg->device_type == AV_HWDEVICE_TYPE_CUDA &&
+            (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+            return 1;
+    }
+}
+
+static int open_decoder(enc_ctx *c)
+{
+    /* deinterlacing filters run on the CPU: decode there too */
+    const int want_hw = (c->o.decoder != DEC_CPU) && !c->o.no_zerocopy &&
+                        !c->dml && !c->dgraph;
+    if (!want_hw)
+        return open_cpu_decoder(c);
+    const AVCodec *codec =
+        avcodec_find_decoder(c->ifmt->streams[c->vstream]->codecpar->codec_id);
+    if (codec && !codec_has_cuda(codec) && c->o.decoder == DEC_AUTO) {
+        loge("NVDEC can't decode %s; decoding on the CPU", codec->name);
+        return open_cpu_decoder(c);
+    }
+
+    if (!(c->dec = alloc_decoder(c))) return -1;
+    c->dec->hw_device_ctx = av_buffer_ref(c->hw_device);
+    c->dec->get_format = get_hw_format;
+    c->dec->opaque = c;
+    int r = avcodec_open2(c->dec, c->dec->codec, NULL);
+    if (r < 0 && c->o.decoder == DEC_AUTO) {
+        loge("NVDEC open failed; falling back to CPU decode");
+        return open_cpu_decoder(c);
+    }
+    if (r < 0) { AV(r); }
+    c->nvdec = 1;
+    /* --decoder auto: NVDEC may still turn the stream down once it sees
+     * it (get_hw_format); keep the packets until then (dec_send) */
+    c->dec_hold = c->o.decoder == DEC_AUTO;
+    return 0;
+fail:
+    return -1;
+}
+
+static void dec_drop_held(enc_ctx *c)
+{
+    for (int i = 0; i < c->dec_held_n; i++)
+        av_packet_free(&c->dec_held[i]);
+    c->dec_held_n = 0;
+}
+
+static void dec_drop_pending(enc_ctx *c)
+{
+    while (c->dec_pend_n > 0) {
+        av_frame_free(&c->dec_pend[c->dec_pend_head]);
+        c->dec_pend_head = (c->dec_pend_head + 1) % MAX_HELD;
+        c->dec_pend_n--;
+    }
+    c->dec_pend_head = 0;
+}
+
+/* avcodec_send_packet that takes the frames waiting to be received out
+ * first (into dec_pend, for dec_receive) instead of returning EAGAIN */
+static int dec_send_pending(enc_ctx *c, const AVPacket *pkt)
+{
+    int r;
+    while ((r = avcodec_send_packet(c->dec, pkt)) == AVERROR(EAGAIN)) {
+        AVFrame *fr = c->dec_pend_n < MAX_HELD ? av_frame_alloc() : NULL;
+        if (!fr) return AVERROR(ENOMEM);
+        if ((r = avcodec_receive_frame(c->dec, fr)) < 0) {
+            av_frame_free(&fr);
+            return r;
+        }
+        c->dec_pend[(c->dec_pend_head + c->dec_pend_n++) % MAX_HELD] = fr;
+    }
+    return r;
+}
+
+/* NVDEC turned the stream down after opening: libavcodec carries on in
+ * software, but on one thread (threads can't be set on an open decoder).
+ * Hand the stream to a threaded CPU decoder instead, giving it the packets
+ * NVDEC was given; no frame has come out yet, so it starts from the same
+ * point. */
+static int dec_restart_cpu(enc_ctx *c, int eof)
+{
+    c->dec_hold = 0;
+    int r = open_cpu_decoder(c) < 0 ? AVERROR(EINVAL) : 0;
+    for (int i = 0; r >= 0 && i < c->dec_held_n; i++)
+        r = dec_send_pending(c, c->dec_held[i]);
+    dec_drop_held(c);
+    if (r >= 0 && eof)
+        r = dec_send_pending(c, NULL);
+    return r;
+}
+
+/* avcodec_send_packet for the video decoder (NULL: end of stream). */
+static int dec_send(enc_ctx *c, const AVPacket *pkt)
+{
+    if (c->dec_hold && pkt) {
+        AVPacket *ref = c->dec_held_n < MAX_HELD ? av_packet_clone(pkt) : NULL;
+        if (ref) {
+            c->dec_held[c->dec_held_n++] = ref;
+        } else {
+            c->dec_hold = 0;        /* too many: NVDEC's fallback stays */
+            dec_drop_held(c);
+        }
+    }
+    const int r = avcodec_send_packet(c->dec, pkt);
+    if (c->dec_hold && c->dec_sw)
+        return dec_restart_cpu(c, !pkt);
+    if (c->dec_hold && c->dec_hw) {
+        c->dec_hold = 0;            /* NVDEC took it */
+        dec_drop_held(c);
+    }
+    return r;
+}
+
+/* avcodec_receive_frame for the video decoder */
+static int dec_receive(enc_ctx *c, AVFrame *fr)
+{
+    if (c->dec_pend_n > 0) {
+        av_frame_move_ref(fr, c->dec_pend[c->dec_pend_head]);
+        av_frame_free(&c->dec_pend[c->dec_pend_head]);
+        c->dec_pend_head = (c->dec_pend_head + 1) % MAX_HELD;
+        c->dec_pend_n--;
+        return 0;
+    }
+    const int r = avcodec_receive_frame(c->dec, fr);
+    if (r >= 0 && c->dec_hold) {
+        c->dec_hold = 0;            /* a frame is out: too late to restart */
+        dec_drop_held(c);
+    }
+    return r;
+}
+
+/* drop everything the decoder holds (a seek) */
+static void dec_flush(enc_ctx *c)
+{
+    dec_drop_pending(c);
+    dec_drop_held(c);
+    avcodec_flush_buffers(c->dec);
 }
 
 /* ---- --deinterlace: libavfilter graph on the decoded frames -------------- */
@@ -2926,10 +3078,10 @@ static int run(enc_ctx *c)
 
     while (av_read_frame(c->ifmt, pkt) >= 0) {
         if (pkt->stream_index == c->vstream) {
-            AV(avcodec_send_packet(c->dec, pkt));
+            AV(dec_send(c, pkt));
             for (;;) {
                 AVFrame *fr = av_frame_alloc();
-                int r = avcodec_receive_frame(c->dec, fr);
+                int r = dec_receive(c, fr);
                 if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
                     av_frame_free(&fr);
                     break;
@@ -2960,10 +3112,10 @@ static int run(enc_ctx *c)
     }
 
     /* flush decoder */
-    avcodec_send_packet(c->dec, NULL);
+    dec_send(c, NULL);
     for (;;) {
         AVFrame *fr = av_frame_alloc();
-        int r = avcodec_receive_frame(c->dec, fr);
+        int r = dec_receive(c, fr);
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) { av_frame_free(&fr); break; }
         if (r < 0) { av_frame_free(&fr); AV(r); }
         if (push_decoded(c, fr) < 0) goto done;
@@ -3020,7 +3172,7 @@ static int sess_reset(enc_ctx *c)
         c->in_seq = c->out_seq = 0;
     }
     c->last_pts = AV_NOPTS_VALUE;
-    avcodec_flush_buffers(c->dec);
+    dec_flush(c);
     if (c->dgraph && build_deint(c, c->dg_fmt, c->dg_spc, c->dg_range) < 0)
         return -1;
     sess_free_sources(c);
@@ -3059,19 +3211,19 @@ static int sess_serve(enc_ctx *c, double sec)
             const int r = av_read_frame(c->ifmt, pkt);
             if (r < 0) {
                 eof = 1;
-                avcodec_send_packet(c->dec, NULL);
+                dec_send(c, NULL);
             } else if (pkt->stream_index != c->vstream) {
                 av_packet_unref(pkt);
                 continue;
             } else {
-                const int s = avcodec_send_packet(c->dec, pkt);
+                const int s = dec_send(c, pkt);
                 av_packet_unref(pkt);
                 if (s < 0 && s != AVERROR(EAGAIN)) AV(s);
             }
         }
         for (;;) {
             AVFrame *fr = av_frame_alloc();
-            const int r = avcodec_receive_frame(c->dec, fr);
+            const int r = dec_receive(c, fr);
             if (r == AVERROR(EAGAIN)) { av_frame_free(&fr); break; }
             if (r == AVERROR_EOF) {
                 av_frame_free(&fr);
@@ -3181,6 +3333,8 @@ static void cleanup(enc_ctx *c)
     av_buffer_unref(&c->src_pool);
     av_buffer_unref(&c->work_pool);
     if (c->enc) avcodec_free_context(&c->enc);
+    dec_drop_pending(c);
+    dec_drop_held(c);
     if (c->dec) avcodec_free_context(&c->dec);
     if (c->ofmt) {
         if (c->ofmt->pb && !(c->ofmt->oformat->flags & AVFMT_NOFILE))
