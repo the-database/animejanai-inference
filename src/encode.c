@@ -201,6 +201,49 @@ static int aji_matrix_from_av(enum AVColorSpace c)
     }
 }
 
+/* Fill in what an untagged YUV source leaves out, the way mpv does
+ * (mp_image_params_guess_csp, which runs on every decoded frame before
+ * vf_animejanai sees it), from the source's frame size w x h:
+ *   matrix     BT.709 if w >= 1280 or h > 576, else BT.601
+ *              (mp_csp_guess_colorspace); tagged bt470bg at 576 lines and
+ *              smpte170m otherwise, the same matrix under its PAL and NTSC
+ *              names
+ *   range      limited
+ *   primaries  BT.2020 for a BT.2020 matrix, BT.709 for BT.709; otherwise
+ *              by size (mp_csp_guess_primaries): BT.709 for HD, bt470bg
+ *              (625-line) at 576 lines, smpte170m (525-line) at 480/486,
+ *              BT.709 for any other size
+ *   transfer   BT.1886 for limited range (tagged bt709), sRGB for full
+ * Only missing fields are filled, so a tagged source keeps its tags.
+ * libaji converts with the matrix and range and writes its output in
+ * them, and the encoder is tagged with all four: the upscaled file is
+ * HD-sized, and a player guessing on its own would take BT.709. */
+static void guess_colorimetry(int *spc, int *range, int *pri, int *trc,
+                              int w, int h)
+{
+    const int hd = w >= 1280 || h > 576;
+    if (*spc == AVCOL_SPC_UNSPECIFIED || *spc == AVCOL_SPC_RESERVED)
+        *spc = hd ? AVCOL_SPC_BT709 : h == 576 ? AVCOL_SPC_BT470BG
+                                               : AVCOL_SPC_SMPTE170M;
+    if (*range == AVCOL_RANGE_UNSPECIFIED)
+        *range = AVCOL_RANGE_MPEG;
+    if (*pri == AVCOL_PRI_UNSPECIFIED || *pri == AVCOL_PRI_RESERVED ||
+        *pri == AVCOL_PRI_RESERVED0) {
+        if (*spc == AVCOL_SPC_BT2020_NCL || *spc == AVCOL_SPC_BT2020_CL)
+            *pri = AVCOL_PRI_BT2020;
+        else if (*spc == AVCOL_SPC_BT709 || hd)
+            *pri = AVCOL_PRI_BT709;
+        else
+            *pri = h == 576 ? AVCOL_PRI_BT470BG
+                 : h == 480 || h == 486 ? AVCOL_PRI_SMPTE170M
+                 : AVCOL_PRI_BT709;
+    }
+    if (*trc == AVCOL_TRC_UNSPECIFIED || *trc == AVCOL_TRC_RESERVED ||
+        *trc == AVCOL_TRC_RESERVED0)
+        *trc = *range == AVCOL_RANGE_JPEG ? AVCOL_TRC_IEC61966_2_1
+                                          : AVCOL_TRC_BT709;
+}
+
 static int aji_range_from_av(enum AVColorRange r)
 {
     return r == AVCOL_RANGE_JPEG ? AJI_RANGE_FULL : AJI_RANGE_LIMITED;
@@ -749,6 +792,15 @@ static int open_input(enc_ctx *c)
         c->color_space = AVCOL_SPC_BT709;
         c->color_range = AVCOL_RANGE_MPEG;
         c->chroma_loc  = AVCHROMA_LOC_LEFT;
+    } else {
+        /* untagged: an SD source is BT.601, as in mpv, not BT.709 */
+        const int spc0 = c->color_space;
+        guess_colorimetry(&c->color_space, &c->color_range, &c->color_pri,
+                          &c->color_trc, par->width, par->height);
+        if (c->color_space != spc0)
+            loge("untagged colour matrix: assuming %s for %dx%d",
+                 av_color_space_name(c->color_space), par->width,
+                 par->height);
     }
 
     /* upscaling scales both axes alike, so the pixel aspect carries over */
