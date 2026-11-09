@@ -401,6 +401,32 @@ extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
     return c->be.rife_factor(c->inner, num, den);
 }
 
+extern "C" AJI_EXPORT int aji_rife_factor_for_config(
+    const aji_create_params *params, int w, int h, double fps, int *num,
+    int *den)
+{
+    // Mirrors the backends' aji_configure: the same conf parse and chain
+    // selection, and RIFE only with a rife model dir.
+    if (!params || !params->conf_path || !params->conf_path[0])
+        return 0;
+    AjiConf conf;
+    std::string err;
+    if (!aji_conf_load(params->conf_path, &conf, &err))
+        return 0;
+    const int slot = params->slot >= 0 ? params->slot : 1;
+    const std::string model_dir = params->model_dir ? params->model_dir : ".";
+    const AjiChainConf *chain =
+        aji_select_chain(conf, slot, model_dir, w, h, fps, nullptr);
+    if (!chain || !chain->rife || !params->rife_model_dir ||
+        !params->rife_model_dir[0])
+        return 0;
+    if (num)
+        *num = chain->rife_factor_num;
+    if (den)
+        *den = chain->rife_factor_den;
+    return 1;
+}
+
 extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
 {
     return c->be.rife_before_upscale(c->inner);
