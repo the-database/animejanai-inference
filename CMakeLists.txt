@@ -1,12 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
-project(animejanai-inference LANGUAGES C CXX CUDA)
-
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
-endif()
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+# Select the default before project() initializes it from nvcc's default GPU.
+# Preserve explicit -D overrides and CMake's CUDAARCHS environment override.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
     # Ship kernels for every supported GPU generation (Turing..Blackwell), NOT
     # "native": native builds only for the build machine's GPU, so the shipped
     # binary dies with "no kernel image is available for execution on the device"
@@ -14,7 +9,15 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     # 4090/sm89). The trailing -virtual emits PTX so future archs JIT-compile.
     # Keep in sync with the TensorRT builder packs (sm75/80/86/89/90/100/120).
     # Local dev can still override with -DCMAKE_CUDA_ARCHITECTURES=native.
-    set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual)
+    set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual
+        CACHE STRING "CUDA architectures for AJN kernels")
+endif()
+project(animejanai-inference LANGUAGES C CXX CUDA)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
 endif()
 
 # TensorRT location (default: userland dpkg -x extract on Linux; on Windows
@@ -22,7 +25,10 @@ endif()
 if(WIN32)
     set(AJI_TRT_ROOT "" CACHE PATH "TensorRT root")
     set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include")
-    set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
+    set(AJI_TRT_LIB "" CACHE PATH "TensorRT import library directory (empty uses AJI_TRT_ROOT)")
+    if(NOT AJI_TRT_LIB)
+        set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
+    endif()
     set(AJI_NVINFER "nvinfer_10" CACHE STRING
         "nvinfer import library name (nvinfer_10 / nvinfer_11)")
 else()
@@ -108,6 +114,21 @@ set_target_properties(aji_trt PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden
     CUDA_VISIBILITY_PRESET hidden)
+
+# Optional observation module: neither aji nor aji_trt imports it. Its model
+# parser, allocations and kernels are loaded only for an addon subscription.
+option(AJI_BUILD_ANALYSIS "Build the optional Windows addon observation module" OFF)
+if(AJI_BUILD_ANALYSIS)
+    if(NOT WIN32)
+        message(FATAL_ERROR "AJI_BUILD_ANALYSIS currently supports Windows only")
+    endif()
+    string(REPLACE "nvinfer" "nvonnxparser" AJI_NVONNXPARSER "${AJI_NVINFER}")
+    add_library(aji_analysis SHARED src/aji_analysis.cpp src/analysis_kernels.cu src/kernels.cu)
+    target_include_directories(aji_analysis PUBLIC include PRIVATE ${AJI_TRT_INCLUDE})
+    target_link_directories(aji_analysis PRIVATE ${AJI_TRT_LIB})
+    target_link_libraries(aji_analysis PRIVATE ${AJI_NVINFER} ${AJI_NVONNXPARSER} CUDA::cuda_driver CUDA::cudart bcrypt)
+    set_target_properties(aji_analysis PROPERTIES CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden)
+endif()
 if(NOT WIN32)
     # backends export the same aji_* names as the dispatcher; bind their
     # internal references locally so the global (dispatcher) symbols
@@ -272,6 +293,9 @@ if(WIN32)
     add_executable(aji_harness_dml src/harness_dml.cpp src/utf8-argv.manifest)
     target_link_libraries(aji_harness_dml PRIVATE aji d3d11)
     add_dependencies(aji_harness_dml aji_dml)
+    add_executable(aji_scene_dml_test sanity/scene_dml.cpp)
+    target_link_libraries(aji_scene_dml_test PRIVATE aji d3d11)
+    add_dependencies(aji_scene_dml_test aji_dml)
 endif()
 
 # Parity test tool: compiles the kernels directly (the shared lib hides
@@ -306,3 +330,14 @@ target_link_libraries(aji_runtime_packs_test PRIVATE ${CMAKE_DL_LIBS})
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
 target_include_directories(aji_msb444_test PRIVATE include src)
 target_link_libraries(aji_msb444_test PRIVATE CUDA::cudart)
+
+# Regression for concurrent first CUDA runtime loading in separate DLLs.
+if(WIN32)
+    foreach(probe IN ITEMS aji_cuda_init_a aji_cuda_init_b)
+        add_library(${probe} SHARED EXCLUDE_FROM_ALL sanity/cuda_init.cu)
+        target_include_directories(${probe} PRIVATE include)
+        target_link_libraries(${probe} PRIVATE CUDA::cudart)
+    endforeach()
+    add_executable(aji_cuda_init_test EXCLUDE_FROM_ALL sanity/cuda_init.cpp)
+    add_dependencies(aji_cuda_init_test aji_cuda_init_a aji_cuda_init_b)
+endif()

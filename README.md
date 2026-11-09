@@ -1,5 +1,7 @@
 # animejanai-inference
 
+Optional addon interfaces are documented in [docs/ADDON-API.md](docs/ADDON-API.md), including build dependencies, inactive behavior and qualification limits.
+
 A GPU inference engine for upscaling. `libaji` runs ONNX upscaling models, plus RIFE
 interpolation and temporal models, entirely on the GPU, with three backends: TensorRT and
 TensorRT-RTX (NVIDIA, through CUDA) and DirectML (Windows, any DirectX 12 GPU). Callers load it at
