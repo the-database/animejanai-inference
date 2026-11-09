@@ -332,6 +332,14 @@ above `rife_step` in `src/encode.c` has the details. Unlike mpv, `aji_encode` ha
 A factor below 1 fails before any engine is built: `aji_rife_factor_for_config` (dispatcher
 only) reads the chain's factor from the conf without configuring.
 
+## Untagged colour in `aji_encode`
+
+A YUV source without colour tags is treated the way mpv treats it (`mp_image_params_guess_csp`,
+which runs before `vf_animejanai`): BT.601 when the frame is narrower than 1280 and at most 576
+lines tall, else BT.709; limited range; primaries and transfer guessed as mpv does. Only missing
+fields are filled, and the output is tagged with all four, since libaji writes the upscaled
+frames in the source's matrix and range. `guess_colorimetry` in `src/encode.c` has the rule.
+
 ## Conventions
 
 - Commits: author `the-database`, short imperative subject, no co-author trailers.
