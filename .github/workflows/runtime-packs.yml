@@ -7,6 +7,9 @@ name: Runtime packs
 # and entries for the MangaJaNai model archives (not re-uploaded). See scripts/runtime_packs.py.
 # Published on their own tag (TAG in the script, runtime-<n>). Run this only after bumping TAG
 # along with a pinned version; apps pin the tag and each index's SHA-256.
+# The script compares each pack with the earlier runtime-<k> releases (it downloads their indexes):
+# a pack whose files didn't change keeps its earlier archive, URL and SHA-256 and isn't uploaded
+# again, so this release holds only the changed packs.
 on:
   workflow_dispatch: {}
 
@@ -61,6 +64,21 @@ jobs:
             echo "::error::$tag already exists; bump TAG in scripts/runtime_packs.py"
             exit 1
           fi
+          # Every archive an index points at on this tag must be uploaded, and nothing else.
+          python3 - "$tag" <<'PY'
+          import glob, json, os, sys
+          tag = sys.argv[1]
+          want = set()
+          for f in glob.glob("packs/packs-*.json"):
+              for p in json.load(open(f))["packs"]:
+                  if f"/releases/download/{tag}/" in p["url"]:
+                      want.add(p["asset"])
+                  else:
+                      print(f"{p['name']}/{p['version']}: not uploaded here, from {p['url']}")
+          have = {os.path.basename(f) for f in glob.glob("packs/*.7z")}
+          if want != have:
+              sys.exit(f"::error::archives don't match the indexes: missing {sorted(want - have)}, extra {sorted(have - want)}")
+          PY
           gh release create "$tag" packs/* --title "Runtime packs ($tag)" --latest=false --notes-file - <<'NOTES'
           Shared runtime packs for libaji apps (installed into the per-user pack store by aji-runtime):
           - NVIDIA TensorRT 11.4.0.106 (CUDA 13.4), split into trt-runtime plus one builder-resource pack per GPU generation (trt-sm75 … trt-sm120; trt-ptx is the fallback), for Windows and Linux.
@@ -68,7 +86,7 @@ jobs:
           - ONNX Runtime 1.24.4 + DirectML 1.15.4 for Windows (dml-runtime; apps keep it in their own folder).
           - The MangaJaNai and IllustrationJaNai models, from the-database/MangaJaNai's releases.
 
-          packs-<platform>.json lists each pack's version, kind, SHA-256, size and files. TensorRT and TensorRT for RTX are NVIDIA proprietary software, redistributed under their licenses; NVIDIA's and Microsoft's notices ship in the packs.
+          packs-<platform>.json lists each pack's version, kind, URL, SHA-256, size and files. Packs that didn't change since an earlier runtime release keep that release's archive and URL, so they aren't attached here and installed apps don't download them again. TensorRT and TensorRT for RTX are NVIDIA proprietary software, redistributed under their licenses; NVIDIA's and Microsoft's notices ship in the packs.
           NOTES
 
   # Ask the apps that pin the shared runtime packs to open bump PRs (their bump-pins.yml,
