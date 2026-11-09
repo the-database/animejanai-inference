@@ -193,6 +193,19 @@ AJI_IMG_EXPORT const char *aji_img_last_error(aji_img_ctx *c);
 /* Releases any models still loaded and stops a running engine build. */
 AJI_IMG_EXPORT void aji_img_destroy(aji_img_ctx **c);
 
+/* Frees what the process still holds on a device after every context on
+ * it is destroyed: on the CUDA backends, the CUDA context that TensorRT's
+ * CUDA runtime keeps until the process exits (a few hundred MB). For a
+ * caller that pauses for a while and wants the GPU memory back (MangaJaNai
+ * GUI's Pause); a new context afterwards works as before. It resets the
+ * device for the whole process, so call it only when nothing else in the
+ * process uses CUDA on that device. `device_id` is aji_img_device.id (0 =
+ * first device). 0 on success, and on DirectML, which keeps nothing;
+ * negative if a context on the device is still open, or it isn't found.
+ * Added in libaji 0.24.0 without an API version change: probe for the
+ * symbol. */
+AJI_IMG_EXPORT int aji_img_release_device(int backend, uint64_t device_id);
+
 #ifdef __cplusplus
 }
 #endif
