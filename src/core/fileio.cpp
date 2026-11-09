@@ -19,6 +19,7 @@
 #else
 #include <dlfcn.h>
 #include <libgen.h>
+#include <sys/stat.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -77,6 +78,19 @@ long long file_size(const std::string &path)
                               &a))
         return -1;
     return ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+}
+
+bool file_stamp(const std::string &path, long long *size, long long *mtime)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a = {};
+    if (!GetFileAttributesExW(win_long_path(path).c_str(), GetFileExInfoStandard,
+                              &a) ||
+        (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return false;
+    *size = ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+    *mtime = ((long long)a.ftLastWriteTime.dwHighDateTime << 32) |
+             a.ftLastWriteTime.dwLowDateTime;
+    return true;
 }
 
 bool move_file(const std::string &from, const std::string &to)
@@ -186,6 +200,16 @@ long long file_size(const std::string &path)
     std::error_code ec;
     auto n = fs::file_size(path, ec);
     return ec ? -1 : (long long)n;
+}
+
+bool file_stamp(const std::string &path, long long *size, long long *mtime)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+        return false;
+    *size = (long long)st.st_size;
+    *mtime = (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+    return true;
 }
 
 bool move_file(const std::string &from, const std::string &to)

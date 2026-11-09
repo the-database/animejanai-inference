@@ -25,6 +25,9 @@ bool file_exists(const std::string &path);
 void remove_file(const std::string &path);
 // Size in bytes, or -1 if the file can't be stat'ed.
 long long file_size(const std::string &path);
+// Size and last-write time (Windows: FILETIME ticks; POSIX: ns since the
+// epoch) of a file; false if it can't be stat'ed.
+bool file_stamp(const std::string &path, long long *size, long long *mtime);
 // Rename over an existing file.
 bool move_file(const std::string &from, const std::string &to);
 bool read_file_bytes(const std::string &path, std::vector<char> *out);
