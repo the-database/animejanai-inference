@@ -587,6 +587,12 @@ extern "C" AJI_IMG_EXPORT const char *aji_img_last_error(aji_img_ctx *c)
     return c ? c->err.c_str() : "no context";
 }
 
+// DirectML keeps nothing on the device once its contexts are destroyed.
+extern "C" AJI_IMG_EXPORT int aji_img_release_device(int, uint64_t)
+{
+    return 0;
+}
+
 extern "C" AJI_IMG_EXPORT void aji_img_destroy(aji_img_ctx **pc)
 {
     if (!pc || !*pc)

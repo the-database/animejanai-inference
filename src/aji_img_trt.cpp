@@ -28,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -385,6 +386,10 @@ extern "C" AJI_IMG_EXPORT int aji_img_enum_devices(int backend,
     return n;
 }
 
+// Open contexts per CUDA ordinal: aji_img_release_device resets a device only when none is open.
+std::mutex g_open_mu;
+std::map<int, int> g_open;
+
 extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_params *p,
                                                       char *err, size_t err_size)
 {
@@ -437,6 +442,10 @@ extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_param
 #else
     c->trtexec = p->trtexec ? p->trtexec : own_dir() + "/trtexec";
 #endif
+    {
+        std::lock_guard<std::mutex> lock(g_open_mu);
+        g_open[ordinal]++;
+    }
     return c.release();
 }
 
@@ -895,6 +904,38 @@ extern "C" AJI_IMG_EXPORT void aji_img_destroy(aji_img_ctx **pc)
         c->runtime.reset();
     }
     cuDevicePrimaryCtxRelease(c->cu_dev);
+    {
+        std::lock_guard<std::mutex> lock(g_open_mu);
+        g_open[c->device]--;
+    }
     delete c;
     *pc = nullptr;
+}
+
+// Releasing the primary context isn't enough: the CUDA runtime that TensorRT uses keeps it (and
+// what TensorRT loaded into it) until the process exits. cudaDeviceReset destroys it.
+extern "C" AJI_IMG_EXPORT int aji_img_release_device(int, uint64_t device_id)
+{
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1)
+        return -1;
+    int ordinal = -1;
+    for (int i = 0; i < n; i++) {
+        cudaDeviceProp prop = {};
+        if (cudaGetDeviceProperties(&prop, i) == cudaSuccess &&
+            (device_id == 0 || pci_id(prop) == device_id)) {
+            ordinal = i;
+            break;
+        }
+    }
+    if (ordinal < 0)
+        return -1;
+    std::lock_guard<std::mutex> lock(g_open_mu);
+    if (g_open[ordinal] > 0)
+        return -2;  // a context on it is still open
+    // No cudaSetDevice back to the thread's previous device afterwards: since CUDA 12 that call
+    // creates the device's context, which would undo the reset.
+    if (cudaSetDevice(ordinal) != cudaSuccess)
+        return -1;
+    return cudaDeviceReset() == cudaSuccess ? 0 : -1;
 }
