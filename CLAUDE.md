@@ -51,6 +51,16 @@ workspace flags), are cached as `....trtrtx-<ver>.gpu-<name-smN>.rtxengine` — 
 with a TensorRT-RTX runtime cache saved beside each engine as `<engine>.jitcache`. Each backend's
 stale cleanup only touches its own extension, so both share a model directory.
 
+**Engines remember their ONNX.** The cache key holds the model's file name, not its contents,
+so every engine (both backends, both front-ends) gets `<engine>.onnxinfo` beside it: the ONNX's
+size, last-write time and CRC-32 at build time (`engine_matches_onnx` in `core/trt_engine`). A
+different size, or a different time *and* CRC, means the model under that name changed (a
+re-export, or VideoJaNai's `StageModels` copying another model over it), so the engine is deleted
+and rebuilt; a new time with the same CRC (the same file copied again) only refreshes the record.
+An engine without a record (built by an older libaji) gets one from the current ONNX and is
+reused, so updating libaji rebuilds nothing. Stale cleanup removes an engine's `.onnxinfo` (and
+`.jitcache`) with it.
+
 TensorRT-RTX compiles kernels at the first enqueue (seconds, into the driver's compute cache),
 so every engine gets a **warm-up**: one throwaway inference on zeroed scratch buffers, on the
 build thread right after a build (`run_build_inprocess`, so with `async_build` it is part of the
@@ -105,7 +115,7 @@ visibility (an internal static "library", no ABI of its own):
 | File | What |
 |---|---|
 | `core/fileio` | UTF-8/long-path file helpers, `own_dir()` |
-| `core/trt_engine` | engine cache naming, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading; under `AJI_TRTRTX` the in-process builder and the runtime (JIT) cache |
+| `core/trt_engine` | engine cache naming, the `.onnxinfo` model records, stale-engine cleanup, trtexec build specs/subprocesses, `AsyncBuild`, engine loading; under `AJI_TRTRTX` the in-process builder and the runtime (JIT) cache |
 | `core/ort_dml` | ORT + DirectML loading (DirectML.dll before onnxruntime.dll) |
 | `core/tiling` | the image path's tile cover / reflect pad / overlap blend on the host (backend-agnostic; DirectML uses it, and the CUDA backends with `AJI_IMG_CPU_TILING=1`). The band is a ring of rows; blend and flush are split across a few threads with `parallel_for`, per element, so the result doesn't depend on the split. **Seams:** overlaps default to 128 px and blend only across a 16 px band at their centre (`DEFAULT_OVERLAP`, `BLEND_WIDTH`). MangaJaNai's ESRGAN models generate screentone whose phase drifts near a tile's edge; the former 32 px linear ramp mixed the drifted patterns into visible interference patches. Torture test: `bwgradient_autolevels.png` (flat gradient, so the model invents all halftones) against a single-tile run. Also `even_origins`, the layout for `AJI_IMG_LOAD_EVEN_TILES` |
 | `core/tiling_gpu` | the same tiling on the GPU for the CUDA backends (`upscale_gpu` in `aji_img_trt.cpp`): one upload, tile extract / blend / 8-bit flush kernels on the model's stream. **Bit-identical to `core/tiling`**: every multiply and add is `__fmul_rn`/`__fadd_rn` (never fused) in the host's order, with the host's fp16/bf16 rounding. Keep it that way, or the md5 gate below stops working |

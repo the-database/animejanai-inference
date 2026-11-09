@@ -520,6 +520,14 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
     m->engine_path = short_engine_path_for(dir, m->name, m->settings, c->device);
     m->timing_cache = (fs::u8path(dir) / fs::u8path(m->name + ".timing.cache")).u8string();
 
+    // built from a different ONNX than the one at this path now (a
+    // re-export, or a same-named model elsewhere sharing cache_dir)
+    if (file_exists(m->engine_path) &&
+        !engine_matches_onnx(m->engine_path, m->onnx_path)) {
+        c->info(m->name + ": model changed since its engine was built, rebuilding");
+        remove_engine_files(m->engine_path);
+    }
+
     if (file_exists(m->engine_path)) {
         std::string e;
         CtxGuard guard(c->cu_ctx);

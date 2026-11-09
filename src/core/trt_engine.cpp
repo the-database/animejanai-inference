@@ -53,23 +53,30 @@ void TrtLogger::log(Severity sev, const char *msg) noexcept
         fprintf(stderr, "[aji-trt] %s\n", msg);
 }
 
+// Running zlib CRC-32: start from 0, feed the bytes in any number of calls.
+static uint32_t crc32_update(uint32_t crc, const unsigned char *p, size_t n)
+{
+    struct Table {
+        uint32_t t[256];
+        Table() {
+            for (uint32_t i = 0; i < 256; i++) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; k++)
+                    c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                t[i] = c;
+            }
+        }
+    };
+    static const Table table;  // thread-safe initialization
+    uint32_t c = crc ^ 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++)
+        c = table.t[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
 uint32_t crc32_z(const std::string &data)
 {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            table[i] = c;
-        }
-        init = true;
-    }
-    uint32_t c = 0xFFFFFFFFu;
-    for (unsigned char ch : data)
-        c = table[(c ^ ch) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+    return crc32_update(0, (const unsigned char *)data.data(), data.size());
 }
 
 std::string sanitize_token(std::string s)
@@ -167,10 +174,15 @@ void clean_stale_engines(const std::string &dir, int fallback_dev,
     for (const auto &e : fs::directory_iterator(dir, ec)) {
         const std::string name = e.path().filename().string();
         std::string key = name;  // the engine name this file belongs to
+        // an engine's ONNX record (and JIT cache) goes with it
+        if (ends_with(key, ONNX_INFO_EXT))
+            key.resize(key.size() - strlen(ONNX_INFO_EXT));
 #ifdef AJI_TRTRTX
-        if (ends_with(key, JIT_CACHE_EXT))  // an engine's JIT cache goes with it
+        else if (ends_with(key, JIT_CACHE_EXT))
             key.resize(key.size() - strlen(JIT_CACHE_EXT));
 #endif
+        // only this backend's own files: ".rtxengine" does not end in
+        // ".engine", so TensorRT and TensorRT-RTX share a directory
         if (!ends_with(key, ENGINE_EXT))
             continue;
         bool current = false;
@@ -182,6 +194,93 @@ void clean_stale_engines(const std::string &dir, int fallback_dev,
         if (fs::remove(e.path(), rec))
             removed->push_back(name);
     }
+}
+
+const char *const ONNX_INFO_EXT = ".onnxinfo";
+
+bool read_onnx_info(const std::string &onnx_path, OnnxInfo *info)
+{
+    if (!file_stamp(onnx_path, &info->size, &info->mtime))
+        return false;
+    std::FILE *f = fopen_utf8(onnx_path, "rb");
+    if (!f)
+        return false;
+    std::vector<unsigned char> buf(1 << 20);
+    uint32_t crc = 0;
+    long long total = 0;
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        crc = crc32_update(crc, buf.data(), n);
+        total += (long long)n;
+    }
+    const bool ok = !ferror(f);
+    fclose(f);
+    if (!ok || total != info->size)  // changed while we read it
+        return false;
+    info->crc = crc;
+    return true;
+}
+
+void write_onnx_info(const std::string &engine_path, const OnnxInfo &info)
+{
+    char text[128];
+    const int n = snprintf(text, sizeof(text), "size=%lld\nmtime=%lld\ncrc32=%08x\n",
+                           info.size, info.mtime, (unsigned)info.crc);
+    const std::string path = engine_path + ONNX_INFO_EXT;
+    // via a temp file, so a crash never leaves a half-written record
+    if (!write_file_bytes(path + ".tmp", text, (size_t)n) ||
+        !move_file(path + ".tmp", path))
+        remove_file(path + ".tmp");
+}
+
+// false if absent or unparsable
+static bool load_onnx_info(const std::string &engine_path, OnnxInfo *info)
+{
+    std::vector<char> text;
+    if (!read_file_bytes(engine_path + ONNX_INFO_EXT, &text))
+        return false;
+    text.push_back('\0');
+    unsigned crc = 0;
+    if (sscanf(text.data(), "size=%lld mtime=%lld crc32=%x", &info->size,
+               &info->mtime, &crc) != 3)
+        return false;
+    info->crc = crc;
+    return true;
+}
+
+bool engine_matches_onnx(const std::string &engine_path,
+                         const std::string &onnx_path)
+{
+    OnnxInfo now;
+    if (!file_stamp(onnx_path, &now.size, &now.mtime))
+        return true;  // can't tell; the engine is all there is
+    OnnxInfo rec;
+    if (!load_onnx_info(engine_path, &rec)) {
+        // an engine from before these records: trust it, once
+        if (read_onnx_info(onnx_path, &now))
+            write_onnx_info(engine_path, now);
+        return true;
+    }
+    if (now.size != rec.size)
+        return false;
+    if (now.mtime == rec.mtime)
+        return true;
+    // same size, new time: a re-export, or the same file copied again
+    if (!read_onnx_info(onnx_path, &now))
+        return true;
+    if (now.crc != rec.crc)
+        return false;
+    write_onnx_info(engine_path, now);  // the same model: just a new time
+    return true;
+}
+
+void remove_engine_files(const std::string &engine_path)
+{
+    remove_file(engine_path);
+    remove_file(engine_path + ONNX_INFO_EXT);
+#ifdef AJI_TRTRTX
+    remove_file(engine_path + JIT_CACHE_EXT);
+#endif
 }
 
 std::string shapes_label(const std::string &settings)
@@ -376,6 +475,12 @@ bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
         return run_build_process(spec, child) == 0;
 #endif
     remove_file(spec.tmp_path);  // a previous build's leftover
+    remove_file(spec.engine_path + ONNX_INFO_EXT);
+    // the ONNX as the build reads it (taken first: it could change while
+    // the build runs, and the record must not claim the newer file)
+    OnnxInfo onnx;
+    const bool have_onnx =
+        !spec.onnx_path.empty() && read_onnx_info(spec.onnx_path, &onnx);
     int rc = run_build_process(spec, child);
     if (rc != 0 || file_size(spec.tmp_path) <= 0 ||
         !move_file(spec.tmp_path, spec.engine_path)) {
@@ -388,6 +493,8 @@ bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
         append_file_text(spec.log_path, msg);
         return false;
     }
+    if (have_onnx)
+        write_onnx_info(spec.engine_path, onnx);
     return true;
 }
 

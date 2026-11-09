@@ -506,6 +506,26 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath =
         short_engine_path_for(model_dir, name, settings, c->cuda_dev);
+    // A cached engine built from a different ONNX than the one under this
+    // name now (re-exported, or another model copied over it) is stale:
+    // removed, so it gets rebuilt. Returns true if it was.
+    const std::string onnx_path =
+        (fs::u8path(model_dir) / fs::u8path(name + ".onnx")).u8string();
+    auto drop_if_model_changed = [&](const std::string &path) -> bool {
+        // (cached-only checks report it in try_cached and delete nothing)
+        if (c->check_engines_only || !file_exists(path) ||
+            ajicore::engine_matches_onnx(path, onnx_path))
+            return false;
+        c->log_steps.push_back("Model " + name +
+                               " changed since its engine was built; rebuilding");
+        c->verbose("model changed since engine was built, removing: %s",
+                   path.c_str());
+        ajicore::remove_engine_files(path);
+        return true;
+    };
+    drop_if_model_changed(epath);
+    if (short_epath != epath)
+        drop_if_model_changed(short_epath);
 #ifdef AJI_TRTRTX
     // a failure already reported (and not replaced by the TensorRT
     // fallback): passthrough, as aji_trt does for a failed build
@@ -542,6 +562,13 @@ int ensure_engine(aji_ctx *c, const std::string &name,
             // print a TensorRT API error first)
             c->verbose("removing incomplete cached engine: %s", path.c_str());
             remove_file(path);
+            return -1;
+        }
+        if (c->check_engines_only &&
+            !ajicore::engine_matches_onnx(path, onnx_path)) {
+            c->set_error("AJN_ENGINE_INCOMPATIBLE: model=%s; path=%s; model "
+                         "changed since the engine was built",
+                         name.c_str(), path.c_str());
             return -1;
         }
 #ifdef AJI_TRTRTX

@@ -138,9 +138,32 @@ std::string short_engine_path_for(const std::string &model_dir,
 // Deletes *.engine files in `dir` built for a TensorRT version or GPU not
 // in this system (engines of every present GPU are kept, so moving work
 // between GPUs never rebuilds; `fallback_dev` names the one to keep when
-// the devices can't be enumerated). Appends removed names to *removed.
+// the devices can't be enumerated), with their .onnxinfo (and, for
+// TensorRT-RTX, .jitcache) files. Appends removed names to *removed.
 void clean_stale_engines(const std::string &dir, int fallback_dev,
                          std::vector<std::string> *removed);
+
+// The cache key holds the ONNX's file name, not its contents, so a model
+// re-exported (or copied over) under the same name would keep running the
+// old engine. Each engine therefore records the ONNX it was built from in
+// {engine}.onnxinfo: size, last-write time and CRC-32 of the file.
+extern const char *const ONNX_INFO_EXT;
+struct OnnxInfo {
+    long long size = -1, mtime = 0;
+    uint32_t crc = 0;
+};
+// Stat and checksum `onnx_path`; false if it can't be read.
+bool read_onnx_info(const std::string &onnx_path, OnnxInfo *info);
+void write_onnx_info(const std::string &engine_path, const OnnxInfo &info);
+// False when the engine was built from a different ONNX than `onnx_path`
+// is now: its size differs, or its last-write time does and so does its
+// CRC-32 (a copy that only changed the time refreshes the record). An
+// engine without a record (built by an older libaji) gets one from the
+// current ONNX and is kept, as is any engine whose ONNX can't be read.
+bool engine_matches_onnx(const std::string &engine_path,
+                         const std::string &onnx_path);
+// Remove an engine with its .onnxinfo (and TensorRT-RTX .jitcache).
+void remove_engine_files(const std::string &engine_path);
 
 // Human-readable build resolution from the trtexec shape flags.
 std::string shapes_label(const std::string &settings);
