@@ -20,6 +20,7 @@
 #include "aji_analysis.h"
 #include "aji_cuda_init.h"
 #include "analysis_kernels.h"
+#include "core/runtime_packs.h"
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -196,14 +197,24 @@ extern "C" AJI_EXPORT aji_observer *aji_observer_create(void *context, int width
 #if defined(_WIN32) && NV_TENSORRT_MAJOR >= 11
                 // TensorRT loads builder resources lazily. Its documented
                 // resource path is independent of LoadLibraryEx's DLL path.
-                // Keep it beside this optional module, never relative to the
-                // player's working directory or a guest-provided location.
-                HMODULE self; wchar_t module_path[32768];
-                require(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    reinterpret_cast<LPCWSTR>(&aji_observer_create), &self), "Could not locate the analysis runtime.");
-                DWORD length = GetModuleFileNameW(self,module_path,32768);
-                require(length > 0 && length < 32768, "Could not locate the analysis runtime directory.");
-                auto library_path = std::filesystem::path(module_path).parent_path().u8string();
+                // With aji-runtime.json it is the shared builder pack for this
+                // GPU; otherwise beside this optional module. Never relative
+                // to the player's working directory or a guest-provided location.
+                const std::string resource = "nvinfer_builder_resource_sm" + std::to_string(gpu.major) +
+                    std::to_string(gpu.minor) + "_" + std::to_string(NV_TENSORRT_MAJOR) + ".dll";
+                std::string library_path = ajicore::trt_builder_dir(resource);
+                if (library_path.empty()) {
+                    const auto &packs = ajicore::runtime_packs();
+                    require(!(packs.present && packs.error.empty() && !packs.trt.empty()),
+                        ("The TensorRT builder component for this GPU (" + resource +
+                         ") is not installed. Install it through AJN Manager.").c_str());
+                    HMODULE self; wchar_t module_path[32768];
+                    require(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        reinterpret_cast<LPCWSTR>(&aji_observer_create), &self), "Could not locate the analysis runtime.");
+                    DWORD length = GetModuleFileNameW(self,module_path,32768);
+                    require(length > 0 && length < 32768, "Could not locate the analysis runtime directory.");
+                    library_path = std::filesystem::path(module_path).parent_path().u8string();
+                }
                 require(nvinfer1::setInternalLibraryPath(library_path.c_str()), "Could not set the TensorRT builder resource directory.");
 #endif
                 std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(p->logger));

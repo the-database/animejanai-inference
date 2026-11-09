@@ -17,15 +17,10 @@ param(
     [Parameter(Mandatory)][string]$Tag,
     [string]$BuildDir = (Join-Path $PSScriptRoot '..\..\build-win-release'),
     [string]$OutDir = (Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) 'dist'),
-    [string]$TrtRoot,
     [string]$TrtRtxRoot = ($env:AJI_TRTRTX_ROOT ??
         (Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) 'trtrtx171'))
 )
 $ErrorActionPreference = 'Stop'
-$dependencies = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'dependencies.json') -Raw | ConvertFrom-Json
-if (-not $TrtRoot) {
-    $TrtRoot = Join-Path ($env:AJI_WIN ?? (Join-Path $env:USERPROFILE 'aji-win')) $dependencies.tensorRTDirectory
-}
 $cache = Get-Content -LiteralPath (Join-Path $BuildDir 'CMakeCache.txt')
 $analysisEnabled = @($cache | Where-Object { $_ -match '^AJI_BUILD_ANALYSIS:BOOL=(ON|TRUE|YES|1)$' }).Count -eq 1
 
@@ -40,16 +35,14 @@ $engine = foreach ($f in 'aji.dll', 'aji_dml.dll', 'aji_trt.dll', 'aji_encode.ex
     Get-Artifact $f
 }
 $trtrtx = @(Get-Artifact 'aji_trtrtx.dll')
-# The observation module is optional. A build that enables it must also ship
-# its parser and builder resources, including the lean runtime they require.
+# The observation module is optional: its loader (aji_analysis.dll) and the
+# observer (aji_analysis_trt.dll). Like aji_trt, it takes the TensorRT
+# runtime, ONNX parser and per-GPU builder resources from the consumer's
+# install: the shared runtime packs (aji-runtime.json) or the TensorRT files
+# the consumer ships beside libaji. None of them is bundled here.
 if ($analysisEnabled) {
     $engine += Get-Artifact 'aji_analysis.dll'
-    $libraryDirectory = if (Test-Path -LiteralPath (Join-Path $TrtRoot 'lib')) { Join-Path $TrtRoot 'lib' } else { $TrtRoot }
-    foreach ($pattern in 'nvonnxparser_*.dll', 'nvinfer_builder_resource_*.dll', 'nvinfer_lean_*.dll') {
-        $matches = @(Get-ChildItem -LiteralPath $libraryDirectory -Filter $pattern -File)
-        if (!$matches.Count) { throw "Analysis runtime dependency missing: $pattern in $libraryDirectory" }
-        $engine += $matches.FullName
-    }
+    $engine += Get-Artifact 'aji_analysis_trt.dll'
 }
 # the TensorRT-RTX runtime: exactly one (versioned) core and ONNX parser DLL
 foreach ($pat in 'tensorrt_rtx_*.dll', 'tensorrt_onnxparser_rtx_*.dll') {
