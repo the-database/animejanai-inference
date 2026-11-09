@@ -8,7 +8,7 @@ This PR supplies the inference side of AJN addon API 1.12. The public guest API 
 | --- | --- | --- |
 | `aji_rife_scene_supported`, `aji_infer_rife_with_scene` | Optional cut/continuous decision supplied by the trusted player; preserves default detection when no override is supplied | `include/aji.h`, dispatcher and both backends |
 | `aji_stream_policy_version_for_config`, `async_build=2` | Cached-only streaming; fail on missing/incompatible engines instead of silently building or sending passthrough output | `include/aji.h`, dispatcher, `src/aji_trt.cpp`, `src/aji_dml.cpp` |
-| `aji_observer_*`, analysis ABI 1 | Optional worker-owned CUDA source reduction and fixed-model character masks | `include/aji_analysis.h`, `src/aji_analysis.cpp`, `src/analysis_kernels.*` |
+| `aji_observer_*`, analysis ABI 1 | Optional worker-owned CUDA source reduction and fixed-model character masks | `include/aji_analysis.h`, `src/aji_analysis_loader.cpp`, `src/aji_analysis.cpp`, `src/analysis_kernels.*` |
 
 These are additive to AJI ABI 9. Old backend support is queried, not assumed. Invalid explicit scene decisions fail rather than silently changing semantics. The ordinary inference path does not call the observation API or import `aji_analysis.dll`.
 
@@ -28,7 +28,7 @@ This is not a new TensorRT-RTX addon feature. Source for the same scene hooks is
 
 ## Build and evidence
 
-`AJI_BUILD_ANALYSIS` defaults to `OFF`. Ordinary Windows and Linux builds do not need `NvOnnxParser.h` or the analysis runtime. Explicitly enabling it currently requires Windows. The optional release packaging includes `aji_analysis.dll`, the ONNX parser, builder resources and lean runtime from the matching TensorRT installation.
+`AJI_BUILD_ANALYSIS` defaults to `OFF`. Ordinary Windows and Linux builds do not need `NvOnnxParser.h` or the analysis runtime. Explicitly enabling it currently requires Windows. The optional release packaging adds `aji_analysis.dll` and `aji_analysis_trt.dll`. The loader `aji_analysis.dll` imports no CUDA or TensorRT library: it loads cudart, nvinfer and the ONNX parser from the shared runtime packs when `aji-runtime.json` names them (otherwise the observer's imports resolve beside it), then the observer, and points TensorRT's in-process builder at the GPU's builder pack. No TensorRT file is bundled; consumers supply them like they do for `aji_trt.dll`.
 
 `tools/build-windows-test.ps1` explicitly enables analysis and builds dispatcher, classic TensorRT, DirectML and regression harnesses. It and `ci/windows/build-aji-release.bat` read SDK versions from `ci/windows/dependencies.json`; downloaded NuGet dependencies are SHA-256 pinned. The script records its producing commit in `build/build-info.json`. The manual `build-windows-test.yml` workflow uploads those artifacts. It does not enable or certify TensorRT-RTX without its separate SDK.
 

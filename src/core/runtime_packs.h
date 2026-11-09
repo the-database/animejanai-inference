@@ -19,13 +19,18 @@
  * - The dispatchers preload what a backend imports (cudart + nvinfer for
  *   aji_trt; cudart + the TensorRT-RTX runtime for aji_trtrtx) by full
  *   path before loading it, so the backend's imports bind to them.
+ *   aji_analysis (the optional addon observer) does the same for
+ *   aji_analysis_trt (cudart + nvinfer + the ONNX parser), and points
+ *   TensorRT's in-process builder at the GPU's trt_builder folder
+ *   (trt_builder_dir).
  * - aji_trt runs the trt pack's trtexec, with the trt and trt_builder
  *   folders on its PATH (Windows) / LD_LIBRARY_PATH (Linux): nvinfer loads
  *   the per-GPU builder resource by file name, which only a search path
  *   finds (see plans/shared-runtime-packs.md in the animejan.ai repo,
  *   "Phase 0 results"). The host's trtexec parameter is then ignored.
  *
- * Part of the internal core: compiled into aji and the TensorRT backends.
+ * Part of the internal core: compiled into aji, the TensorRT backends and
+ * the two analysis libraries.
  */
 
 #ifndef AJI_CORE_RUNTIME_PACKS_H
@@ -54,12 +59,18 @@ const RuntimePacks &runtime_packs();
 // for tests; runtime_packs() uses it.
 RuntimePacks parse_runtime_packs(const std::string &text, const std::string &dir);
 
-// Before loading backend `stem` (aji_trt / aji_trtrtx / aji_dml), loads
-// the libraries it imports from the packs aji-runtime.json names. True if
-// there was nothing to do or everything loaded; false with *err otherwise.
+// Before loading backend `stem` (aji_trt / aji_trtrtx / aji_dml, or the
+// addon observer aji_analysis_trt), loads the libraries it imports from the
+// packs aji-runtime.json names. True if there was nothing to do or
+// everything loaded; false with *err otherwise.
 // *what (if not NULL) gets a log line describing what was loaded.
 bool preload_backend_deps(const char *stem, std::string *err,
                           std::string *what);
+
+// The trt_builder pack folder that holds `file` (a per-GPU builder resource,
+// e.g. nvinfer_builder_resource_sm120_11.dll), for an in-process TensorRT
+// build. "" without aji-runtime.json, or when no builder pack has it.
+std::string trt_builder_dir(const std::string &file);
 
 // The trtexec to run and how: the host's values without aji-runtime.json
 // (or without its "trt"), else the trt pack's trtexec with the pack
