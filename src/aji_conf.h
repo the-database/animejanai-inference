@@ -61,3 +61,12 @@ bool aji_conf_load(const char *path, AjiConf *out, std::string *err);
 // config reference degrades to passthrough instead of failing playback.
 std::string aji_chain_missing_model(const std::string &model_dir,
                                     const AjiChainConf &chain);
+
+// The chain aji_configure() activates for a w x h stream at fps on slot: the
+// first whose resolution and fps ranges match and whose model files exist.
+// Each matching chain skipped for a missing model adds a line to *skipped (if
+// given). nullptr = none (passthrough; slot 0 is bypass and matches nothing).
+const AjiChainConf *aji_select_chain(const AjiConf &conf, int slot,
+                                     const std::string &model_dir, int w,
+                                     int h, double fps,
+                                     std::vector<std::string> *skipped);

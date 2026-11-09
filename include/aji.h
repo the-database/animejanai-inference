@@ -202,6 +202,19 @@ AJI_EXPORT int aji_scale_factor(aji_ctx *c);
  * num/den if RIFE is active after the last aji_configure(), else 0. */
 AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den);
 
+/* Dispatcher query, no context: the RIFE factor (as configured, unreduced)
+ * of the chain aji_configure(w, h, fps) would activate for these create
+ * params (conf_path, model_dir, slot, rife_model_dir), read from the conf
+ * alone - no GPU work, no engine builds. Returns 1 and fills num/den if that
+ * chain runs RIFE, 0 if it doesn't (or direct mode, or an unreadable conf).
+ * Lets an offline caller reject a factor it can't schedule before
+ * aji_configure() spends minutes building engines; aji_rife_factor() stays
+ * the authority afterwards. Exported by the dispatcher only; additive, no
+ * API_VERSION bump. */
+AJI_EXPORT int aji_rife_factor_for_config(const aji_create_params *params,
+                                          int w, int h, double fps,
+                                          int *num, int *den);
+
 /* RIFE ordering of the active chain. Returns 1 if RIFE is active AND runs
  * before the upscale models (interpolating source-resolution frames, which
  * the upscale models then process), else 0 (RIFE inactive, or the default

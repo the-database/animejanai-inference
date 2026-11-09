@@ -29,6 +29,7 @@
  * the NVIDIA driver.
  */
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,7 +269,7 @@ typedef struct {
     enum AVPixelFormat out_pixfmt;   /* final software-encoder pix_fmt */
     int             passthrough;     /* no chain active: transcode only */
     int             rife;            /* RIFE active */
-    int             rnum, rden;
+    int             rnum, rden;      /* its factor, reduced (rnum >= rden) */
     int             temporal_r;      /* temporal chain window radius, 0 = none */
     uint64_t        in_seq, out_seq; /* temporal: next frame to ingest / infer */
     int             rife_only;       /* RIFE with no scaling chain (aji_configure
@@ -325,6 +326,10 @@ typedef struct {
     /* RIFE state: two persistent upscaled CUDA frames + interp scratch */
     AVFrame *up_prev, *up_cur, *up_interp;
     int      have_prev;
+    int      rife_acc;               /* where the next output falls past the
+                                        held frame (up_prev / src_prev), in
+                                        1/rnum of the interval to its
+                                        successor: 0 = on the held frame */
     AVFrame *src_prev;               /* RIFE-first: previous work-res source */
 
     /* bookkeeping */
@@ -1048,6 +1053,29 @@ fail:
 
 /* ---- libaji init --------------------------------------------------------- */
 
+/* Reduce a RIFE factor num/den in place and check it can be scheduled: at
+ * least 1, and small enough that the output time base (src_tb / num) stays
+ * exact. Logs why and returns -1 if not. */
+static int rife_factor_ok(const enc_ctx *c, int *num, int *den)
+{
+    const int n0 = *num, d0 = *den;
+    if (n0 <= 0 || d0 <= 0 || n0 < d0) {
+        loge("RIFE factor %d/%d is not supported: it must be 1 or more "
+             "(e.g. 2, 3/2 or 5/2)", n0, d0);
+        return -1;
+    }
+    int a = n0, b = d0;
+    while (b) { int t = a % b; a = b; b = t; }
+    *num = n0 / a;
+    *den = d0 / a;
+    if ((int64_t)c->src_tb.den * *num > INT_MAX) {
+        loge("RIFE factor %d/%d is too large for the source time base %d/%d",
+             n0, d0, c->src_tb.num, c->src_tb.den);
+        return -1;
+    }
+    return 0;
+}
+
 static int init_aji(enc_ctx *c)
 {
     c->out_tb = c->src_tb;     /* RIFE refines it below */
@@ -1067,6 +1095,13 @@ static int init_aji(enc_ctx *c)
         .max_height     = c->src_h,
         .log            = aji_log_cb,
     };
+    /* the factor the conf's chain asks for, checked before aji_configure
+     * builds engines (minutes, the first time) */
+    int qnum = 0, qden = 0;
+    if (aji_rife_factor_for_config(&p, c->src_w, c->src_h, av_q2d(c->out_fps),
+                                   &qnum, &qden) == 1 &&
+        rife_factor_ok(c, &qnum, &qden) < 0)
+        return -1;
     c->aji = aji_create(&p);
     if (!c->aji) { loge("aji_create failed"); return -1; }
 
@@ -1116,13 +1151,11 @@ static int init_aji(enc_ctx *c)
                                         c->src_sar.num) + 1) & ~1;
     }
 
-    if (aji_rife_factor(c->aji, &c->rnum, &c->rden) && c->rnum > 0) {
-        if (c->rden != 1 || c->rnum % c->rden != 0) {
-            loge("rational RIFE factor %d/%d not yet supported in offline "
-                 "encode (v1 handles integer factors only)", c->rnum, c->rden);
-            return -1;
-        }
+    if (aji_rife_factor(c->aji, &c->rnum, &c->rden)) {
+        /* the engine's word is final (the check above read the conf) */
+        if (rife_factor_ok(c, &c->rnum, &c->rden) < 0) return -1;
         c->rife = 1;
+        loge("RIFE: %d/%d interpolation", c->rnum, c->rden);
         c->out_fps = av_mul_q(c->out_fps, (AVRational){c->rnum, c->rden});
         c->out_tb = av_div_q(c->src_tb, (AVRational){c->rnum, 1});
         if (c->passthrough) {
@@ -2214,6 +2247,17 @@ static int sess_emit(enc_ctx *c, AVFrame *f, int64_t pts)
 
 /* ---- emit one finished output frame: resize -> encode -> mux ------------- */
 
+/* Output frames to expect from src_frames_est source frames. RIFE puts out
+ * the points of its output grid (rden/rnum of a source frame apart) from the
+ * first source frame through the last, so n frames give
+ * floor((n - 1) * rnum / rden) + 1. */
+static int64_t out_frames_est(const enc_ctx *c)
+{
+    const int64_t n = c->src_frames_est;
+    if (!c->rife || n <= 0) return n;
+    return (n - 1) * c->rnum / c->rden + 1;
+}
+
 /* Emit one finished output frame at pts (out_tb). Frames arrive in display
  * order (the non-RIFE ring drains FIFO; RIFE emits base then phases in
  * order); the timestamps come from the source frames (frame_pts). */
@@ -2317,12 +2361,9 @@ encode:
 
     c->out_frames++;
     if ((c->out_frames & 31) == 0) {
-        int pct = c->src_frames_est ? (int)(c->out_frames * 100 /
-                  (c->src_frames_est * (c->rife ? c->rnum : 1) /
-                   (c->rife ? c->rden : 1))) : 0;
-        progress("encode", c->out_frames,
-                 c->src_frames_est * (c->rife ? c->rnum : 1) /
-                 (c->rife ? c->rden : 1), 0, pct > 100 ? 100 : pct);
+        const int64_t total = out_frames_est(c);
+        int pct = total ? (int)(c->out_frames * 100 / total) : 0;
+        progress("encode", c->out_frames, total, 0, pct > 100 ? 100 : pct);
     }
     rc = 0;
 done:
@@ -2551,13 +2592,38 @@ static int64_t interp_pts(const AVFrame *a, const AVFrame *b, int k, int n)
     return a->pts + (b->pts - a->pts) * k / n;
 }
 
-/* take one upscaled frame (up==NULL flushes): emit the previous one and the
- * interpolation phases between the two */
+/*
+ * The RIFE output schedule (every path; the same grid as mpv's
+ * vf_animejanai). Output frames lie on a grid rden/rnum of a source frame
+ * apart, starting at the first source frame. Between held frame a and its
+ * successor b they fall at a + (b - a) * acc / rnum for acc = rife_acc,
+ * rife_acc + rden, ... while acc < rnum; acc == 0 is a itself (the grid
+ * lands on a source frame), any other acc an interpolation at
+ * t = acc / rnum. Then rife_acc -= rnum carries the remainder into the next
+ * pair. An integer factor F (rden == 1) gives acc = 0, 1, ..., F-1 in every
+ * pair: a, then F-1 phases at k/F, as before fractions were supported.
+ *
+ * Timestamps are exact: out_tb = src_tb / rnum, so a source frame d source
+ * ticks long is d * rnum output ticks and every grid point of a
+ * constant-rate source lands on a whole tick (frame_pts keeps frames at
+ * least rnum ticks apart, so in-between timestamps never collide). A
+ * variable-rate source places them proportionally within each pair, like
+ * mpv.
+ *
+ * At the end of the stream the last source frame is put out only if the grid
+ * lands on it (always for an integer factor); nothing is put out past it, as
+ * there is no successor to interpolate towards. So n source frames give
+ * floor((n - 1) * rnum / rden) + 1 output frames (out_frames_est).
+ */
+
+/* take one upscaled frame (up==NULL flushes): emit the grid points from the
+ * held frame up to (not including) this one */
 static int rife_step(enc_ctx *c, AVFrame *up)
 {
     if (!up) {
-        /* emit the final upscaled frame, no successor to interpolate with */
-        if (c->have_prev) {
+        /* the final upscaled frame, if on the grid: no successor to
+         * interpolate with */
+        if (c->have_prev && c->rife_acc == 0) {
             if (emit_output(c, c->up_prev, c->up_prev->pts) < 0) return -1;
         }
         return 0;
@@ -2566,45 +2632,44 @@ static int rife_step(enc_ctx *c, AVFrame *up)
     if (!c->have_prev) {
         c->up_prev = up;
         c->have_prev = 1;
+        c->rife_acc = 0;               /* the grid starts on the first frame */
         return 0;
     }
     c->up_cur = up;
 
-    /* emit base frame N (= up_prev) */
-    if (emit_output(c, c->up_prev, c->up_prev->pts) < 0) return -1;
-
-    /* interpolation phases between N and N+1 */
-    double factor = (double)c->rnum / c->rden;
-    int phases = c->rnum / c->rden;        /* integer factor: F-1 phases */
-    if (c->rnum % c->rden == 0) {
-        for (int k = 1; k < phases; k++) {
-            double t = (double)k / phases;
-            /* fresh pool buffer per phase: the encoder holds a ref to the
-             * previous one, so we must not overwrite it */
-            AVFrame *interp = av_frame_alloc();
-            if (av_hwframe_get_buffer(c->aji_pool, interp, 0) < 0) {
-                loge("hwframe_get_buffer (interp) failed");
-                av_frame_free(&interp); return -1;
-            }
-            aji_frame a, b, o;
-            fill_aji_frame(c, &a, c->up_prev, 1);
-            fill_aji_frame(c, &b, c->up_cur, 1);
-            fill_aji_frame(c, &o, interp, 1);
-            int ret = aji_infer_rife(c->aji, &a, &b, t, &o, c->stream);
-            AVFrame *emit = interp;
-            if (ret == AJI_SCENE) { emit = c->up_prev; c->scene_dupes++; }
-            else if (ret != AJI_OK) {
-                loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
-                av_frame_free(&interp); return -1;
-            }
-            int er = emit_output(c, emit,
-                                 interp_pts(c->up_prev, c->up_cur, k, phases));
-            av_frame_free(&interp);
-            if (er < 0) return -1;
+    for (; c->rife_acc < c->rnum; c->rife_acc += c->rden) {
+        const int acc = c->rife_acc;
+        if (acc == 0) {
+            /* on source frame N (= up_prev) */
+            if (emit_output(c, c->up_prev, c->up_prev->pts) < 0) return -1;
+            continue;
         }
-    } else {
-        (void)factor;   /* rational factors: handled in a later revision */
+        /* between N and N+1 */
+        double t = (double)acc / c->rnum;
+        /* fresh pool buffer per phase: the encoder holds a ref to the
+         * previous one, so we must not overwrite it */
+        AVFrame *interp = av_frame_alloc();
+        if (av_hwframe_get_buffer(c->aji_pool, interp, 0) < 0) {
+            loge("hwframe_get_buffer (interp) failed");
+            av_frame_free(&interp); return -1;
+        }
+        aji_frame a, b, o;
+        fill_aji_frame(c, &a, c->up_prev, 1);
+        fill_aji_frame(c, &b, c->up_cur, 1);
+        fill_aji_frame(c, &o, interp, 1);
+        int ret = aji_infer_rife(c->aji, &a, &b, t, &o, c->stream);
+        AVFrame *emit = interp;
+        if (ret == AJI_SCENE) { emit = c->up_prev; c->scene_dupes++; }
+        else if (ret != AJI_OK) {
+            loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
+            av_frame_free(&interp); return -1;
+        }
+        int er = emit_output(c, emit,
+                             interp_pts(c->up_prev, c->up_cur, acc, c->rnum));
+        av_frame_free(&interp);
+        if (er < 0) return -1;
     }
+    c->rife_acc -= c->rnum;
 
     av_frame_free(&c->up_prev);
     c->up_prev = c->up_cur;
@@ -2666,13 +2731,14 @@ static AVFrame *alloc_work(enc_ctx *c)
     return f;
 }
 
-/* RIFE-first (dec==NULL flushes): when source frame N+1 arrives, emit
- * upscaled N, then upscale each interpolation between the two. A scene
- * change repeats upscaled N, like the default order. */
+/* RIFE-first (dec==NULL flushes): when source frame N+1 arrives, emit the
+ * grid points from N up to N+1 (rife_step's schedule): upscaled N if the
+ * grid lands on it, and each interpolation between the two, upscaled. A
+ * scene change repeats upscaled N, like the default order. */
 static int push_rife_first(enc_ctx *c, AVFrame *dec)
 {
     if (!dec) {
-        if (!c->src_prev) return 0;
+        if (!c->src_prev || c->rife_acc != 0) return 0;  /* off the grid */
         AVFrame *up = upscale_one(c, c->src_prev);
         int r = up ? emit_output(c, up, up->pts) : -1;
         av_frame_free(&up);
@@ -2696,25 +2762,33 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
     }
     if (!c->src_prev) {
         c->src_prev = cur;
+        c->rife_acc = 0;               /* the grid starts on the first frame */
         return 0;
     }
 
-    AVFrame *base = upscale_one(c, c->src_prev);
-    int rc = base ? emit_output(c, base, base->pts) : -1;
-    int phases = c->rnum / c->rden;        /* integer factor: F-1 phases */
-    for (int k = 1; rc == 0 && k < phases; k++) {
+    AVFrame *base = NULL;              /* upscaled N, once needed */
+    int rc = 0;
+    for (; rc == 0 && c->rife_acc < c->rnum; c->rife_acc += c->rden) {
+        const int acc = c->rife_acc;
+        if (acc == 0) {
+            base = upscale_one(c, c->src_prev);
+            rc = base ? emit_output(c, base, base->pts) : -1;
+            continue;
+        }
         AVFrame *interp = alloc_work(c);
         if (!interp) { rc = -1; break; }
-        interp->pts = interp_pts(c->src_prev, cur, k, phases);
+        interp->pts = interp_pts(c->src_prev, cur, acc, c->rnum);
         aji_frame a, b, o;
         fill_aji_frame(c, &a, c->src_prev, 0);
         fill_aji_frame(c, &b, cur, 0);
         fill_aji_frame(c, &o, interp, 0);
-        int ret = aji_infer_rife(c->aji, &a, &b, (double)k / phases, &o,
+        int ret = aji_infer_rife(c->aji, &a, &b, (double)acc / c->rnum, &o,
                                  c->stream);
         if (ret == AJI_SCENE) {
             c->scene_dupes++;
-            rc = emit_output(c, base, interp->pts);
+            /* off the grid, N itself wasn't put out (or upscaled) */
+            if (!base) base = upscale_one(c, c->src_prev);
+            rc = base ? emit_output(c, base, interp->pts) : -1;
         } else if (ret != AJI_OK) {
             loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
             rc = -1;
@@ -2725,6 +2799,7 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
         }
         av_frame_free(&interp);
     }
+    c->rife_acc -= c->rnum;
     av_frame_free(&base);
     av_frame_free(&c->src_prev);
     c->src_prev = cur;
@@ -2852,13 +2927,10 @@ static int run(enc_ctx *c)
     if (drain_encoder(c, 1) < 0) goto done;
     AV(av_write_trailer(c->ofmt));
 
-    if (c->rife) {
-        int64_t expect = (int64_t)(c->src_frames_est *
-                         (double)c->rnum / c->rden + 0.5);
+    if (c->rife)
         loge("rife: produced %lld frames (~expected %lld), %lld scene dupes",
-             (long long)c->out_frames, (long long)expect,
+             (long long)c->out_frames, (long long)out_frames_est(c),
              (long long)c->scene_dupes);
-    }
     progress("encode", c->out_frames, c->out_frames, 0, 100);
     rc = 0;
 done:
