@@ -247,7 +247,7 @@ struct aji_ctx {
 
     // ONNX input frame counts, keyed by path, valid while size/mtime match
     struct OnnxFrames {
-        uintmax_t size = 0;
+        long long size = -1;
         int64_t mtime = 0;
         int frames = 1;
         bool rank5 = false;
@@ -809,12 +809,9 @@ void finalize_log(aji_ctx *c)
 aji_ctx::OnnxFrames onnx_frames(aji_ctx *c, const std::string &name)
 {
     const std::string path =
-        (fs::path(c->model_dir) / (name + ".onnx")).string();
-    std::error_code ec;
-    const uintmax_t size = fs::file_size(path, ec);
-    const int64_t mtime =
-        ec ? 0
-           : (int64_t)fs::last_write_time(path, ec).time_since_epoch().count();
+        (fs::u8path(c->model_dir) / fs::u8path(name + ".onnx")).u8string();
+    long long size = -1, mtime = 0;
+    ajicore::file_stamp(path, &size, &mtime);
     auto it = c->onnx_frames.find(path);
     if (it != c->onnx_frames.end() && it->second.size == size &&
         it->second.mtime == mtime)

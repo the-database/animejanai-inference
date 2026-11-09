@@ -135,9 +135,10 @@ std::string engine_path_for(const std::string &model_dir,
                             const std::string &onnx_name,
                             const std::string &settings, int dev)
 {
-    return (fs::path(model_dir) /
-            (onnx_name + "." + std::to_string(crc32_z(settings)) + engine_suffix(dev)))
-        .string();
+    return (fs::u8path(model_dir) /
+            fs::u8path(onnx_name + "." + std::to_string(crc32_z(settings)) +
+                       engine_suffix(dev)))
+        .u8string();
 }
 
 std::string short_engine_path_for(const std::string &model_dir,
@@ -146,10 +147,10 @@ std::string short_engine_path_for(const std::string &model_dir,
 {
     char model_hash[9];
     snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
-    return (fs::path(model_dir) /
-            ("aji-" + std::string(model_hash) + "." +
-             std::to_string(crc32_z(settings)) + engine_suffix(dev)))
-        .string();
+    return (fs::u8path(model_dir) /
+            fs::u8path("aji-" + std::string(model_hash) + "." +
+                       std::to_string(crc32_z(settings)) + engine_suffix(dev)))
+        .u8string();
 }
 
 void clean_stale_engines(const std::string &dir, int fallback_dev,
@@ -171,8 +172,8 @@ void clean_stale_engines(const std::string &dir, int fallback_dev,
                s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
     };
     std::error_code ec;
-    for (const auto &e : fs::directory_iterator(dir, ec)) {
-        const std::string name = e.path().filename().string();
+    for (const auto &e : fs::directory_iterator(fs::u8path(dir), ec)) {
+        const std::string name = e.path().filename().u8string();
         std::string key = name;  // the engine name this file belongs to
         // an engine's ONNX record (and JIT cache) goes with it
         if (ends_with(key, ONNX_INFO_EXT))
@@ -561,8 +562,10 @@ bool make_build_spec(const std::string &trtexec, const std::string &trtexec_env,
     // NVIDIA's mitigation for timing noise when the GPU isn't idle - our
     // background builds run alongside playback.
     return make_build_spec_paths(
-        trtexec, trtexec_env, (fs::path(dir) / (onnx_name + ".onnx")).string(),
-        (fs::path(dir) / (onnx_name + ".timing.cache")).string(), onnx_name,
+        trtexec, trtexec_env,
+        (fs::u8path(dir) / fs::u8path(onnx_name + ".onnx")).u8string(),
+        (fs::u8path(dir) / fs::u8path(onnx_name + ".timing.cache")).u8string(),
+        onnx_name,
         settings, engine_path, dev, spec, err);
 }
 

@@ -82,7 +82,7 @@ ImgBackend *backend_for(int backend, std::string *err)
         const std::string path = ajicore::own_dir() + "\\" + stem + ".dll";
         // search-own-dir flags so nvinfer/onnxruntime/DirectML resolve
         // from the backend's directory, not PATH
-        b.lib = LoadLibraryExA(path.c_str(), NULL,
+        b.lib = LoadLibraryExW(ajicore::widen_utf8(path).c_str(), NULL,
                                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
                                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (!b.lib)
