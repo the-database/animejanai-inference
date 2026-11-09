@@ -46,6 +46,7 @@
 #include <NvInfer.h>
 
 #include "aji.h"
+#include "aji_cuda_init.h"
 #include "aji_conf.h"
 #include "kernels.h"
 #include "onnx_shape.h"
@@ -128,6 +129,7 @@ struct aji_ctx {
     // caller thread owns build.epath/failed_builds (written only while no
     // worker is running / in aji_poll).
     bool async_build = false;
+    bool check_engines_only = false;
     ajicore::AsyncBuild build;
     std::set<std::string> failed_builds;
 #ifdef AJI_TRTRTX
@@ -495,6 +497,12 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                   ModelEngine *me, int w, int h, int ch,
                   const std::string *dir = nullptr, int rank5_t = 0)
 {
+#ifdef AJI_TRTRTX
+    if (c->check_engines_only) {
+        c->set_error("AJN_ENGINE_POLICY_UNSUPPORTED: TensorRT-RTX does not support cached-only engines");
+        return -1;
+    }
+#endif
     const std::string model_dir = dir ? *dir : c->model_dir;
     const std::string short_epath =
         short_engine_path_for(model_dir, name, settings, c->cuda_dev);
@@ -525,6 +533,10 @@ int ensure_engine(aji_ctx *c, const std::string &name,
         if (!file_exists(path))
             return 0;
         if (file_size(path) <= 0) {
+            if (c->check_engines_only) {
+                c->set_error("AJN_ENGINE_INCOMPATIBLE: model=%s; path=%s; empty engine", name.c_str(), path.c_str());
+                return -1;
+            }
             // an interrupted build from before builds went through a temp
             // file: not an error, just rebuild (deserializing it would only
             // print a TensorRT API error first)
@@ -549,18 +561,25 @@ int ensure_engine(aji_ctx *c, const std::string &name,
         if (load_engine(c, path, me, w, h, ch, rank5_t))
             return 1;
 #endif
+        if (c->check_engines_only) {
+            c->set_error("AJN_ENGINE_INCOMPATIBLE: model=%s; path=%s", name.c_str(), path.c_str());
+            return -1;
+        }
         c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
         remove_file(path);
         return -1;
     };
 
     int cached = try_cached(epath);
+    int legacy_cached = cached;
     if (cached == 1)
         return 1;
     if (cached == -2)
         return -1;
     if (short_epath != epath) {
         cached = try_cached(short_epath);
+        if (cached < 0 && c->check_engines_only)
+            return -1;
         if (cached == 1)
             return 1;
         if (cached == -2)
@@ -570,6 +589,11 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     // New builds use a short filename. This avoids MAX_PATH failures for
     // portable installs while keeping the model/settings/GPU/TRT cache key.
     const std::string &build_epath = short_epath;
+    if (c->check_engines_only) {
+        if (legacy_cached < 0) return -1;
+        c->set_error("AJN_ENGINE_MISSING: model=%s; expected=%s", name.c_str(), build_epath.c_str());
+        return -1;
+    }
     if (c->async_build) {
         if (c->failed_builds.count(build_epath)) {
 #ifdef AJI_TRTRTX
@@ -861,6 +885,11 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         c->set_error("cuInit failed");
         return nullptr;
     }
+    cudaError_t initialized = aji_initialize_cuda_runtime();
+    if (initialized != cudaSuccess) {
+        c->set_error("failed to initialize CUDA runtime (error %d)", (int)initialized);
+        return nullptr;
+    }
     if (params->cuda_context) {
         c->cu_ctx = (CUcontext)params->cuda_context;
     } else {
@@ -878,9 +907,12 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         // cudaGetDevice reports the current (pushed) context's device as a
         // runtime ordinal, the numbering cudaGetDeviceProperties and
         // trtexec --device use
-        if (!guard.ok || cuCtxGetDevice(&c->cu_dev) != CUDA_SUCCESS ||
-            cudaGetDevice(&c->cuda_dev) != cudaSuccess) {
-            c->set_error("failed to query the CUDA context's device");
+        int driver_query = guard.ok ? (int)cuCtxGetDevice(&c->cu_dev) : -1;
+        int runtime_query = driver_query == CUDA_SUCCESS ? (int)cudaGetDevice(&c->cuda_dev) : -1;
+        if (!guard.ok || driver_query != CUDA_SUCCESS || runtime_query != cudaSuccess) {
+            const char *message = runtime_query >= 0 ? cudaGetErrorString((cudaError_t)runtime_query) : "not called";
+            c->set_error("failed to query the CUDA context's device: driver=%d, runtime=%d (%s)",
+                driver_query, runtime_query, message ? message : "unavailable");
             if (c->owns_primary)
                 cuDevicePrimaryCtxRelease(c->cu_dev);
             return nullptr;
@@ -910,6 +942,7 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         c->rife_model_dir =
             params->rife_model_dir ? params->rife_model_dir : "";
         c->async_build = params->async_build != 0;
+        c->check_engines_only = params->async_build == 2;
         return c.release();
     }
 
@@ -1074,7 +1107,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         chain->max_resolution + ";    FPS Range: " + fmt_num(chain->min_fps) +
         " - " + fmt_num(chain->max_fps));
 
-    if (!c->engines_cleaned) {
+    if (!c->engines_cleaned && !c->check_engines_only) {
         clean_stale_engines(c);
         c->engines_cleaned = true;
     }
@@ -2400,7 +2433,20 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *b, double t,
                                          const aji_frame *out, void *cu_stream)
 {
-    if (!c || !a || !b || !out)
+    return aji_infer_rife_with_scene(c, a, b, t, out, cu_stream, -1);
+}
+
+extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
+{
+    return c != nullptr;
+}
+
+extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b, double t,
+                                         const aji_frame *out, void *cu_stream,
+                                         int scene)
+{
+    if (!c || !a || !b || !out || scene < -1 || scene > 1)
         return AJI_ERR;
     auto &R = c->rife;
     if (!R.enabled) {
@@ -2419,6 +2465,9 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                      R.w, R.h);
         return AJI_ERR_SHAPE;
     }
+
+    if (scene == 1)
+        return AJI_SCENE;
 
     CtxGuard guard(c->cu_ctx);
     if (!guard.ok) {
@@ -2478,26 +2527,29 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
         R.format = fmt;
     }
 
-    // scene detection on the unpadded luma (misc.SCDetect's metric)
-    cudaMemsetAsync(R.scd, 0, sizeof(float), stream);
-    int err = aji_scd_diff(fmt, a->plane[0], a->stride[0], b->plane[0],
-                           b->stride[0], R.w, R.h, R.scd, stream);
-    if (err) {
-        c->set_error("scd kernel failed: %s",
-                     cudaGetErrorString((cudaError_t)err));
-        return AJI_ERR_CUDA;
+    int err = 0;
+    if (scene < 0) {
+        // scene detection on the unpadded luma (misc.SCDetect's metric)
+        cudaMemsetAsync(R.scd, 0, sizeof(float), stream);
+        err = aji_scd_diff(fmt, a->plane[0], a->stride[0], b->plane[0],
+                               b->stride[0], R.w, R.h, R.scd, stream);
+        if (err) {
+            c->set_error("scd kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+        float sum = 0.0f;
+        cudaMemcpyAsync(&sum, R.scd, sizeof(float), cudaMemcpyDeviceToHost,
+                        stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            c->set_error("scd sync failed");
+            return AJI_ERR_CUDA;
+        }
+        // The reference runs SCDetect on the padded clip; the constant borders
+        // contribute zero difference, so its mean divides by the padded area.
+        if (sum / ((double)R.pw * R.ph) > R.scd_threshold)
+            return AJI_SCENE;
     }
-    float sum = 0.0f;
-    cudaMemcpyAsync(&sum, R.scd, sizeof(float), cudaMemcpyDeviceToHost,
-                    stream);
-    if (cudaStreamSynchronize(stream) != cudaSuccess) {
-        c->set_error("scd sync failed");
-        return AJI_ERR_CUDA;
-    }
-    // The reference runs SCDetect on the padded clip; the constant borders
-    // contribute zero difference, so its mean divides by the padded area.
-    if (sum / ((double)R.pw * R.ph) > R.scd_threshold)
-        return AJI_SCENE;
 
     // stage both frames into the padded buffers (interior only)
     const size_t doff_y = (size_t)R.pad_t * prow + (size_t)R.pad_l * bpp;
@@ -2656,4 +2708,15 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         cuDevicePrimaryCtxRelease(c->cu_dev);
     delete c;
     *pc = nullptr;
+}
+
+extern "C" AJI_EXPORT int aji_stream_policy_version(void)
+{
+#ifdef AJI_TRTRTX
+    // The addon cached-only contract is qualified for classic TensorRT.
+    // TensorRT-RTX warm-up/build/fallback requires separate qualification.
+    return 0;
+#else
+    return 1;
+#endif
 }
