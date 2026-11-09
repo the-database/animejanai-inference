@@ -27,6 +27,18 @@ plus packs-<platform>.json, the index apps pin by SHA-256 (format 1):
     kind: trt | trt-builder (+ "sm": "sm120" / "ptx") | trtrtx | models | private
     version: the content version (store folder packs/<name>/<version>), not the release tag
 
+A store folder never changes, so a name/version must always mean the same files. Each build compares
+every pack's files (paths, sizes, SHA-256s) with the same pack in the earlier runtime-<k> releases'
+indexes (downloaded; --previous-index gives them instead):
+    unchanged  the entry keeps the earlier release's url, sha256 and bytes, and no new archive is
+               built or uploaded, so apps see the same pin and don't download the pack again
+               (aji-runtime 0.2.0 and older compare the archive's SHA-256). Consumers must take each
+               pack's url from the index, not derive it from the tag.
+    changed    if an earlier release used the version for other files, it becomes <version>-r2
+               (-r3, ...), so the new files get a store folder of their own.
+Archives are also built reproducibly (fixed file times, entries in sorted order) as a second line of
+defence; a different 7-Zip still packs differently.
+
 Files sit at each archive's root (models included). Every source is pinned below and checked
 against its SHA-256:
     windows  NVIDIA's redistributable TensorRT and TensorRT-RTX zips + the CUDA redistributable
@@ -38,8 +50,13 @@ against its SHA-256:
 usage: runtime_packs.py --print-tag
        runtime_packs.py --platform windows|linux --out DIR [--work DIR] [--local-dir DIR ...]
                         [--sevenzip PATH] [--no-models]
-  --local-dir  take the TensorRT / TensorRT-RTX / cudart / ORT files from folders that already
-               hold them (flat), instead of downloading; repeat for several folders
+                        [--previous-index FILE|URL ... | --no-previous] [--no-url-check]
+  --local-dir       take the TensorRT / TensorRT-RTX / cudart / ORT files from folders that already
+                    hold them (flat), instead of downloading; repeat for several folders
+  --previous-index  the earlier releases' indexes for this platform, oldest first, instead of
+                    downloading packs-<platform>.json from runtime-2 up to the release before TAG
+  --no-previous     compare with nothing, so every pack gets a new archive (local test builds only)
+  --no-url-check    don't check that a reused archive's url is still there (testing)
 """
 
 import argparse
@@ -58,6 +75,11 @@ import zipfile
 # each index's SHA-256. (runtime-1 is MangaJaNaiCLI's older, CLI-only release.)
 TAG = "runtime-2"
 REPO = "the-database/animejanai-inference"
+# The first release this script built, and so the first one in any store. A build compares its packs
+# with every release from this one on.
+FIRST_STORE_TAG = 2
+# The modification time every packed file gets, so that the same files pack to the same bytes.
+PACK_MTIME = 1704067200  # 2024-01-01T00:00:00Z
 
 TRT_VERSION = "11.4.0.106"
 TRT_CUDA = "13.4"
@@ -287,6 +309,105 @@ def file_list(folder):
     return sorted(out, key=lambda e: e["path"])
 
 
+def history_tags():
+    """The earlier runtime-<k> releases this one is compared with, oldest first."""
+    n = int(TAG.split("-")[1])
+    return [f"runtime-{k}" for k in range(FIRST_STORE_TAG, n)]
+
+
+def load_history(plat, sources, none):
+    """[(label, index)] of the earlier releases, oldest first. Any failure stops the build: without
+    them, an unchanged pack would get a new archive SHA-256 and be installed again everywhere."""
+    if none:
+        return []
+    if not sources:
+        sources = [f"https://github.com/{REPO}/releases/download/{t}/packs-{plat}.json" for t in history_tags()]
+    out = []
+    for src in sources:
+        try:
+            if src.startswith(("http://", "https://")):
+                req = urllib.request.Request(src, headers={"User-Agent": "animejanai-inference-runtime-packs"})
+                with urllib.request.urlopen(req) as r:
+                    data = r.read()
+            else:
+                with open(src, "rb") as f:
+                    data = f.read()
+            idx = json.loads(data)
+        except Exception as e:  # any failure is fatal, with its source named
+            sys.exit(f"can't read the earlier index {src}: {e} (--previous-index gives it; --no-previous for a test build)")
+        if not isinstance(idx, dict) or idx.get("format") != 1 or idx.get("platform") != plat \
+                or not isinstance(idx.get("packs"), list):
+            sys.exit(f"{src}: not a format-1 {plat} index")
+        if idx.get("tag") == TAG:
+            sys.exit(f"{src} is {TAG} itself; bump TAG")
+        out.append((idx.get("tag") or src, idx))
+    return out
+
+
+def files_key(files):
+    """A file list as builds compare it: each path with its size and SHA-256. None if malformed."""
+    try:
+        key = sorted((f["path"], int(f["bytes"]), f["sha256"].lower()) for f in files)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    if len({p for p, _, _ in key}) != len(key):
+        return None
+    return key
+
+
+def same_pack(prev, kind, extra, files):
+    """Whether an earlier index entry holds exactly these files and has what reusing it takes."""
+    want = files_key(files)
+    return (want is not None and prev.get("kind") == kind and prev.get("sm") == extra.get("sm")
+            and files_key(prev.get("files")) == want
+            and isinstance(prev.get("url"), str) and isinstance(prev.get("asset"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", str(prev.get("sha256"))) is not None
+            and isinstance(prev.get("bytes"), int) and prev["bytes"] > 0)
+
+
+def resolve_pack(name, base, kind, extra, files, history):
+    """(version, earlier entry to reuse or None, its release) for a staged pack.
+
+    Reuses the newest earlier entry of this name with exactly these files, at its version, as long as
+    that version never meant other files. Otherwise the version is the first of base, base-r2,
+    base-r3, ... that no earlier release used for this name, so no store folder is asked to hold
+    other files than it does."""
+    seen = {}  # version -> [entry] of this name in the earlier releases
+    for _, idx in history:
+        for p in idx["packs"]:
+            if isinstance(p, dict) and p.get("name") == name:
+                seen.setdefault(str(p.get("version")), []).append(p)
+    mixed = {v for v, es in seen.items() if len({repr(files_key(p.get("files"))) for p in es}) > 1}
+    for v in sorted(mixed):
+        log(f"warning: earlier releases used {name}/{v} for different files; it won't be used again")
+    family = re.compile(re.escape(base) + r"(-r[0-9]+)?")
+    for label, idx in reversed(history):
+        for p in idx["packs"]:
+            if not isinstance(p, dict) or p.get("name") != name:
+                continue
+            v = str(p.get("version"))
+            if family.fullmatch(v) and v not in mixed and same_pack(p, kind, extra, files):
+                return v, p, label
+    version, k = base, 2
+    while version in seen:
+        version, k = f"{base}-r{k}", k + 1
+    if version != base:
+        log(f"warning: {name}/{base} has other files than in an earlier release, so it's {name}/{version}")
+    return version, None, None
+
+
+def check_url(url, want_bytes):
+    """That a reused archive can still be downloaded, at its size."""
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "animejanai-inference-runtime-packs"})
+        with urllib.request.urlopen(req) as r:
+            got = r.headers.get("Content-Length")
+    except Exception as e:  # any failure is fatal
+        sys.exit(f"the reused archive {url} can't be reached: {e}")
+    if got is not None and int(got) != want_bytes:
+        sys.exit(f"the reused archive {url} is {got} bytes; its index says {want_bytes}")
+
+
 def pack_meta(name):
     """(version, kind, extra fields) of a staged pack."""
     if name == "trt-runtime":
@@ -326,6 +447,10 @@ def main():
     ap.add_argument("--local-dir", action="append", default=[])
     ap.add_argument("--no-models", action="store_true", help="leave the model packs out (testing)")
     ap.add_argument("--sevenzip", default=shutil.which("7z") or r"C:\Program Files\7-Zip\7z.exe")
+    ap.add_argument("--previous-index", action="append", default=[], metavar="FILE|URL",
+                    help="an earlier release's index for this platform, oldest first (default: download them)")
+    ap.add_argument("--no-previous", action="store_true", help="compare with no earlier release (local test builds)")
+    ap.add_argument("--no-url-check", action="store_true", help="don't check reused archives' urls (testing)")
     a = ap.parse_args()
     if a.print_tag:
         print(TAG)
@@ -353,6 +478,10 @@ def main():
     groups = sorted(d for d in os.listdir(stage) if os.listdir(os.path.join(stage, d)))
     if "trt-runtime" not in groups or not any(g.startswith("trt-") and g != "trt-runtime" for g in groups):
         sys.exit(f"incomplete runtime: {groups}")
+    if a.no_previous and a.previous_index:
+        ap.error("--no-previous and --previous-index don't go together")
+    history = load_history(plat, a.previous_index, a.no_previous)
+    log(f"comparing with {', '.join(label for label, _ in history) or 'no earlier release (--no-previous)'}")
     index = {"format": 1, "tag": TAG, "platform": plat, "packs": []}
     for name in groups:
         folder = os.path.join(stage, name)
@@ -361,20 +490,40 @@ def main():
         dest = os.path.abspath(os.path.join(a.out, asset))
         if os.path.exists(dest):
             os.remove(dest)
-        log(f"packing {asset}: {', '.join(f['path'] for f in files)}")
-        # Plain LZMA2 without the BCJ/BCJ2 executable filters 7-Zip adds to DLLs by default: what
-        # aji-runtime decodes (sevenz-rust2) is LZMA2.
-        subprocess.run([a.sevenzip, "a", "-t7z", "-m0=LZMA2", "-mx=7", "-mf=off", "-bso0", "-bsp0", dest]
-                       + [f["path"] for f in files], cwd=folder, check=True)
-        version, kind, extra = pack_meta(name)
+        base, kind, extra = pack_meta(name)
+        version, prev, label = resolve_pack(name, base, kind, extra, files, history)
+        if prev is not None:
+            # The same files as in an earlier release: its archive and pin, nothing to upload.
+            log(f"unchanged: {name}/{version} keeps {label}'s archive {prev['url']}")
+            if not a.no_url_check:
+                check_url(prev["url"], prev["bytes"])
+            asset, url, digest, size = prev["asset"], prev["url"], prev["sha256"], prev["bytes"]
+        else:
+            log(f"packing {asset}: {', '.join(f['path'] for f in files)}")
+            # The same files pack to the same bytes: fixed file times, entries in sorted order.
+            for f in files:
+                os.utime(os.path.join(folder, f["path"]), (PACK_MTIME, PACK_MTIME))
+            # Plain LZMA2 without the BCJ/BCJ2 executable filters 7-Zip adds to DLLs by default: what
+            # aji-runtime decodes (sevenz-rust2) is LZMA2.
+            subprocess.run([a.sevenzip, "a", "-t7z", "-m0=LZMA2", "-mx=7", "-mf=off", "-mtc=off", "-mta=off",
+                            "-bso0", "-bsp0", dest] + [f["path"] for f in files], cwd=folder, check=True)
+            url = f"https://github.com/{REPO}/releases/download/{TAG}/{asset}"
+            digest, size = sha256(dest), os.path.getsize(dest)
         index["packs"].append({
             "name": name, "version": version, "kind": kind, **extra,
-            "asset": asset, "url": f"https://github.com/{REPO}/releases/download/{TAG}/{asset}",
-            "sha256": sha256(dest), "bytes": os.path.getsize(dest),
+            "asset": asset, "url": url, "sha256": digest, "bytes": size,
             "installed_bytes": sum(f["bytes"] for f in files), "files": files,
         })
     if not a.no_models:
-        index["packs"] += model_packs(a.work, a.sevenzip)
+        models = model_packs(a.work, a.sevenzip)
+        # Their versions are MangaJaNai's release tags: a change there needs a new tag, not -r2.
+        for m in models:
+            for label, idx in history:
+                for p in idx["packs"]:
+                    if isinstance(p, dict) and p.get("name") == m["name"] and p.get("version") == m["version"] \
+                            and files_key(p.get("files")) != files_key(m["files"]):
+                        sys.exit(f"{m['name']}/{m['version']} has other files than in {label}; it needs a new version")
+        index["packs"] += models
     with open(os.path.join(a.out, f"packs-{plat}.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)
         f.write("\n")

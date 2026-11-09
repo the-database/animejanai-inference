@@ -223,7 +223,12 @@ version (a new TensorRT, say):
    `upstream-release` dispatch, `source=runtime-packs`; MangaJaNaiCLI, MangaJaNai GUI, VideoJaNai and mpv-AnimeJaNai). Add an app there once
    its `bump_pins.py` knows that source.
 
-Packs whose contents didn't change keep their version, so the stores keep them. A libaji release
+A store folder (`packs/<name>/<version>`) never changes, so a name/version must always mean the same
+files. The script compares each pack's files with the earlier `runtime-<k>` releases' indexes
+(it downloads them; `--previous-index` for local runs): a pack whose files didn't change keeps its
+earlier version, archive, URL and SHA-256 and isn't uploaded again, so the stores keep it and apps
+don't download it again. A changed pack whose version an earlier release used gets `-r2`, `-r3`, ...
+Apps must take each pack's `url` from the index, not build it from the tag. A libaji release
 built against the new TensorRT usually goes with it. (`runtime-1` is MangaJaNaiCLI's older,
 CLI-only release.)
 
