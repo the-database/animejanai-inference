@@ -19,14 +19,16 @@ bool load_ort(std::string *err)
     const std::string dir = own_dir();
     const DWORD flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
                         LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
-    HMODULE dml = LoadLibraryExA((dir + "\\DirectML.dll").c_str(), NULL, flags);
+    // wide: own_dir() is UTF-8
+    HMODULE dml = LoadLibraryExW(widen_utf8(dir + "\\DirectML.dll").c_str(), NULL,
+                                 flags);
     if (!dml) {
         *err = "DirectML.dll not found next to aji_dml.dll (error " +
                std::to_string(GetLastError()) + ")";
         return false;
     }
-    HMODULE ort = LoadLibraryExA((dir + "\\onnxruntime.dll").c_str(), NULL,
-                                 flags);
+    HMODULE ort = LoadLibraryExW(widen_utf8(dir + "\\onnxruntime.dll").c_str(),
+                                 NULL, flags);
     if (!ort) {
         *err = "onnxruntime.dll not found next to aji_dml.dll (error " +
                std::to_string(GetLastError()) + ")";

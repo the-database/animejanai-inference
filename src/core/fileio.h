@@ -18,6 +18,7 @@ namespace ajicore {
 
 #ifdef _WIN32
 std::wstring widen_utf8(const std::string &s);
+std::string narrow_utf8(const std::wstring &w);
 std::wstring win_long_path(const std::string &path);
 #endif
 
@@ -38,7 +39,8 @@ bool write_file_bytes(const std::string &path, const void *data, size_t size);
 std::FILE *fopen_utf8(const std::string &path, const char *mode);
 
 // Directory of the library this code is compiled into (aji.dll,
-// aji_trt.dll, ...): backends resolve their runtime dependencies there.
+// aji_trt.dll, ...), UTF-8: backends resolve their runtime dependencies
+// there. Windows: load what's in it with LoadLibraryExW(widen_utf8(...)).
 std::string own_dir();
 
 } // namespace ajicore

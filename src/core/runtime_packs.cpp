@@ -250,31 +250,6 @@ std::string resolve(const std::string &dir, std::string p)
     return dir + SEP + p;
 }
 
-// UTF-8 folder of this library (own_dir() is ANSI on Windows).
-std::string own_dir_utf8()
-{
-#ifdef _WIN32
-    HMODULE self = NULL;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&own_dir_utf8, &self);
-    std::wstring w(32768, L'\0');
-    DWORD n = GetModuleFileNameW(self, &w[0], (DWORD)w.size());
-    w.resize(n);
-    size_t slash = w.find_last_of(L'\\');
-    if (slash != std::wstring::npos)
-        w.resize(slash);
-    int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr,
-                                  0, nullptr, nullptr);
-    std::string s(len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], len,
-                        nullptr, nullptr);
-    return s;
-#else
-    return own_dir();
-#endif
-}
-
 // Loads `file` from pack folder `dir` by full path, once; global on POSIX
 // so later loads by soname (the backend's DT_NEEDED) bind to it.
 bool load_from(const std::string &dir, const char *file, const char *pack,
@@ -453,7 +428,7 @@ const RuntimePacks &runtime_packs()
         std::string file = runtime_json_env();
         std::string dir;
         if (file.empty()) {
-            dir = own_dir_utf8();
+            dir = own_dir();
             file = dir + SEP + "aji-runtime.json";
         } else {
             // relative paths in it are relative to its own folder
