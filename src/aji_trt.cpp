@@ -287,10 +287,14 @@ aji_csp make_csp(const aji_frame *f)
     return aji_make_csp(f->format, f->matrix, f->range);
 }
 
+// Both engine directories: the models' and RIFE's (its own folder when
+// rife_model_dir is set), with the same rules.
 void clean_stale_engines(aji_ctx *c)
 {
     std::vector<std::string> removed;
     ajicore::clean_stale_engines(c->model_dir, c->cuda_dev, &removed);
+    if (!c->rife_model_dir.empty() && c->rife_model_dir != c->model_dir)
+        ajicore::clean_stale_engines(c->rife_model_dir, c->cuda_dev, &removed);
     for (const std::string &name : removed) {
         c->log_steps.push_back(
             "Removed stale " AJI_TRT_PRODUCT " engine (different GPU or "
