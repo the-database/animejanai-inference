@@ -378,6 +378,37 @@ lines tall, else BT.709; limited range; primaries and transfer guessed as mpv do
 fields are filled, and the output is tagged with all four, since libaji writes the upscaled
 frames in the source's matrix and range. `guess_colorimetry` in `src/encode.c` has the rule.
 
+## Damaged input in `aji_encode`
+
+`--on-damage fail|continue` (default `fail`). Damage is detected the same way for NVDEC and the
+CPU decoder: the decoder rejecting data (`AVERROR_INVALIDDATA` from send/receive), a frame
+flagged `decode_error_flags` / `AV_FRAME_FLAG_CORRUPT`, a video packet the demuxer flags
+`AV_PKT_FLAG_CORRUPT` (MPEG-TS continuity errors, a sample cut short by the end of the file) or
+`AVERROR_INVALIDDATA` from `av_read_frame`, and errors the video decoder or the demuxer *log*
+(`av_log_cb` counts them): HEVC drops a slice or a frame without references, and Matroska resyncs
+past a broken element, with nothing but a log line. Other errors (ENOMEM, a device failure, the
+encoder) stay fatal. Errors before the decoder's first frame are not damage (a recording that
+starts mid-GOP). NVDEC decodes macroblocks in hardware and libavcodec (9.0.2) never asks it for
+its decode status, so damage it conceals there goes unseen; `--decoder cpu` sees it.
+
+Each damaged spot prints one stdout line, next to `PROGRESS`, in both modes (in `--progress
+json`, `{"damage":{"t":...,"frame":...}}`):
+
+```
+DAMAGE t=<seconds since the video stream's start, 3 decimals> frame=<source frame index | -1>
+```
+
+Finds less than a second apart are one spot (an error, its concealed frame and the frames left
+without references are one line); `frame` is the first frame of the spot the decoder put out, or
+-1 when the spot starts with a packet that produced none. A packet-level find waits a few frames
+for a flagged frame to report instead (frame threads report errors late), so its time can be off
+by about that much. `fail` stops at the first spot with exit status **3** and says where on stderr
+(`damaged video at 1:23.4 (frame 2001)`); `continue` keeps concealed frames, drops what the
+decoder rejects and prints the total. A read error that isn't EOF (or `pb->error`) fails with
+exit status 1 in both modes and in `--preview-session`; damage never stops a preview session (it
+has no `--on-damage`), which prints no `DAMAGE` lines. `tools/test-encode-damage.py` is the
+regression test (Windows + NVIDIA GPU; it simulates the read error with a byte-range lock).
+
 ## Conventions
 
 - Commits: author `the-database`, short imperative subject, no co-author trailers.
