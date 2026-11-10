@@ -427,7 +427,9 @@ regression test (Windows + NVIDIA GPU; it simulates the read error with a byte-r
 ## HDR in `aji_encode`
 
 Colour tags (BT.2020 matrix and primaries, PQ or HLG transfer) carry over like any others, and
-a 10-bit output (`--pix-fmt yuv420p10`, the default) keeps the depth. The HDR10 static metadata
+a 10-bit output (`--pix-fmt yuv420p10`, the default) keeps the depth. There is no tone mapping:
+an 8-bit `--pix-fmt` on a PQ/HLG source writes an 8-bit HDR file (it bands), which is allowed but
+gets a `warning:` line on stderr (`resolve_pixfmt`). The HDR10 static metadata
 (mastering display, content light level) is taken from the first decoded frame (the decoder
 puts the bitstream's SEI/OBUs or the container's side data on every frame) by `hdr_capture`,
 since libaji's output frames don't carry it. It goes to the encoder as `decoded_side_data`
