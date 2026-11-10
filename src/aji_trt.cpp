@@ -175,6 +175,7 @@ struct aji_ctx {
                                      // upscale models (else: after, the default)
         int num = 1, den = 1;
         double scd_threshold = 0.150;
+        bool scene_detect_enhanced = false;
         ModelEngine engine;
         int w = 0, h = 0;            // unpadded; chain output dims, or the
                                      // source dims when before_upscale
@@ -715,6 +716,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     R.num = chain->rife_factor_num;
     R.den = chain->rife_factor_den;
     R.scd_threshold = chain->rife_scd_threshold;
+    R.scene_detect_enhanced = chain->rife_scene_detect_enhanced;
 
     const std::string model =
         rife_model_name(chain->rife_model, chain->rife_ensemble);
@@ -2436,6 +2438,11 @@ extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
 {
     return (c && c->rife.enabled && c->rife.before_upscale) ? 1 : 0;
+}
+
+extern "C" AJI_EXPORT int aji_rife_enhanced_scene(aji_ctx *c)
+{
+    return c && c->rife.enabled && c->rife.scene_detect_enhanced;
 }
 
 extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
