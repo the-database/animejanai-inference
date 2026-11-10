@@ -378,6 +378,21 @@ lines tall, else BT.709; limited range; primaries and transfer guessed as mpv do
 fields are filled, and the output is tagged with all four, since libaji writes the upscaled
 frames in the source's matrix and range. `guess_colorimetry` in `src/encode.c` has the rule.
 
+## Frame formats in `aji_encode`
+
+A frame reaches the encoder in one of two ways (`emit_output`). It goes zero-copy into NVENC
+only if it is already a CUDA frame (or DirectML's D3D11 texture) in exactly the 4:2:0 format the
+output asks for (`nvenc_takes`). libaji's output always is. In passthrough (no chain active), the
+frame is the decoder's own and only sometimes qualifies: a CPU-decoded frame is in host memory,
+and an NVDEC frame may have another bit depth or be 4:2:2 / 4:4:4. Every other frame is
+downloaded if need be, converted (and resized) with swscale, and NVENC uploads it. The first
+frame decides, since the encoder is opened for it; a zero-copy encode that later meets a frame
+of another format or size fails with a message instead of feeding NVENC a frame it was not
+opened for. `tools/test-encode-formats.py` (NVIDIA GPU) runs every source layout (8/10-bit
+4:2:0, 4:2:2, 4:4:4, odd width) through NVDEC and the CPU decoder, NVENC and the CPU encoders,
+both bit depths, `--final-resize-height` and `--deinterlace`, in passthrough and (given a model)
+upscaling, and checks the output format, frame count and PSNR against the source.
+
 ## Damaged input in `aji_encode`
 
 `--on-damage fail|continue` (default `fail`). Damage is detected the same way for NVDEC and the
