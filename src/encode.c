@@ -402,7 +402,12 @@ typedef struct {
     AVPacket       **aux_buf;        /* aux packets seen before header */
     int              aux_n, aux_cap;
 
-    /* resize (nvenc + downscale): scale_cuda graph */
+    /* final resize (nvenc + --final-resize-*): libaji's Spline36 on the
+     * GPU (aji_resize_frame) into its own frame pool, on its own stream;
+     * the scale_cuda graph only if this libaji can't */
+    AVBufferRef     *final_pool;
+    cudaStream_t     final_stream;
+    int              final_scale_cuda;  /* aji_resize_frame failed */
     AVFilterGraph   *graph;
     AVFilterContext *buf_src, *buf_sink;
 
@@ -2358,7 +2363,59 @@ fail:
     return -1;
 }
 
-/* ---- optional final resize (nvenc path): scale_cuda filtergraph ---------- */
+/* ---- optional final resize (nvenc path) --------------------------------- */
+
+/* Resize a CUDA NV12/P010 frame to the final size with libaji's Spline36 (to
+ * RGB, resize, back: the reference pipeline's resize.Spline36), as the
+ * upscale chain resizes. scale_cuda's bicubic has no prefilter when
+ * downscaling, so screentone and fine lines alias. Returns the new frame,
+ * complete on the GPU, or NULL (logged) if libaji can't, and the caller
+ * falls back to scale_cuda. */
+static AVFrame *final_resize_aji(enc_ctx *c, AVFrame *src)
+{
+    if (!c->aji || c->final_scale_cuda)
+        return NULL;
+    const AVHWFramesContext *fc = (const AVHWFramesContext *)src->hw_frames_ctx->data;
+    if (!c->final_pool) {
+        if (!(c->final_pool = make_pool(c, fc->sw_format, c->out_w, c->out_h, 48)) ||
+            cudaStreamCreate(&c->final_stream) != cudaSuccess) {
+            loge("final resize: CUDA setup failed; using scale_cuda");
+            c->final_scale_cuda = 1;
+            return NULL;
+        }
+    }
+    AVFrame *f = av_frame_alloc();
+    if (!f || av_hwframe_get_buffer(c->final_pool, f, 0) < 0) {
+        loge("final resize: no frame from the pool");
+        av_frame_free(&f);
+        c->final_scale_cuda = 1;
+        return NULL;
+    }
+    /* both in the output format (libaji's output, or an NVDEC frame NVENC
+     * takes as it is: nvenc_takes) */
+    aji_frame in_f, out_f;
+    fill_aji_frame(c, &in_f, src, 1);
+    fill_aji_frame(c, &out_f, f, 1);
+    /* libaji writes 4:2:0 with left siting whatever the source's (a
+     * passthrough frame is the decoder's, sited as the source) */
+    if (c->aji_pool && src->hw_frames_ctx->data == c->aji_pool->data)
+        in_f.siting = AJI_SITING_LEFT;
+    int r = aji_resize_frame(c->aji, &in_f, &out_f, c->final_stream);
+    if (r == AJI_OK && cudaStreamSynchronize(c->final_stream) != cudaSuccess)
+        r = AJI_ERR_CUDA;
+    if (r != AJI_OK) {
+        loge("final resize: aji_resize_frame: %d (%s); using scale_cuda", r,
+             aji_last_error(c->aji));
+        av_frame_free(&f);
+        c->final_scale_cuda = 1;
+        return NULL;
+    }
+    av_frame_copy_props(f, src);
+    f->sample_aspect_ratio = c->out_sar;  /* the stretch is the resize's */
+    return f;
+}
+
+/* scale_cuda filtergraph: the final resize when libaji can't do it */
 
 static int init_resize(enc_ctx *c, AVFrame *first)
 {
@@ -2896,7 +2953,9 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out, int64_t pts)
         goto done;
     }
 
-    if (zerocopy && resize_needed(c)) {
+    if (zerocopy && resize_needed(c) && (resized = final_resize_aji(c, cuda_out))) {
+        to_encode = resized;
+    } else if (zerocopy && resize_needed(c)) {
         if (init_resize(c, cuda_out) < 0) goto done;
         AV(av_buffersrc_add_frame_flags(c->buf_src, cuda_out,
                                         AV_BUFFERSRC_FLAG_KEEP_REF));
@@ -2933,9 +2992,14 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out, int64_t pts)
          * crop_w x crop_h (the engine output keeps the padded size) */
         const int in_w = (c->pad_r || c->pad_b) ? c->crop_w : host->width;
         const int in_h = (c->pad_r || c->pad_b) ? c->crop_h : host->height;
+        /* a final resize: SWS_LANCZOS, of swscale's filters the closest to
+         * the reference pipeline's Spline36 on anime video, and closer than
+         * bicubic on screentone too (SWS_SPLINE is further off on video,
+         * and slower); a plain repack as before */
         c->sws = sws_getCachedContext(c->sws, in_w, in_h,
                     host->format, sw->width, sw->height, sw->format,
-                    SWS_BICUBIC, NULL, NULL, NULL);
+                    resize_needed(c) ? SWS_LANCZOS : SWS_BICUBIC,
+                    NULL, NULL, NULL);
         if (!c->sws) { loge("sws_getContext failed"); av_frame_free(&sw);
                        av_frame_free(&dl); goto done; }
         sws_scale(c->sws, (const uint8_t *const *)host->data, host->linesize,
@@ -3818,6 +3882,8 @@ static void cleanup(enc_ctx *c)
     if (c->in_sws) sws_freeContext(c->in_sws);
     av_frame_free(&c->host_frame);
     if (c->graph) avfilter_graph_free(&c->graph);
+    av_buffer_unref(&c->final_pool);
+    if (c->final_stream) cudaStreamDestroy(c->final_stream);
     avfilter_graph_free(&c->dgraph);
     sws_freeContext(c->preview_img.sws);
     avcodec_free_context(&c->preview_img.enc);

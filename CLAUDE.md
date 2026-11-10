@@ -398,7 +398,11 @@ and an NVDEC frame may have another bit depth or be 4:2:2 / 4:4:4. Every other f
 downloaded if need be, converted (and resized) with swscale, and NVENC uploads it. The first
 frame decides, since the encoder is opened for it; a zero-copy encode that later meets a frame
 of another format or size fails with a message instead of feeding NVENC a frame it was not
-opened for. `tools/test-encode-formats.py` (NVIDIA GPU) runs every source layout (8/10-bit
+opened for. The final resize (`--final-resize-*`, `--square-pixels after`) is Spline36 like every
+other resize: on the zero-copy path `aji_resize_frame` (TensorRT backends; scale_cuda only if it
+fails), else swscale's `SWS_LANCZOS`, the closest of its filters to Spline36 on anime video
+(scale_cuda's bicubic has no prefilter when downscaling: ~50 dB from Spline36 against libaji's
+~69). `tools/test-encode-formats.py` (NVIDIA GPU) runs every source layout (8/10-bit
 4:2:0, 4:2:2, 4:4:4, odd width) through NVDEC and the CPU decoder, NVENC and the CPU encoders,
 both bit depths, `--final-resize-height` and `--deinterlace`, in passthrough and (given a model)
 upscaling, and checks the output format, frame count and PSNR against the source.
