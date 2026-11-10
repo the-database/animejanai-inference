@@ -425,6 +425,9 @@ typedef struct {
 
     /* bookkeeping */
     int64_t  out_frames;
+    int      zc;                     /* frames go to NVENC on the device:
+                                        -1 = not decided (first frame) */
+    int      zc_w, zc_h;             /* ... at this size */
     /* PROGRESS fps=: (time, out_frames) at each progress line, the oldest
      * first; fps_t0 is when the first frame went to the encoder */
     int64_t  fps_t[64], fps_n[64];
@@ -2401,7 +2404,7 @@ static void compute_final_dims(enc_ctx *c)
     }
 }
 
-static int resize_needed(enc_ctx *c)
+static int resize_needed(const enc_ctx *c)
 {
     return c->o.final_h > 0 || (c->o.final_pct > 0 && c->o.final_pct != 100) ||
            c->sq_after;
@@ -2818,6 +2821,26 @@ static double encode_fps(enc_ctx *c)
                     1e6 / dt : 0;
 }
 
+/* Whether NVENC can take this frame as it is, on the device: a CUDA frame
+ * (or DirectML's D3D11 texture) in exactly the 4:2:0 format the output asks
+ * for. libaji's output frames always are (its pool is in that format). A
+ * passthrough frame (no chain active) is the decoder's own, and only NVDEC's
+ * can be: a CPU-decoded frame is in host memory, in the decoder's format,
+ * and NVDEC's may be 8-bit for a 10-bit output, 10-bit for an 8-bit one, or
+ * 4:2:2 / 4:4:4. Those go through the swscale path, which converts any of
+ * them. */
+static int nvenc_takes(const enc_ctx *c, const AVFrame *f)
+{
+    if (!is_nvenc(c->o.vcodec) || c->is_444 || c->pad_r || c->pad_b ||
+        !f->hw_frames_ctx ||
+        (f->format != AV_PIX_FMT_CUDA && f->format != AV_PIX_FMT_D3D11))
+        return 0;
+    if (f->format == AV_PIX_FMT_D3D11 && resize_needed(c))
+        return 0;                       /* scale_cuda is CUDA-only */
+    const AVHWFramesContext *fc = (const AVHWFramesContext *)f->hw_frames_ctx->data;
+    return fc->sw_format == (c->ten_bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12);
+}
+
 /* Emit one finished output frame at pts (out_tb). Frames arrive in display
  * order (the non-RIFE ring drains FIFO; RIFE emits base then phases in
  * order); the timestamps come from the source frames (frame_pts). */
@@ -2831,18 +2854,30 @@ static int emit_output(enc_ctx *c, AVFrame *cuda_out, int64_t pts)
      * final resize is done in its image scaler) */
     if (c->o.session) return sess_emit(c, cuda_out, pts);
 
-    /* Zero-copy only when the libaji output is a CUDA NV12/P010 frame NVENC
-     * can read directly. Anything routed through the YUV444P16 intermediate
-     * (bit-depth/chroma change or 4:4:4) is downloaded and converted with
-     * swscale, then handed to the encoder (NVENC uploads host frames itself;
-     * software encoders consume them directly). DirectML's D3D11 output goes
-     * to NVENC zero-copy too (NVENC takes D3D11 textures), except with a
-     * final resize (scale_cuda is CUDA-only); every other encoder reads it
-     * back. */
-    int zerocopy = is_nvenc(c->o.vcodec) &&
-                   c->out_aji_fmt != AJI_FMT_YUV444P16 &&
-                   (!c->dml || !resize_needed(c)) &&
-                   !c->pad_r && !c->pad_b;     /* cropped in the sws path */
+    /* Zero-copy when NVENC can read the frame directly (nvenc_takes):
+     * libaji's CUDA NV12/P010 output, DirectML's D3D11 output without a
+     * final resize, or an NVDEC frame already in the output format. Every
+     * other frame is downloaded if need be and converted with swscale, then
+     * handed to the encoder (NVENC uploads host frames itself; software
+     * encoders consume them directly). The first frame decides, as the
+     * encoder is opened for it: a zero-copy NVENC can't take a host frame
+     * or another size later. */
+    if (c->zc < 0) {
+        c->zc = nvenc_takes(c, cuda_out);
+        c->zc_w = cuda_out->width;
+        c->zc_h = cuda_out->height;
+    }
+    const int zerocopy = c->zc;
+    if (zerocopy && (!nvenc_takes(c, cuda_out) || cuda_out->width != c->zc_w ||
+                     cuda_out->height != c->zc_h)) {
+        loge("the video changed format or size mid-stream (%dx%d %s), which "
+             "NVENC can't follow on the GPU; --no-zerocopy encodes it",
+             cuda_out->width, cuda_out->height,
+             av_get_pix_fmt_name(cuda_out->hw_frames_ctx
+                 ? ((AVHWFramesContext *)cuda_out->hw_frames_ctx->data)->sw_format
+                 : cuda_out->format));
+        goto done;
+    }
 
     if (zerocopy && resize_needed(c)) {
         if (init_resize(c, cuda_out) < 0) goto done;
@@ -3856,6 +3891,7 @@ int main(int argc, char **argv)
     c.o.decoder = DEC_AUTO;
     c.o.pipeline_depth = 4;
     c.o.pix_fmt = OUT_420P10;     /* default: 10-bit 4:2:0 (matches old pipeline) */
+    c.zc = -1;
     g_log = stderr;
 
     for (int i = 1; i < argc; i++) {
