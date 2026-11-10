@@ -30,6 +30,7 @@
  */
 
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,6 +103,11 @@ enum decoder_mode { DEC_AUTO, DEC_NVDEC, DEC_CPU };
 enum progress_mode { PROG_NONE, PROG_LINE, PROG_JSON };
 enum deint_mode { DEINT_OFF, DEINT_IVTC, DEINT_BWDIF };
 enum square_mode { SQUARE_OFF, SQUARE_BEFORE, SQUARE_AFTER };
+enum damage_mode { DAMAGE_FAIL, DAMAGE_CONTINUE };
+
+/* exit status: 1 = error (a read error included), 2 = bad arguments,
+ * 3 = damaged input with --on-damage fail */
+#define EXIT_DAMAGED 3
 
 /* output chroma subsampling + bit depth, chosen via --pix-fmt and decoupled
  * from the source. 16-bit 4:4:4 is libaji's intermediate, never the file. */
@@ -132,6 +138,7 @@ typedef struct {
     const char *preview;    /* --preview: JPEG of the latest output frame */
     int preview_w;
     int session;            /* --preview-session: serve a player, no encode */
+    enum damage_mode on_damage;
 
     /* direct mode (testing) */
     const char *engine;
@@ -160,8 +167,38 @@ static void aji_log_cb(void *opaque, int level, const char *msg)
         loge("[aji:%d] %s", level, msg);
 }
 
+/* Errors logged by the video decoder and by the demuxer while run() decodes.
+ * Some damage reaches the API only as a log line: the HEVC decoder skips a
+ * slice it can't parse, or a frame whose references are gone ("Error
+ * constructing the frame RPS"), and Matroska resyncs past a broken element,
+ * all without an error code or a flagged frame. The decoder's frame threads
+ * log too, hence the atomic counters. */
+#ifdef _WIN32
+typedef volatile LONG err_count;
+#define ERR_INC(x) InterlockedIncrement(&(x))
+#define ERR_GET(x) InterlockedCompareExchange(&(x), 0, 0)
+#else
+typedef long err_count;
+#define ERR_INC(x) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
+#define ERR_GET(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#endif
+static err_count g_dec_errs, g_demux_errs;
+static int g_count_errs;        /* set while run() decodes */
+
 static void av_log_cb(void *p, int level, const char *fmt, va_list ap)
 {
+    if (level <= AV_LOG_ERROR && g_count_errs && p) {
+        const AVClass *cls = *(const AVClass **)p;
+        if (cls == avcodec_get_class()) {
+            const AVCodecContext *ac = p;
+            if (ac->codec_type == AVMEDIA_TYPE_VIDEO && ac->codec &&
+                av_codec_is_decoder(ac->codec))
+                ERR_INC(g_dec_errs);
+        } else if (cls == avformat_get_class() &&
+                   ((const AVFormatContext *)p)->iformat) {
+            ERR_INC(g_demux_errs);
+        }
+    }
     if (level > av_log_get_level())
         return;
     /* --deinterlace ivtc: fieldmatch warns about every frame it leaves combed
@@ -429,6 +466,22 @@ typedef struct {
     img_enc          sess_src_img;
     src_image        sess_src[16];   /* source images awaiting their output */
     int              sess_src_n;
+
+    /* damaged input (see "damaged input" below) */
+    int64_t          dec_frames;     /* frames the decoder has put out: the
+                                        source index of the next one */
+    int64_t          vstart_us;      /* the video stream's start (AV_TIME_BASE) */
+    double           pkt_t;          /* time of the last video packet sent (s) */
+    double           frame_t;        /* time of the last decoded frame (s) */
+    long             dec_errs_seen, demux_errs_seen;
+    int              pend;           /* damage found in a packet, waiting to
+                                        be tied to a flagged frame */
+    double           pend_t;
+    int              pend_wait;      /* frames left to wait for one */
+    int              spot_open;      /* a damaged spot is being reported */
+    double           spot_first, spot_last;
+    int64_t          damage_spots;
+    int              damage_stop;    /* --on-damage fail: stop now */
 } enc_ctx;
 
 /* forward decls */
@@ -858,6 +911,10 @@ static int open_input(enc_ctx *c)
     c->start_us = c->ifmt->start_time != AV_NOPTS_VALUE ? c->ifmt->start_time
                                                          : 0;
     c->last_pts = AV_NOPTS_VALUE;
+    /* DAMAGE times count from the video stream's own start */
+    c->vstart_us = vst->start_time != AV_NOPTS_VALUE
+                 ? av_rescale_q(vst->start_time, vst->time_base, AV_TIME_BASE_Q)
+                 : c->start_us;
 
     /* frame-count estimate for progress */
     if (vst->nb_frames > 0)
@@ -956,6 +1013,9 @@ static AVCodecContext *alloc_decoder(enc_ctx *c)
         return NULL;
     }
     dec->pkt_timebase = vst->time_base;
+    /* a frame carries its packet's opaque: DMG_TAG marks the packets the
+     * demuxer flagged corrupt */
+    dec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
     return dec;
 }
 
@@ -1050,6 +1110,8 @@ static int dec_send_pending(enc_ctx *c, const AVPacket *pkt)
         if (!fr) return AVERROR(ENOMEM);
         if ((r = avcodec_receive_frame(c->dec, fr)) < 0) {
             av_frame_free(&fr);
+            if (r == AVERROR_INVALIDDATA)
+                continue;   /* before the first frame: not damage (run) */
             return r;
         }
         c->dec_pend[(c->dec_pend_head + c->dec_pend_n++) % MAX_HELD] = fr;
@@ -1120,6 +1182,186 @@ static void dec_flush(enc_ctx *c)
     dec_drop_pending(c);
     dec_drop_held(c);
     avcodec_flush_buffers(c->dec);
+}
+
+/* ---- damaged input ------------------------------------------------------- *
+ *
+ * Damage is found the same way whatever the decoder (NVDEC or CPU) and the
+ * container:
+ *   - the decoder rejects data: avcodec_send_packet / avcodec_receive_frame
+ *     return AVERROR_INVALIDDATA (the packet is dropped);
+ *   - a decoded frame is flagged: decode_error_flags (concealed) or
+ *     AV_FRAME_FLAG_CORRUPT;
+ *   - the demuxer flags a video packet AV_PKT_FLAG_CORRUPT (MPEG-TS
+ *     continuity errors, a sample cut short by the end of the file) or
+ *     av_read_frame returns AVERROR_INVALIDDATA;
+ *   - the video decoder or the demuxer logs an error (g_dec_errs).
+ * Any other error (ENOMEM, a hardware/device failure, the encoder) stays
+ * fatal. NVDEC decodes the macroblocks in hardware and libavcodec does not
+ * ask it for its decode status, so macroblock-level damage it conceals is
+ * not seen; what libavcodec parses itself (NAL units, parameter sets, slice
+ * headers, references) is, as on the CPU.
+ *
+ * Errors before the decoder's first frame are not damage: a recording that
+ * starts mid-GOP has undecodable packets until its first keyframe, and NVDEC
+ * turning a stream down (--decoder auto) logs errors before the CPU decoder
+ * takes over.
+ *
+ * The first three name a packet, not a frame, and with frame threads the
+ * error surfaces a few packets late; such a find waits (pend) for the
+ * decoder's next few frames, and if one of them is flagged it is reported
+ * as that frame. Finds less than a second apart are one damaged spot, so a
+ * broken slice (an error, its concealed frame, the frames left without
+ * references) is one line. Each spot prints, on stdout,
+ *   DAMAGE t=<s since the video stream's start, 3 decimals> frame=<n | -1>
+ * with the first frame of the spot the decoder put out (its source index),
+ * or -1 if the spot starts with a packet. --on-damage fail stops at the
+ * first (exit status 3); continue keeps concealed frames, drops what the
+ * decoder rejects, and gives the total at the end. A preview session always
+ * goes on and prints nothing. */
+
+#define DMG_TAG ((void *)&g_dmg_tag)
+static const char g_dmg_tag = 0;
+#define SPOT_GAP 1.0    /* s */
+
+static double us_to_t(const enc_ctx *c, int64_t us)
+{
+    const double t = (double)(us - c->vstart_us) / AV_TIME_BASE;
+    return t > 0 ? t : 0;
+}
+
+/* a packet's time (s since the video start), NAN if it has none */
+static double pkt_time(const enc_ctx *c, const AVPacket *pkt)
+{
+    const int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+    if (ts == AV_NOPTS_VALUE) return NAN;
+    return us_to_t(c, av_rescale_q(ts, c->ifmt->streams[pkt->stream_index]
+                                       ->time_base, AV_TIME_BASE_Q));
+}
+
+/* [h:]mm:ss.s */
+static const char *clock_str(double t, char *buf, size_t n)
+{
+    const long long ds = (long long)(t * 10 + 0.5);
+    const long long s = ds / 10;
+    if (s >= 3600)
+        snprintf(buf, n, "%lld:%02lld:%02lld.%lld", s / 3600, s / 60 % 60,
+                 s % 60, ds % 10);
+    else
+        snprintf(buf, n, "%lld:%02lld.%lld", s / 60, s % 60, ds % 10);
+    return buf;
+}
+
+static void damage_report(enc_ctx *c, double t, int64_t frame)
+{
+    if (c->spot_open && t >= c->spot_first - SPOT_GAP &&
+        t <= c->spot_last + SPOT_GAP) {
+        if (t > c->spot_last) c->spot_last = t;
+        return;                         /* the same spot */
+    }
+    c->spot_open = 1;
+    c->spot_first = c->spot_last = t;
+    c->damage_spots++;
+    if (g_progress == PROG_JSON)
+        printf("{\"damage\":{\"t\":%.3f,\"frame\":%lld}}\n", t, (long long)frame);
+    else
+        printf("DAMAGE t=%.3f frame=%lld\n", t, (long long)frame);
+    fflush(stdout);
+    char clk[32], what[64];
+    clock_str(t, clk, sizeof clk);
+    if (frame >= 0)
+        snprintf(what, sizeof what, "frame %lld", (long long)frame);
+    else
+        snprintf(what, sizeof what, "damaged data, no frame");
+    if (c->o.on_damage == DAMAGE_FAIL) {
+        loge("damaged video at %s (%s); stopping (--on-damage continue "
+             "encodes past damage)", clk, what);
+        c->damage_stop = 1;
+    } else if (c->damage_spots <= 10) {
+        loge("damaged video at %s (%s); continuing", clk, what);
+        if (c->damage_spots == 10)
+            loge("further damaged spots are listed on stdout only");
+    }
+}
+
+/* damage found in a packet: wait a few frames for the frame it hit */
+static void damage_suspect(enc_ctx *c, double t)
+{
+    if (c->o.session) return;
+    if (c->dec_frames == 0) return;     /* not damage, see above */
+    if (isnan(t)) t = c->pkt_t;
+    if (c->pend) return;
+    c->pend = 1;
+    c->pend_t = t;
+    c->pend_wait = FFMIN(FFMAX(c->dec->thread_count, 1) +
+                         c->dec->has_b_frames + 1, 64);
+}
+
+static void damage_pend_flush(enc_ctx *c)
+{
+    if (c->pend) {
+        c->pend = 0;
+        damage_report(c, c->pend_t, -1);
+    }
+}
+
+/* what the decoder and the demuxer logged since the last look */
+static void damage_logs(enc_ctx *c, double t)
+{
+    const long d = ERR_GET(g_dec_errs), m = ERR_GET(g_demux_errs);
+    if (d != c->dec_errs_seen || m != c->demux_errs_seen)
+        damage_suspect(c, t);
+    c->dec_errs_seen = d;
+    c->demux_errs_seen = m;
+}
+
+/* an avcodec_send_packet / avcodec_receive_frame error: 0 if it is damaged
+ * data (dropped), -1 (logged) if it is fatal */
+static int dec_error(enc_ctx *c, int r, const char *what)
+{
+    if (r == AVERROR_INVALIDDATA) {
+        damage_suspect(c, c->pkt_t);
+        return 0;
+    }
+    char b[AV_ERROR_MAX_STRING_SIZE];
+    av_strerror(r, b, sizeof b);
+    loge("video %s failed: %s", what, b);
+    return -1;
+}
+
+/* a frame out of the decoder (the next source frame) */
+static void damage_frame(enc_ctx *c, const AVFrame *fr)
+{
+    const int64_t idx = c->dec_frames++;
+    const int64_t ts = fr->best_effort_timestamp;
+    c->frame_t = ts != AV_NOPTS_VALUE
+               ? us_to_t(c, av_rescale_q(ts, c->dec->pkt_timebase,
+                                         AV_TIME_BASE_Q))
+               : c->frame_t + (c->src_fps.num > 0 ? av_q2d(av_inv_q(c->src_fps))
+                                                  : 0);
+    if (c->o.session) return;
+    if (fr->decode_error_flags || (fr->flags & AV_FRAME_FLAG_CORRUPT) ||
+        fr->opaque == DMG_TAG) {
+        c->pend = 0;
+        damage_report(c, c->frame_t, idx);
+    } else if (c->pend && --c->pend_wait <= 0) {
+        damage_pend_flush(c);
+    }
+}
+
+/* av_read_frame returned r < 0: 0 = the end of the input, 1 = damaged
+ * container data, -1 = a read error (logged) */
+static int read_result(enc_ctx *c, int r)
+{
+    if (c->ifmt->pb && c->ifmt->pb->error < 0)
+        r = c->ifmt->pb->error;         /* demuxers often say EOF for it */
+    if (r == AVERROR_EOF) return 0;
+    if (r == AVERROR_INVALIDDATA) return 1;
+    char b[AV_ERROR_MAX_STRING_SIZE], clk[32];
+    av_strerror(r, b, sizeof b);
+    loge("reading the input failed after %s: %s",
+         clock_str(c->pkt_t, clk, sizeof clk), b);
+    return -1;
 }
 
 /* ---- --deinterlace: libavfilter graph on the decoded frames -------------- */
@@ -3074,52 +3316,109 @@ static int push_frame(enc_ctx *c, AVFrame *fr)
 static int run(enc_ctx *c)
 {
     AVPacket *pkt = av_packet_alloc();
-    int rc = -1;
+    int rc = -1, r, bad_reads = 0;
+    if (!pkt) goto done;
 
-    while (av_read_frame(c->ifmt, pkt) >= 0) {
+    c->dec_errs_seen = ERR_GET(g_dec_errs);
+    c->demux_errs_seen = ERR_GET(g_demux_errs);
+    g_count_errs = 1;
+    for (;;) {
+        r = av_read_frame(c->ifmt, pkt);
+        if (r == AVERROR(EAGAIN)) { av_usleep(10000); continue; }
+        if (r < 0) {
+            const int how = read_result(c, r);
+            if (how < 0) goto done;
+            if (how == 0) break;
+            /* damaged container data: the demuxer resyncs on the next
+             * read, unless it can't get past it */
+            damage_suspect(c, NAN);
+            if (c->damage_stop) goto damaged;
+            if (++bad_reads == 64) {
+                loge("the rest of the input can't be read; finishing");
+                break;
+            }
+            continue;
+        }
+        bad_reads = 0;
         if (pkt->stream_index == c->vstream) {
-            AV(dec_send(c, pkt));
+            const double t = pkt_time(c, pkt);
+            if (!isnan(t)) c->pkt_t = t;
+            damage_logs(c, c->pkt_t);   /* the demuxer's, reading it */
+            if (pkt->flags & AV_PKT_FLAG_CORRUPT) {
+                pkt->opaque = DMG_TAG;  /* its frame is damaged too */
+                damage_suspect(c, c->pkt_t);
+            }
+            r = dec_send(c, pkt);
+            if (r < 0 && dec_error(c, r, "decoding") < 0) goto done;
+            damage_logs(c, c->pkt_t);
             for (;;) {
                 AVFrame *fr = av_frame_alloc();
-                int r = dec_receive(c, fr);
+                if (!fr) goto done;
+                r = dec_receive(c, fr);
                 if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
                     av_frame_free(&fr);
                     break;
                 }
-                if (r < 0) { av_frame_free(&fr); AV(r); }
+                if (r < 0) {
+                    av_frame_free(&fr);
+                    if (dec_error(c, r, "decoding") < 0) goto done;
+                    continue;
+                }
+                damage_frame(c, fr);
+                if (c->damage_stop) { av_frame_free(&fr); goto damaged; }
                 /* fr is owned by the pipeline now */
                 if (push_decoded(c, fr) < 0) goto done;
             }
-        } else if (c->smap && c->smap[pkt->stream_index] >= 0) {
-            AVPacket *out = av_packet_clone(pkt);
-            if (c->opened) {
-                write_aux(c, out, pkt->stream_index);
-            } else {
-                /* header not written yet: buffer (in the input time base;
-                 * the output stream's is only final after the header) */
-                if (c->aux_n == c->aux_cap) {
-                    c->aux_cap = c->aux_cap ? c->aux_cap * 2 : 16;
-                    c->aux_buf = av_realloc_f(c->aux_buf, c->aux_cap,
-                                              sizeof(*c->aux_buf));
-                    c->aux_src = av_realloc_f(c->aux_src, c->aux_cap,
-                                              sizeof(*c->aux_src));
+            damage_logs(c, c->pkt_t);
+            if (c->damage_stop) goto damaged;
+        } else {
+            if (ERR_GET(g_demux_errs) != c->demux_errs_seen)
+                damage_logs(c, pkt_time(c, pkt));
+            if (c->damage_stop) goto damaged;
+            if (c->smap && c->smap[pkt->stream_index] >= 0) {
+                AVPacket *out = av_packet_clone(pkt);
+                if (c->opened) {
+                    write_aux(c, out, pkt->stream_index);
+                } else {
+                    /* header not written yet: buffer (in the input time
+                     * base; the output stream's is only final after the
+                     * header) */
+                    if (c->aux_n == c->aux_cap) {
+                        c->aux_cap = c->aux_cap ? c->aux_cap * 2 : 16;
+                        c->aux_buf = av_realloc_f(c->aux_buf, c->aux_cap,
+                                                  sizeof(*c->aux_buf));
+                        c->aux_src = av_realloc_f(c->aux_src, c->aux_cap,
+                                                  sizeof(*c->aux_src));
+                    }
+                    c->aux_src[c->aux_n] = pkt->stream_index;
+                    c->aux_buf[c->aux_n++] = out;
                 }
-                c->aux_src[c->aux_n] = pkt->stream_index;
-                c->aux_buf[c->aux_n++] = out;
             }
         }
         av_packet_unref(pkt);
     }
 
     /* flush decoder */
-    dec_send(c, NULL);
+    r = dec_send(c, NULL);
+    if (r < 0 && dec_error(c, r, "decoding") < 0) goto done;
     for (;;) {
         AVFrame *fr = av_frame_alloc();
-        int r = dec_receive(c, fr);
+        if (!fr) goto done;
+        r = dec_receive(c, fr);
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) { av_frame_free(&fr); break; }
-        if (r < 0) { av_frame_free(&fr); AV(r); }
+        if (r < 0) {
+            av_frame_free(&fr);
+            if (dec_error(c, r, "decoding") < 0) goto done;
+            continue;
+        }
+        damage_frame(c, fr);
+        if (c->damage_stop) { av_frame_free(&fr); goto damaged; }
         if (push_decoded(c, fr) < 0) goto done;
     }
+    damage_logs(c, c->pkt_t);
+    damage_pend_flush(c);               /* no frames left to tie it to */
+    g_count_errs = 0;
+    if (c->damage_stop) goto damaged;
     if (push_decoded(c, NULL) < 0) goto done;   /* flush the deinterlacer */
 
     /* flush pipeline */
@@ -3135,10 +3434,18 @@ static int run(enc_ctx *c)
         loge("rife: produced %lld frames (~expected %lld), %lld scene dupes",
              (long long)c->out_frames, (long long)out_frames_est(c),
              (long long)c->scene_dupes);
+    if (c->damage_spots)
+        loge("damaged video: %lld spot(s), encoded past (concealed frames "
+             "kept, data the decoder rejected dropped)",
+             (long long)c->damage_spots);
     progress("encode", c->out_frames, c->out_frames, 0, 100);
     rc = 0;
+    goto done;
+damaged:
+    rc = EXIT_DAMAGED;
 done:
 fail:
+    g_count_errs = 0;
     av_packet_free(&pkt);
     return rc;
 }
@@ -3209,16 +3516,25 @@ static int sess_serve(enc_ctx *c, double sec)
     while (!c->sess_done && !c->sess_abort) {
         if (!eof) {
             const int r = av_read_frame(c->ifmt, pkt);
+            if (r == AVERROR(EAGAIN)) continue;
             if (r < 0) {
+                /* a read error ends the session; damaged container data
+                 * ends the video here, like its end */
+                if (read_result(c, r) < 0) goto done;
                 eof = 1;
                 dec_send(c, NULL);
             } else if (pkt->stream_index != c->vstream) {
                 av_packet_unref(pkt);
                 continue;
             } else {
+                /* damage never stops a preview (it has no --on-damage):
+                 * a rejected packet is dropped, a concealed frame shown */
+                const double t = pkt_time(c, pkt);
+                if (!isnan(t)) c->pkt_t = t;
                 const int s = dec_send(c, pkt);
                 av_packet_unref(pkt);
-                if (s < 0 && s != AVERROR(EAGAIN)) AV(s);
+                if (s < 0 && s != AVERROR(EAGAIN) && s != AVERROR_INVALIDDATA)
+                    AV(s);
             }
         }
         for (;;) {
@@ -3238,6 +3554,7 @@ static int sess_serve(enc_ctx *c, double sec)
                 rc = 0;
                 goto done;
             }
+            if (r == AVERROR_INVALIDDATA) { av_frame_free(&fr); continue; }
             if (r < 0) { av_frame_free(&fr); AV(r); }
             if (push_decoded(c, fr) < 0) goto done;
             if (c->sess_done || c->sess_abort) break;
@@ -3368,6 +3685,9 @@ static void usage(void)
 "           [--device <id>] (a GPU id= from --probe-encoders; default: on\n"
 "                           DirectML the high-performance GPU, on TensorRT CUDA device 0)\n"
 "           [--deinterlace off|ivtc|bwdif] [--square-pixels off|before|after]\n"
+"           [--on-damage fail|continue] (damaged video: fail = stop at the first\n"
+"                           damaged spot, exit status 3 (default); continue = encode\n"
+"                           past it; each spot prints DAMAGE t=<s> frame=<n|-1>)\n"
 "           [--preview <f.jpg> [--preview-width W]]\n"
 "           [--preview-session] (no --output: frames for a GUI's player)\n"
 "           (direct mode: --engine <e> --max-width W --max-height H)\n");
@@ -3476,6 +3796,12 @@ int main(int argc, char **argv)
             else { loge("unknown --square-pixels '%s' (off|before|after)", v);
                    return 2; }
         }
+        else if (!strcmp(a, "--on-damage")) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "fail"))          c.o.on_damage = DAMAGE_FAIL;
+            else if (!strcmp(v, "continue")) c.o.on_damage = DAMAGE_CONTINUE;
+            else { loge("unknown --on-damage '%s' (fail|continue)", v); return 2; }
+        }
         else if (!strcmp(a, "--preview")) c.o.preview = argv[++i];
         else if (!strcmp(a, "--preview-width")) c.o.preview_w = atoi(argv[++i]);
         else { loge("unknown arg: %s", a); usage(); return 2; }
@@ -3554,8 +3880,8 @@ int main(int argc, char **argv)
         goto out;
     }
     if (open_output(&c) < 0) goto out;
-    if (run(&c) < 0) goto out;
-    rc = 0;
+    rc = run(&c);
+    if (rc < 0) rc = 1;
 
 out:
     cleanup(&c);
