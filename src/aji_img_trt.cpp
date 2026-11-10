@@ -127,6 +127,21 @@ struct aji_img_ctx {
     std::set<std::string> cleaned_dirs;
     std::string err;
 
+    // Inference on this context runs one call at a time, whatever the model:
+    // the models share one activation buffer and the GPU tiling scratch.
+    // TensorRT's default gives every execution context its own activation
+    // memory (~340 MB for a 2x ESRGAN at 512x512 tiles, ~1.35 GB for a 4x
+    // one), so each model loaded used to keep that until it was released.
+    // Lock order: mu, then run_mu; never wait for mu while holding run_mu.
+    // Every run waits for its stream before it lets go of run_mu, so nothing
+    // is in flight on the GPU while it is held. Guarded by run_mu:
+    std::mutex run_mu;
+    void *act = nullptr;     // shared activation memory
+    int64_t act_cap = 0;     // its size: the largest bound model's need
+    uint64_t act_gen = 1;    // bumped when `act` moves
+    std::set<aji_img_model *> bound;  // models with an execution context
+    GpuTileScratch gpu;      // upscale_gpu's device buffers
+
     void set_error(const std::string &e) {
         err = e;
         if (logger.fn)
@@ -144,8 +159,10 @@ struct aji_img_model : TileModel {
     int state = AJI_IMG_STATE_BUILDING;
     int overlap = DEFAULT_OVERLAP;
 
-    std::mutex run_mu;  // serializes aji_img_upscale on this model
     ModelEngine me;
+    bool oom = false;       // the last finalize ran out of memory
+    int64_t act_need = 0;   // the engine's activation memory (c->run_mu)
+    uint64_t act_gen = 0;   // c->act_gen when me.exec was pointed at c->act
     nvinfer1::DataType in_dt = nvinfer1::DataType::kFLOAT;
     nvinfer1::DataType out_dt = nvinfer1::DataType::kFLOAT;
     cudaStream_t stream = nullptr;
@@ -154,7 +171,6 @@ struct aji_img_model : TileModel {
     size_t in_elems = 0, out_elems = 0;
 
     cudaEvent_t prof_ev[4] = {};  // AJI_IMG_PROFILE: h2d / infer / d2h edges
-    GpuTileScratch gpu;           // upscale_gpu's device buffers
     bool even = false;  // AJI_IMG_LOAD_EVEN_TILES: engine for any tile shape
     int cur_w = 0, cur_h = 0;     // the input shape last set on the context
     std::vector<cudaEvent_t> tile_ev;  // AJI_IMG_PROFILE on the GPU path
@@ -229,7 +245,6 @@ struct aji_img_model : TileModel {
         for (cudaEvent_t ev : tile_ev)
             cudaEventDestroy(ev);
         tile_ev.clear();
-        gpu.release();
         cudaFree(d_in);
         cudaFree(d_out);
         cudaFreeHost(h_in);
@@ -240,6 +255,7 @@ struct aji_img_model : TileModel {
         stream = nullptr;
         me.exec.reset();
         me.engine.reset();
+        act_gen = 0;
 #ifdef AJI_TRTRTX
         me.rt.save();  // needs the context, which the callers hold
 #endif
@@ -248,14 +264,112 @@ struct aji_img_model : TileModel {
 
 namespace {
 
-// Deserialize the model's engine and set up tile buffers. Context pushed.
+std::string mb(int64_t bytes)
+{
+    return std::to_string((bytes + (1 << 20) - 1) >> 20) + " MB";
+}
+
+// Make the shared activation buffer at least `need` bytes. c->run_mu held,
+// context pushed. The old buffer goes first (nothing runs while run_mu is
+// held), so growing never needs the old and the new size at once.
+bool reserve_activations(aji_img_ctx *c, int64_t need, const std::string &who,
+                         std::string *err)
+{
+    if (need <= c->act_cap && (c->act || need == 0))
+        return true;
+    cudaFree(c->act);
+    c->act = nullptr;
+    c->act_cap = 0;
+    c->act_gen++;
+    if (cudaMalloc(&c->act, (size_t)need) != cudaSuccess) {
+        cudaGetLastError();  // not sticky; clear it
+        c->act = nullptr;
+        *err = "out of GPU memory: " + who + " needs " + mb(need) +
+               " for its activations (" + gpu_memory_note() + ")";
+        return false;
+    }
+    c->act_cap = need;
+    return true;
+}
+
+// Point the model's execution context at the shared buffer, growing it to
+// the model's need first. c->run_mu held, context pushed.
+bool bind_activations(aji_img_model *m, std::string *err)
+{
+    aji_img_ctx *c = m->c;
+    if (!reserve_activations(c, m->act_need, m->name, err))
+        return false;
+    if (m->act_gen != c->act_gen) {
+        m->me.exec->setDeviceMemoryV2(c->act, c->act_cap);
+        m->act_gen = c->act_gen;
+    }
+    return true;
+}
+
+// Shrink the shared buffer to what the bound models need (none: free it, and
+// the tiling scratch). c->run_mu held, context pushed. If the smaller buffer
+// can't be had, the next run allocates it.
+void trim_activations(aji_img_ctx *c)
+{
+    int64_t need = 0;
+    for (aji_img_model *m : c->bound)
+        need = std::max(need, m->act_need);
+    if (c->bound.empty())
+        c->gpu.release();
+    if (need >= c->act_cap)
+        return;
+    cudaFree(c->act);
+    c->act = nullptr;
+    c->act_cap = 0;
+    c->act_gen++;
+    if (need > 0) {
+        std::string ignored;
+        reserve_activations(c, need, "", &ignored);
+    }
+}
+
+bool finalize_locked(aji_img_model *m, std::string *err, bool *keep);
+
+// Deserialize the model's engine and set up tile buffers. Context pushed,
+// c->mu held; takes c->run_mu (the shared buffer may grow). On failure the
+// model's engine and buffers are released again.
 // *keep (optional): see load_engine - set when the engine file itself is
 // fine, so a failure is not a stale cache entry.
 bool finalize(aji_img_model *m, std::string *err, bool *keep = nullptr)
 {
     aji_img_ctx *c = m->c;
+    std::lock_guard<std::mutex> run(c->run_mu);
+    const int oom_errors = c->logger.oom_errors.load();
+    m->oom = false;
+    if (finalize_locked(m, err, keep)) {
+        c->bound.insert(m);
+        c->info(m->name + ": " + mb(m->act_need) +
+                " of activation memory (shared on this context: " + mb(c->act_cap) + ")");
+        return true;
+    }
+    if (!m->oom && c->logger.oom_errors.load() != oom_errors) {
+        // TensorRT couldn't allocate something itself (the weights, say):
+        // the engine is fine
+        m->oom = true;
+        *err = "out of GPU memory loading " + m->name + " (" + gpu_memory_note() + ")";
+    }
+    m->free_buffers();
+    trim_activations(c);
+    return false;
+}
+
+bool finalize_locked(aji_img_model *m, std::string *err, bool *keep)
+{
+    aji_img_ctx *c = m->c;
+    const BindMemory bind = [m](nvinfer1::IExecutionContext *, int64_t bytes,
+                                std::string *e) {
+        m->act_need = bytes;
+        m->act_gen = 0;
+        m->oom = !bind_activations(m, e);
+        return !m->oom;
+    };
     if (!load_engine(c->runtime.get(), m->engine_path, &m->me, m->tile_w,
-                     m->tile_h, m->in_ch, 0, err, keep))
+                     m->tile_h, m->in_ch, 0, err, keep, &bind))
         return false;
     nvinfer1::Dims od = m->me.exec->getTensorShape(m->me.out_name);
     m->out_ch = (int)od.d[1];
@@ -287,14 +401,15 @@ bool finalize(aji_img_model *m, std::string *err, bool *keep = nullptr)
         cudaMalloc(&m->d_out, ob) != cudaSuccess ||
         cudaMallocHost(&m->h_in, ib) != cudaSuccess ||
         cudaMallocHost(&m->h_out, ob) != cudaSuccess) {
-        *err = m->name + ": out of memory for tile buffers";
-        m->free_buffers();
+        cudaGetLastError();
+        *err = "out of memory for " + m->name + "'s tile buffers (" +
+               gpu_memory_note() + ")";
+        m->oom = true;
         return false;
     }
     if (!m->me.exec->setTensorAddress(m->me.in_name, m->d_in) ||
         !m->me.exec->setTensorAddress(m->me.out_name, m->d_out)) {
         *err = m->name + ": setTensorAddress failed";
-        m->free_buffers();
         return false;
     }
     return true;
@@ -531,25 +646,24 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
     if (file_exists(m->engine_path)) {
         std::string e;
         CtxGuard guard(c->cu_ctx);
-#ifdef AJI_TRTRTX
         bool keep = false;
         if (finalize(m.get(), &e, &keep)) {
-#else
-        if (finalize(m.get(), &e)) {
-#endif
             m->state = AJI_IMG_STATE_READY;
             c->models.insert(m.get());
             return m.release();
         }
 #ifdef AJI_TRTRTX
-        if (keep) {
+        if (keep || m->oom) {
             // the engine deserialized; the context or warm-up failed (e.g.
             // out of memory): rebuilding would not help, report it
+#else
+        if (m->oom) {
+            // the engine is fine; there is no GPU memory to run it
+#endif
             m->free_buffers();
             c->set_error(e);
             return nullptr;
         }
-#endif
         c->info("cached engine unusable, rebuilding: " + e);
         m->free_buffers();
         remove_file(m->engine_path);
@@ -646,7 +760,7 @@ template <typename T> bool grow(T **p, size_t *cap, size_t need)
 // core/tiling_gpu.h): one upload, then per tile extract -> infer -> blend
 // queued on the model's stream with no host round trip, and per tile row
 // one flush to 8-bit plus a copy of those rows into `out`. Context pushed,
-// run_mu held. Bit-identical to upscale_tiled.
+// c->run_mu held. Bit-identical to upscale_tiled.
 int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
                 const aji_img_buffer *out, aji_img_progress_fn progress,
                 void *opaque, std::string *err)
@@ -701,7 +815,7 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
     const int total = (int)(ox.size() * oy.size());
     const GpuDtype in_t = gpu_dtype(m.in_dt), out_t = gpu_dtype(m.out_dt);
     cudaStream_t st = m.stream;
-    GpuTileScratch &g = m.gpu;
+    GpuTileScratch &g = m.c->gpu;
 
     std::vector<float> wxf, wyf;
     try {
@@ -719,8 +833,9 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
         !grow(&g.rows, &g.rows_cap, (size_t)band_rows * OW * Co) ||
         !grow(&g.wx, &g.wx_cap, wxf.size() * sizeof(float)) ||
         !grow(&g.wy, &g.wy_cap, wyf.size() * sizeof(float))) {
-        *err = m.name + ": out of GPU memory for a " + std::to_string(W) +
-               "x" + std::to_string(H) + " image";
+        cudaGetLastError();
+        *err = "out of GPU memory: " + m.name + " for a " + std::to_string(W) +
+               "x" + std::to_string(H) + " image (" + gpu_memory_note() + ")";
         return AJI_IMG_ERR_NO_MEM;
     }
     if (prof)
@@ -832,14 +947,16 @@ extern "C" AJI_IMG_EXPORT int aji_img_upscale(aji_img_model *m,
         return AJI_IMG_ERR_ARGS;
     if (aji_img_model_state(m) != AJI_IMG_STATE_READY)
         return AJI_IMG_NOT_READY;
-    std::lock_guard<std::mutex> run(m->run_mu);
     std::string e;
     int rc;
     {
+        // one run at a time on the context; let go before taking mu below
+        std::lock_guard<std::mutex> run(m->c->run_mu);
         CtxGuard guard(m->c->cu_ctx);
-        // AJI_IMG_CPU_TILING=1: the host tiling path, for comparison. It
-        // runs fixed full-size tiles.
-        if (std::getenv("AJI_IMG_CPU_TILING")) {
+        if (!bind_activations(m, &e)) {
+            rc = AJI_IMG_ERR_NO_MEM;
+        } else if (std::getenv("AJI_IMG_CPU_TILING")) {
+            // the host tiling path, for comparison; fixed full-size tiles
             if ((m->cur_w != m->tile_w || m->cur_h != m->tile_h) &&
                 m->me.exec->setInputShape(
                     m->me.in_name,
@@ -879,9 +996,11 @@ extern "C" AJI_IMG_EXPORT void aji_img_release(aji_img_model **pm)
         pump(c);
     }
     {
-        std::lock_guard<std::mutex> run(m->run_mu);
+        std::lock_guard<std::mutex> run(c->run_mu);  // let a running upscale finish
         CtxGuard guard(c->cu_ctx);
+        c->bound.erase(m);
         m->free_buffers();
+        trim_activations(c);
     }
     delete m;
     *pm = nullptr;
@@ -909,6 +1028,9 @@ extern "C" AJI_IMG_EXPORT void aji_img_destroy(aji_img_ctx **pc)
         aji_img_release(&m);
     {
         CtxGuard guard(c->cu_ctx);
+        c->gpu.release();
+        cudaFree(c->act);
+        c->act = nullptr;
         c->runtime.reset();
     }
     cuDevicePrimaryCtxRelease(c->cu_dev);
