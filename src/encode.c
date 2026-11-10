@@ -1015,6 +1015,23 @@ static void resolve_pixfmt(enc_ctx *c)
      * sources are subsampled. */
     if (c->dml)
         c->src_aji_fmt = c->out_aji_fmt;
+
+    /* The output keeps the source's transfer tags and HDR metadata (no tone
+     * mapping), so an 8-bit output of a PQ/HLG source is an 8-bit HDR file:
+     * players show it as HDR, but 8 bits across the HDR range band visibly.
+     * Allowed (some players and encoders want 8-bit), but said once. */
+    if (!c->ten_bit && !c->o.build_only &&
+        (c->color_trc == AVCOL_TRC_SMPTE2084 ||
+         c->color_trc == AVCOL_TRC_ARIB_STD_B67))
+        loge("warning: the source is HDR (%s) but --pix-fmt %s is 8-bit; the "
+             "output stays HDR at 8 bits, which bands visibly. Use %s for "
+             "HDR sources%s",
+             c->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ" : "HLG",
+             c->is_444 ? "yuv444p" : "yuv420p",
+             c->is_444 ? "yuv444p10" : "yuv420p10",
+             !strcmp(c->o.vcodec, "h264_amf") || !strcmp(c->o.vcodec, "h264_qsv")
+                 ? " (with an HEVC or AV1 encoder: this one has no 10-bit)"
+                 : "");
 }
 
 static AVCodecContext *alloc_decoder(enc_ctx *c)
