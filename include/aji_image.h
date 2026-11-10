@@ -17,8 +17,14 @@
  * engine per (model, tile, GPU, TensorRT version), cached on disk;
  * DirectML compiles the tile shape when the model loads.
  *
- * Threading: a context may be used from any thread. Calls on one model
- * are serialized internally; different models may run concurrently.
+ * Threading: a context may be used from any thread. TensorRT and
+ * TensorRT-RTX run one aji_img_upscale at a time per context, whatever the
+ * model: a context's models share one block of GPU working memory, sized to
+ * the largest of them, so each model loaded costs little more than its
+ * weights. To run in parallel, use one context per thread. DirectML
+ * serializes calls per model; different models may run concurrently.
+ * (libaji 0.25 and older also ran different models of one TensorRT context
+ * concurrently, each with its own working memory.)
  */
 
 #ifndef AJI_IMAGE_H
@@ -182,7 +188,8 @@ typedef struct aji_img_buffer {
  * out->channels must equal in->channels. A gray input is replicated to
  * a 3-channel model's input on the way in, and channel 0 of the output
  * is kept. Images smaller than the tile are reflect-padded to it.
- * `progress` may be NULL. Blocks until done. */
+ * `progress` may be NULL; it must not call into libaji for the same
+ * context. Blocks until done. */
 AJI_IMG_EXPORT int aji_img_upscale(aji_img_model *m, const aji_img_buffer *in,
                                    const aji_img_buffer *out,
                                    aji_img_progress_fn progress, void *opaque);

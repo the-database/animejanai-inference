@@ -47,6 +47,9 @@ static const char *const VERSION_TAG = ".trt-";
 
 void TrtLogger::log(Severity sev, const char *msg) noexcept
 {
+    if (sev <= Severity::kERROR && msg &&
+        (strstr(msg, "OutOfMemory") || strstr(msg, "out of memory")))
+        oom_errors++;
     if (fn)
         fn(opaque, (int)sev, msg);
     else if (sev <= Severity::kWARNING)
@@ -1148,9 +1151,20 @@ void RuntimeCache::save()
 }
 #endif
 
+std::string gpu_memory_note()
+{
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        cudaGetLastError();
+        return "free GPU memory unknown";
+    }
+    return std::to_string(free_b >> 20) + " of " + std::to_string(total_b >> 20) +
+           " MB of GPU memory free";
+}
+
 bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
                  ModelEngine *me, int in_w, int in_h, int in_ch, int rank5_t,
-                 std::string *err, bool *keep)
+                 std::string *err, bool *keep, const BindMemory *bind)
 {
     if (keep)
         *keep = false;
@@ -1197,16 +1211,26 @@ bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
             load_runtime_cache(&me->rt, engine_path + JIT_CACHE_EXT);
             me->rt.config->setRuntimeCache(*me->rt.cache);
         }
+        if (bind)
+            me->rt.config->setExecutionContextAllocationStrategy(
+                nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
     }
     if (!forced_failure("context"))
-        me->exec.reset(me->rt.config
-                           ? me->engine->createExecutionContext(me->rt.config.get())
-                           : me->engine->createExecutionContext());
+        me->exec.reset(
+            me->rt.config
+                ? me->engine->createExecutionContext(me->rt.config.get())
+                : me->engine->createExecutionContext(
+                      bind ? nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED
+                           : nvinfer1::ExecutionContextAllocationStrategy::kSTATIC));
 #else
-    me->exec.reset(me->engine->createExecutionContext());
+    me->exec.reset(me->engine->createExecutionContext(
+        bind ? nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED
+             : nvinfer1::ExecutionContextAllocationStrategy::kSTATIC));
 #endif
     if (!me->exec) {
-        *err = "createExecutionContext failed";
+        // with kSTATIC this is where the activation memory is allocated, so
+        // running out of GPU memory usually ends up here
+        *err = "createExecutionContext failed (" + gpu_memory_note() + ")";
         return false;
     }
     nvinfer1::Dims in_dims = nvinfer1::Dims4{1, in_ch, in_h, in_w};
@@ -1232,6 +1256,8 @@ bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
     me->in_h = in_h;
     me->out_w = (int)od.d[3];
     me->out_h = (int)od.d[2];
+    if (bind && !(*bind)(me->exec.get(), me->engine->getDeviceMemorySizeV2(), err))
+        return false;
 #ifdef AJI_TRTRTX
     // One throwaway inference at the configured shape, so the first real
     // frame doesn't pay TensorRT-RTX's first-enqueue compiles (cheap when
