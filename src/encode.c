@@ -44,6 +44,8 @@
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avstring.h>
+#include <libavutil/dovi_meta.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #ifdef _WIN32
@@ -429,6 +431,12 @@ typedef struct {
     img_enc          sess_src_img;
     src_image        sess_src[16];   /* source images awaiting their output */
     int              sess_src_n;
+
+    /* HDR10 static metadata (mastering display, content light level) from
+     * the first decoded frame, for the encoder and the container */
+    AVFrameSideData **hdr_sd;
+    int              nb_hdr_sd;
+    int              hdr_seen;
 } enc_ctx;
 
 /* forward decls */
@@ -1216,8 +1224,12 @@ static int push_frame(enc_ctx *c, AVFrame *fr);
 
 /* one decoded frame through the deinterlace graph (NULL flushes it); the
  * frames it puts out go on into the pipeline */
+static void hdr_capture(enc_ctx *c, const AVFrame *fr);
+
 static int push_decoded(enc_ctx *c, AVFrame *fr)
 {
+    if (fr && !c->hdr_seen)
+        hdr_capture(c, fr);
     if (!c->dgraph)
         return fr ? push_frame(c, fr) : 0;
     if (fr) {
@@ -1253,6 +1265,67 @@ static int push_decoded(enc_ctx *c, AVFrame *fr)
     }
 fail:
     return -1;
+}
+
+/* ---- HDR metadata -------------------------------------------------------- */
+
+/* Keep the first decoded frame's HDR10 static metadata. The decoder puts it
+ * on every frame, from the bitstream (HEVC/AV1 SEI/OBUs) or the container
+ * (codecpar coded side data); upscaling and RIFE don't change it, but
+ * libaji's output frames don't carry it. open_encoder hands it to the
+ * encoder (decoded_side_data: x265, SVT-AV1, x264, NVENC HEVC/AV1 write it
+ * into the bitstream, and libavcodec copies it to the stream's coded side
+ * data, which the Matroska and MP4 muxers write), and emit_output puts it
+ * on each frame (QSV and AMF read it there). Dolby Vision's RPU describes
+ * the source encode and can't be carried through a re-encode: it is
+ * dropped, with a note. */
+static void hdr_capture(enc_ctx *c, const AVFrame *fr)
+{
+    static const enum AVFrameSideDataType types[] = {
+        AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+        AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+    };
+    c->hdr_seen = 1;
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(types); i++) {
+        const AVFrameSideData *sd = av_frame_get_side_data(fr, types[i]);
+        if (sd && av_frame_side_data_clone(&c->hdr_sd, &c->nb_hdr_sd, sd,
+                                           AV_FRAME_SIDE_DATA_FLAG_UNIQUE) < 0)
+            loge("HDR metadata: out of memory; not passed on");
+    }
+    for (int i = 0; i < c->nb_hdr_sd; i++) {
+        const AVFrameSideData *sd = c->hdr_sd[i];
+        if (sd->type == AV_FRAME_DATA_MASTERING_DISPLAY_METADATA) {
+            const AVMasteringDisplayMetadata *m = (const void *)sd->data;
+            loge("HDR mastering display: %s%s, luminance %.4f-%.0f cd/m2",
+                 m->has_primaries ? "primaries set" : "no primaries",
+                 m->has_luminance ? "" : ", no luminance",
+                 m->has_luminance ? av_q2d(m->min_luminance) : 0,
+                 m->has_luminance ? av_q2d(m->max_luminance) : 0);
+        } else {
+            const AVContentLightMetadata *l = (const void *)sd->data;
+            loge("HDR content light level: MaxCLL %u, MaxFALL %u cd/m2",
+                 l->MaxCLL, l->MaxFALL);
+        }
+    }
+
+    const AVCodecParameters *par = c->ifmt->streams[c->vstream]->codecpar;
+    const AVPacketSideData *dv = av_packet_side_data_get(
+        par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
+    if (dv) {
+        const AVDOVIDecoderConfigurationRecord *cfg = (const void *)dv->data;
+        const int compat = cfg->dv_bl_signal_compatibility_id;
+        loge("Dolby Vision profile %d: its metadata (RPU) can't be carried "
+             "through a re-encode and is dropped; %s", cfg->dv_profile,
+             compat == 1 || compat == 6 ? "the output is the HDR10 base layer"
+             : compat == 4 ? "the output is the HLG base layer"
+             : compat == 2 ? "the output is the SDR base layer"
+             : "this base layer has no HDR10/HLG/SDR fallback, so its "
+               "colours will be wrong");
+    } else if (av_frame_get_side_data(fr, AV_FRAME_DATA_DOVI_RPU_BUFFER) ||
+               av_frame_get_side_data(fr, AV_FRAME_DATA_DOVI_METADATA)) {
+        loge("Dolby Vision: its metadata (RPU) can't be carried through a "
+             "re-encode and is dropped; the output is the base layer");
+    }
 }
 
 /* ---- libaji init --------------------------------------------------------- */
@@ -1756,6 +1829,16 @@ static int open_encoder(enc_ctx *c, AVFrame *first)
      * slower for ffv1, ~13x for x264. Hardware encoders ignore it. An
      * explicit -threads in --vquality wins. */
     av_dict_set(&opts, "threads", "auto", AV_DICT_DONT_OVERWRITE);
+
+    for (int i = 0; i < c->nb_hdr_sd; i++)
+        if (av_frame_side_data_clone(&c->enc->decoded_side_data,
+                                     &c->enc->nb_decoded_side_data,
+                                     c->hdr_sd[i],
+                                     AV_FRAME_SIDE_DATA_FLAG_UNIQUE) < 0) {
+            av_dict_free(&opts);
+            loge("HDR metadata: out of memory");
+            return -1;
+        }
 
     int r = avcodec_open2(c->enc, codec, &opts);
     AVDictionaryEntry *e = NULL;
@@ -2557,6 +2640,15 @@ encode:
         AVFrame *sendf = av_frame_clone(to_encode);
         if (!sendf) { loge("av_frame_clone failed"); goto done; }
         sendf->pts = pts;
+        for (int i = 0; i < c->nb_hdr_sd; i++)
+            if (!av_frame_get_side_data(sendf, c->hdr_sd[i]->type) &&
+                av_frame_side_data_clone(&sendf->side_data,
+                                          &sendf->nb_side_data, c->hdr_sd[i],
+                                          0) < 0) {
+                av_frame_free(&sendf);
+                loge("HDR metadata: out of memory");
+                goto done;
+            }
         int sret = avcodec_send_frame(c->enc, sendf);
         av_frame_free(&sendf);
         if (sret < 0) { AV(sret); }
@@ -3336,6 +3428,7 @@ static void cleanup(enc_ctx *c)
     dec_drop_pending(c);
     dec_drop_held(c);
     if (c->dec) avcodec_free_context(&c->dec);
+    av_frame_side_data_free(&c->hdr_sd, &c->nb_hdr_sd);
     if (c->ofmt) {
         if (c->ofmt->pb && !(c->ofmt->oformat->flags & AVFMT_NOFILE))
             avio_closep(&c->ofmt->pb);
