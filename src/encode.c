@@ -425,6 +425,11 @@ typedef struct {
 
     /* bookkeeping */
     int64_t  out_frames;
+    /* PROGRESS fps=: (time, out_frames) at each progress line, the oldest
+     * first; fps_t0 is when the first frame went to the encoder */
+    int64_t  fps_t[64], fps_n[64];
+    int      fps_head, fps_count;
+    int64_t  fps_t0;
     int64_t  src_frames_est;
     int64_t  scene_dupes;
     int      color_space, color_range, color_pri, color_trc, chroma_loc;
@@ -2787,6 +2792,32 @@ static int64_t out_frames_est(const enc_ctx *c)
     return (n - 1) * c->rnum / c->rden + 1;
 }
 
+/* The encode rate for PROGRESS: output frames per second over the last
+ * FPS_WINDOW (from the first frame while the encode is younger than that). */
+#define FPS_WINDOW 3000000      /* us */
+
+static double encode_fps(enc_ctx *c)
+{
+    const int64_t now = av_gettime_relative();
+    const int n = FF_ARRAY_ELEMS(c->fps_t);
+    if (c->fps_count == n) {            /* full: forget the oldest */
+        c->fps_head = (c->fps_head + 1) % n;
+        c->fps_count--;
+    }
+    const int in = (c->fps_head + c->fps_count++) % n;
+    c->fps_t[in] = now;
+    c->fps_n[in] = c->out_frames;
+    /* the base: the newest sample at least FPS_WINDOW old, else the oldest */
+    while (c->fps_count > 2 &&
+           now - c->fps_t[(c->fps_head + 1) % n] >= FPS_WINDOW) {
+        c->fps_head = (c->fps_head + 1) % n;
+        c->fps_count--;
+    }
+    const int64_t dt = now - c->fps_t[c->fps_head];
+    return dt > 0 ? (double)(c->out_frames - c->fps_n[c->fps_head]) *
+                    1e6 / dt : 0;
+}
+
 /* Emit one finished output frame at pts (out_tb). Frames arrive in display
  * order (the non-RIFE ring drains FIFO; RIFE emits base then phases in
  * order); the timestamps come from the source frames (frame_pts). */
@@ -2866,6 +2897,11 @@ encode:
     if (!c->opened) {
         if (open_encoder(c, to_encode) < 0) goto done;
         if (finalize_output(c) < 0) goto done;
+        c->fps_t0 = av_gettime_relative();
+        c->fps_count = 1;               /* the rate counts from here */
+        c->fps_head = 0;
+        c->fps_t[0] = c->fps_t0;
+        c->fps_n[0] = 0;
     }
     if (c->o.preview) {
         const int64_t now = av_gettime_relative();
@@ -2901,7 +2937,8 @@ encode:
     if ((c->out_frames & 31) == 0) {
         const int64_t total = out_frames_est(c);
         int pct = total ? (int)(c->out_frames * 100 / total) : 0;
-        progress("encode", c->out_frames, total, 0, pct > 100 ? 100 : pct);
+        progress("encode", c->out_frames, total, encode_fps(c),
+                 pct > 100 ? 100 : pct);
     }
     rc = 0;
 done:
@@ -3530,7 +3567,11 @@ static int run(enc_ctx *c)
         loge("damaged video: %lld spot(s), encoded past (concealed frames "
              "kept, data the decoder rejected dropped)",
              (long long)c->damage_spots);
-    progress("encode", c->out_frames, c->out_frames, 0, 100);
+    {   /* the last line: the whole encode's average */
+        const int64_t dt = av_gettime_relative() - c->fps_t0;
+        progress("encode", c->out_frames, c->out_frames,
+                 dt > 0 ? (double)c->out_frames * 1e6 / dt : 0, 100);
+    }
     rc = 0;
     goto done;
 damaged:
