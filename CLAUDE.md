@@ -127,6 +127,16 @@ them through its own context. **A change to engine caching or builds goes in the
 front-ends get it. The image front-end does inference only — model selection, grayscale
 detection, resizes and alpha are the caller's (yosh / MangaJaNaiConverterGui keep that policy).
 
+**The image path shares GPU working memory per context** (`aji_img_trt.cpp`). Its execution
+contexts are created `kUSER_MANAGED` (`load_engine`'s `bind`), and one activation buffer per
+`aji_img_ctx`, sized to the largest loaded model's `getDeviceMemorySizeV2()`, serves them all,
+with the GPU tiling scratch; so runs on one context are serialized (`run_mu`; lock order `mu`
+then `run_mu`). With TensorRT's default each model kept its own activations (~340 MB for a 2x
+ESRGAN at 512 tiles, ~1.35 GB for 4x), which piled up in apps that never unload. The video path
+keeps the default: its chains run upscale, RIFE and temporal steps that may overlap. Out of
+memory at load is reported as such and keeps the engine (TensorRT's own allocation failures are
+caught through `TrtLogger::oom_errors`), instead of deleting it as stale and rebuilding.
+
 ## Build system
 
 CMake only (`cmake_minimum_required(VERSION 3.24)`, C11 / C++17, `LANGUAGES C CXX CUDA`).
