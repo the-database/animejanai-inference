@@ -1,46 +1,57 @@
 name: Build Linux (aji)
 
-# Builds libaji.so + libaji_trt.so (TensorRT/CUDA backend) on the Ubuntu 22.04
-# baseline image and publishes aji-linux-x64.tar.zst. The mpv-upscale-2x_animejanai
-# assembler downloads this (InstallAji).
+# The Linux release leg: builds libaji.so + libaji_trt.so (TensorRT/CUDA backend) on the
+# Ubuntu 22.04 baseline image and publishes aji-linux-x64.tar.zst on the release tag. The
+# mpv-upscale-2x_animejanai assembler downloads this (InstallAji). Dispatched by hand from main
+# with the tag; this run creates the release, the Windows zips are uploaded to it afterwards:
+#   gh workflow run build-linux.yml -R the-database/animejanai-inference --ref main -f release_tag=v0.26.0
 #
-# Also publishes aji-encode-linux-x64.tar.zst: aji_encode plus the FFmpeg shared
-# libraries it links, for VideoJaNai. It is a separate asset so the player
-# package does not carry ~100 MB of libav it never loads. FFmpeg is BtbN's
-# gpl-shared build (libx264/libx265 built in, glibc-only deps) - the Linux
-# counterpart of the gyan.dev shared build the Windows aji_encode links. BtbN
-# prunes old autobuilds: when FFMPEG_URL 404s, move to a current 9.0 build and
-# update FFMPEG_SHA256.
+# Also publishes aji-encode-linux-x64.tar.zst: aji_encode plus the FFmpeg shared libraries it
+# links, for VideoJaNai. It is a separate asset so the player package does not carry ~100 MB of
+# libav it never loads.
 #
-# TensorRT comes from NVIDIA's apt packages fetched here, NOT from the build
-# image, so this build pins the same TensorRT the package ships (TrtVersion in
-# the assembler) without waiting on an image rebuild that three repos share.
-# Keep TRT_VERSION/TRT_CUDA in step with that pin; CUDA itself still comes from
-# the image (minor versions are compatible within CUDA 13).
+# The dependency pins (TensorRT, FFmpeg) and the build itself live in
+# .github/actions/linux-build, which ci.yml runs on every PR and push to main.
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (matches AjiVersion in the assembler)'
+        description: 'Release tag (matches AjiVersion in the assembler), e.g. v0.26.0'
         required: true
-  push:
-    branches: [linux-support]
-    paths:
-      - .github/workflows/build-linux.yml
-      - CMakeLists.txt
-      - 'src/**'
-      - 'include/**'
-
-env:
-  DEFAULT_TAG: v0.15.0
-  # Must match TrtVersion / TrtCudaVersion in mpv-AnimeJaNai's Program.cs.
-  TRT_VERSION: 11.4.0.106
-  TRT_CUDA: '13.4'
-  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-07-12-47/ffmpeg-n9.0.2-48-gd4070a14ce-linux64-gpl-shared-9.0.tar.xz
-  FFMPEG_SHA256: 7dfdfcb76a6193bed9f7be2de3fbd1ca51714bcc3d9ce819e5b4097944989496
+      replace_assets:
+        description: 'Overwrite the Linux assets the release already has'
+        type: boolean
+        default: false
 
 jobs:
+  # Before the build: refuse a malformed tag, and refuse to overwrite an existing release's
+  # Linux assets unless replace_assets is set (re-running a leg that failed before publishing
+  # needs no override, since nothing was uploaded).
+  check-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Check the tag
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ inputs.release_tag }}
+        REPLACE: ${{ inputs.replace_assets }}
+      run: |
+        [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
+        if have="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null)"; then
+          echo "$TAG already exists"
+          if grep -qxE 'aji-(encode-)?linux-x64\.tar\.zst' <<< "$have"; then
+            if [ "$REPLACE" != true ]; then
+              echo "::error::$TAG already has Linux assets; dispatch with replace_assets=true to overwrite them"
+              exit 1
+            fi
+            echo "::warning::replacing the Linux assets of $TAG"
+          fi
+        fi
+
   build-linux:
+    needs: check-tag
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/the-database/animejanai-linux-build:ubuntu2204
@@ -53,55 +64,10 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
-    - name: Install TensorRT ${{ env.TRT_VERSION }} from NVIDIA
-      # Unpacked over the container's own /usr (it is a throwaway), replacing
-      # whatever TensorRT the image happens to carry. That keeps AJI_TRT_ROOT
-      # at /usr, so the RPATH baked into the shipped libaji_trt.so is the same
-      # system path as before rather than a CI workspace path.
-      #
-      # libnvinfer11 is ~1.9 GB because it carries every per-SM builder
-      # resource; only libnvinfer.so.11 is needed to link against (the
-      # libnvinfer.so symlink comes from -dev), so unpack just that and delete
-      # the .deb immediately to stay inside the runner's disk budget.
-      run: |
-        set -eux
-        repo=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64
-        ver="${TRT_VERSION}-1+cuda${TRT_CUDA}"
-        for pkg in libnvinfer-headers-dev libnvinfer-dev; do
-          curl -fsSL -o "$pkg.deb" "$repo/${pkg}_${ver}_amd64.deb"
-          dpkg-deb -x "$pkg.deb" /
-          rm -f "$pkg.deb"
-        done
-        curl -fsSL -o runtime.deb "$repo/libnvinfer11_${ver}_amd64.deb"
-        dpkg-deb --fsys-tarfile runtime.deb \
-          | tar -C / -x --wildcards './usr/lib/x86_64-linux-gnu/libnvinfer.so.*'
-        rm -f runtime.deb
-        # Fail loudly if the headers are not the version we asked for.
-        grep -E 'TRT_(MAJOR|MINOR|PATCH|BUILD)_ENTERPRISE' \
-          /usr/include/x86_64-linux-gnu/NvInferVersion.h
-        ls -l /usr/lib/x86_64-linux-gnu/libnvinfer.so*
+    - uses: ./.github/actions/linux-build
 
-    - name: Fetch FFmpeg 9.0 (shared, for aji_encode)
-      shell: bash
-      run: |
-        set -euxo pipefail
-        curl -fsSL -o ffmpeg.tar.xz "$FFMPEG_URL"
-        echo "$FFMPEG_SHA256  ffmpeg.tar.xz" | sha256sum -c -
-        mkdir -p /opt/ffmpeg
-        tar -xf ffmpeg.tar.xz -C /opt/ffmpeg --strip-components=1
-        rm -f ffmpeg.tar.xz
-        # the .pc files are ${pcfiledir}-relative, so the path is all CMake
-        # needs to find them; the libs' own sonames (libswresample, ...) are
-        # resolved at link time through -rpath-link in the configure below
-        echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
-
-    - name: Build aji (full per-SM kernel set)
-      run: |
-        cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
-          -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" \
-          -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/opt/ffmpeg/lib"
-        cmake --build build -j"$(nproc)"
-        test -x build/aji_encode || { echo "aji_encode was not built (ffmpeg not found)"; exit 1; }
+    - name: CPU-only tests
+      run: ctest --test-dir build -L cpu --output-on-failure
 
     - name: Stage + tar (flat, extracts into animejanai/inference)
       run: |
@@ -117,21 +83,24 @@ jobs:
         mkdir -p stage-encode
         cp build/aji_encode stage-encode/
         # the libav sonames aji_encode needs, dereferenced (libavcodec.so.63 ...)
-        for f in /opt/ffmpeg/lib/lib*.so.*; do
+        for f in "$FFMPEG_ROOT"/lib/lib*.so.*; do
           if [[ "$f" =~ \.so\.[0-9]+$ ]]; then cp -L "$f" stage-encode/; fi
         done
-        cp /opt/ffmpeg/LICENSE.txt stage-encode/ffmpeg_LICENSE.txt
+        cp "$FFMPEG_ROOT/LICENSE.txt" stage-encode/ffmpeg_LICENSE.txt
         # libaji.so, libaji_trt.so, cudart and the libav libs all sit beside it
         patchelf --set-rpath '$ORIGIN' stage-encode/aji_encode stage-encode/lib*.so.*
         chmod +x stage-encode/aji_encode
         ldd stage-encode/aji_encode | grep -E 'libav|libsw|not found' || true
         tar --zstd -C stage-encode -cf aji-encode-linux-x64.tar.zst .
 
+    # allowUpdates: the Windows zips may already be on the release; check-tag has made sure
+    # this doesn't overwrite Linux assets by accident. A new tag is created on the built commit.
     - name: Publish release
       uses: ncipollo/release-action@v1
       with:
-        tag: ${{ github.event.inputs.release_tag || env.DEFAULT_TAG }}
-        name: ${{ github.event.inputs.release_tag || env.DEFAULT_TAG }}
+        tag: ${{ inputs.release_tag }}
+        name: ${{ inputs.release_tag }}
+        commit: ${{ github.sha }}
         draft: false
         prerelease: false
         allowUpdates: true

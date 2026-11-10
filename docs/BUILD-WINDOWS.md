@@ -1,7 +1,9 @@
 # Building libaji on Windows
 
-The manually dispatched `build-windows-test.yml` workflow builds Windows test artifacts
-and runs configuration/packaging checks. It does not publish a release. The `aji-windows-x64.zip` release asset that
+CI (`.github/workflows/ci.yml`, on pull requests and pushes to `main`) builds the Windows
+targets with `tools/build-windows-test.ps1`, runs the CPU-only tests and the configuration/packaging
+checks, and uploads the binaries as the `aji-windows-test` artifact; dispatch it on a branch to
+get test binaries. It does not publish a release. The `aji-windows-x64.zip` release asset that
 `the-database/mpv-AnimeJaNai` downloads is built and uploaded **by hand**, with the two scripts
 in [`ci/windows/`](../ci/windows/):
 
@@ -132,7 +134,7 @@ the runtime DLLs, every per-SM builder resource, a prebuilt `trtexec.exe`, and
 of `lib/` and `bin/` at the root — which is the layout `CMakeLists.txt` expects on Windows
 (`AJI_TRT_INCLUDE = <root>/include`, `AJI_TRT_LIB = <root>`).
 
-**Keep this, the Linux workflow's `TRT_VERSION`, and `TrtVersion` in the package assembler on
+**Keep this, the Linux build's `TRT_VERSION` (`.github/actions/linux-build/action.yml`), and `TrtVersion` in the package assembler on
 the same version.** `aji_trt` links `nvinfer_11`, which every TensorRT 11.x release ships under
 the same name, so the DLL runs on any 11.x runtime. **Engines do not carry over**: a serialized
 engine only loads on the TensorRT version that built it (the 11.4 runtime rejects 11.0 engines,
@@ -422,7 +424,8 @@ To test the zip in a package build before releasing it, point the assembler at i
 
 ## Testing
 
-The Windows test workflow covers build and CPU checks, not playback on a physical GPU.
+CI covers the build and CPU checks, not playback on a physical GPU; `ctest --test-dir <build> -L gpu`
+runs the self-contained GPU tests locally.
 The practical GPU check is to play
 content through an installed package with the new engine dropped in: copy `aji.dll`,
 `aji_trt.dll` and `aji_dml.dll` into a copy of an install's `animejanai\inference\`, run its

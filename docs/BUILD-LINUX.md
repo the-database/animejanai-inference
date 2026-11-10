@@ -3,8 +3,10 @@
 Windows build: [`BUILD-WINDOWS.md`](BUILD-WINDOWS.md). Engine overview:
 [`../CLAUDE.md`](../CLAUDE.md).
 
-Unlike Windows, Linux **is** covered by CI: `.github/workflows/build-linux.yml` produces the
-`aji-linux-x64.tar.zst` release asset. Local Linux work on this workstation happens in WSL.
+Unlike Windows, the Linux release is built in CI: `.github/workflows/build-linux.yml` produces
+the `aji-linux-x64.tar.zst` release asset. `.github/workflows/ci.yml` runs the same build (and
+`ctest -L cpu`) on pull requests and pushes to `main`. Local Linux work on this workstation
+happens in WSL.
 
 ## Local build
 
@@ -70,17 +72,21 @@ gh workflow run "Build Linux (aji)" -R the-database/animejanai-inference \
   --ref main -f release_tag=v0.8.0
 ```
 
-`release_tag` is **required** on dispatch and must match `AjiVersion` in the
-`mpv-upscale-2x_animejanai` assembler. There is also a `push` trigger on the **`linux-support`**
-branch (paths `.github/workflows/build-linux.yml`, `CMakeLists.txt`, `src/**`, `include/**`),
-which falls back to `env.DEFAULT_TAG` — currently `v0.6.0`, i.e. **stale**. Dispatch from `main`
-with an explicit tag rather than relying on the push path.
+Dispatch is its only trigger. `release_tag` is **required** and must match `AjiVersion` in the
+`mpv-upscale-2x_animejanai` assembler; a first job rejects anything that isn't `vX.Y.Z` (with an
+optional `-suffix`), and **refuses a tag whose release already has Linux assets** unless you
+pass `-f replace_assets=true`. Re-running a leg that failed before publishing needs no override.
+The release (and the tag, on the dispatched commit) is created by this run; the Windows zips are
+uploaded to it afterwards.
 
 The job runs on `ubuntu-latest` inside `ghcr.io/the-database/animejanai-linux-build:ubuntu2204`
-(GHCR login via `github.actor` + `GITHUB_TOKEN`). The toolchain comes from that image, but
-**TensorRT does not**: a step fetches NVIDIA's `.deb`s (`TRT_VERSION` / `TRT_CUDA` in the
-workflow env, which must match `TrtVersion` / `TrtCudaVersion` in the assembler) and unpacks
-them over the throwaway container's `/usr`, replacing whatever TensorRT the image carries.
+(GHCR login via `github.actor` + `GITHUB_TOKEN`). The dependency setup and the build live in the
+composite action `.github/actions/linux-build`, shared with `ci.yml`. The toolchain comes from
+that image, but **TensorRT does not**: the action fetches NVIDIA's `.deb`s (`TRT_VERSION` /
+`TRT_CUDA` in the action, which must match `TrtVersion` / `TrtCudaVersion` in the assembler)
+and copies them over the throwaway container's `/usr`, replacing whatever TensorRT the image
+carries. TensorRT and FFmpeg are staged in `/opt/aji-deps`, which `actions/cache` keeps under a
+key made of the pins, so most runs download neither.
 
 That keeps this build pinned to the exact TensorRT the package ships without waiting on a
 rebuild of an image three repos share, and because the destination is still `/usr`,
@@ -91,16 +97,17 @@ Only `libnvinfer.so.11` is unpacked from the ~1.9 GB `libnvinfer11` package (the
 per-SM builder resources, which the *package* ships but this build does not need), and each
 `.deb` is deleted immediately to stay inside the runner's disk budget.
 
-Before configuring, the workflow fetches BtbN's FFmpeg 9.0 `linux64-gpl-shared` build
-(pinned by `FFMPEG_URL` + `FFMPEG_SHA256`) into `/opt/ffmpeg` and puts its `lib/pkgconfig` on
-`PKG_CONFIG_PATH`, so `aji_encode` builds. BtbN prunes old autobuilds; when the pinned URL
-404s, move to a current 9.0 build and update the checksum.
+Before configuring, the action fetches BtbN's FFmpeg 9.0 `linux64-gpl-shared` build
+(pinned by `FFMPEG_URL` + `FFMPEG_SHA256`) into `/opt/aji-deps/ffmpeg` (`$FFMPEG_ROOT`) and puts
+its `lib/pkgconfig` on `PKG_CONFIG_PATH`, so `aji_encode` builds. BtbN prunes old autobuilds;
+when the pinned URL 404s, move to a current 9.0 build and update the checksum.
 
 ```bash
 cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
   -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" \
-  -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/opt/ffmpeg/lib"
+  -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$FFMPEG_ROOT/lib"
 cmake --build build -j"$(nproc)"
+ctest --test-dir build -L cpu --output-on-failure    # the CPU-only tests
 ```
 
 `-rpath-link` lets the linker resolve the libav libraries' own dependencies (libswresample,
