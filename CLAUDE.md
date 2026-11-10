@@ -409,6 +409,19 @@ exit status 1 in both modes and in `--preview-session`; damage never stops a pre
 has no `--on-damage`), which prints no `DAMAGE` lines. `tools/test-encode-damage.py` is the
 regression test (Windows + NVIDIA GPU; it simulates the read error with a byte-range lock).
 
+## HDR in `aji_encode`
+
+Colour tags (BT.2020 matrix and primaries, PQ or HLG transfer) carry over like any others, and
+a 10-bit output (`--pix-fmt yuv420p10`, the default) keeps the depth. The HDR10 static metadata
+(mastering display, content light level) is taken from the first decoded frame (the decoder
+puts the bitstream's SEI/OBUs or the container's side data on every frame) by `hdr_capture`,
+since libaji's output frames don't carry it. It goes to the encoder as `decoded_side_data`
+(x265, SVT-AV1, x264 and NVENC HEVC/AV1 write it into the bitstream; libavcodec copies it to the
+stream's coded side data, which Matroska and MP4 write) and onto every frame sent (QSV and AMF
+read it there; not tested, no such GPU here). Dolby Vision is dropped with a note: its RPU
+describes the source encode. A profile 8.1 source plays as HDR10 from its base layer; profile 5
+has no compatible base layer, so its colours come out wrong.
+
 ## Conventions
 
 - Commits: author `the-database`, short imperative subject, no co-author trailers.
