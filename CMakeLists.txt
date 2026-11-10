@@ -354,3 +354,16 @@ if(WIN32)
     add_executable(aji_cuda_init_test EXCLUDE_FROM_ALL sanity/cuda_init.cpp)
     add_dependencies(aji_cuda_init_test aji_cuda_init_a aji_cuda_init_b)
 endif()
+
+# Self-contained tests for ctest. CI runs `ctest -L cpu` (no GPU on hosted
+# runners); `ctest -L gpu` needs an NVIDIA GPU. aji_kernel_test, the harnesses
+# and the sanity/*.py drivers take models or fixtures and are run by hand.
+enable_testing()
+foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test)
+    add_test(NAME ${test} COMMAND ${test})
+    set_tests_properties(${test} PROPERTIES LABELS cpu)
+endforeach()
+foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test)
+    add_test(NAME ${test} COMMAND ${test})
+    set_tests_properties(${test} PROPERTIES LABELS gpu)
+endforeach()

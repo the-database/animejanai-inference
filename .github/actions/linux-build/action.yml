@@ -1,0 +1,103 @@
+name: Linux build (aji)
+description: >-
+  Installs the pinned TensorRT and FFmpeg (cached) and builds libaji into build/ with the
+  release configuration. Shared by build-linux.yml (the release) and ci.yml, so CI builds what
+  ships. Runs inside ghcr.io/the-database/animejanai-linux-build:ubuntu2204, which supplies the
+  toolchain and CUDA.
+
+# TensorRT comes from NVIDIA's apt packages fetched here, NOT from the build image, so this
+# build pins the same TensorRT the package ships (TrtVersion in the assembler) without waiting
+# on an image rebuild that three repos share. Keep TRT_VERSION/TRT_CUDA in step with that pin;
+# CUDA itself still comes from the image (minor versions are compatible within CUDA 13).
+#
+# FFmpeg is BtbN's gpl-shared build (libx264/libx265 built in, glibc-only deps), the Linux
+# counterpart of the gyan.dev shared build the Windows aji_encode links. BtbN prunes old
+# autobuilds: when FFMPEG_URL 404s, move to a current 9.0 build and update FFMPEG_SHA256.
+#
+# Both land in /opt/aji-deps, which is cached under a key made of these pins. The step exports
+# FFMPEG_ROOT for the caller's later steps.
+
+runs:
+  using: composite
+  steps:
+    - name: Pin the dependencies
+      id: pins
+      shell: bash
+      run: |
+        set -eu
+        TRT_VERSION=11.4.0.106
+        TRT_CUDA=13.4
+        FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-07-12-47/ffmpeg-n9.0.2-48-gd4070a14ce-linux64-gpl-shared-9.0.tar.xz
+        FFMPEG_SHA256=7dfdfcb76a6193bed9f7be2de3fbd1ca51714bcc3d9ce819e5b4097944989496
+        {
+          echo "TRT_VERSION=$TRT_VERSION"
+          echo "TRT_CUDA=$TRT_CUDA"
+          echo "FFMPEG_URL=$FFMPEG_URL"
+          echo "FFMPEG_SHA256=$FFMPEG_SHA256"
+          echo "FFMPEG_ROOT=/opt/aji-deps/ffmpeg"
+        } >> "$GITHUB_ENV"
+        echo "key=aji-linux-deps-trt$TRT_VERSION-cuda$TRT_CUDA-ffmpeg$FFMPEG_SHA256" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache@v6
+      with:
+        path: /opt/aji-deps
+        key: ${{ steps.pins.outputs.key }}
+
+    - name: Install TensorRT and FFmpeg 9.0
+      shell: bash
+      run: |
+        set -euxo pipefail
+        # TensorRT is staged in /opt/aji-deps/trt, then copied over the container's own /usr (it
+        # is a throwaway), replacing whatever TensorRT the image happens to carry. That keeps
+        # AJI_TRT_ROOT at /usr, so the RPATH baked into the shipped libaji_trt.so is the same
+        # system path as before rather than a CI workspace path.
+        #
+        # libnvinfer11 is ~1.9 GB because it carries every per-SM builder resource; only
+        # libnvinfer.so.11 is needed to link against (the libnvinfer.so symlink comes from
+        # -dev), so unpack just that and delete each .deb at once to stay inside the runner's
+        # disk budget.
+        trt=/opt/aji-deps/trt
+        if [ ! -f "$trt/usr/include/x86_64-linux-gnu/NvInferVersion.h" ]; then
+          rm -rf "$trt" && mkdir -p "$trt"
+          repo=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64
+          ver="${TRT_VERSION}-1+cuda${TRT_CUDA}"
+          curl -fsSL -o runtime.deb "$repo/libnvinfer11_${ver}_amd64.deb"
+          dpkg-deb --fsys-tarfile runtime.deb \
+            | tar -C "$trt" -x --wildcards './usr/lib/x86_64-linux-gnu/libnvinfer.so.*'
+          rm -f runtime.deb
+          # the headers last: their presence marks a complete stage
+          for pkg in libnvinfer-dev libnvinfer-headers-dev; do
+            curl -fsSL -o "$pkg.deb" "$repo/${pkg}_${ver}_amd64.deb"
+            dpkg-deb -x "$pkg.deb" "$trt"
+            rm -f "$pkg.deb"
+          done
+        fi
+        cp -a "$trt/usr/." /usr/
+        # Fail loudly if the headers are not the version we asked for.
+        h=/usr/include/x86_64-linux-gnu/NvInferVersion.h
+        got=$(for f in MAJOR MINOR PATCH BUILD; do
+          sed -nE "s/^#define TRT_${f}_ENTERPRISE +([0-9]+).*/\1/p" "$h"; done | paste -sd.)
+        [ "$got" = "$TRT_VERSION" ] || { echo "::error::TensorRT headers are $got, not $TRT_VERSION"; exit 1; }
+        ls -l /usr/lib/x86_64-linux-gnu/libnvinfer.so*
+
+        # The .pc files are ${pcfiledir}-relative, so the path is all CMake needs to find them.
+        if [ ! -f "$FFMPEG_ROOT/lib/pkgconfig/libavcodec.pc" ]; then
+          rm -rf "$FFMPEG_ROOT" && mkdir -p "$FFMPEG_ROOT"
+          curl -fsSL -o ffmpeg.tar.xz "$FFMPEG_URL"
+          echo "$FFMPEG_SHA256  ffmpeg.tar.xz" | sha256sum -c -
+          tar -xf ffmpeg.tar.xz -C "$FFMPEG_ROOT" --strip-components=1
+          rm -f ffmpeg.tar.xz
+        fi
+
+    - name: Build aji (full per-SM kernel set)
+      shell: bash
+      run: |
+        set -euxo pipefail
+        # the libs' own sonames (libswresample, ...) are resolved at link time through
+        # -rpath-link
+        export PKG_CONFIG_PATH="$FFMPEG_ROOT/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+        cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
+          -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" \
+          -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$FFMPEG_ROOT/lib"
+        cmake --build build -j"$(nproc)"
+        test -x build/aji_encode || { echo "aji_encode was not built (ffmpeg not found)"; exit 1; }
