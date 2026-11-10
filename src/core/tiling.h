@@ -90,6 +90,10 @@ public:
     int tile_w = 0, tile_h = 0;  // input pixels
     int scale = 0;
     int in_ch = 3, out_ch = 3;
+    // How many of run_tile's output planes upscale_tiled reads, set per
+    // image: 1 for a gray image (or a 1-channel model), else out_ch. A
+    // backend that converts its output may skip the other planes.
+    int out_used = 3;
     TileProfile prof;
 
     virtual ~TileModel() = default;
