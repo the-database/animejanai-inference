@@ -226,6 +226,13 @@ AJI_EXPORT int aji_rife_factor_for_config(const aji_create_params *params,
  * simply never query it and get the default order. */
 AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c);
 
+/* Configure-time query: 1 only when the active RIFE chain opted into
+ * chain_N_rife_scene_detect_enhanced=yes (default: no). The caller owns the
+ * optional detector and supplies decisions through aji_infer_rife_with_scene.
+ * No detector work is performed by this query or by the inference backend.
+ * Additive export; callers should resolve it optionally for older libraries. */
+AJI_EXPORT int aji_rife_enhanced_scene(aji_ctx *c);
+
 /* Pre-RIFE downscale (rife-first only). When aji_rife_before_upscale() returns
  * 1 and the active chain's first model carries a "resize before upscale", this
  * returns 1 and fills (work_w, work_h): the resolution the caller must

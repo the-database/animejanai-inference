@@ -48,6 +48,7 @@ struct aji_backend {
     int (*scale_factor)(aji_ctx *);
     int (*rife_factor)(aji_ctx *, int *, int *);
     int (*rife_before_upscale)(aji_ctx *);
+    int (*rife_enhanced_scene)(aji_ctx *);
     int (*pre_resize)(aji_ctx *, int *, int *);
     int (*resize)(aji_ctx *, const aji_frame *, const aji_frame *, void *);
     int (*poll)(aji_ctx *);
@@ -201,6 +202,7 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(infer_rife,   "aji_infer_rife");
     // Optional: do not make old backends unusable for existing callers.
     *(void **)&be->infer_rife_with_scene = lib_sym(be->lib, "aji_infer_rife_with_scene");
+    *(void **)&be->rife_enhanced_scene = lib_sym(be->lib, "aji_rife_enhanced_scene");
     SYM(temporal_radius, "aji_temporal_radius");
     SYM(ingest,       "aji_ingest");
     SYM(infer_seq,    "aji_infer_seq");
@@ -432,6 +434,12 @@ extern "C" AJI_EXPORT int aji_rife_factor_for_config(
 extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
 {
     return c->be.rife_before_upscale(c->inner);
+}
+
+extern "C" AJI_EXPORT int aji_rife_enhanced_scene(aji_ctx *c)
+{
+    return c && c->be.rife_enhanced_scene &&
+           c->be.rife_enhanced_scene(c->inner);
 }
 
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
