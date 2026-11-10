@@ -244,6 +244,19 @@ AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h);
 AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
                           const aji_frame *out, void *cu_stream);
 
+/* Resize one frame between any sizes with the chain's resampler: to fp16
+ * RGB, Spline36, back to the frame's format (4:2:0 output subsampled with
+ * left siting, like the chain's output). `in` and `out` have the same
+ * format (NV12, P010 or YUV444P16), any dims; `out` takes `in`'s matrix and
+ * range. For a caller's final resize of aji_infer output or of passthrough
+ * frames (aji_encode's --final-resize-*), on the GPU and in the reference
+ * pipeline's resize.Spline36. Plans and buffers are kept per size, apart
+ * from the chain's. Enqueues on cu_stream like aji_infer. TensorRT backends
+ * only: DirectML (and libaji before this call) returns AJI_ERR. Additive, no
+ * API_VERSION bump. */
+AJI_EXPORT int aji_resize_frame(aji_ctx *c, const aji_frame *in,
+                                const aji_frame *out, void *cu_stream);
+
 /* Async builds: returns 1 (once) when a background engine build finished;
  * the caller should re-run aji_configure, which now finds the engine in
  * the cache (or logs the failure and stays passthrough). Cheap to call

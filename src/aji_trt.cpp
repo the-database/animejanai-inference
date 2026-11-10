@@ -164,6 +164,14 @@ struct aji_ctx {
     aji_plan *pr_pre_plan = nullptr, *pr_post_plan = nullptr;
     int pr_pre_key[4] = {0}, pr_post_key[4] = {0};
 
+    // aji_resize_frame (aji_encode's final resize): any size to any size,
+    // with its own plans and RGB buffers, apart from the chain's.
+    aji_plan *fr_pre_plan = nullptr, *fr_resize_plan = nullptr,
+             *fr_post_plan = nullptr;
+    int fr_pre_key[4] = {0}, fr_resize_key[4] = {0}, fr_post_key[4] = {0};
+    void *fr_buf[2] = {nullptr, nullptr};
+    size_t fr_buf_bytes[2] = {0, 0};
+
     // RIFE (phase 1.5): interpolation between already-upscaled frames,
     // replicating animejanai_core's pad/crop + rife_cuda.py's bilinear 709
     // conversions + the vsmlrt v1 11-channel model input. Geometry state
@@ -2196,6 +2204,96 @@ extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
     return 1;
 }
 
+namespace {
+
+// in -> out (same format) through fp16 RGB: the pre kernel into b0, the
+// Spline36 resize plan rplan into b1, the post kernel out, as the chain's own
+// resize steps do. *pre_plan / *post_plan (keyed by pre_key / post_key) are
+// rebuilt when the frame's format, size or siting changes. Context pushed;
+// `what` names the step in errors.
+int resize_through_rgb(aji_ctx *c, const aji_frame *in, const aji_frame *out,
+                       cudaStream_t stream, aji_plan *rplan, void *b0, void *b1,
+                       aji_plan **pre_plan, int pre_key[4], aji_plan **post_plan,
+                       int post_key[4], const char *what)
+{
+    const aji_csp csp = make_csp(in);
+    const bool in444 = aji_format_is_444(in->format);
+    if (!in444) {
+        const int pkey[4] = {in->format, in->width, in->height, in->siting};
+        if (!*pre_plan || memcmp(pkey, pre_key, sizeof(pkey)) != 0) {
+            aji_plan_destroy(*pre_plan);
+            *pre_plan = aji_pre_plan_create(in->format, in->width,
+                                            in->height, in->siting,
+                                            AJI_FILTER_SPLINE36);
+            if (!*pre_plan) {
+                c->set_error("%s pre plan allocation failed", what);
+                return AJI_ERR_CUDA;
+            }
+            memcpy(pre_key, pkey, sizeof(pkey));
+        }
+    }
+
+    int err = in444
+        ? aji_run_pre444(in->width, in->height, in->plane[0], in->stride[0],
+                         in->plane[1], in->stride[1], in->plane[2],
+                         in->stride[2], &csp, b0, stream)
+        : aji_run_pre(*pre_plan, in->plane[0], in->stride[0],
+                      in->plane[1], in->stride[1], &csp, b0, stream);
+    if (err) {
+        c->set_error("%s pre-kernel failed: %s", what,
+                     cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+
+    err = aji_run_resize(rplan, b0, b1, stream);
+    if (err) {
+        c->set_error("%s kernel failed: %s", what,
+                     cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+
+    if (aji_format_is_444(out->format)) {
+        const aji_csp ocsp = aji_make_csp(out->format, in->matrix,
+                                          in->range);
+        int err4 = aji_run_post444(out->format, out->width, out->height, b1, &ocsp,
+                                   out->plane[0], out->stride[0],
+                                   out->plane[1], out->stride[1],
+                                   out->plane[2], out->stride[2], stream);
+        if (err4) {
+            c->set_error("%s post444 kernel failed: %s", what,
+                         cudaGetErrorString((cudaError_t)err4));
+            return AJI_ERR_CUDA;
+        }
+        return AJI_OK;
+    }
+
+    const int qkey[4] = {out->format, out->width, out->height, AJI_SITING_LEFT};
+    if (!*post_plan || memcmp(qkey, post_key, sizeof(qkey)) != 0) {
+        aji_plan_destroy(*post_plan);
+        *post_plan = aji_post_plan_create(out->format, out->width,
+                                          out->height, AJI_SITING_LEFT,
+                                          AJI_FILTER_SPLINE36);
+        if (!*post_plan) {
+            c->set_error("%s post plan allocation failed", what);
+            return AJI_ERR_CUDA;
+        }
+        memcpy(post_key, qkey, sizeof(qkey));
+    }
+
+    const aji_csp ocsp = aji_make_csp(out->format, in->matrix, in->range);
+    err = aji_run_post(*post_plan, b1, &ocsp,
+                       out->plane[0], out->stride[0], out->plane[1],
+                       out->stride[1], stream);
+    if (err) {
+        c->set_error("%s post-kernel failed: %s", what,
+                     cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+    return AJI_OK;
+}
+
+} // namespace
+
 // Downscale one source-resolution frame to the work resolution (the rife-first
 // pre-RIFE step), reusing the pre -> resize -> post kernels over c->buf with
 // aji_resize's OWN pre/post plans so it doesn't thrash run_chain's per-frame
@@ -2232,82 +2330,68 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
         c->set_error("cuCtxPushCurrent failed");
         return AJI_ERR_CUDA;
     }
-    cudaStream_t stream = (cudaStream_t)cu_stream;
+    return resize_through_rgb(c, in, out, (cudaStream_t)cu_stream,
+                              c->pre_resize_plan, c->buf[0], c->buf[1],
+                              &c->pr_pre_plan, c->pr_pre_key, &c->pr_post_plan,
+                              c->pr_post_key, "pre-resize");
+}
 
-    const aji_csp csp = make_csp(in);
-    const bool in444 = aji_format_is_444(in->format);
-    if (!in444) {
-        const int pkey[4] = {in->format, in->width, in->height, in->siting};
-        if (!c->pr_pre_plan || memcmp(pkey, c->pr_pre_key, sizeof(pkey)) != 0) {
-            aji_plan_destroy(c->pr_pre_plan);
-            c->pr_pre_plan = aji_pre_plan_create(in->format, in->width,
-                                                 in->height, in->siting,
-                                                 AJI_FILTER_SPLINE36);
-            if (!c->pr_pre_plan) {
-                c->set_error("pre-resize pre plan allocation failed");
-                return AJI_ERR_CUDA;
-            }
-            memcpy(c->pr_pre_key, pkey, sizeof(pkey));
-        }
+extern "C" AJI_EXPORT int aji_resize_frame(aji_ctx *c, const aji_frame *in,
+                                           const aji_frame *out, void *cu_stream)
+{
+    if (!c || !in || !out)
+        return AJI_ERR;
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
+        !aji_format_is_444(in->format)) {
+        c->set_error("unsupported input format %d", in->format);
+        return AJI_ERR_FORMAT;
+    }
+    if (out->format != in->format) {
+        c->set_error("aji_resize_frame requires matching in/out formats");
+        return AJI_ERR_FORMAT;
+    }
+    if (in->width < 1 || in->height < 1 || out->width < 1 || out->height < 1) {
+        c->set_error("aji_resize_frame dims %dx%d->%dx%d", in->width,
+                     in->height, out->width, out->height);
+        return AJI_ERR_SHAPE;
     }
 
-    int err = in444
-        ? aji_run_pre444(in->width, in->height, in->plane[0], in->stride[0],
-                         in->plane[1], in->stride[1], in->plane[2],
-                         in->stride[2], &csp, c->buf[0], stream)
-        : aji_run_pre(c->pr_pre_plan, in->plane[0], in->stride[0],
-                      in->plane[1], in->stride[1], &csp, c->buf[0], stream);
-    if (err) {
-        c->set_error("pre-resize pre-kernel failed: %s",
-                     cudaGetErrorString((cudaError_t)err));
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
         return AJI_ERR_CUDA;
     }
-
-    err = aji_run_resize(c->pre_resize_plan, c->buf[0], c->buf[1], stream);
-    if (err) {
-        c->set_error("pre-resize kernel failed: %s",
-                     cudaGetErrorString((cudaError_t)err));
-        return AJI_ERR_CUDA;
-    }
-
-    if (aji_format_is_444(out->format)) {
-        const aji_csp ocsp = aji_make_csp(out->format, in->matrix,
-                                          in->range);
-        int err4 = aji_run_post444(out->format, c->work_w, c->work_h, c->buf[1], &ocsp,
-                                   out->plane[0], out->stride[0],
-                                   out->plane[1], out->stride[1],
-                                   out->plane[2], out->stride[2], stream);
-        if (err4) {
-            c->set_error("pre-resize post444 kernel failed: %s",
-                         cudaGetErrorString((cudaError_t)err4));
+    const int rkey[4] = {in->width, in->height, out->width, out->height};
+    if (!c->fr_resize_plan || memcmp(rkey, c->fr_resize_key, sizeof(rkey)) != 0) {
+        aji_plan_destroy(c->fr_resize_plan);
+        c->fr_resize_plan = aji_resize_plan_create(in->width, in->height,
+                                                   out->width, out->height);
+        if (!c->fr_resize_plan) {
+            c->set_error("final resize plan allocation failed");
             return AJI_ERR_CUDA;
         }
-        return AJI_OK;
+        memcpy(c->fr_resize_key, rkey, sizeof(rkey));
     }
-
-    const int qkey[4] = {out->format, c->work_w, c->work_h, AJI_SITING_LEFT};
-    if (!c->pr_post_plan || memcmp(qkey, c->pr_post_key, sizeof(qkey)) != 0) {
-        aji_plan_destroy(c->pr_post_plan);
-        c->pr_post_plan = aji_post_plan_create(out->format, c->work_w,
-                                               c->work_h, AJI_SITING_LEFT,
-                                               AJI_FILTER_SPLINE36);
-        if (!c->pr_post_plan) {
-            c->set_error("pre-resize post plan allocation failed");
+    // fp16 NCHW RGB at each end
+    const size_t need[2] = {(size_t)3 * in->width * in->height * 2,
+                            (size_t)3 * out->width * out->height * 2};
+    for (int i = 0; i < 2; i++) {
+        if (c->fr_buf[i] && c->fr_buf_bytes[i] >= need[i])
+            continue;
+        cudaFree(c->fr_buf[i]);
+        c->fr_buf[i] = nullptr;
+        c->fr_buf_bytes[i] = 0;
+        if (cudaMalloc(&c->fr_buf[i], need[i]) != cudaSuccess) {
+            cudaGetLastError();
+            c->set_error("cudaMalloc(%zu) failed for the final resize", need[i]);
             return AJI_ERR_CUDA;
         }
-        memcpy(c->pr_post_key, qkey, sizeof(qkey));
+        c->fr_buf_bytes[i] = need[i];
     }
-
-    const aji_csp ocsp = aji_make_csp(out->format, in->matrix, in->range);
-    err = aji_run_post(c->pr_post_plan, c->buf[1], &ocsp,
-                       out->plane[0], out->stride[0], out->plane[1],
-                       out->stride[1], stream);
-    if (err) {
-        c->set_error("pre-resize post-kernel failed: %s",
-                     cudaGetErrorString((cudaError_t)err));
-        return AJI_ERR_CUDA;
-    }
-    return AJI_OK;
+    return resize_through_rgb(c, in, out, (cudaStream_t)cu_stream,
+                              c->fr_resize_plan, c->fr_buf[0], c->fr_buf[1],
+                              &c->fr_pre_plan, c->fr_pre_key, &c->fr_post_plan,
+                              c->fr_post_key, "final resize");
 }
 
 extern "C" AJI_EXPORT uint64_t aji_flush(aji_ctx *c, void *cu_stream)
@@ -2697,6 +2781,11 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         aji_plan_destroy(c->pre_resize_plan);
         aji_plan_destroy(c->pr_pre_plan);
         aji_plan_destroy(c->pr_post_plan);
+        aji_plan_destroy(c->fr_pre_plan);
+        aji_plan_destroy(c->fr_resize_plan);
+        aji_plan_destroy(c->fr_post_plan);
+        for (auto &b : c->fr_buf)
+            cudaFree(b);
         rife_teardown(c);
         temporal_teardown(c);
         for (auto &g : c->direct_graphs) cudaGraphExecDestroy(g.exec);
