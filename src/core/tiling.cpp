@@ -149,6 +149,7 @@ int upscale_tiled(TileModel &m, int overlap, const aji_img_buffer *in,
     const auto ms = [](clk::time_point a, clk::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
+    m.out_used = (m.out_ch == 1 || Co == 1) ? 1 : m.out_ch;
     TileProfile &P = m.prof;
     P = TileProfile{};
     P.on = std::getenv("AJI_IMG_PROFILE") != nullptr;
