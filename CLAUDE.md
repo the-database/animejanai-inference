@@ -19,10 +19,11 @@ ABI.
 ## Documentation map
 
 - **[`docs/BUILD-WINDOWS.md`](docs/BUILD-WINDOWS.md)** — the Windows dependency setup and
-  release build. **There is no Windows CI**: `aji-windows-x64.zip` is built and uploaded by hand
-  with the scripts in `ci/windows/`, against SDKs in an out-of-repo working area.
-- **[`docs/BUILD-LINUX.md`](docs/BUILD-LINUX.md)** — the Linux/WSL build, the CI workflow, and
-  the parity harness.
+  release build. **The Windows release is not built in CI**: `aji-windows-x64.zip` is built and
+  uploaded by hand with the scripts in `ci/windows/`, against SDKs in an out-of-repo working area.
+  CI does build and test Windows on pull requests (see [CI](#ci)).
+- **[`docs/BUILD-LINUX.md`](docs/BUILD-LINUX.md)** — the Linux/WSL build, the Linux release
+  workflow, and the parity harness.
 
 `README.md` is the public-facing overview. Its "Build (Linux)" section is still accurate; the
 prose describing the engine as "Phase 0 spike scope" predates chain selection, RIFE, and the
@@ -172,6 +173,12 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_image` | EXE | `aji` | image-ABI CLI (PNM in/out); the reference consumer of `aji_image.h` |
 | `aji_tiling_test` | EXE | — | CPU-only checks of `core/tiling` and the fp16/bf16 conversions |
 
+The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
+cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`; what CI runs) and `-L gpu`
+(`aji_pre_fusion_test`, `aji_msb444_test`; needs an NVIDIA GPU). A new test that needs no GPU,
+models or fixtures goes in the `cpu` list at the end of `CMakeLists.txt`, and CI runs it on both
+platforms.
+
 **`aji_encode` is skipped silently** unless its ffmpeg dependency resolves. On Windows that
 means `AJI_FFMPEG_ROOT` must be set; on Linux, pkg-config must find `libavformat libavcodec
 libavutil libavfilter libswscale`. The configure output says which:
@@ -193,18 +200,39 @@ set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 12
 
 > **That fallback never fires.** CMake pre-defines `CMAKE_CUDA_ARCHITECTURES` during
 > `project()`, so omitting `-DCMAKE_CUDA_ARCHITECTURES=...` yields a **single default arch**
-> (e.g. `sm_75`) that runs on one GPU generation and dies on every other. Both the release
-> script and the Linux CI workflow therefore pass the full list explicitly. Never drop it from
-> a build that ships.
+> (e.g. `sm_75`) that runs on one GPU generation and dies on every other. The Windows release
+> script, `tools/build-windows-test.ps1` and the Linux build action therefore pass the full list
+> explicitly. Never drop it from a build that ships.
 
 For local dev on one machine, `-DCMAKE_CUDA_ARCHITECTURES=120` (or `native`) is much faster to
 compile — the release list builds eight architectures.
+
+## CI
+
+`.github/workflows/ci.yml` runs on pull requests, and on pushes to `main`, that touch `src/`,
+`include/`, `sanity/`, `tools/`, `ci/`, `CMakeLists.txt`, `.github/actions/` or `ci.yml` itself
+(doc-only changes build nothing). It publishes nothing. Dispatch it on a branch to get Windows
+test binaries.
+
+| Job | Runner | Builds | Runs |
+|---|---|---|---|
+| `windows` | `windows-2022` + MSVC | `tools/build-windows-test.ps1`: every arch, `AJI_BUILD_ANALYSIS=ON`; no `aji_encode` or `aji_trtrtx` (no FFmpeg / TensorRT-RTX SDK there) | `ctest -L cpu`, `sanity/half_isa_check.py`, `tools/test-stream-policy-dispatch.py`, `tools/test-release-configuration.py`, `tools/test-release-packaging.ps1`; uploads `aji-windows-test` (7 days) |
+| `linux` | `ubuntu-latest`, in the build image | `.github/actions/linux-build`: exactly the release build, `aji_encode` included | `ctest -L cpu` |
+
+Hosted runners have no GPU, so the GPU tests (`ctest -L gpu`, `aji_kernel_test`, the harnesses
+and the md5 regression gate below) are compiled but not run: run them locally. The SDKs are
+cached: Windows `build-deps/` under a key from `ci/windows/dependencies.json`, Linux
+`/opt/aji-deps` under a key from the pins in the action. A cold run downloads ~2 GB of
+TensorRT per platform.
+
+`build-linux.yml` (the Linux release) runs the same action and `ctest -L cpu` before it
+publishes, so a Linux release can't ship a build that fails them.
 
 ## Where the artifacts go
 
 | Platform | Built by | Asset |
 |---|---|---|
-| Linux | `.github/workflows/build-linux.yml` | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
+| Linux | `.github/workflows/build-linux.yml`, dispatched with `release_tag` (no default; refuses a release that already has Linux assets unless `replace_assets=true`) | `aji-linux-x64.tar.zst`, `aji-encode-linux-x64.tar.zst` (aji_encode + libav, for VideoJaNai) |
 | Windows | **locally, by hand** (`docs/BUILD-WINDOWS.md`) | `aji-windows-x64.zip`, `aji-trtrtx-windows-x64.zip` (opt-in: `aji_trtrtx.dll` + TensorRT-RTX runtime, ~91 MB), `aji-trtrtx-backend-windows-x64.zip` (`aji_trtrtx.dll` alone, for apps that take the runtime from a shared pack) |
 
 All are attached to the **same release tag**, because the consumer derives every URL from one
