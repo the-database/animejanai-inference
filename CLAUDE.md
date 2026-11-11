@@ -127,6 +127,16 @@ them through its own context. **A change to engine caching or builds goes in the
 front-ends get it. The image front-end does inference only — model selection, grayscale
 detection, resizes and alpha are the caller's (yosh / MangaJaNaiConverterGui keep that policy).
 
+**The image path shares GPU working memory per context** (`aji_img_trt.cpp`). Its execution
+contexts are created `kUSER_MANAGED` (`load_engine`'s `bind`), and one activation buffer per
+`aji_img_ctx`, sized to the largest loaded model's `getDeviceMemorySizeV2()`, serves them all,
+with the GPU tiling scratch; so runs on one context are serialized (`run_mu`; lock order `mu`
+then `run_mu`). With TensorRT's default each model kept its own activations (~340 MB for a 2x
+ESRGAN at 512 tiles, ~1.35 GB for 4x), which piled up in apps that never unload. The video path
+keeps the default: its chains run upscale, RIFE and temporal steps that may overlap. Out of
+memory at load is reported as such and keeps the engine (TensorRT's own allocation failures are
+caught through `TrtLogger::oom_errors`), instead of deleting it as stale and rebuilding.
+
 ## Build system
 
 CMake only (`cmake_minimum_required(VERSION 3.24)`, C11 / C++17, `LANGUAGES C CXX CUDA`).
@@ -388,7 +398,11 @@ and an NVDEC frame may have another bit depth or be 4:2:2 / 4:4:4. Every other f
 downloaded if need be, converted (and resized) with swscale, and NVENC uploads it. The first
 frame decides, since the encoder is opened for it; a zero-copy encode that later meets a frame
 of another format or size fails with a message instead of feeding NVENC a frame it was not
-opened for. `tools/test-encode-formats.py` (NVIDIA GPU) runs every source layout (8/10-bit
+opened for. The final resize (`--final-resize-*`, `--square-pixels after`) is Spline36 like every
+other resize: on the zero-copy path `aji_resize_frame` (TensorRT backends; scale_cuda only if it
+fails), else swscale's `SWS_LANCZOS`, the closest of its filters to Spline36 on anime video
+(scale_cuda's bicubic has no prefilter when downscaling: ~50 dB from Spline36 against libaji's
+~69). `tools/test-encode-formats.py` (NVIDIA GPU) runs every source layout (8/10-bit
 4:2:0, 4:2:2, 4:4:4, odd width) through NVDEC and the CPU decoder, NVENC and the CPU encoders,
 both bit depths, `--final-resize-height` and `--deinterlace`, in passthrough and (given a model)
 upscaling, and checks the output format, frame count and PSNR against the source.
@@ -427,7 +441,9 @@ regression test (Windows + NVIDIA GPU; it simulates the read error with a byte-r
 ## HDR in `aji_encode`
 
 Colour tags (BT.2020 matrix and primaries, PQ or HLG transfer) carry over like any others, and
-a 10-bit output (`--pix-fmt yuv420p10`, the default) keeps the depth. The HDR10 static metadata
+a 10-bit output (`--pix-fmt yuv420p10`, the default) keeps the depth. There is no tone mapping:
+an 8-bit `--pix-fmt` on a PQ/HLG source writes an 8-bit HDR file (it bands), which is allowed but
+gets a `warning:` line on stderr (`resolve_pixfmt`). The HDR10 static metadata
 (mastering display, content light level) is taken from the first decoded frame (the decoder
 puts the bitstream's SEI/OBUs or the container's side data on every frame) by `hdr_capture`,
 since libaji's output frames don't carry it. It goes to the encoder as `decoded_side_data`

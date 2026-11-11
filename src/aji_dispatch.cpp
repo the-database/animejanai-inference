@@ -51,6 +51,7 @@ struct aji_backend {
     int (*rife_enhanced_scene)(aji_ctx *);
     int (*pre_resize)(aji_ctx *, int *, int *);
     int (*resize)(aji_ctx *, const aji_frame *, const aji_frame *, void *);
+    int (*resize_frame)(aji_ctx *, const aji_frame *, const aji_frame *, void *);
     int (*poll)(aji_ctx *);
     int (*infer_rife)(aji_ctx *, const aji_frame *, const aji_frame *,
                       double, const aji_frame *, void *);
@@ -203,6 +204,8 @@ static bool load_backend(const char *stem, aji_backend *be,
     // Optional: do not make old backends unusable for existing callers.
     *(void **)&be->infer_rife_with_scene = lib_sym(be->lib, "aji_infer_rife_with_scene");
     *(void **)&be->rife_enhanced_scene = lib_sym(be->lib, "aji_rife_enhanced_scene");
+    // Optional too: TensorRT backends only (DirectML has none).
+    *(void **)&be->resize_frame = lib_sym(be->lib, "aji_resize_frame");
     SYM(temporal_radius, "aji_temporal_radius");
     SYM(ingest,       "aji_ingest");
     SYM(infer_seq,    "aji_infer_seq");
@@ -451,6 +454,14 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
                                      const aji_frame *out, void *cu_stream)
 {
     return c->be.resize(c->inner, in, out, cu_stream);
+}
+
+extern "C" AJI_EXPORT int aji_resize_frame(aji_ctx *c, const aji_frame *in,
+                                           const aji_frame *out, void *cu_stream)
+{
+    if (!c || !c->be.resize_frame)
+        return AJI_ERR;
+    return c->be.resize_frame(c->inner, in, out, cu_stream);
 }
 
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)

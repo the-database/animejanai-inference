@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -43,6 +44,10 @@ class TrtLogger : public nvinfer1::ILogger {
 public:
     log_fn fn = nullptr;
     void *opaque = nullptr;
+    // Errors TensorRT reported as out of (GPU) memory so far. Its calls
+    // only return null or false; this tells an allocation failure (e.g. of
+    // the weights, while deserializing) from a broken engine.
+    std::atomic<int> oom_errors{0};
     void log(Severity sev, const char *msg) noexcept override;
 };
 
@@ -263,6 +268,14 @@ struct AsyncBuild {
     void stop();
 };
 
+// Points a new execution context at `bytes` of activation memory (see
+// load_engine's `bind`); false with *err if it can't.
+using BindMemory =
+    std::function<bool(nvinfer1::IExecutionContext *exec, int64_t bytes, std::string *err)>;
+
+// "1234 of 8188 MB of GPU memory free", for out-of-memory messages.
+std::string gpu_memory_note();
+
 // Deserialize `engine_path`, bind its single input/output and set the
 // input shape: [1, in_ch, in_h, in_w], or [1, rank5_t, 3, in_h, in_w]
 // when rank5_t > 0. Fills me->out_w/out_h from the resolved output and
@@ -271,9 +284,15 @@ struct AsyncBuild {
 // engine one warm-up inference. *keep (optional) is set on failure when the
 // engine file itself deserialized fine (context, shape or warm-up failed):
 // not a stale cache entry to delete and rebuild.
+// Without `bind` the context allocates its own activation memory (TensorRT's
+// default, kSTATIC). With it the context gets none (kUSER_MANAGED), and
+// `bind` is called with the engine's getDeviceMemorySizeV2() once the input
+// shape is set, before anything is enqueued, to give it that memory: the
+// image path shares one buffer between the models of a context.
 bool load_engine(nvinfer1::IRuntime *runtime, const std::string &engine_path,
                  ModelEngine *me, int in_w, int in_h, int in_ch, int rank5_t,
-                 std::string *err, bool *keep = nullptr);
+                 std::string *err, bool *keep = nullptr,
+                 const BindMemory *bind = nullptr);
 
 } // namespace ajicore
 

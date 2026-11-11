@@ -244,12 +244,14 @@ struct aji_img_model : TileModel {
             prof.wait += ms(t0, t1);  // ORT Run: upload, inference, download
             t0 = t1;
         }
+        // only the planes the blend reads (a gray page: the first)
+        const size_t nu = no / out_ch * std::min(out_used, out_ch);
         if (fp16) {
-            parallel_for(no, (size_t)1 << 18, [&](size_t b, size_t e) {
+            parallel_for(nu, (size_t)1 << 18, [&](size_t b, size_t e) {
                 f16_to_f32_array(out16.data() + b, out + b, e - b);
             });
         } else {
-            memcpy(out, out32.data(), no * 4);
+            memcpy(out, out32.data(), nu * 4);
         }
         if (prof.on)
             prof.unpack += ms(t0, clk::now());
