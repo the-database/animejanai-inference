@@ -141,6 +141,9 @@ typedef struct {
     int preview_w;
     int session;            /* --preview-session: serve a player, no encode */
     enum damage_mode on_damage;
+    int reuse_held;         /* held-frame reuse: on unless --no-reuse-held-frames */
+    float reuse_t;          /* --reuse-held-threshold: largest 8x8 tile mean |diff| */
+    float reuse_fade;       /* --reuse-held-fade-threshold: largest region signed mean */
 
     /* direct mode (testing) */
     const char *engine;
@@ -301,6 +304,7 @@ static int aji_siting_from_av(enum AVChromaLocation l)
 
 #define MAX_RING 32
 #define MAX_HELD 256    /* video packets kept until NVDEC is known to work */
+#define REUSE_QMAX (MAX_RING + 3)   /* held-frame reuse queue (>= reuse_lag + 1) */
 
 typedef struct {
     AVFrame  *out;       /* aji output (or decoded, passthrough) CUDA frame */
@@ -308,6 +312,13 @@ typedef struct {
     uint64_t  ticket;
     int64_t   pts;       /* output PTS in the video stream time_base */
 } slot;
+
+/* held-frame reuse: a decoded frame waiting for its decision, and the
+ * event recorded on the legacy stream when it arrived */
+typedef struct {
+    AVFrame     *f;
+    cudaEvent_t  ev;
+} held_frame;
 
 /* a still-image encoder (scaler + PNG/MJPEG), kept across frames */
 typedef struct {
@@ -503,6 +514,22 @@ typedef struct {
     AVFrameSideData **hdr_sd;
     int              nb_hdr_sd;
     int              hdr_seen;
+
+    /* held-frame reuse (see push_reuse) */
+    int              reuse;          /* on: requested, and a plain upscale chain */
+    cudaStream_t     diff_stream;    /* aji_frame_diff and anchor copies only */
+    AVBufferRef     *anchor_pool;    /* one source-format frame: */
+    AVFrame         *anchor_src;     /* a copy of the last upscaled source frame */
+    AVFrame         *anchor_out;     /* a ref of its upscaled output */
+    int              have_anchor;
+    held_frame       hq[REUSE_QMAX]; /* frames not yet decided, oldest first */
+    int              hq_head, hq_n;
+    int              reuse_lag;      /* frames decided this many frames late */
+    int              next_known;     /* look-ahead: D and fade of the next frame */
+    float            next_d, next_fade;  /* against the anchor, if known */
+    int              skip_run;       /* frames reused since the anchor */
+    int64_t          reused, reuse_seen;
+    FILE            *reuse_trace;    /* AJI_REUSE_TRACE: every comparison, CSV */
 } enc_ctx;
 
 /* forward decls */
@@ -1776,8 +1803,11 @@ static AVBufferRef *make_pool(enc_ctx *c, enum AVPixelFormat sw, int w, int h,
 static int init_aji_pool(enc_ctx *c)
 {
     /* cover in-flight ring/RIFE frames plus those the encoder holds
-     * (NVENC async depth + B-frames) — the CUDA pool is fixed-size */
-    c->aji_pool = make_pool(c, c->sw_fmt, c->up_w, c->up_h, c->ring_depth + 48);
+     * (NVENC async depth + B-frames) — the CUDA pool is fixed-size. Held
+     * frame reuse keeps one more: the anchor's output, after its slot has
+     * gone (reused frames share its buffer and take none). */
+    c->aji_pool = make_pool(c, c->sw_fmt, c->up_w, c->up_h,
+                            c->ring_depth + 48 + (c->reuse ? 1 : 0));
     return c->aji_pool ? 0 : -1;
 }
 
@@ -1857,9 +1887,11 @@ static AVFrame *to_device(enc_ctx *c, AVFrame *fr)
         return fr;
 
     AVFrame *host = NULL, *packed = NULL, *padded = NULL, *dev = NULL;
+    /* the ring's frames, plus held-frame reuse's queue (push_reuse) */
     if (!c->src_pool &&
         !(c->src_pool = make_pool(c, sw, c->src_w, c->src_h,
-                                  c->ring_depth + 8)))
+                                  c->ring_depth + 8 +
+                                  (c->reuse ? c->reuse_lag + 1 : 0))))
         goto fail;
     if (fr->format == AV_PIX_FMT_CUDA) {
         host = av_frame_alloc();
@@ -3228,10 +3260,310 @@ static int push_upscale_temporal(enc_ctx *c, AVFrame *dec)
     return ring_drain(c);
 }
 
+/* enqueue the upscale of dec into a new pool frame (complete once a ticket
+ * taken after it is) */
+static AVFrame *infer_enqueue(enc_ctx *c, AVFrame *dec)
+{
+    AVFrame *out = alloc_up(c);
+    if (!out) return NULL;
+    aji_frame in_f, out_f;
+    fill_aji_frame(c, &in_f, dec, 0);
+    fill_aji_frame(c, &out_f, out, 1);
+    int ret = aji_infer(c->aji, &in_f, &out_f, c->stream);
+    if (ret != AJI_OK) {
+        loge("aji_infer: %d: %s", ret, aji_last_error(c->aji));
+        av_frame_free(&out);
+        return NULL;
+    }
+    out->pts = dec->pts;
+    return out;
+}
+
+/* ---- held-frame reuse (on by default; --no-reuse-held-frames) ------------ *
+ *
+ * A frame that is the same picture as the last frame that was upscaled (the
+ * anchor) is not inferred: the anchor's output is encoded again under the
+ * frame's timestamp. Anime holds drawings for 2-3 frames; slides, screen
+ * recordings and still shots repeat frames exactly.
+ *
+ * D(x, y) is aji_frame_diff's largest 8x8-tile mean |y - x| over all planes,
+ * in 8-bit levels; "fade" its largest |signed mean| over a 4x4 luma region
+ * grid. With a the anchor, T = 2.5 (--reuse-held-threshold) and F = 0.15
+ * (--reuse-held-fade-threshold), frame N is reused iff
+ *   D(a, N) <= T and fade(a, N) <= F,
+ *   fewer than REUSE_MAX_RUN frames in a row were reused (long stills pick
+ *   up the codec's quality refinements now and then),
+ *   N, N+1 and N+2 are undamaged and N+1 and N+2 exist (the last two frames
+ *   of the stream are always upscaled), and none of these holds:
+ *     D(a, N+1) > T and D(N, N+1) <= T              the change starts at N
+ *     D(a, N+1) > 1.5 * max(D(a, N), D(N, N+1), 0.5) D from the anchor grows
+ *     D(a, N+2) > T and D(N, N+2) <= T
+ *     D(a, N+2) > 1.5 * max(D(a, N), D(N, N+2), 0.5)
+ *
+ * Why: codec noise between held frames gives D of about 0.5-3, slow real
+ * motion more (a soft cloud shadow drifting by 3.5-5 a frame). Comparing
+ * with the anchor rather than with the previous frame keeps a slow drift
+ * from creeping through in small steps. Motion slower than T/2 a frame
+ * still stays under T for a frame or two from the anchor, and with only the
+ * first test every other frame of a slow pan was reused (60 of 120 frames
+ * of a blurred still panning 0.1 px a frame): the trend tests see D from
+ * the anchor grow, which noise doesn't do. The 0.5 floor keeps tiny noise
+ * from tripping them. Fade guard: signed means don't separate noise from
+ * drift (codec DC shifts move whole blocks), but a fade of 0.5 levels a
+ * frame would step; noise-only region means stay under 0.13 (see
+ * REUSE_FADE_DEFAULT).
+ *
+ * Evidence (RTX 5090): on full episodes 16-57% of frames are reused (a
+ * 1999 DVD 16.2%, three 1080p web episodes 29.5-56.7%). Frame counts and
+ * timestamps match an encode without reuse; with a lossless NVENC every
+ * upscaled frame is bit-identical to one, and a reused frame is 48.8 dB or
+ * more from a fresh upscale. A blind A/B of the closest calls (clouds, a
+ * title-card fade, smoke, a blurred concert background) showed no stall,
+ * and clean synthetic pans of 0.1-1 px a frame (sharp and blurred) and
+ * drifting patches reuse no frame inside the motion.
+ * Known limits: slow motion under codec noise can still be held for single
+ * frames (with x264 noise added, a blurred pan of 0.1 px a frame held 26 of
+ * 120 frames and a 0.25 px drifting patch 5, each alone: a sub-pixel
+ * shift); a faint one-pixel change at half
+ * contrast or less (an anti-aliased caret) can be held for up to
+ * REUSE_MAX_RUN frames. Speed: where inference is the limit (-preset p1)
+ * wall time fell 24-31%, about in proportion to the reuse rate; where NVENC
+ * is (VideoJaNai's p7 at 4K on a fast GPU), it doesn't change.
+ *
+ * Streams: libav's decoder copies (and uploads) frames on CUDA's legacy
+ * default stream, which waits for all work queued on c->stream before it.
+ * A decoded frame is therefore only ready once the inference queued ahead
+ * of it is done, and a comparison on a blocking stream would wait for all
+ * of that too, stalling the pipeline on every frame. So the comparisons and
+ * the anchor copies run on diff_stream, non-blocking and high-priority,
+ * which waits only for an event recorded on the legacy stream when each
+ * frame arrived; and frames are decided reuse_lag (ring_depth + 2) frames
+ * late, by which time ring_make_room has waited for everything those events
+ * wait for. Decisions are still made in order and each frame still goes
+ * into the ring, so the output order and timestamps don't change.
+ *
+ * The anchor's source is a copy, in a pool of its own (keeping the
+ * decoder's frame through a long still would starve NVDEC's pool). A
+ * reused frame takes a ring slot like any other, with an av_frame_clone of
+ * the anchor's output and ticket 0: slots are reclaimed in order
+ * (ring_reclaim from the oldest), so the anchor's own slot has waited for
+ * its inference before a reused frame is emitted. Nothing downstream writes
+ * into an output frame (NVENC reads it; the final resize, scale_cuda and
+ * the preview write frames of their own; the software path downloads it),
+ * so sharing the buffer is safe, and NVENC maps a buffer sent twice once,
+ * as for RIFE's scene duplicates. Damaged frames are always upscaled and
+ * never become the anchor. */
+
+#define REUSE_MAX_RUN 24
+/* Signed region means between frames whose tile D is within 2.5 (noise
+ * only), on the calibration clips' first 2 minutes: p99 0.061 / 0.101, max
+ * 0.071 / 0.127 (the larger clip's top values are a real drift of ~0.1 a
+ * frame in one region, which the look-ahead rejects anyway); frame-wide,
+ * p99 0.036 / 0.038, max 0.043 / 0.055. About 2x the noise maximum, and
+ * well under a fade of 0.25 levels a frame. */
+#define REUSE_FADE_DEFAULT 0.15f
+
+static int frame_damaged(const AVFrame *f)
+{
+    return f->decode_error_flags || (f->flags & AV_FRAME_FLAG_CORRUPT) ||
+           f->opaque == DMG_TAG;
+}
+
+/* D(a, b) and fade(a, b) (NULL: not wanted); 0, or -1 if aji_frame_diff
+ * failed (logged, and reuse stops). ev_a/ev_b: the frames' arrival events
+ * (NULL: the anchor, which diff_stream wrote itself) */
+static int reuse_cmp(enc_ctx *c, AVFrame *a, cudaEvent_t ev_a, AVFrame *b,
+                     cudaEvent_t ev_b, const char *pair, float *d, float *fade)
+{
+    if ((ev_a && cudaStreamWaitEvent(c->diff_stream, ev_a, 0) != cudaSuccess) ||
+        (ev_b && cudaStreamWaitEvent(c->diff_stream, ev_b, 0) != cudaSuccess)) {
+        loge("held frames: cudaStreamWaitEvent failed; reusing no more frames");
+        c->reuse = 0;
+        return -1;
+    }
+    aji_frame fa, fb;
+    fill_aji_frame(c, &fa, a, 0);
+    fill_aji_frame(c, &fb, b, 0);
+    aji_frame_diff_result r;
+    const int ret = aji_frame_diff(c->aji, &fa, &fb, &r, c->diff_stream);
+    if (ret != AJI_OK) {
+        loge("held frames: aji_frame_diff: %d (%s); reusing no more frames",
+             ret, aji_last_error(c->aji));
+        c->reuse = 0;
+        return -1;
+    }
+    float m = 0.0f;
+    for (int i = 0; i < 16; i++)
+        m = FFMAX(m, fabsf(r.region_mean[i]));
+    *d = r.max_tile;
+    if (fade) *fade = m;
+    if (c->reuse_trace) {
+        /* source frame N (0-based), pair, D, the 16 region means */
+        fprintf(c->reuse_trace, "%lld,%s,%.4f", (long long)c->reuse_seen - 1,
+                pair, r.max_tile);
+        for (int i = 0; i < 16; i++)
+            fprintf(c->reuse_trace, ",%.4f", r.region_mean[i]);
+        fputc('\n', c->reuse_trace);
+    }
+    return 0;
+}
+
+/* make dec, just enqueued for upscaling into out, the anchor */
+static int reuse_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev, AVFrame *out)
+{
+    if (!c->anchor_src) {
+        if (!c->anchor_pool &&
+            !(c->anchor_pool = make_pool(c, src_sw_fmt(c), c->src_w, c->src_h, 1)))
+            return -1;
+        c->anchor_src = av_frame_alloc();
+        if (!c->anchor_src ||
+            av_hwframe_get_buffer(c->anchor_pool, c->anchor_src, 0) < 0) {
+            av_frame_free(&c->anchor_src);
+            return -1;
+        }
+    }
+    const enum AVPixelFormat sw = src_sw_fmt(c);
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(sw);
+    int row[4];
+    if (av_image_fill_linesizes(row, sw, dec->width) < 0 ||
+        cudaStreamWaitEvent(c->diff_stream, ev, 0) != cudaSuccess)
+        return -1;
+    for (int p = 0; p < av_pix_fmt_count_planes(sw); p++) {
+        const int h = p ? AV_CEIL_RSHIFT(dec->height, d->log2_chroma_h)
+                        : dec->height;
+        if (cudaMemcpy2DAsync(c->anchor_src->data[p], c->anchor_src->linesize[p],
+                              dec->data[p], dec->linesize[p], row[p], h,
+                              cudaMemcpyDeviceToDevice, c->diff_stream)
+            != cudaSuccess)
+            return -1;
+    }
+    /* done before dec can go back to its pool: its ring slot only waits
+     * for c->stream */
+    if (cudaStreamSynchronize(c->diff_stream) != cudaSuccess) return -1;
+    av_frame_unref(c->anchor_out);
+    if (av_frame_ref(c->anchor_out, out) < 0) return -1;
+    c->have_anchor = 1;
+    return 0;
+}
+
+/* The look-ahead tests for frame p against frame n (n = N+1 or N+2):
+ * 1 when p may still be reused, 0 when not (or a comparison failed).
+ * d_ap is D(anchor, p); D(anchor, n) and fade(anchor, n) go to *d_an and
+ * *f_an. */
+static int reuse_ahead(enc_ctx *c, AVFrame *p, cudaEvent_t ev_p, float d_ap,
+                       AVFrame *n, cudaEvent_t ev_n, const char *an,
+                       const char *pn, float *d_an, float *f_an)
+{
+    const float T = c->o.reuse_t;
+    float d_pn;
+    if (reuse_cmp(c, c->anchor_src, NULL, n, ev_n, an, d_an, f_an) < 0 ||
+        reuse_cmp(c, p, ev_p, n, ev_n, pn, &d_pn, NULL) < 0)
+        return 0;
+    if (*d_an > T && d_pn <= T)
+        return 0;     /* the change starts at p */
+    if (*d_an > 1.5f * FFMAX(FFMAX(d_ap, d_pn), 0.5f))
+        return 0;     /* D from the anchor grows: motion */
+    return 1;
+}
+
+/* upscale p (owned) or reuse the anchor's output for it; n and n2 are the
+ * two frames after it (NULL past the end); the events are their arrival
+ * events (NULL when reuse is off) */
+static int reuse_decide(enc_ctx *c, AVFrame *p, cudaEvent_t ev_p, AVFrame *n,
+                        cudaEvent_t ev_n, AVFrame *n2, cudaEvent_t ev_n2)
+{
+    int skip = 0;
+    const int known = c->next_known;
+    float d_ap = c->next_d, f_ap = c->next_fade;
+    c->next_known = 0;
+    c->reuse_seen++;
+    if (c->reuse && c->have_anchor && c->skip_run < REUSE_MAX_RUN && n && n2 &&
+        !frame_damaged(p) && !frame_damaged(n) && !frame_damaged(n2) &&
+        (known || reuse_cmp(c, c->anchor_src, NULL, p, ev_p, "ap", &d_ap,
+                            &f_ap) == 0) &&
+        d_ap <= c->o.reuse_t && f_ap <= c->o.reuse_fade) {
+        float d_an, f_an, d_an2, f_an2;
+        skip = reuse_ahead(c, p, ev_p, d_ap, n, ev_n, "an", "pn", &d_an, &f_an) &&
+               reuse_ahead(c, p, ev_p, d_ap, n2, ev_n2, "an2", "pn2", &d_an2,
+                           &f_an2);
+        if (skip) {           /* the anchor stays: D(anchor, n) is known */
+            c->next_known = 1;
+            c->next_d = d_an;
+            c->next_fade = f_an;
+        }
+    }
+    if (c->reuse_trace)
+        fprintf(c->reuse_trace, "%lld,%s\n", (long long)c->reuse_seen - 1,
+                skip ? "reuse" : "upscale");
+    if (ring_make_room(c) < 0) { av_frame_free(&p); return -1; }
+    if (skip) {
+        AVFrame *out = av_frame_clone(c->anchor_out);
+        if (!out) { loge("av_frame_clone failed"); av_frame_free(&p); return -1; }
+        out->pts = p->pts;
+        av_frame_free(&p);
+        ring_commit(c, NULL, out, 0);
+        c->skip_run++;
+        c->reused++;
+        return 0;
+    }
+    AVFrame *out = infer_enqueue(c, p);
+    if (!out) { av_frame_free(&p); return -1; }
+    c->skip_run = 0;
+    c->have_anchor = 0;
+    if (c->reuse && !frame_damaged(p) && reuse_anchor(c, p, ev_p, out) < 0) {
+        loge("held frames: keeping the anchor frame failed; reusing no more "
+             "frames");
+        c->reuse = 0;
+    }
+    ring_commit(c, p, out, aji_flush(c->aji, c->stream));
+    return 0;
+}
+
+/* a plain upscale chain with held-frame reuse: frames wait in a queue and
+ * are decided reuse_lag frames late, each with the two after it as its
+ * look-ahead; dec==NULL flushes */
+static int push_reuse(enc_ctx *c, AVFrame *dec)
+{
+    int queued = 0;
+    if (dec && c->reuse) {
+        held_frame *h = &c->hq[(c->hq_head + c->hq_n) % REUSE_QMAX];
+        /* the legacy stream: after libav's copy or upload of the frame */
+        if (cudaEventRecord(h->ev, 0) != cudaSuccess) {
+            loge("held frames: cudaEventRecord failed");
+            av_frame_free(&dec);
+            return -1;
+        }
+        h->f = dec;
+        dec = NULL;
+        c->hq_n++;
+        queued = 1;
+    }
+    while (c->hq_n > (queued && c->reuse ? c->reuse_lag : 0)) {
+        held_frame *p = &c->hq[c->hq_head];
+        held_frame *n = c->hq_n > 1 ? &c->hq[(c->hq_head + 1) % REUSE_QMAX]
+                                    : NULL;
+        held_frame *n2 = c->hq_n > 2 ? &c->hq[(c->hq_head + 2) % REUSE_QMAX]
+                                     : NULL;
+        AVFrame *pf = p->f;
+        p->f = NULL;
+        c->hq_head = (c->hq_head + 1) % REUSE_QMAX;
+        c->hq_n--;
+        if (reuse_decide(c, pf, p->ev, n ? n->f : NULL, n ? n->ev : NULL,
+                         n2 ? n2->f : NULL, n2 ? n2->ev : NULL) < 0) {
+            av_frame_free(&dec);
+            return -1;
+        }
+    }
+    if (dec)      /* reuse is off */
+        return reuse_decide(c, dec, NULL, NULL, NULL, NULL, NULL);
+    return queued ? 0 : ring_drain(c);
+}
+
 /* push one decoded frame (dec==NULL flushes the ring) */
 static int push_upscale(enc_ctx *c, AVFrame *dec)
 {
     if (c->temporal_r) return push_upscale_temporal(c, dec);
+    if (c->reuse || c->hq_n) return push_reuse(c, dec);
     if (!dec) return ring_drain(c);
     if (ring_make_room(c) < 0) return -1;
 
@@ -3241,18 +3573,8 @@ static int push_upscale(enc_ctx *c, AVFrame *dec)
         return 0;
     }
 
-    AVFrame *out = alloc_up(c);
+    AVFrame *out = infer_enqueue(c, dec);
     if (!out) return -1;
-    aji_frame in_f, out_f;
-    fill_aji_frame(c, &in_f, dec, 0);
-    fill_aji_frame(c, &out_f, out, 1);
-    int ret = aji_infer(c->aji, &in_f, &out_f, c->stream);
-    if (ret != AJI_OK) {
-        loge("aji_infer: %d: %s", ret, aji_last_error(c->aji));
-        av_frame_free(&out);
-        return -1;
-    }
-    out->pts = dec->pts;
     ring_commit(c, dec, out, aji_flush(c->aji, c->stream));
     return 0;
 }
@@ -3556,6 +3878,47 @@ static int push_frame(enc_ctx *c, AVFrame *fr)
     return c->rife_first ? push_rife_first(c, fr) : push_rife(c, fr);
 }
 
+/* held-frame reuse: on by default for a plain upscale chain on CUDA frames
+ * (see push_reuse); otherwise off, with a line saying why */
+static int reuse_setup(enc_ctx *c)
+{
+    if (!c->o.reuse_held) return 0;
+    const char *why = c->o.session ? "--preview-session"
+                    : c->dml       ? "the DirectML backend"
+                    : c->rife      ? "RIFE interpolates the frames"
+                    : c->passthrough ? "no upscale chain is active"
+                    : c->temporal_r ? "the chain is temporal"
+                    : NULL;
+    if (why) {
+        loge("held frames: not reused (%s)", why);
+        return 0;
+    }
+    int prio_lo = 0, prio_hi = 0;
+    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+    if (cudaStreamCreateWithPriority(&c->diff_stream, cudaStreamNonBlocking,
+                                     prio_hi) != cudaSuccess ||
+        !(c->anchor_out = av_frame_alloc())) {
+        loge("held frames: setup failed");
+        return -1;
+    }
+    for (int i = 0; i < REUSE_QMAX; i++)
+        if (cudaEventCreateWithFlags(&c->hq[i].ev, cudaEventDisableTiming)
+            != cudaSuccess) {
+            loge("held frames: setup failed");
+            return -1;
+        }
+    c->reuse_lag = c->ring_depth + 2;
+    const char *trace = getenv("AJI_REUSE_TRACE");
+    if (trace && *trace && !(c->reuse_trace = fopen(trace, "w")))
+        loge("held frames: can't write %s", trace);
+    c->reuse = 1;
+    loge("held frames: reusing the last upscale for unchanged frames "
+         "(tile threshold %.2f, fade threshold %.3f, at most %d in a row; "
+         "--no-reuse-held-frames turns it off)",
+         c->o.reuse_t, c->o.reuse_fade, REUSE_MAX_RUN);
+    return 0;
+}
+
 /* ---- main demux/decode loop ---------------------------------------------- */
 
 static int run(enc_ctx *c)
@@ -3679,6 +4042,9 @@ static int run(enc_ctx *c)
         loge("rife: produced %lld frames (~expected %lld), %lld scene dupes",
              (long long)c->out_frames, (long long)out_frames_est(c),
              (long long)c->scene_dupes);
+    if (c->o.reuse_held && c->reuse_seen)
+        loge("held frames: reused %lld of %lld (%.1f%%)", (long long)c->reused,
+             (long long)c->reuse_seen, 100.0 * c->reused / c->reuse_seen);
     if (c->damage_spots)
         loge("damaged video: %lld spot(s), encoded past (concealed frames "
              "kept, data the decoder rejected dropped)",
@@ -3879,6 +4245,15 @@ static void cleanup(enc_ctx *c)
     av_frame_free(&c->up_cur);
     av_frame_free(&c->up_interp);
     av_frame_free(&c->src_prev);
+    for (int i = 0; i < REUSE_QMAX; i++) {
+        av_frame_free(&c->hq[i].f);
+        if (c->hq[i].ev) cudaEventDestroy(c->hq[i].ev);
+    }
+    av_frame_free(&c->anchor_src);
+    av_frame_free(&c->anchor_out);
+    av_buffer_unref(&c->anchor_pool);
+    if (c->diff_stream) cudaStreamDestroy(c->diff_stream);
+    if (c->reuse_trace) fclose(c->reuse_trace);
     if (c->in_sws) sws_freeContext(c->in_sws);
     av_frame_free(&c->host_frame);
     if (c->graph) avfilter_graph_free(&c->graph);
@@ -3940,9 +4315,16 @@ static void usage(void)
 "           [--on-damage fail|continue] (damaged video: fail = stop at the first\n"
 "                           damaged spot, exit status 3 (default); continue = encode\n"
 "                           past it; each spot prints DAMAGE t=<s> frame=<n|-1>)\n"
+"           [--no-reuse-held-frames] (upscale every frame: by default a frame that\n"
+"                           is the same picture as the last upscaled one reuses its\n"
+"                           upscale; plain upscale chains on CUDA only)\n"
+"           tuning/debug: [--reuse-held-threshold D] (largest 8x8 tile mean difference,\n"
+"                           8-bit levels; default 2.5) [--reuse-held-fade-threshold F]\n"
+"                           (largest region brightness change; default %.2f)\n"
 "           [--preview <f.jpg> [--preview-width W]]\n"
 "           [--preview-session] (no --output: frames for a GUI's player)\n"
-"           (direct mode: --engine <e> --max-width W --max-height H)\n");
+"           (direct mode: --engine <e> --max-width W --max-height H)\n",
+    REUSE_FADE_DEFAULT);
 }
 
 /* Windows 11 power-throttles (EcoQoS) windowless processes whose parent
@@ -3974,6 +4356,9 @@ int main(int argc, char **argv)
     c.o.decoder = DEC_AUTO;
     c.o.pipeline_depth = 4;
     c.o.pix_fmt = OUT_420P10;     /* default: 10-bit 4:2:0 (matches old pipeline) */
+    c.o.reuse_held = 1;           /* held-frame reuse (see push_reuse) */
+    c.o.reuse_t = 2.5f;           /* --reuse-held-threshold */
+    c.o.reuse_fade = REUSE_FADE_DEFAULT;
     c.zc = -1;
     g_log = stderr;
 
@@ -3986,6 +4371,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--build-only")) c.o.build_only = 1;
         else if (!strcmp(a, "--preview-session")) c.o.session = 1;
         else if (!strcmp(a, "--no-zerocopy")) c.o.no_zerocopy = 1;
+        else if (!strcmp(a, "--reuse-held-frames")) c.o.reuse_held = 1;   /* the default */
+        else if (!strcmp(a, "--no-reuse-held-frames")) c.o.reuse_held = 0;
         else if (!strcmp(a, "--probe-encoders")) { probe_encoders(); return 0; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (i >= argc - 1) { usage(); return 2; }
@@ -4054,6 +4441,18 @@ int main(int argc, char **argv)
             if (!strcmp(v, "fail"))          c.o.on_damage = DAMAGE_FAIL;
             else if (!strcmp(v, "continue")) c.o.on_damage = DAMAGE_CONTINUE;
             else { loge("unknown --on-damage '%s' (fail|continue)", v); return 2; }
+        }
+        else if (!strcmp(a, "--reuse-held-threshold") ||
+                 !strcmp(a, "--reuse-held-fade-threshold")) {
+            char *end = NULL;
+            const double v = strtod(argv[++i], &end);
+            if (!end || *end || !(v >= 0)) {
+                loge("%s '%s': expected a number of 8-bit levels, 0 or more",
+                     a, argv[i]);
+                return 2;
+            }
+            if (!strcmp(a, "--reuse-held-threshold")) c.o.reuse_t = (float)v;
+            else c.o.reuse_fade = (float)v;
         }
         else if (!strcmp(a, "--preview")) c.o.preview = argv[++i];
         else if (!strcmp(a, "--preview-width")) c.o.preview_w = atoi(argv[++i]);
@@ -4125,6 +4524,7 @@ int main(int argc, char **argv)
     }
 
     if (resize_needed(&c)) compute_final_dims(&c);
+    if (reuse_setup(&c) < 0) goto out;
     /* RIFE-only chains interpolate into this pool too (at the source dims) */
     if ((!c.passthrough || c.rife_only) && init_aji_pool(&c) < 0) goto out;
     if (open_decoder(&c) < 0) goto out;

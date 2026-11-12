@@ -264,6 +264,34 @@ AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
 AJI_EXPORT int aji_resize_frame(aji_ctx *c, const aji_frame *in,
                                 const aji_frame *out, void *cu_stream);
 
+/* How different two frames are, for a caller deciding whether a frame is
+ * the same picture as an earlier one (aji_encode --reuse-held-frames).
+ * All values are in 8-bit units: 16-bit containers (P010, the 4:4:4
+ * formats) are divided by 256. */
+typedef struct aji_frame_diff_result {
+    /* The largest mean |b - a| of any 8x8 tile, over all planes: luma, and
+     * each chroma component in 8x8 tiles at its own resolution. */
+    float max_tile;
+    /* The signed mean (b - a) of luma in each region of a 4x4 grid over
+     * the frame, row-major (regions follow 8x8 tile edges: about a
+     * quarter of the width and height each). A fade moves these together
+     * while every tile stays small. */
+    float region_mean[16];
+} aji_frame_diff_result;
+
+/* Compare frames a and b (same format and dims; any format aji_infer takes
+ * as input on CUDA: NV12, P010, YUV444P16, YUV444P10MSB, YUV444P12MSB) and
+ * write *out. The documented synchronous exception, like aji_infer_rife:
+ * the result is a CPU readback, so this synchronizes cu_stream and returns
+ * with *out written. Uses its own scratch, apart from the chain's; give it
+ * a stream of its own to keep it from waiting for queued inference (both
+ * frames must be complete on that stream, as for aji_infer).
+ * TensorRT backends only: DirectML (and libaji before this call) returns
+ * AJI_ERR. Additive, no API_VERSION bump. */
+AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
+                              const aji_frame *b, aji_frame_diff_result *out,
+                              void *cu_stream);
+
 /* Async builds: returns 1 (once) when a background engine build finished;
  * the caller should re-run aji_configure, which now finds the engine in
  * the cache (or logs the failure and stays passthrough). Cheap to call
