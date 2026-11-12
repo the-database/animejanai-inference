@@ -206,7 +206,8 @@ static bool load_backend(const char *stem, aji_backend *be,
     // Optional: do not make old backends unusable for existing callers.
     *(void **)&be->infer_rife_with_scene = lib_sym(be->lib, "aji_infer_rife_with_scene");
     *(void **)&be->rife_enhanced_scene = lib_sym(be->lib, "aji_rife_enhanced_scene");
-    // Optional too: TensorRT backends only (DirectML has none).
+    // Optional too: aji_resize_frame is TensorRT-only (DirectML has none);
+    // aji_frame_diff is in every backend since its DirectML port.
     *(void **)&be->resize_frame = lib_sym(be->lib, "aji_resize_frame");
     *(void **)&be->frame_diff = lib_sym(be->lib, "aji_frame_diff");
     SYM(temporal_radius, "aji_temporal_radius");

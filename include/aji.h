@@ -280,14 +280,22 @@ typedef struct aji_frame_diff_result {
 } aji_frame_diff_result;
 
 /* Compare frames a and b (same format and dims; any format aji_infer takes
- * as input on CUDA: NV12, P010, YUV444P16, YUV444P10MSB, YUV444P12MSB) and
- * write *out. The documented synchronous exception, like aji_infer_rife:
- * the result is a CPU readback, so this synchronizes cu_stream and returns
- * with *out written. Uses its own scratch, apart from the chain's; give it
- * a stream of its own to keep it from waiting for queued inference (both
- * frames must be complete on that stream, as for aji_infer).
- * TensorRT backends only: DirectML (and libaji before this call) returns
- * AJI_ERR. Additive, no API_VERSION bump. */
+ * as input: on CUDA NV12, P010, YUV444P16, YUV444P10MSB, YUV444P12MSB; on
+ * DirectML NV12, P010 and RGB10A2, whose R, G and B count as three
+ * components of one plane, divided by 4, regions their mean) and write
+ * *out. Both backends give the same values for the same frames. The
+ * documented synchronous exception, like aji_infer_rife: the result is a
+ * CPU readback, so this returns with *out written. Uses its own scratch,
+ * apart from the chain's.
+ *  - TensorRT: synchronizes cu_stream. Give it a stream of its own to keep
+ *    it from waiting for queued inference (both frames must be complete on
+ *    that stream, as for aji_infer).
+ *  - DirectML: cu_stream is ignored. Like aji_infer, it reads the frames
+ *    after all work queued on the caller's D3D11 immediate context before
+ *    the call (a shared-fence signal), on a queue of its own, so it never
+ *    waits for queued inference.
+ * libaji before this call returns AJI_ERR. Additive, no API_VERSION
+ * bump. */
 AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, aji_frame_diff_result *out,
                               void *cu_stream);

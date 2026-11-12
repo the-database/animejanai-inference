@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "aji.h"
+#include "frame_diff.h"
 #include "kernels.h"
 #include "resample.h"
 
@@ -712,7 +713,7 @@ __global__ void k_tile_diff(const uint8_t *a, ptrdiff_t sa, const uint8_t *b,
                 }
             }
         }
-        const float inv = scale / (float)(nx * ny);
+        const float inv = aji_frame_diff_tile_inv(scale, nx * ny);
 #pragma unroll
         for (int k = 0; k < C; k++)
             m = fmaxf(m, (float)asum[k] * inv);
@@ -746,7 +747,7 @@ extern "C" int aji_frame_diff_launch(const aji_frame *a, const aji_frame *b,
     if (f != AJI_FMT_NV12 && f != AJI_FMT_P010 && !f444)
         return -1;
     const bool wide = f != AJI_FMT_NV12;
-    const float scale = wide ? 1.0f / 256.0f : 1.0f;
+    const float scale = aji_frame_diff_scale(f);
     cudaStream_t s = (cudaStream_t)stream;
     fdiff_acc *acc = (fdiff_acc *)acc_dev;
     cudaError_t e = cudaMemsetAsync(acc, 0, sizeof(fdiff_acc), s);
@@ -791,25 +792,11 @@ extern "C" void aji_frame_diff_finish(const aji_frame *a, const void *acc_host,
     float m;
     memcpy(&m, &acc.max_bits, sizeof(m));
     out->max_tile = m;
-    const double scale = a->format == AJI_FMT_NV12 ? 1.0 : 1.0 / 256.0;
-    const int tiles[2] = {(a->width + 7) / 8, (a->height + 7) / 8};
-    const int dims[2] = {a->width, a->height};
-    int span[2][4];   // pixels per grid column / row
-    for (int d = 0; d < 2; d++) {
-        for (int i = 0; i < 4; i++) {
-            // the tiles t with t * 4 / tiles == i: [ceil(i*T/4), ceil((i+1)*T/4))
-            const int lo = (i * tiles[d] + 3) / 4;
-            const int hi = ((i + 1) * tiles[d] + 3) / 4;
-            span[d][i] = hi > lo ? min(hi * 8, dims[d]) - lo * 8 : 0;
-        }
-    }
-    for (int ry = 0; ry < 4; ry++) {
-        for (int rx = 0; rx < 4; rx++) {
-            const double n = (double)span[0][rx] * span[1][ry];
-            const long long sum = (long long)acc.region[ry * 4 + rx];
-            out->region_mean[ry * 4 + rx] = n > 0 ? (float)(sum * scale / n) : 0.0f;
-        }
-    }
+    long long sum[16];
+    for (int i = 0; i < 16; i++)
+        sum[i] = (long long)acc.region[i];
+    aji_frame_diff_regions(a->width, a->height, a->format, 1, sum,
+                           out->region_mean);
 }
 
 /* ---------------- temporal (multi-frame) models ---------------- */
