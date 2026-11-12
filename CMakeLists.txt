@@ -344,6 +344,11 @@ add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
 target_include_directories(aji_msb444_test PRIVATE include src)
 target_link_libraries(aji_msb444_test PRIVATE CUDA::cudart)
 
+# aji_frame_diff's tile and region differences (held-frame reuse).
+add_executable(aji_frame_diff_test sanity/frame_diff.cu src/kernels.cu)
+target_include_directories(aji_frame_diff_test PRIVATE include src)
+target_link_libraries(aji_frame_diff_test PRIVATE CUDA::cudart)
+
 # Regression for concurrent first CUDA runtime loading in separate DLLs.
 if(WIN32)
     foreach(probe IN ITEMS aji_cuda_init_a aji_cuda_init_b)
@@ -365,7 +370,7 @@ foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_r
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS cpu)
 endforeach()
-foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test)
+foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS gpu)
 endforeach()
