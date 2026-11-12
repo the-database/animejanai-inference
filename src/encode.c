@@ -313,11 +313,11 @@ typedef struct {
     int64_t   pts;       /* output PTS in the video stream time_base */
 } slot;
 
-/* held-frame reuse: a decoded frame waiting for its decision, and the
- * event recorded on the legacy stream when it arrived */
+/* held-frame reuse: a decoded frame waiting for its decision, and (CUDA)
+ * the event recorded on the legacy stream when it arrived */
 typedef struct {
     AVFrame     *f;
-    cudaEvent_t  ev;
+    cudaEvent_t  ev;         /* NULL on DirectML (see reuse_arrived) */
 } held_frame;
 
 /* a still-image encoder (scaler + PNG/MJPEG), kept across frames */
@@ -517,7 +517,7 @@ typedef struct {
 
     /* held-frame reuse (see push_reuse) */
     int              reuse;          /* on: requested, and a plain upscale chain */
-    cudaStream_t     diff_stream;    /* aji_frame_diff and anchor copies only */
+    cudaStream_t     diff_stream;    /* CUDA: aji_frame_diff and anchor copies only */
     AVBufferRef     *anchor_pool;    /* one source-format frame: */
     AVFrame         *anchor_src;     /* a copy of the last upscaled source frame */
     AVFrame         *anchor_out;     /* a ref of its upscaled output */
@@ -3330,7 +3330,11 @@ static AVFrame *infer_enqueue(enc_ctx *c, AVFrame *dec)
  * wall time fell 24-31%, about in proportion to the reuse rate; where NVENC
  * is (VideoJaNai's p7 at 4K on a fast GPU), it doesn't change.
  *
- * Streams: libav's decoder copies (and uploads) frames on CUDA's legacy
+ * The rule, the queue and the anchor are the same on both backends; only
+ * the three steps that touch the GPU differ (reuse_arrived, the waits in
+ * reuse_cmp, reuse_copy_anchor).
+ *
+ * CUDA: libav's decoder copies (and uploads) frames on CUDA's legacy
  * default stream, which waits for all work queued on c->stream before it.
  * A decoded frame is therefore only ready once the inference queued ahead
  * of it is done, and a comparison on a blocking stream would wait for all
@@ -3342,8 +3346,29 @@ static AVFrame *infer_enqueue(enc_ctx *c, AVFrame *dec)
  * wait for. Decisions are still made in order and each frame still goes
  * into the ring, so the output order and timestamps don't change.
  *
+ * DirectML: frames are D3D11 textures that libav uploads (and the anchor
+ * copy copies) on the D3D11 immediate context, which never waits for
+ * libaji's D3D12 inference queue (libaji only signals a shared fence from
+ * it, and aji_encode waits for outputs on the CPU). aji_frame_diff signals
+ * that fence after everything queued on the context so far and compares on
+ * a D3D12 queue of its own that waits for the signal, so a frame is
+ * compared only after its upload, the anchor only after its copy, and
+ * neither waits for queued inference. No events are needed; the decision
+ * lag is the same as on CUDA. It does wait for whatever else is queued on
+ * the D3D11 context, and NVENC's zero-copy encodes of D3D11 frames are:
+ * with NVENC a comparison waits for the queued encodes (about 15 ms at p7
+ * 4K on the RTX 5090, against 1.2-1.7 ms with a CPU encoder or p1), so
+ * where NVENC is the limit reuse costs time instead of saving it.
+ * Evidence (2878 frames of two 1080p clips, 2x to 4K): every decision, D
+ * and region mean is the same as on CUDA (238 and 904 frames reused), and
+ * frame counts and timestamps match an encode without reuse. RTX 5090,
+ * NVENC p7: 6-8% slower; p1: 6% and 23% faster. Intel UHD 770 (the
+ * Performance model, QSV, 480 frames, 15% and 32% reused): 11% and 24%
+ * faster, with the same decisions as the RTX 5090.
+ *
  * The anchor's source is a copy, in a pool of its own (keeping the
- * decoder's frame through a long still would starve NVDEC's pool). A
+ * decoder's frame through a long still would starve NVDEC's pool; on
+ * DirectML it is a shareable D3D11 texture like the others). A
  * reused frame takes a ring slot like any other, with an av_frame_clone of
  * the anchor's output and ticket 0: slots are reclaimed in order
  * (ring_reclaim from the oldest), so the anchor's own slot has waited for
@@ -3369,9 +3394,23 @@ static int frame_damaged(const AVFrame *f)
            f->opaque == DMG_TAG;
 }
 
+/* a decoded frame joined the reuse queue: CUDA records its arrival on the
+ * legacy stream (after libav's copy or upload of it); DirectML needs
+ * nothing, as aji_frame_diff orders itself after the D3D11 upload */
+static int reuse_arrived(enc_ctx *c, held_frame *h)
+{
+    if (c->dml) return 0;
+    if (cudaEventRecord(h->ev, 0) != cudaSuccess) {
+        loge("held frames: cudaEventRecord failed");
+        return -1;
+    }
+    return 0;
+}
+
 /* D(a, b) and fade(a, b) (NULL: not wanted); 0, or -1 if aji_frame_diff
  * failed (logged, and reuse stops). ev_a/ev_b: the frames' arrival events
- * (NULL: the anchor, which diff_stream wrote itself) */
+ * (NULL: the anchor, which diff_stream wrote itself; always NULL on
+ * DirectML) */
 static int reuse_cmp(enc_ctx *c, AVFrame *a, cudaEvent_t ev_a, AVFrame *b,
                      cudaEvent_t ev_b, const char *pair, float *d, float *fade)
 {
@@ -3408,19 +3447,27 @@ static int reuse_cmp(enc_ctx *c, AVFrame *a, cudaEvent_t ev_a, AVFrame *b,
     return 0;
 }
 
-/* make dec, just enqueued for upscaling into out, the anchor */
-static int reuse_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev, AVFrame *out)
+/* copy dec (arrived at ev) into c->anchor_src */
+static int reuse_copy_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev)
 {
-    if (!c->anchor_src) {
-        if (!c->anchor_pool &&
-            !(c->anchor_pool = make_pool(c, src_sw_fmt(c), c->src_w, c->src_h, 1)))
-            return -1;
-        c->anchor_src = av_frame_alloc();
-        if (!c->anchor_src ||
-            av_hwframe_get_buffer(c->anchor_pool, c->anchor_src, 0) < 0) {
-            av_frame_free(&c->anchor_src);
-            return -1;
-        }
+    if (c->dml) {
+#ifdef _WIN32
+        /* on the D3D11 immediate context, after dec's upload; the next
+         * aji_frame_diff waits for it (see push_reuse), and a later upload
+         * into dec's texture, once it is back in its pool, comes after it
+         * on the same context */
+        AVHWDeviceContext *dc = (AVHWDeviceContext *)c->hw_device->data;
+        AVD3D11VADeviceContext *dx = (AVD3D11VADeviceContext *)dc->hwctx;
+        dx->lock(dx->lock_ctx);
+        ID3D11DeviceContext_CopySubresourceRegion(
+            dx->device_context, (ID3D11Resource *)c->anchor_src->data[0],
+            (UINT)(intptr_t)c->anchor_src->data[1], 0, 0, 0,
+            (ID3D11Resource *)dec->data[0], (UINT)(intptr_t)dec->data[1], NULL);
+        dx->unlock(dx->lock_ctx);
+        return 0;
+#else
+        return -1;
+#endif
     }
     const enum AVPixelFormat sw = src_sw_fmt(c);
     const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(sw);
@@ -3439,7 +3486,24 @@ static int reuse_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev, AVFrame *out)
     }
     /* done before dec can go back to its pool: its ring slot only waits
      * for c->stream */
-    if (cudaStreamSynchronize(c->diff_stream) != cudaSuccess) return -1;
+    return cudaStreamSynchronize(c->diff_stream) == cudaSuccess ? 0 : -1;
+}
+
+/* make dec, just enqueued for upscaling into out, the anchor */
+static int reuse_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev, AVFrame *out)
+{
+    if (!c->anchor_src) {
+        if (!c->anchor_pool &&
+            !(c->anchor_pool = make_pool(c, src_sw_fmt(c), c->src_w, c->src_h, 1)))
+            return -1;
+        c->anchor_src = av_frame_alloc();
+        if (!c->anchor_src ||
+            av_hwframe_get_buffer(c->anchor_pool, c->anchor_src, 0) < 0) {
+            av_frame_free(&c->anchor_src);
+            return -1;
+        }
+    }
+    if (reuse_copy_anchor(c, dec, ev) < 0) return -1;
     av_frame_unref(c->anchor_out);
     if (av_frame_ref(c->anchor_out, out) < 0) return -1;
     c->have_anchor = 1;
@@ -3527,9 +3591,7 @@ static int push_reuse(enc_ctx *c, AVFrame *dec)
     int queued = 0;
     if (dec && c->reuse) {
         held_frame *h = &c->hq[(c->hq_head + c->hq_n) % REUSE_QMAX];
-        /* the legacy stream: after libav's copy or upload of the frame */
-        if (cudaEventRecord(h->ev, 0) != cudaSuccess) {
-            loge("held frames: cudaEventRecord failed");
+        if (reuse_arrived(c, h) < 0) {
             av_frame_free(&dec);
             return -1;
         }
@@ -3878,13 +3940,12 @@ static int push_frame(enc_ctx *c, AVFrame *fr)
     return c->rife_first ? push_rife_first(c, fr) : push_rife(c, fr);
 }
 
-/* held-frame reuse: on by default for a plain upscale chain on CUDA frames
- * (see push_reuse); otherwise off, with a line saying why */
+/* held-frame reuse: on by default for a plain upscale chain, CUDA or
+ * DirectML (see push_reuse); otherwise off, with a line saying why */
 static int reuse_setup(enc_ctx *c)
 {
     if (!c->o.reuse_held) return 0;
     const char *why = c->o.session ? "--preview-session"
-                    : c->dml       ? "the DirectML backend"
                     : c->rife      ? "RIFE interpolates the frames"
                     : c->passthrough ? "no upscale chain is active"
                     : c->temporal_r ? "the chain is temporal"
@@ -3893,20 +3954,25 @@ static int reuse_setup(enc_ctx *c)
         loge("held frames: not reused (%s)", why);
         return 0;
     }
-    int prio_lo = 0, prio_hi = 0;
-    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
-    if (cudaStreamCreateWithPriority(&c->diff_stream, cudaStreamNonBlocking,
-                                     prio_hi) != cudaSuccess ||
-        !(c->anchor_out = av_frame_alloc())) {
+    if (!(c->anchor_out = av_frame_alloc())) {
         loge("held frames: setup failed");
         return -1;
     }
-    for (int i = 0; i < REUSE_QMAX; i++)
-        if (cudaEventCreateWithFlags(&c->hq[i].ev, cudaEventDisableTiming)
-            != cudaSuccess) {
+    if (!c->dml) {      /* DirectML makes no CUDA call (see push_reuse) */
+        int prio_lo = 0, prio_hi = 0;
+        cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+        if (cudaStreamCreateWithPriority(&c->diff_stream, cudaStreamNonBlocking,
+                                         prio_hi) != cudaSuccess) {
             loge("held frames: setup failed");
             return -1;
         }
+        for (int i = 0; i < REUSE_QMAX; i++)
+            if (cudaEventCreateWithFlags(&c->hq[i].ev, cudaEventDisableTiming)
+                != cudaSuccess) {
+                loge("held frames: setup failed");
+                return -1;
+            }
+    }
     c->reuse_lag = c->ring_depth + 2;
     const char *trace = getenv("AJI_REUSE_TRACE");
     if (trace && *trace && !(c->reuse_trace = fopen(trace, "w")))
@@ -4317,7 +4383,7 @@ static void usage(void)
 "                           past it; each spot prints DAMAGE t=<s> frame=<n|-1>)\n"
 "           [--no-reuse-held-frames] (upscale every frame: by default a frame that\n"
 "                           is the same picture as the last upscaled one reuses its\n"
-"                           upscale; plain upscale chains on CUDA only)\n"
+"                           upscale; plain upscale chains only)\n"
 "           tuning/debug: [--reuse-held-threshold D] (largest 8x8 tile mean difference,\n"
 "                           8-bit levels; default 2.5) [--reuse-held-fade-threshold F]\n"
 "                           (largest region brightness change; default %.2f)\n"

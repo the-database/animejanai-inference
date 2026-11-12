@@ -49,6 +49,7 @@
 #include "aji.h"
 #include "aji_conf.h"
 #include "dml_shaders.h"
+#include "frame_diff.h"
 #include "onnx_shape.h"
 #include "resample.h"
 #include "core/fileio.h"
@@ -84,13 +85,14 @@ enum Kern {
     K_H_F32, K_UV_V_STORE, K_RS_H, K_RS_V,
     K_FILL, K_WINDOW, K_RIFE_CONSTS, K_SCD_PARTIAL, K_SCD_FINAL,
     K_PRE_RGB10, K_POST_RGB10, K_RGB_DIFF_PARTIAL, K_TEMPORAL_GATHER,
+    K_FRAME_DIFF,
 };
 const char *const KERN_ENTRY[] = {
     "cs_uv_h", "cs_v_f32", "cs_pre_combine", "cs_post_matrix",
     "cs_h_f32", "cs_uv_v_store", "cs_rs_h", "cs_rs_v",
     "cs_fill", "cs_window", "cs_rife_consts", "cs_scd_partial",
     "cs_scd_final", "cs_pre_rgb10", "cs_post_rgb10", "cs_rgb_diff_partial",
-    "cs_temporal_gather",
+    "cs_temporal_gather", "cs_frame_diff",
 };
 
 struct DmlPass {
@@ -280,6 +282,33 @@ struct aji_ctx {
         uint64_t ingests = 0;        // AJI_TEMPORAL_STATS
         std::vector<TemporalStage> st;
     } temporal;
+
+    // aji_frame_diff (held-frame reuse in aji_encode): a COMPUTE queue of
+    // its own, so a comparison never waits behind inference queued on
+    // `queue`, with its own recording, fence and staging. Synchronous, so
+    // one allocator/list pair is enough.
+    struct {
+        ComPtr<ID3D12CommandQueue> queue;
+        ComPtr<ID3D12CommandAllocator> alloc;
+        ComPtr<ID3D12GraphicsCommandList> cl;
+        ComPtr<ID3D12Fence> fence;
+        HANDLE event = NULL;
+        uint64_t val = 0;
+        ComPtr<ID3D12Resource> y[2], uv[2];  // planes of a and b, pitched
+        uint32_t pitch = 0;
+        int key[3] = {0};                    // format, w, h of the staging
+        ComPtr<ID3D12Resource> inv;          // scale / n, n = 0..64 (upload)
+        ComPtr<ID3D12Resource> acc, read;    // 33 dwords (see cs_frame_diff)
+        // Opened frames, each with a reference to its D3D11 texture: while
+        // an entry holds it, the texture can't be freed and its address
+        // can't come back as another texture's (which a cache keyed by
+        // address alone would then misread).
+        struct Opened {
+            ComPtr<IUnknown> tex11;
+            ComPtr<ID3D12Resource> res;
+        };
+        std::map<void *, Opened> opened;
+    } fd;
 
     void set_error(const char *fmt, ...) {
         va_list ap;
@@ -562,6 +591,26 @@ bool make_rootsig(aji_ctx *c)
 
 /* ---------------- command recording ---------------- */
 
+// Record one kernel on cl: gx x gy threads (32 x 8 per group), gz deep.
+bool dispatch_on(aji_ctx *c, ID3D12GraphicsCommandList *cl, Kern k, bool t16,
+                 bool io16, const KernArgs &args, ID3D12Resource *s0,
+                 ID3D12Resource *s1, ID3D12Resource *u0, ID3D12Resource *u1,
+                 ID3D12Resource *u2, int gx, int gy, int gz)
+{
+    ID3D12PipelineState *pso = get_pso(c, k, t16, io16);
+    if (!pso)
+        return false;
+    cl->SetPipelineState(pso);
+    cl->SetComputeRoot32BitConstants(0, 16, &args, 0);
+    if (s0) cl->SetComputeRootShaderResourceView(1, s0->GetGPUVirtualAddress());
+    if (s1) cl->SetComputeRootShaderResourceView(2, s1->GetGPUVirtualAddress());
+    if (u0) cl->SetComputeRootUnorderedAccessView(3, u0->GetGPUVirtualAddress());
+    if (u1) cl->SetComputeRootUnorderedAccessView(4, u1->GetGPUVirtualAddress());
+    if (u2) cl->SetComputeRootUnorderedAccessView(5, u2->GetGPUVirtualAddress());
+    cl->Dispatch((gx + 31) / 32, (gy + 7) / 8, gz);
+    return true;
+}
+
 struct Recorder {
     aji_ctx *c;
     bool open = false;
@@ -636,18 +685,8 @@ struct Recorder {
                   ID3D12Resource *s0, ID3D12Resource *s1, ID3D12Resource *u0,
                   ID3D12Resource *u1, ID3D12Resource *u2,
                   int gx, int gy, int gz) {
-        ID3D12PipelineState *pso = get_pso(c, k, t16, io16);
-        if (!pso)
-            return false;
-        c->cl->SetPipelineState(pso);
-        c->cl->SetComputeRoot32BitConstants(0, 16, &args, 0);
-        if (s0) c->cl->SetComputeRootShaderResourceView(1, s0->GetGPUVirtualAddress());
-        if (s1) c->cl->SetComputeRootShaderResourceView(2, s1->GetGPUVirtualAddress());
-        if (u0) c->cl->SetComputeRootUnorderedAccessView(3, u0->GetGPUVirtualAddress());
-        if (u1) c->cl->SetComputeRootUnorderedAccessView(4, u1->GetGPUVirtualAddress());
-        if (u2) c->cl->SetComputeRootUnorderedAccessView(5, u2->GetGPUVirtualAddress());
-        c->cl->Dispatch((gx + 31) / 32, (gy + 7) / 8, gz);
-        return true;
+        return dispatch_on(c, c->cl.Get(), k, t16, io16, args, s0, s1, u0,
+                           u1, u2, gx, gy, gz);
     }
 };
 
@@ -854,11 +893,9 @@ bool record_resize(aji_ctx *c, Recorder &r, DmlPlan *p, ID3D12Resource *src,
 
 void diagnose_device(aji_ctx *c, const char *where);
 
-ID3D12Resource *open_shared(aji_ctx *c, void *tex11)
+// Open a shared D3D11 texture on our D3D12 device (uncached).
+ComPtr<ID3D12Resource> open_shared_uncached(aji_ctx *c, void *tex11)
 {
-    auto it = c->shared.find(tex11);
-    if (it != c->shared.end())
-        return it->second.Get();
     ComPtr<IDXGIResource1> dxgi;
     if (FAILED(((IUnknown *)tex11)
                    ->QueryInterface(IID_PPV_ARGS(&dxgi)))) {
@@ -881,6 +918,17 @@ ID3D12Resource *open_shared(aji_ctx *c, void *tex11)
         diagnose_device(c, "OpenSharedHandle");
         return nullptr;
     }
+    return res;
+}
+
+ID3D12Resource *open_shared(aji_ctx *c, void *tex11)
+{
+    auto it = c->shared.find(tex11);
+    if (it != c->shared.end())
+        return it->second.Get();
+    ComPtr<ID3D12Resource> res = open_shared_uncached(c, tex11);
+    if (!res)
+        return nullptr;
     c->shared[tex11] = res;
     return c->shared[tex11].Get();
 }
@@ -984,11 +1032,14 @@ ComPtr<ID3D12Resource> make_readback(ID3D12Device *dev, uint64_t bytes)
     return res;
 }
 
-// copy one plane between a shared texture and a staging buffer
+// copy one plane between a shared texture and a staging buffer (recorded
+// on cl, by default the current recording's)
 void copy_plane(aji_ctx *c, bool to_buffer, ID3D12Resource *tex, UINT subres,
                 int plane, int format, int w, int h, ID3D12Resource *buf,
-                uint32_t pitch)
+                uint32_t pitch, ID3D12GraphicsCommandList *cl = nullptr)
 {
+    if (!cl)
+        cl = c->cl.Get();
     D3D12_RESOURCE_DESC td = tex->GetDesc();
     D3D12_TEXTURE_COPY_LOCATION t = {};
     t.pResource = tex;
@@ -1005,9 +1056,9 @@ void copy_plane(aji_ctx *c, bool to_buffer, ID3D12Resource *tex, UINT subres,
     b.PlacedFootprint.Footprint.RowPitch = pitch;
 
     if (to_buffer)
-        c->cl->CopyTextureRegion(&b, 0, 0, 0, &t, NULL);
+        cl->CopyTextureRegion(&b, 0, 0, 0, &t, NULL);
     else
-        c->cl->CopyTextureRegion(&t, 0, 0, 0, &b, NULL);
+        cl->CopyTextureRegion(&t, 0, 0, 0, &b, NULL);
 }
 
 /* ---------------- ORT session handling ---------------- */
@@ -3240,6 +3291,255 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
     return AJI_OK;
 }
 
+/* ---------------- frame difference (aji_frame_diff) ---------------- */
+
+// Held-frame reuse (aji_encode): kernels.cu's tile and region differences
+// of two frames (cs_frame_diff, the same arithmetic: see frame_diff.h), read
+// back to the host, so this is synchronous like aji_infer_rife.
+//
+// Ordering: a and b are D3D11 textures the caller wrote (uploads, copies)
+// on its immediate context. As for aji_infer, a signal of the shared fence
+// on that context after a Flush covers every write queued before this
+// call, and the comparison waits for it on the GPU. The comparison runs on
+// a COMPUTE queue of its own (high priority), not on `queue`: it waits for
+// nothing queued for inference there, only for the D3D11 work before it.
+// The textures are read through implicit promotion from COMMON to
+// COPY_SOURCE (decaying back at the end of the submission) rather than
+// explicit transitions, so this queue never changes a frame's state under
+// the inference queue. Uses its own staging and accumulator, apart from
+// the chain's: any time after aji_create, configured or not.
+extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b,
+                                         aji_frame_diff_result *out,
+                                         void *cu_stream)
+{
+    (void)cu_stream;
+    if (!c || !a || !b || !out)
+        return AJI_ERR;
+    const int fmt = a->format;
+    if (fmt != AJI_FMT_NV12 && fmt != AJI_FMT_P010 && fmt != AJI_FMT_RGB10A2) {
+        c->set_error("aji_frame_diff: unsupported format %d", fmt);
+        return AJI_ERR_FORMAT;
+    }
+    if (b->format != fmt) {
+        c->set_error("aji_frame_diff requires matching formats");
+        return AJI_ERR_FORMAT;
+    }
+    const bool rgb = fmt == AJI_FMT_RGB10A2;
+    if (a->width < 1 || a->height < 1 || b->width != a->width ||
+        b->height != a->height || (!rgb && ((a->width | a->height) & 1))) {
+        c->set_error("aji_frame_diff dims %dx%d vs %dx%d", a->width,
+                     a->height, b->width, b->height);
+        return AJI_ERR_SHAPE;
+    }
+    if (FAILED(c->dev->GetDeviceRemovedReason())) {
+        diagnose_device(c, "aji_frame_diff entry");
+        return AJI_ERR;
+    }
+    auto &F = c->fd;
+    const int w = a->width, h = a->height;
+    const int bpp = rgb ? 4 : (fmt == AJI_FMT_P010 ? 2 : 1);
+
+    if (!F.queue) {
+        D3D12_COMMAND_QUEUE_DESC qd = {};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+        qd.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+        if (FAILED(c->dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&F.queue))) ||
+            FAILED(c->dev->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&F.alloc))) ||
+            FAILED(c->dev->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_COMPUTE, F.alloc.Get(), NULL,
+                IID_PPV_ARGS(&F.cl))) ||
+            FAILED(F.cl->Close()) ||
+            FAILED(c->dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                       IID_PPV_ARGS(&F.fence))) ||
+            !(F.event = CreateEventA(NULL, FALSE, FALSE, NULL)) ||
+            !(F.acc = make_buffer(c->dev.Get(), 33 * 4, false)) ||
+            !(F.read = make_readback(c->dev.Get(), 33 * 4))) {
+            F.queue.Reset();
+            c->set_error("aji_frame_diff: D3D12 setup failed");
+            return AJI_ERR;
+        }
+    }
+    const int key[3] = {fmt, w, h};
+    if (memcmp(key, F.key, sizeof(key)) != 0) {
+        F.key[0] = 0;
+        F.pitch = align256((uint32_t)(w * bpp));
+        // 4 KiB of slack past each plane: root UAVs have no bounds checks,
+        // and drivers widen cs_frame_diff's dword loads of a tile row past
+        // the plane's end (without it: a page fault right past the last
+        // row on the UHD 770, a hang on the RTX 5090, wherever nothing
+        // else was mapped after the buffer)
+        const uint64_t slack = 4096;
+        for (int i = 0; i < 2; i++) {
+            F.y[i] = make_buffer(c->dev.Get(), (uint64_t)F.pitch * h + slack,
+                                 false);
+            F.uv[i] = rgb ? nullptr
+                          : make_buffer(c->dev.Get(),
+                                        (uint64_t)F.pitch * (h / 2) + slack,
+                                        false);
+            if (!F.y[i] || (!rgb && !F.uv[i])) {
+                c->set_error("aji_frame_diff: staging allocation failed");
+                return AJI_ERR;
+            }
+        }
+        // weights[n] = scale / n for a tile of n pixels (cs_frame_diff)
+        float inv[65] = {0.0f};
+        const float scale = aji_frame_diff_scale(fmt);
+        for (int n = 1; n <= 64; n++)
+            inv[n] = aji_frame_diff_tile_inv(scale, n);
+        F.inv = make_buffer(c->dev.Get(), sizeof(inv), true);
+        void *m = nullptr;
+        D3D12_RANGE none = {0, 0};
+        if (!F.inv || FAILED(F.inv->Map(0, &none, &m))) {
+            c->set_error("aji_frame_diff: allocation failed");
+            return AJI_ERR;
+        }
+        memcpy(m, inv, sizeof(inv));
+        F.inv->Unmap(0, NULL);
+        memcpy(F.key, key, sizeof(key));
+    }
+
+    // aji_encode compares a few dozen pool textures; anything beyond that
+    // starts over (dropping references, never misreading)
+    if (F.opened.size() > 256)
+        F.opened.clear();
+    ID3D12Resource *tex[2];
+    for (int i = 0; i < 2; i++) {
+        void *t11 = (i ? b : a)->plane[0];
+        auto it = F.opened.find(t11);
+        if (it == F.opened.end()) {
+            decltype(F.opened)::mapped_type o;
+            o.tex11 = (IUnknown *)t11;
+            if (!(o.res = open_shared_uncached(c, t11)))
+                return AJI_ERR;
+            it = F.opened.emplace(t11, std::move(o)).first;
+        }
+        tex[i] = it->second.res.Get();
+        const D3D12_RESOURCE_DESC rd = tex[i]->GetDesc();
+        const DXGI_FORMAT want = rgb ? DXGI_FORMAT_R10G10B10A2_UNORM
+                               : fmt == AJI_FMT_P010 ? DXGI_FORMAT_P010
+                                                     : DXGI_FORMAT_NV12;
+        if (rd.Format != want || rd.Width < (UINT64)w || rd.Height < (UINT)h) {
+            c->set_error("aji_frame_diff: frame %c is a %llux%u texture of "
+                         "DXGI format %d, not %dx%d of %d", 'a' + i,
+                         (unsigned long long)rd.Width, rd.Height,
+                         (int)rd.Format, w, h, (int)want);
+            return AJI_ERR_FORMAT;
+        }
+    }
+    const UINT sub[2] = {(UINT)(intptr_t)a->plane[1],
+                         (UINT)(intptr_t)b->plane[1]};
+
+    // the frames are ready once the caller's D3D11 work before this call is
+    c->fence_val++;
+    c->ctx11_4->Signal(c->fence11.Get(), c->fence_val);
+    c->ctx11->Flush();
+    F.queue->Wait(c->fence.Get(), c->fence_val);
+
+    ID3D12GraphicsCommandList *cl = F.cl.Get();
+    if (FAILED(F.alloc->Reset()) || FAILED(cl->Reset(F.alloc.Get(), NULL))) {
+        c->set_error("aji_frame_diff: command list reset failed");
+        return AJI_ERR;
+    }
+    cl->SetComputeRootSignature(c->rootsig.Get());
+    const int np = rgb ? 1 : 2;
+    ID3D12Resource *st[2][2] = {{F.y[0].Get(), F.uv[0].Get()},
+                                {F.y[1].Get(), F.uv[1].Get()}};
+    D3D12_RESOURCE_BARRIER bs[4] = {};
+    UINT nb = 0;
+    for (int i = 0; i < 2; i++) {
+        for (int p = 0; p < np; p++) {
+            copy_plane(c, true, tex[i], sub[i], p, fmt, w, h, st[i][p],
+                       F.pitch, cl);
+            bs[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bs[nb].Transition = {st[i][p], 0, D3D12_RESOURCE_STATE_COPY_DEST,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+            nb++;
+        }
+    }
+    cl->ResourceBarrier(nb, bs);
+    KernArgs z = {};
+    z.di[0] = 33;
+    if (!dispatch_on(c, cl, K_FILL, false, false, z, NULL, NULL, F.acc.Get(),
+                     NULL, NULL, 32, 1, 1)) {
+        cl->Close();
+        return AJI_ERR;
+    }
+    {
+        D3D12_RESOURCE_BARRIER ub = {};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        cl->ResourceBarrier(1, &ub);
+    }
+    for (int p = 0; p < np; p++) {
+        // 4:2:0's second plane is CbCr interleaved at half size
+        const int pw = p ? (w + 1) / 2 : w, ph = p ? (h + 1) / 2 : h;
+        KernArgs k = {};
+        k.di[0] = pw;
+        k.di[1] = ph;
+        k.di[2] = rgb ? 3 : (p ? 2 : 1);
+        k.di[3] = p == 0;
+        k.dj[0] = (int)F.pitch;
+        k.dj[1] = (int)F.pitch;
+        k.dj[2] = rgb ? 2 : (fmt == AJI_FMT_P010 ? 1 : 0);
+        if (!dispatch_on(c, cl, K_FRAME_DIFF, false, false, k, NULL,
+                         F.inv.Get(), st[0][p], st[1][p], F.acc.Get(),
+                         (pw + 7) / 8, (ph + 7) / 8, 1)) {
+            cl->Close();
+            return AJI_ERR;
+        }
+    }
+    {
+        D3D12_RESOURCE_BARRIER tb = {};
+        tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        tb.Transition = {F.acc.Get(), 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_COPY_SOURCE};
+        cl->ResourceBarrier(1, &tb);
+    }
+    cl->CopyBufferRegion(F.read.Get(), 0, F.acc.Get(), 0, 33 * 4);
+    if (FAILED(cl->Close())) {
+        c->set_error("aji_frame_diff: command list close failed");
+        diagnose_device(c, "aji_frame_diff close");
+        return AJI_ERR;
+    }
+    ID3D12CommandList *lists[] = {cl};
+    F.queue->ExecuteCommandLists(1, lists);
+    F.val++;
+    F.queue->Signal(F.fence.Get(), F.val);
+    if (F.fence->GetCompletedValue() < F.val) {
+        F.fence->SetEventOnCompletion(F.val, F.event);
+        if (WaitForSingleObject(F.event, 10000) != WAIT_OBJECT_0) {
+            c->set_error("GPU timeout in aji_frame_diff");
+            diagnose_device(c, "aji_frame_diff fence wait");
+            return AJI_ERR;
+        }
+    }
+    if (FAILED(c->dev->GetDeviceRemovedReason())) {
+        diagnose_device(c, "aji_frame_diff");
+        return AJI_ERR;
+    }
+
+    uint32_t acc[33];
+    {
+        void *m = nullptr;
+        D3D12_RANGE rr = {0, sizeof(acc)};
+        if (FAILED(F.read->Map(0, &rr, &m))) {
+            c->set_error("aji_frame_diff readback failed");
+            return AJI_ERR;
+        }
+        memcpy(acc, m, sizeof(acc));
+        D3D12_RANGE none = {0, 0};
+        F.read->Unmap(0, &none);
+    }
+    memcpy(&out->max_tile, &acc[0], sizeof(float));
+    long long sum[16];
+    for (int i = 0; i < 16; i++)
+        sum[i] = (long long)(int32_t)acc[17 + i] * 65536 + (long long)acc[1 + i];
+    aji_frame_diff_regions(w, h, fmt, rgb ? 3 : 1, sum, out->region_mean);
+    return AJI_OK;
+}
+
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)
 {
     return c ? c->errbuf : "no context";
@@ -3257,6 +3557,8 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         g_ort->ReleaseEnv(c->env);
     if (c->fence_event)
         CloseHandle(c->fence_event);
+    if (c->fd.event)
+        CloseHandle(c->fd.event);
     delete c;
     *pc = nullptr;
 }

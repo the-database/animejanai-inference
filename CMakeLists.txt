@@ -309,6 +309,36 @@ if(WIN32)
     add_executable(aji_scene_dml_test sanity/scene_dml.cpp)
     target_link_libraries(aji_scene_dml_test PRIVATE aji d3d11)
     add_dependencies(aji_scene_dml_test aji_dml)
+
+    # aji_frame_diff on DirectML, cross-checked bit for bit against
+    # kernels.cu where CUDA works (cudart is delay-loaded, so it runs on any
+    # DirectML GPU). aji_dml loads ONNX Runtime and DirectML from its own
+    # folder, so the test runs from dml-test/ beside copies of the three.
+    add_executable(aji_frame_diff_dml_test sanity/frame_diff_dml.cpp src/kernels.cu)
+    target_include_directories(aji_frame_diff_dml_test PRIVATE include src)
+    target_link_libraries(aji_frame_diff_dml_test PRIVATE aji d3d11 dxgi
+        CUDA::cudart delayimp)
+    target_compile_definitions(aji_frame_diff_dml_test PRIVATE
+        AJI_CUDART_DLL="cudart64_${CUDAToolkit_VERSION_MAJOR}.dll")
+    target_link_options(aji_frame_diff_dml_test PRIVATE
+        /DELAYLOAD:cudart64_${CUDAToolkit_VERSION_MAJOR}.dll)
+    set_target_properties(aji_frame_diff_dml_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dml-test")
+    set(_fd_runtime $<TARGET_FILE:aji> $<TARGET_FILE:aji_dml>)
+    foreach(dll IN ITEMS "${AJI_ORT_ROOT}/runtimes/win-x64/native/onnxruntime.dll"
+                         "${AJI_DML_ROOT}/bin/x64-win/DirectML.dll")
+        if(EXISTS "${dll}")
+            list(APPEND _fd_runtime "${dll}")
+        endif()
+    endforeach()
+    # a target of its own, run on every build: a rebuilt aji_dml.dll must
+    # reach dml-test/ even when the test itself doesn't relink
+    add_custom_target(aji_frame_diff_dml_runtime ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dml-test"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_fd_runtime}
+                "${CMAKE_BINARY_DIR}/dml-test"
+        DEPENDS aji aji_dml)
+    add_dependencies(aji_frame_diff_dml_test aji_frame_diff_dml_runtime)
 endif()
 
 # Parity test tool: compiles the kernels directly (the shared lib hides
@@ -374,3 +404,8 @@ foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS gpu)
 endforeach()
+if(WIN32)
+    # any DirectML GPU; the CUDA cross-check is skipped without an NVIDIA one
+    add_test(NAME aji_frame_diff_dml_test COMMAND aji_frame_diff_dml_test)
+    set_tests_properties(aji_frame_diff_dml_test PROPERTIES LABELS gpu)
+endif()
