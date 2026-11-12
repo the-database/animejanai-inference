@@ -185,7 +185,7 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 
 The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
 cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`; what CI runs) and `-L gpu`
-(`aji_pre_fusion_test`, `aji_msb444_test`; needs an NVIDIA GPU). A new test that needs no GPU,
+(`aji_pre_fusion_test`, `aji_msb444_test`, `aji_frame_diff_test`; needs an NVIDIA GPU). A new test that needs no GPU,
 models or fixtures goes in the `cpu` list at the end of `CMakeLists.txt`, and CI runs it on both
 platforms.
 
@@ -406,6 +406,43 @@ fails), else swscale's `SWS_LANCZOS`, the closest of its filters to Spline36 on 
 4:2:0, 4:2:2, 4:4:4, odd width) through NVDEC and the CPU decoder, NVENC and the CPU encoders,
 both bit depths, `--final-resize-height` and `--deinterlace`, in passthrough and (given a model)
 upscaling, and checks the output format, frame count and PSNR against the source.
+
+## Held-frame reuse in `aji_encode`
+
+On by default (`--no-reuse-held-frames` turns it off, for debugging and A/B tests;
+`--reuse-held-frames` is still accepted). A frame that is the same picture as the last frame
+that was upscaled (the anchor) skips inference: the anchor's output is encoded again under the
+frame's timestamp. Anime holds drawings for 2-3 frames; slides, screen recordings and still
+shots repeat frames exactly. The comparison is `aji_frame_diff` (TensorRT backends; additive
+export, DirectML returns `AJI_ERR`): D is the largest 8x8-tile mean |diff| over all planes, in
+8-bit levels, and the fade measure the largest signed mean of a 4x4 luma region grid. Frame N is
+reused when D(anchor, N) <= 2.5 and fade <= 0.15, fewer than 24 frames in a row were reused, the
+two frames after it exist (the last two frames are always upscaled) and are undamaged, and a
+two-frame look-ahead sees no motion starting: D from the anchor crossing 2.5 while N is already
+close to the later frame, or growing past 1.5x (floor 0.5). The thresholds can be overridden
+(`--reuse-held-threshold`, `--reuse-held-fade-threshold`; tuning/debug only). Only plain upscale
+chains on CUDA frames use it; RIFE, temporal chains, passthrough, DirectML and
+`--preview-session` encode every frame, with a log line saying why.
+
+Evidence (RTX 5090): full episodes reuse 16-57% (a 1999 DVD 16%, 1080p web 30-57%); frame
+counts and timestamps match an encode without reuse; with a lossless NVENC every upscaled frame
+is bit-identical and reused frames are 48.8 dB or more from a fresh upscale; a blind A/B of the
+closest calls (clouds, a title-card fade, smoke, a blurred concert background) showed no stall;
+synthetic slow pans (0.1-1 px a frame, sharp and blurred) and drifting patches reuse nothing
+inside the motion when clean. Speed: where inference is the limit (`-preset p1` on the 5090) wall time fell
+24-31%, about in proportion to the reuse rate; at VideoJaNai's default p7 on a fast GPU NVENC is
+the limit and wall time doesn't change. Known limits: slow motion buried in codec noise can
+still be held for single frames (a sub-pixel shift; with x264 noise added, a blurred 0.1 px a
+frame pan held 26 of 120 frames and a 0.25 px drifting patch 5, each alone); a faint one-pixel change at
+half contrast or less (an anti-aliased caret in a screen recording) can be held for up to 24
+frames.
+
+The comment above `push_reuse` in `src/encode.c` has the rule's reasoning and the stream design:
+frames are decided `ring_depth + 2` frames late and compared on a non-blocking stream that waits
+for each frame's arrival event, because libav's decoder copies run on the legacy default stream
+behind the queued inference. `AJI_REUSE_TRACE=<file>` writes every comparison (frame, pair, D,
+the 16 region means) and decision (frame, `reuse` or `upscale`) as CSV. The last line says
+`held frames: reused N of M (P%)`.
 
 ## Damaged input in `aji_encode`
 
