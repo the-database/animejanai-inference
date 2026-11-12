@@ -185,7 +185,7 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 
 The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
 cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`; what CI runs) and `-L gpu`
-(`aji_pre_fusion_test`, `aji_msb444_test`; needs an NVIDIA GPU). A new test that needs no GPU,
+(`aji_pre_fusion_test`, `aji_msb444_test`, `aji_frame_diff_test`; needs an NVIDIA GPU). A new test that needs no GPU,
 models or fixtures goes in the `cpu` list at the end of `CMakeLists.txt`, and CI runs it on both
 platforms.
 
@@ -406,6 +406,23 @@ fails), else swscale's `SWS_LANCZOS`, the closest of its filters to Spline36 on 
 4:2:0, 4:2:2, 4:4:4, odd width) through NVDEC and the CPU decoder, NVENC and the CPU encoders,
 both bit depths, `--final-resize-height` and `--deinterlace`, in passthrough and (given a model)
 upscaling, and checks the output format, frame count and PSNR against the source.
+
+## Held-frame reuse in `aji_encode`
+
+`--reuse-held-frames` (off by default) skips inference for a frame that is the same picture as
+the last frame that was upscaled (the anchor) and encodes the anchor's output again under the
+frame's timestamp: anime holds drawings for 2-3 frames. The test is `aji_frame_diff`
+(TensorRT backends; additive export, DirectML returns `AJI_ERR`): the largest 8x8-tile mean
+|diff| over all planes, in 8-bit levels, at most `--reuse-held-threshold` (2.5), and no region
+of a 4x4 luma grid shifted by more than `--reuse-held-fade-threshold` (0.15) on average, which
+keeps slow fades from stepping. A one-frame look-ahead rejects a frame where a slow drift starts,
+and at most 24 frames in a row are reused. Only plain upscale chains on CUDA frames use it; RIFE,
+temporal chains, passthrough, DirectML and `--preview-session` ignore it with a log line. The
+comment above `push_reuse` in `src/encode.c` has the calibration and the stream design: frames
+are decided `ring_depth + 1` frames late, compared on a non-blocking stream that waits for each
+frame's arrival event, because libav's decoder copies run on the legacy default stream behind
+the queued inference. `AJI_REUSE_TRACE=<file>` writes every comparison (frame, pair, D, the 16
+region means) and decision (frame, `reuse` or `upscale`) as CSV. The last line says `held frames: reused N of M (P%)`.
 
 ## Damaged input in `aji_encode`
 

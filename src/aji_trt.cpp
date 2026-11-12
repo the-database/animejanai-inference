@@ -172,6 +172,9 @@ struct aji_ctx {
     void *fr_buf[2] = {nullptr, nullptr};
     size_t fr_buf_bytes[2] = {0, 0};
 
+    // aji_frame_diff: device accumulator + pinned readback
+    void *fd_acc = nullptr, *fd_host = nullptr;
+
     // RIFE (phase 1.5): interpolation between already-upscaled frames,
     // replicating animejanai_core's pad/crop + rife_cuda.py's bilinear 709
     // conversions + the vsmlrt v1 11-channel model input. Geometry state
@@ -2396,6 +2399,67 @@ extern "C" AJI_EXPORT int aji_resize_frame(aji_ctx *c, const aji_frame *in,
                               c->fr_post_key, "final resize");
 }
 
+// Held-frame reuse (aji_encode): tile and region differences of two frames,
+// read back on the caller's stream (its own, apart from the chain's), so
+// this synchronizes like aji_infer_rife's scene check. Its accumulators are
+// its own, so it never touches chain state.
+extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b,
+                                         aji_frame_diff_result *out,
+                                         void *cu_stream)
+{
+    if (!c || !a || !b || !out)
+        return AJI_ERR;
+    if (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010 &&
+        !aji_format_is_444(a->format)) {
+        c->set_error("aji_frame_diff: unsupported format %d", a->format);
+        return AJI_ERR_FORMAT;
+    }
+    if (b->format != a->format) {
+        c->set_error("aji_frame_diff requires matching formats");
+        return AJI_ERR_FORMAT;
+    }
+    if (a->width < 1 || a->height < 1 || b->width != a->width ||
+        b->height != a->height) {
+        c->set_error("aji_frame_diff dims %dx%d vs %dx%d", a->width,
+                     a->height, b->width, b->height);
+        return AJI_ERR_SHAPE;
+    }
+
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return AJI_ERR_CUDA;
+    }
+    if (!c->fd_acc) {
+        if (cudaMalloc(&c->fd_acc, AJI_FRAME_DIFF_ACC_BYTES) != cudaSuccess ||
+            cudaMallocHost(&c->fd_host, AJI_FRAME_DIFF_ACC_BYTES) != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(c->fd_acc);
+            c->fd_acc = nullptr;
+            c->set_error("aji_frame_diff: allocation failed");
+            return AJI_ERR_CUDA;
+        }
+    }
+    cudaStream_t stream = (cudaStream_t)cu_stream;
+    int err = aji_frame_diff_launch(a, b, c->fd_acc, stream);
+    if (err) {
+        c->set_error("aji_frame_diff kernels failed: %s",
+                     err < 0 ? "bad frames"
+                             : cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+    if (cudaMemcpyAsync(c->fd_host, c->fd_acc, AJI_FRAME_DIFF_ACC_BYTES,
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+        cudaGetLastError();
+        c->set_error("aji_frame_diff readback failed");
+        return AJI_ERR_CUDA;
+    }
+    aji_frame_diff_finish(a, c->fd_host, out);
+    return AJI_OK;
+}
+
 extern "C" AJI_EXPORT uint64_t aji_flush(aji_ctx *c, void *cu_stream)
 {
     if (!c)
@@ -2793,6 +2857,8 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         aji_plan_destroy(c->fr_post_plan);
         for (auto &b : c->fr_buf)
             cudaFree(b);
+        cudaFree(c->fd_acc);
+        cudaFreeHost(c->fd_host);
         rife_teardown(c);
         temporal_teardown(c);
         for (auto &g : c->direct_graphs) cudaGraphExecDestroy(g.exec);

@@ -16,6 +16,7 @@
 #include <cuda_fp16.h>
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <vector>
 
@@ -655,6 +656,160 @@ extern "C" int aji_scd_diff(int format, const void *ya, ptrdiff_t stride_a,
             w, h, 1.0f / peak, accum_dev);
     }
     return (int)cudaGetLastError();
+}
+
+/* ---------------- frame difference (aji_frame_diff) ---------------- */
+
+namespace {
+
+// The device accumulator behind AJI_FRAME_DIFF_ACC_BYTES.
+struct fdiff_acc {
+    unsigned long long region[16];  // signed luma sums (two's complement)
+    unsigned int max_bits;          // bits of the largest tile mean (>= 0)
+};
+static_assert(sizeof(fdiff_acc) <= AJI_FRAME_DIFF_ACC_BYTES,
+              "AJI_FRAME_DIFF_ACC_BYTES too small");
+
+} // namespace
+
+// One thread per 8x8 tile of a plane with C interleaved components (each
+// component its own tile): the tile's mean |b - a| (the larger of the C),
+// max-reduced over the block and folded into acc->max_bits with one
+// atomicMax on the float's bits, which order like the floats for values
+// >= 0. With regions (luma only, C == 1) each tile's signed sum also goes
+// to its cell of the 4x4 grid (region rx holds tiles tx * 4 / tiles_x ==
+// rx), summed per block in shared memory first.
+template <typename T, int C>
+__global__ void k_tile_diff(const uint8_t *a, ptrdiff_t sa, const uint8_t *b,
+                            ptrdiff_t sb, int w, int h, float scale,
+                            int regions, fdiff_acc *acc)
+{
+    __shared__ float bmax[BLOCK_X * BLOCK_Y];
+    __shared__ unsigned long long rsum[16];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    if (tid < 16)
+        rsum[tid] = 0;
+    __syncthreads();
+
+    const int tiles_x = (w + 7) >> 3, tiles_y = (h + 7) >> 3;
+    const int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ty = blockIdx.y * blockDim.y + threadIdx.y;
+    float m = 0.0f;
+    if (tx < tiles_x && ty < tiles_y) {
+        const int x0 = tx * 8, y0 = ty * 8;
+        const int nx = min(8, w - x0), ny = min(8, h - y0);
+        unsigned int asum[C] = {};
+        int ssum = 0;
+        for (int y = 0; y < ny; y++) {
+            const T *ra = (const T *)(a + (size_t)(y0 + y) * sa) + (size_t)x0 * C;
+            const T *rb = (const T *)(b + (size_t)(y0 + y) * sb) + (size_t)x0 * C;
+            for (int x = 0; x < nx; x++) {
+#pragma unroll
+                for (int k = 0; k < C; k++) {
+                    const int d = (int)rb[x * C + k] - (int)ra[x * C + k];
+                    asum[k] += (unsigned int)abs(d);
+                    ssum += d;
+                }
+            }
+        }
+        const float inv = scale / (float)(nx * ny);
+#pragma unroll
+        for (int k = 0; k < C; k++)
+            m = fmaxf(m, (float)asum[k] * inv);
+        if (regions && ssum) {
+            const int r = (ty * 4 / tiles_y) * 4 + tx * 4 / tiles_x;
+            atomicAdd(&rsum[r], (unsigned long long)(long long)ssum);
+        }
+    }
+    bmax[tid] = m;
+    __syncthreads();
+    for (int n = BLOCK_X * BLOCK_Y / 2; n > 0; n >>= 1) {
+        if (tid < n)
+            bmax[tid] = fmaxf(bmax[tid], bmax[tid + n]);
+        __syncthreads();
+    }
+    if (tid == 0 && bmax[0] > 0.0f)
+        atomicMax(&acc->max_bits, __float_as_uint(bmax[0]));
+    if (regions && tid < 16 && rsum[tid])
+        atomicAdd(&acc->region[tid], rsum[tid]);
+}
+
+extern "C" int aji_frame_diff_launch(const aji_frame *a, const aji_frame *b,
+                                     void *acc_dev, void *stream)
+{
+    if (!a || !b || !acc_dev || a->format != b->format ||
+        a->width != b->width || a->height != b->height || a->width < 1 ||
+        a->height < 1)
+        return -1;
+    const int f = a->format;
+    const bool f444 = aji_format_is_444(f) != 0;
+    if (f != AJI_FMT_NV12 && f != AJI_FMT_P010 && !f444)
+        return -1;
+    const bool wide = f != AJI_FMT_NV12;
+    const float scale = wide ? 1.0f / 256.0f : 1.0f;
+    cudaStream_t s = (cudaStream_t)stream;
+    fdiff_acc *acc = (fdiff_acc *)acc_dev;
+    cudaError_t e = cudaMemsetAsync(acc, 0, sizeof(fdiff_acc), s);
+    if (e != cudaSuccess)
+        return (int)e;
+
+    const int np = f444 ? 3 : 2;
+    for (int p = 0; p < np; p++) {
+        // 4:2:0's second plane is CbCr interleaved at half size
+        const bool uv = !f444 && p == 1;
+        const int w = uv ? (a->width + 1) / 2 : a->width;
+        const int h = uv ? (a->height + 1) / 2 : a->height;
+        const int tx = (w + 7) / 8, ty = (h + 7) / 8;
+        const uint8_t *pa = (const uint8_t *)a->plane[p];
+        const uint8_t *pb = (const uint8_t *)b->plane[p];
+        const ptrdiff_t sa = a->stride[p], sb = b->stride[p];
+        const int regions = p == 0;
+        if (!wide && !uv)
+            k_tile_diff<uint8_t, 1><<<GRID(tx, ty, 1), 0, s>>>(
+                pa, sa, pb, sb, w, h, scale, regions, acc);
+        else if (!wide)
+            k_tile_diff<uint8_t, 2><<<GRID(tx, ty, 1), 0, s>>>(
+                pa, sa, pb, sb, w, h, scale, regions, acc);
+        else if (!uv)
+            k_tile_diff<uint16_t, 1><<<GRID(tx, ty, 1), 0, s>>>(
+                pa, sa, pb, sb, w, h, scale, regions, acc);
+        else
+            k_tile_diff<uint16_t, 2><<<GRID(tx, ty, 1), 0, s>>>(
+                pa, sa, pb, sb, w, h, scale, regions, acc);
+        e = cudaGetLastError();
+        if (e != cudaSuccess)
+            return (int)e;
+    }
+    return 0;
+}
+
+extern "C" void aji_frame_diff_finish(const aji_frame *a, const void *acc_host,
+                                      aji_frame_diff_result *out)
+{
+    fdiff_acc acc;
+    memcpy(&acc, acc_host, sizeof(acc));
+    float m;
+    memcpy(&m, &acc.max_bits, sizeof(m));
+    out->max_tile = m;
+    const double scale = a->format == AJI_FMT_NV12 ? 1.0 : 1.0 / 256.0;
+    const int tiles[2] = {(a->width + 7) / 8, (a->height + 7) / 8};
+    const int dims[2] = {a->width, a->height};
+    int span[2][4];   // pixels per grid column / row
+    for (int d = 0; d < 2; d++) {
+        for (int i = 0; i < 4; i++) {
+            // the tiles t with t * 4 / tiles == i: [ceil(i*T/4), ceil((i+1)*T/4))
+            const int lo = (i * tiles[d] + 3) / 4;
+            const int hi = ((i + 1) * tiles[d] + 3) / 4;
+            span[d][i] = hi > lo ? min(hi * 8, dims[d]) - lo * 8 : 0;
+        }
+    }
+    for (int ry = 0; ry < 4; ry++) {
+        for (int rx = 0; rx < 4; rx++) {
+            const double n = (double)span[0][rx] * span[1][ry];
+            const long long sum = (long long)acc.region[ry * 4 + rx];
+            out->region_mean[ry * 4 + rx] = n > 0 ? (float)(sum * scale / n) : 0.0f;
+        }
+    }
 }
 
 /* ---------------- temporal (multi-frame) models ---------------- */

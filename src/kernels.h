@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#include "aji.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -103,6 +105,24 @@ int aji_fill_plane(int format, void *plane, ptrdiff_t stride, int w, int h,
 int aji_scd_diff(int format, const void *ya, ptrdiff_t stride_a,
                  const void *yb, ptrdiff_t stride_b, int w, int h,
                  float *accum_dev, void *stream);
+
+/* aji_frame_diff (held-frame reuse in aji_encode). Two frames of the same
+ * format and size are compared on every plane (Y, Cb, Cr; interleaved CbCr
+ * as two components): the mean |b - a| of each 8x8 tile, in that plane's
+ * own resolution, in 8-bit units (16-bit containers / 256), and the
+ * largest of them. Luma also gets the signed mean (b - a) of each region of
+ * a 4x4 grid of tiles (region rx holds the tiles tx with tx * 4 / tiles_x ==
+ * rx, so regions follow tile edges), for slow fades that stay under the
+ * tile threshold. aji_frame_diff_launch zeroes the device accumulator
+ * (AJI_FRAME_DIFF_ACC_BYTES) and enqueues the kernels on stream; after a
+ * copy of the accumulator to the host and a sync, aji_frame_diff_finish
+ * turns it into the result. Launch returns a cudaError_t, or -1 for a
+ * format it can't read (RGB10A2) or frames that don't match. */
+#define AJI_FRAME_DIFF_ACC_BYTES (17 * 8)
+int aji_frame_diff_launch(const aji_frame *a, const aji_frame *b,
+                          void *acc_dev, void *stream);
+void aji_frame_diff_finish(const aji_frame *a, const void *acc_host,
+                           aji_frame_diff_result *out);
 
 /* Temporal (multi-frame) models. */
 
