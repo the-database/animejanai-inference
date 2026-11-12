@@ -409,20 +409,40 @@ upscaling, and checks the output format, frame count and PSNR against the source
 
 ## Held-frame reuse in `aji_encode`
 
-`--reuse-held-frames` (off by default) skips inference for a frame that is the same picture as
-the last frame that was upscaled (the anchor) and encodes the anchor's output again under the
-frame's timestamp: anime holds drawings for 2-3 frames. The test is `aji_frame_diff`
-(TensorRT backends; additive export, DirectML returns `AJI_ERR`): the largest 8x8-tile mean
-|diff| over all planes, in 8-bit levels, at most `--reuse-held-threshold` (2.5), and no region
-of a 4x4 luma grid shifted by more than `--reuse-held-fade-threshold` (0.15) on average, which
-keeps slow fades from stepping. A one-frame look-ahead rejects a frame where a slow drift starts,
-and at most 24 frames in a row are reused. Only plain upscale chains on CUDA frames use it; RIFE,
-temporal chains, passthrough, DirectML and `--preview-session` ignore it with a log line. The
-comment above `push_reuse` in `src/encode.c` has the calibration and the stream design: frames
-are decided `ring_depth + 1` frames late, compared on a non-blocking stream that waits for each
-frame's arrival event, because libav's decoder copies run on the legacy default stream behind
-the queued inference. `AJI_REUSE_TRACE=<file>` writes every comparison (frame, pair, D, the 16
-region means) and decision (frame, `reuse` or `upscale`) as CSV. The last line says `held frames: reused N of M (P%)`.
+On by default (`--no-reuse-held-frames` turns it off, for debugging and A/B tests;
+`--reuse-held-frames` is still accepted). A frame that is the same picture as the last frame
+that was upscaled (the anchor) skips inference: the anchor's output is encoded again under the
+frame's timestamp. Anime holds drawings for 2-3 frames; slides, screen recordings and still
+shots repeat frames exactly. The comparison is `aji_frame_diff` (TensorRT backends; additive
+export, DirectML returns `AJI_ERR`): D is the largest 8x8-tile mean |diff| over all planes, in
+8-bit levels, and the fade measure the largest signed mean of a 4x4 luma region grid. Frame N is
+reused when D(anchor, N) <= 2.5 and fade <= 0.15, fewer than 24 frames in a row were reused, the
+two frames after it exist (the last two frames are always upscaled) and are undamaged, and a
+two-frame look-ahead sees no motion starting: D from the anchor crossing 2.5 while N is already
+close to the later frame, or growing past 1.5x (floor 0.5). The thresholds can be overridden
+(`--reuse-held-threshold`, `--reuse-held-fade-threshold`; tuning/debug only). Only plain upscale
+chains on CUDA frames use it; RIFE, temporal chains, passthrough, DirectML and
+`--preview-session` encode every frame, with a log line saying why.
+
+Evidence (RTX 5090): full episodes reuse 16-57% (a 1999 DVD 16%, 1080p web 30-57%); frame
+counts and timestamps match an encode without reuse; with a lossless NVENC every upscaled frame
+is bit-identical and reused frames are 48.8 dB or more from a fresh upscale; a blind A/B of the
+closest calls (clouds, a title-card fade, smoke, a blurred concert background) showed no stall;
+synthetic slow pans (0.1-1 px a frame, sharp and blurred) and drifting patches reuse nothing
+inside the motion when clean. Speed: where inference is the limit (`-preset p1` on the 5090) wall time fell
+24-31%, about in proportion to the reuse rate; at VideoJaNai's default p7 on a fast GPU NVENC is
+the limit and wall time doesn't change. Known limits: slow motion buried in codec noise can
+still be held for single frames (a sub-pixel shift; with x264 noise added, a blurred 0.1 px a
+frame pan held 26 of 120 frames and a 0.25 px drifting patch 5, each alone); a faint one-pixel change at
+half contrast or less (an anti-aliased caret in a screen recording) can be held for up to 24
+frames.
+
+The comment above `push_reuse` in `src/encode.c` has the rule's reasoning and the stream design:
+frames are decided `ring_depth + 2` frames late and compared on a non-blocking stream that waits
+for each frame's arrival event, because libav's decoder copies run on the legacy default stream
+behind the queued inference. `AJI_REUSE_TRACE=<file>` writes every comparison (frame, pair, D,
+the 16 region means) and decision (frame, `reuse` or `upscale`) as CSV. The last line says
+`held frames: reused N of M (P%)`.
 
 ## Damaged input in `aji_encode`
 
