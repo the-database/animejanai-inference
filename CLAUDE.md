@@ -182,14 +182,15 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_kernel_test` | EXE | `CUDA::cudart` | kernel unit tests |
 | `aji_image` | EXE | `aji` | image-ABI CLI (PNM in/out); the reference consumer of `aji_image.h` |
 | `aji_tiling_test` | EXE | — | CPU-only checks of `core/tiling` and the fp16/bf16 conversions |
+| `aji_held_test` | EXE | — | CPU-only checks of `core/held`, the held-frame reuse rule (`aji_held_*`) |
 
 The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
-cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`; what CI runs) and `-L gpu`
-(`aji_pre_fusion_test`, `aji_msb444_test`, `aji_frame_diff_test`; needs an NVIDIA GPU; on Windows
-also `aji_frame_diff_dml_test`, which runs on any DirectML GPU from `dml-test/`, beside copies of
-`aji.dll`, `aji_dml.dll`, ONNX Runtime and DirectML). A new test that needs no GPU,
-models or fixtures goes in the `cpu` list at the end of `CMakeLists.txt`, and CI runs it on both
-platforms.
+cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`, `aji_held_test`; what CI
+runs) and `-L gpu` (`aji_pre_fusion_test`, `aji_msb444_test`, `aji_frame_diff_test`; needs an
+NVIDIA GPU; on Windows also `aji_frame_diff_dml_test`, which runs on any DirectML GPU from
+`dml-test/`, beside copies of `aji.dll`, `aji_dml.dll`, ONNX Runtime and DirectML). A new test
+that needs no GPU, models or fixtures goes in the `cpu` list at the end of `CMakeLists.txt`, and
+CI runs it on both platforms.
 
 **`aji_encode` is skipped silently** unless its ffmpeg dependency resolves. On Windows that
 means `AJI_FFMPEG_ROOT` must be set; on Linux, pkg-config must find `libavformat libavcodec
@@ -409,7 +410,7 @@ fails), else swscale's `SWS_LANCZOS`, the closest of its filters to Spline36 on 
 both bit depths, `--final-resize-height` and `--deinterlace`, in passthrough and (given a model)
 upscaling, and checks the output format, frame count and PSNR against the source.
 
-## Held-frame reuse in `aji_encode`
+## Held-frame reuse (`aji_held_*`, used by `aji_encode`)
 
 On by default (`--no-reuse-held-frames` turns it off, for debugging and A/B tests;
 `--reuse-held-frames` is still accepted). A frame that is the same picture as the last frame
@@ -439,11 +440,35 @@ frame pan held 26 of 120 frames and a 0.25 px drifting patch 5, each alone); a f
 half contrast or less (an anti-aliased caret in a screen recording) can be held for up to 24
 frames.
 
-The comment above `push_reuse` in `src/encode.c` has the rule's reasoning and the stream design:
+**The engine (`aji_held_*`).** The rule is libaji's, in the dispatcher: additive exports of
+`aji.dll` / `libaji.so` only (`AJI_API_VERSION` stays 9; `aji_held_version()` is the rule
+version, 2), so mpv and other callers can share it. `src/core/held.{h,cpp}` (`HeldRule`,
+backend-neutral, with the rule's reasoning and evidence) sits behind a comparison functor;
+`src/aji_held.cpp` is the C ABI and binds it to the dispatcher's own `aji_frame_diff_marked`
+(the later of the two frames' marks; TensorRT gets the plain call on the caller's stream), so it
+reaches every backend the dispatcher loads and follows a TensorRT-RTX context that fell back to
+TensorRT. Backends export nothing for it. A handle owns the rule state (the anchor's descriptor,
+the run, D(anchor, N+1) cached from the last look-ahead), makes the comparisons in a fixed order
+(anchor-N unless cached, anchor-N+1, N-N+1, anchor-N+2, N-N+2, with the rule's short circuits),
+counts them and writes the trace. The caller owns every frame, the queue and the anchor copy: it
+passes N, N+1, N+2 (NULL at the end of the stream) to `aji_held_decide`; on UPSCALE (which drops
+the anchor) it upscales N and hands a copy of N to `aji_held_set_anchor`, on REUSE it emits the
+anchor's output. One handle is one decision point. `aji_held_create` returns NULL for a backend
+without `aji_frame_diff` (an `aji_dml.dll` older than its port beside a new `aji.dll`):
+`aji_encode` then logs `held frames: not reused (the backend can't compare frames)` and encodes
+every frame. `aji_held_test` (`ctest -L cpu`) drives the rule with synthetic comparisons: every
+veto alone, the 0.5 floor, damage, the comparison order and counts, errors, reset, and the trace
+text against a golden string.
+
+**In `aji_encode`.** `src/encode.c` keeps what touches frames (the comment above `push_reuse`):
 frames are decided `ring_depth + 2` frames late and compared on a non-blocking stream that waits
-for each frame's arrival event, because libav's decoder copies run on the legacy default stream
-behind the queued inference. Only three steps differ per backend (`reuse_arrived`, the waits in
-`reuse_cmp`, `reuse_anchor_copy`); the rule, the queue and the anchor bookkeeping are shared.
+for each frame's arrival event (queued for N, N+1 and N+2 before each decision), because libav's
+decoder copies run on the legacy default stream behind the queued inference. Only three steps
+differ per backend (`reuse_arrived`, the event waits in `reuse_decide`, `reuse_anchor_copy`).
+Moving the rule into the engine changed nothing: the four traces of the evidence clips below
+(CUDA and DirectML) are byte-identical to `aji_encode`'s own from before, with the same counts,
+frame counts and timestamps, and CUDA at `-preset p1` is as fast as before (median wall time of
+seven alternating runs 23.37 / 23.31 s and 18.16 / 18.16 s; 0.1 ms a comparison either way).
 
 **DirectML.** `aji_frame_diff` in `aji_dml` is `cs_frame_diff` (`dml_shaders.h`), a port of
 `k_tile_diff` that gives **bit-identical** results: integer sums, the per-tile `scale / n` table
@@ -493,9 +518,10 @@ NVENC p7 (NVENC the limit; 6-8% slower without marks), 7% and 23% faster at p1. 
 (Performance model, QSV as VideoJaNai sets it, 480 frames, 15% and 32% reused): 12% and 26%
 faster (11% and 24% without marks), same decisions as on the 5090; a compare takes ~6 ms there
 (~14 ms without marks).
-`AJI_REUSE_TRACE=<file>` writes every comparison (frame, pair, D, the 16 region means) and
-decision (frame, `reuse` or `upscale`) as CSV. At the end `aji_encode` logs `held frames: reused
-N of M (P%)` and `held frames: K comparisons, X ms each on average`.
+`AJI_REUSE_TRACE=<file>` (`aji_encode` hands it to `aji_held_set_trace`) writes every comparison
+(frame, pair, D, the 16 region means) and decision (frame, `reuse` or `upscale`) as CSV. At the
+end `aji_encode` logs `held frames: reused N of M (P%)` and `held frames: K comparisons, X ms each
+on average` (from `aji_held_get_stats`).
 
 ## Damaged input in `aji_encode`
 
