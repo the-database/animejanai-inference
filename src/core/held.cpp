@@ -80,6 +80,24 @@ bool HeldRule::valid_params(const aji_held_params *p)
            p->threshold >= 0.0f && p->fade_threshold >= 0.0f && p->max_run >= 0;
 }
 
+bool HeldRule::valid_frame(const aji_held_frame &f)
+{
+    return !(f.flags & ~AJI_HELD_FRAME_DAMAGED) && !f.reserved[0] &&
+           !f.reserved[1] && !f.reserved[2];
+}
+
+static bool damaged(const aji_held_frame &f)
+{
+    return (f.flags & AJI_HELD_FRAME_DAMAGED) != 0;
+}
+
+// frames aji_frame_diff can compare
+static bool same_shape(const aji_held_frame &a, const aji_held_frame &b)
+{
+    return a.frame.width == b.frame.width && a.frame.height == b.frame.height &&
+           a.frame.format == b.frame.format;
+}
+
 HeldRule::HeldRule(const aji_held_params &p, Diff diff)
     : diff_(std::move(diff)), T_(p.threshold), F_(p.fade_threshold),
       max_run_(p.max_run)
@@ -155,8 +173,17 @@ void HeldRule::decide(const aji_held_frame &p, const aji_held_frame *n,
     float d_ap = next_d_, f_ap = next_fade_;
     next_known_ = false;
     seen_++;
+    // A change of size or format without a reset (mpv reconfiguring for
+    // the source mid-file) is no comparison error: an anchor unlike p is no
+    // anchor, and a look-ahead frame unlike p means the change starts after
+    // p (upscaled, without comparisons).
+    if (have_anchor_ && !same_shape(anchor_, p)) {
+        have_anchor_ = false;
+        skip_run_ = 0;
+    }
     if (!off_ && have_anchor_ && skip_run_ < max_run_ && n && n2 &&
-        !p.damaged && !n->damaged && !n2->damaged &&
+        same_shape(p, *n) && same_shape(p, *n2) &&
+        !damaged(p) && !damaged(*n) && !damaged(*n2) &&
         (known || cmp(anchor_, p, "ap", &d_ap, &f_ap) == 0) &&
         d_ap <= T_ && f_ap <= F_) {
         float d_an, f_an, d_an2, f_an2;
@@ -191,6 +218,7 @@ void HeldRule::set_anchor(const aji_held_frame &copy)
 {
     anchor_ = copy;
     have_anchor_ = true;
+    skip_run_ = 0;          // a new anchor starts a new run
     next_known_ = false;    // the look-ahead was against the anchor before
 }
 

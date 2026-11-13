@@ -3439,7 +3439,7 @@ static void held_desc(enc_ctx *c, aji_held_frame *d, const held_frame *h)
     fill_aji_frame(c, &d->frame, h->f, 0);
     d->mark = h->mark;
     d->id = h->id;
-    d->damaged = frame_damaged(h->f);
+    d->flags = frame_damaged(h->f) ? AJI_HELD_FRAME_DAMAGED : 0;
 }
 
 /* out, the upscale of h's frame just copied, is the anchor's output, and
@@ -3489,6 +3489,7 @@ static int reuse_decide(enc_ctx *c, held_frame p, const held_frame *n,
             held_desc(c, &dn2, n2);
         }
         aji_held_decision d;
+        memset(&d, 0, sizeof(d));   /* UPSCALE, should the call refuse */
         aji_held_decide(c->held, &dp, ahead ? &dn : NULL, ahead ? &dn2 : NULL,
                         c->diff_stream, &d);
         if (d.error && c->reuse) {

@@ -369,9 +369,12 @@ add_executable(aji_runtime_packs_test sanity/runtime_packs_test.cpp
     src/core/runtime_packs.cpp src/core/fileio.cpp)
 target_include_directories(aji_runtime_packs_test PRIVATE include src)
 
-# The held-frame reuse rule (aji_held_*) against synthetic comparisons.
-add_executable(aji_held_test sanity/held_test.cpp src/core/held.cpp)
+# The held-frame reuse rule against synthetic comparisons, and its C ABI
+# (src/aji_held.cpp) over a stub context.
+add_executable(aji_held_test sanity/held_test.cpp src/core/held.cpp src/aji_held.cpp
+    src/core/fileio.cpp)
 target_include_directories(aji_held_test PRIVATE include src)
+target_link_libraries(aji_held_test PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(aji_runtime_packs_test PRIVATE ${CMAKE_DL_LIBS})
 
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)

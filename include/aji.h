@@ -354,11 +354,15 @@ typedef struct aji_held_params {
     int   max_run;          /* reused frames in a row (>= 0) */
 } aji_held_params;
 
+#define AJI_HELD_FRAME_DAMAGED (1u << 0)  /* never reused, never compared;
+                                            not for aji_held_set_anchor */
+
 typedef struct aji_held_frame {
-    aji_frame frame;   /* as for aji_frame_diff; padded surfaces are fine */
-    uint64_t  mark;    /* DirectML: aji_d3d11_mark after its last write; 0 = none */
-    uint64_t  id;      /* caller's, unique per source frame (a sequence number) */
-    int       damaged; /* never reused, never compared; don't make it the anchor */
+    aji_frame frame;        /* as for aji_frame_diff; padded surfaces are fine */
+    uint64_t  mark;         /* DirectML: aji_d3d11_mark after its last write; 0 = none */
+    uint64_t  id;           /* caller's, unique per source frame (a sequence number) */
+    uint32_t  flags;        /* AJI_HELD_FRAME_*; other bits must be 0 */
+    uint32_t  reserved[3];  /* must be 0 */
 } aji_held_frame;
 
 enum aji_held_action { AJI_HELD_UPSCALE = 0, AJI_HELD_REUSE = 1 };
@@ -394,19 +398,24 @@ AJI_EXPORT int aji_held_set_trace(aji_held *h, const char *path);
  * caller forces an upscale). Synchronous, up to 5 comparisons. TensorRT: on
  * cu_stream, where p, n, n2 and the anchor must be complete. DirectML: waits
  * for the frames' marks. Descriptors read during the call only. Returns AJI_OK
- * with *out written (also when out->error is set); AJI_ERR only for bad args.
- * UPSCALE drops the anchor: upscale p and, unless damaged, give a copy to
- * aji_held_set_anchor. REUSE: emit the anchor's output for p. */
+ * with *out written (also when out->error is set); AJI_ERR, with nothing
+ * decided, only for bad args (a NULL, unknown flags, reserved not 0).
+ * An anchor of another width, height or format than p counts as none
+ * (UPSCALE, no comparison, no error), so a mid-stream change of the source
+ * needs no reset. UPSCALE drops the anchor: upscale p and, unless damaged,
+ * give a copy to aji_held_set_anchor. REUSE: emit the anchor's output for p. */
 AJI_EXPORT int aji_held_decide(aji_held *h, const aji_held_frame *p,
                                const aji_held_frame *n, const aji_held_frame *n2,
                                void *cu_stream, aji_held_decision *out);
 /* The frame just upscaled, as a copy (not a decoder surface) the caller
  * keeps valid and unwritten until the engine drops it: the next UPSCALE,
  * set_anchor, reset or destroy. Descriptor is copied. copy->id = source
- * frame's id; copy->mark = the copy's mark. AJI_ERR for a damaged frame. */
+ * frame's id; copy->mark = the copy's mark. Starts a new run. AJI_ERR for a
+ * damaged frame (or bad flags / reserved, as for aji_held_decide). */
 AJI_EXPORT int aji_held_set_anchor(aji_held *h, const aji_held_frame *copy);
-/* Seek / discontinuity: forget anchor, look-ahead cache and run; clear a
- * comparison error. Counters and trace stay. */
+/* A seek, a discontinuity, or a change of device or context (frames the
+ * anchor's descriptor no longer points at): forget anchor, look-ahead cache
+ * and run; clear a comparison error. Counters and trace stay. */
 AJI_EXPORT void aji_held_reset(aji_held *h);
 /* Fills out up to out->struct_size. */
 AJI_EXPORT void aji_held_get_stats(aji_held *h, aji_held_stats *out);
