@@ -327,6 +327,59 @@ AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
                                      aji_frame_diff_result *out,
                                      void *cu_stream, uint64_t mark);
 
+/* ---- Held-frame reuse: the decision engine (additive; no API_VERSION bump).
+ * Exported by the dispatcher (aji.dll / libaji.so) only; resolve optionally.
+ * Rule V2. D = aji_frame_diff's max_tile, fade = max |region_mean|, a = anchor
+ * (the last upscaled frame), T/F = thresholds. Frame N reuses a's output iff
+ *   D(a,N) <= T and fade(a,N) <= F, fewer than max_run reused in a row,
+ *   N, N+1, N+2 undamaged and N+1, N+2 exist, and for X in {N+1, N+2} neither
+ *     D(a,X) > T and D(N,X) <= T                    (the change starts at N)
+ *     D(a,X) > 1.5 * max(D(a,N), D(N,X), 0.5)       (D from the anchor grows)
+ * The engine owns the rule state, the comparisons (aji_frame_diff_marked),
+ * the counters and the trace. The caller owns all frames, the look-ahead
+ * queue and the anchor copy. One handle is one decision point: a chain that
+ * decides at several stages uses one per stage. Same thread as c's other
+ * calls. */
+#define AJI_HELD_RULE_VERSION      2
+#define AJI_HELD_THRESHOLD_DEFAULT 2.5f
+#define AJI_HELD_FADE_DEFAULT      0.15f
+#define AJI_HELD_MAX_RUN_DEFAULT   24
+
+typedef struct aji_held aji_held;
+
+typedef struct aji_held_params {
+    uint32_t struct_size;   /* sizeof(aji_held_params) */
+    float threshold;        /* T, 8-bit levels (>= 0) */
+    float fade_threshold;   /* F (>= 0) */
+    int   max_run;          /* reused frames in a row (>= 0) */
+} aji_held_params;
+
+typedef struct aji_held_frame {
+    aji_frame frame;   /* as for aji_frame_diff; padded surfaces are fine */
+    uint64_t  mark;    /* DirectML: aji_d3d11_mark after its last write; 0 = none */
+    uint64_t  id;      /* caller's, unique per source frame (a sequence number) */
+    int       damaged; /* never reused, never compared; don't make it the anchor */
+} aji_held_frame;
+
+enum aji_held_action { AJI_HELD_UPSCALE = 0, AJI_HELD_REUSE = 1 };
+
+typedef struct aji_held_decision {
+    int      action;     /* enum aji_held_action */
+    int      run;        /* REUSE: frames reused in a row, this one included */
+    uint64_t anchor_id;  /* REUSE: id of the frame given to aji_held_set_anchor */
+    int      error;      /* AJI_OK, or the aji_status of a failed comparison:
+                            action is UPSCALE, and the engine stays off (every
+                            frame UPSCALE, error set) until aji_held_reset;
+                            aji_last_error(c) has the text */
+    int      reserved[3];
+} aji_held_decision;
+
+typedef struct aji_held_stats {
+    uint32_t struct_size;   /* sizeof(aji_held_stats) */
+    int64_t  seen, reused;          /* decisions; reused / seen = reuse share */
+    int64_t  comparisons, compare_ns;
+} aji_held_stats;
+
 /* Async builds: returns 1 (once) when a background engine build finished;
  * the caller should re-run aji_configure, which now finds the engine in
  * the cache (or logs the failure and stays passthrough). Cheap to call
