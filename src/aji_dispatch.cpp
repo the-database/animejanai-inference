@@ -508,6 +508,12 @@ extern "C" AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
     return c->be.frame_diff(c->inner, a, b, out, cu_stream);
 }
 
+// For aji_held.cpp (not exported): whether c's backend can compare frames
+bool aji_dispatch_has_frame_diff(aji_ctx *c)
+{
+    return c && (c->be.frame_diff || c->be.frame_diff_marked);
+}
+
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
 {
     return c->be.poll(c->inner);

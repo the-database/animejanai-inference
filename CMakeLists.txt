@@ -69,7 +69,7 @@ set(AJI_PACK_DEFS AJI_PACK_CUDART="${_pack_cudart}" AJI_PACK_NVINFER="${_pack_nv
 # conf's [global] backend key and forwards the C ABI to the sibling
 # backend library. No CUDA/TRT/ORT dependencies of its own.
 add_library(aji SHARED src/aji_dispatch.cpp src/aji_conf.cpp src/core/fileio.cpp
-    src/core/runtime_packs.cpp src/aji_img_dispatch.cpp)
+    src/core/runtime_packs.cpp src/aji_img_dispatch.cpp src/aji_held.cpp src/core/held.cpp)
 target_compile_definitions(aji PRIVATE ${AJI_PACK_DEFS})
 target_include_directories(aji PUBLIC include)
 target_link_libraries(aji PRIVATE ${CMAKE_DL_LIBS})
@@ -368,6 +368,13 @@ target_include_directories(aji_tiling_test PRIVATE include src)
 add_executable(aji_runtime_packs_test sanity/runtime_packs_test.cpp
     src/core/runtime_packs.cpp src/core/fileio.cpp)
 target_include_directories(aji_runtime_packs_test PRIVATE include src)
+
+# The held-frame reuse rule against synthetic comparisons, and its C ABI
+# (src/aji_held.cpp) over a stub context.
+add_executable(aji_held_test sanity/held_test.cpp src/core/held.cpp src/aji_held.cpp
+    src/core/fileio.cpp)
+target_include_directories(aji_held_test PRIVATE include src)
+target_link_libraries(aji_held_test PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(aji_runtime_packs_test PRIVATE ${CMAKE_DL_LIBS})
 
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
@@ -396,7 +403,8 @@ endif()
 enable_testing()
 add_executable(aji_rife_conf_test sanity/rife_conf_test.cpp src/aji_conf.cpp)
 target_include_directories(aji_rife_conf_test PRIVATE src)
-foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test)
+foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
+                     aji_held_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS cpu)
 endforeach()

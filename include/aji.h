@@ -327,6 +327,100 @@ AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
                                      aji_frame_diff_result *out,
                                      void *cu_stream, uint64_t mark);
 
+/* ---- Held-frame reuse: the decision engine (additive; no API_VERSION bump).
+ * Exported by the dispatcher (aji.dll / libaji.so) only; resolve optionally.
+ * Rule V2. D = aji_frame_diff's max_tile, fade = max |region_mean|, a = anchor
+ * (the last upscaled frame), T/F = thresholds. Frame N reuses a's output iff
+ *   D(a,N) <= T and fade(a,N) <= F, fewer than max_run reused in a row,
+ *   N, N+1, N+2 undamaged and N+1, N+2 exist, and for X in {N+1, N+2} neither
+ *     D(a,X) > T and D(N,X) <= T                    (the change starts at N)
+ *     D(a,X) > 1.5 * max(D(a,N), D(N,X), 0.5)       (D from the anchor grows)
+ * The engine owns the rule state, the comparisons (aji_frame_diff_marked),
+ * the counters and the trace. The caller owns all frames, the look-ahead
+ * queue and the anchor copy. One handle is one decision point: a chain that
+ * decides at several stages uses one per stage. Same thread as c's other
+ * calls. */
+#define AJI_HELD_RULE_VERSION      2
+#define AJI_HELD_THRESHOLD_DEFAULT 2.5f
+#define AJI_HELD_FADE_DEFAULT      0.15f
+#define AJI_HELD_MAX_RUN_DEFAULT   24
+
+typedef struct aji_held aji_held;
+
+typedef struct aji_held_params {
+    uint32_t struct_size;   /* sizeof(aji_held_params) */
+    float threshold;        /* T, 8-bit levels (>= 0) */
+    float fade_threshold;   /* F (>= 0) */
+    int   max_run;          /* reused frames in a row (>= 0) */
+} aji_held_params;
+
+#define AJI_HELD_FRAME_DAMAGED (1u << 0)  /* never reused, never compared;
+                                            not for aji_held_set_anchor */
+
+typedef struct aji_held_frame {
+    aji_frame frame;        /* as for aji_frame_diff; padded surfaces are fine */
+    uint64_t  mark;         /* DirectML: aji_d3d11_mark after its last write; 0 = none */
+    uint64_t  id;           /* caller's, unique per source frame (a sequence number) */
+    uint32_t  flags;        /* AJI_HELD_FRAME_*; other bits must be 0 */
+    uint32_t  reserved[3];  /* must be 0 */
+} aji_held_frame;
+
+enum aji_held_action { AJI_HELD_UPSCALE = 0, AJI_HELD_REUSE = 1 };
+
+typedef struct aji_held_decision {
+    int      action;     /* enum aji_held_action */
+    int      run;        /* REUSE: frames reused in a row, this one included */
+    uint64_t anchor_id;  /* REUSE: id of the frame given to aji_held_set_anchor */
+    int      error;      /* AJI_OK, or the aji_status of a failed comparison:
+                            action is UPSCALE, and the engine stays off (every
+                            frame UPSCALE, error set) until aji_held_reset;
+                            aji_last_error(c) has the text */
+    int      reserved[3];
+} aji_held_decision;
+
+typedef struct aji_held_stats {
+    uint32_t struct_size;   /* sizeof(aji_held_stats) */
+    int64_t  seen, reused;          /* decisions; reused / seen = reuse share */
+    int64_t  comparisons, compare_ns;
+} aji_held_stats;
+
+/* The rule version this library implements (AJI_HELD_RULE_VERSION). */
+AJI_EXPORT int aji_held_version(void);
+/* NULL on bad params, or when c's backend has no aji_frame_diff. Destroy
+ * before aji_destroy(c). */
+AJI_EXPORT aji_held *aji_held_create(aji_ctx *c, const aji_held_params *p);
+/* CSV trace of every comparison (frame,pair,D,16 region means) and decision
+ * (frame,reuse|upscale); frame = 0-based count of decisions. path is UTF-8.
+ * AJI_ERR if the file can't be opened (the trace before stays). NULL
+ * closes. */
+AJI_EXPORT int aji_held_set_trace(aji_held *h, const char *path);
+/* Decide frame p. n, n2 = the two source frames after it (NULL: not there /
+ * caller forces an upscale). Synchronous, up to 5 comparisons. TensorRT: on
+ * cu_stream, where p, n, n2 and the anchor must be complete. DirectML: waits
+ * for the frames' marks. Descriptors read during the call only. Returns AJI_OK
+ * with *out written (also when out->error is set); AJI_ERR, with nothing
+ * decided, only for bad args (a NULL, unknown flags, reserved not 0).
+ * An anchor of another width, height or format than p counts as none
+ * (UPSCALE, no comparison, no error), so a mid-stream change of the source
+ * needs no reset. UPSCALE drops the anchor: upscale p and, unless damaged,
+ * give a copy to aji_held_set_anchor. REUSE: emit the anchor's output for p. */
+AJI_EXPORT int aji_held_decide(aji_held *h, const aji_held_frame *p,
+                               const aji_held_frame *n, const aji_held_frame *n2,
+                               void *cu_stream, aji_held_decision *out);
+/* The frame just upscaled, as a copy (not a decoder surface) the caller
+ * keeps valid and unwritten until the engine drops it: the next UPSCALE,
+ * set_anchor, reset or destroy. Descriptor is copied. copy->id = source
+ * frame's id; copy->mark = the copy's mark. Starts a new run. AJI_ERR for a
+ * damaged frame (or bad flags / reserved, as for aji_held_decide). */
+AJI_EXPORT int aji_held_set_anchor(aji_held *h, const aji_held_frame *copy);
+/* A seek, a discontinuity, or a change of device or context (frames the
+ * anchor's descriptor no longer points at): forget anchor, look-ahead cache
+ * and run; clear a comparison error. Counters and trace stay. */
+AJI_EXPORT void aji_held_reset(aji_held *h);
+/* Fills out up to out->struct_size. */
+AJI_EXPORT void aji_held_get_stats(aji_held *h, aji_held_stats *out);
+AJI_EXPORT void aji_held_destroy(aji_held **h);
+
 /* Async builds: returns 1 (once) when a background engine build finished;
  * the caller should re-run aji_configure, which now finds the engine in
  * the cache (or logs the failure and stays passthrough). Cheap to call
