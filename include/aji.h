@@ -300,6 +300,33 @@ AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, aji_frame_diff_result *out,
                               void *cu_stream);
 
+/* DirectML: put a mark on the caller's D3D11 immediate context and return
+ * it. Signals libaji's shared fence there with the next value (one counter
+ * per context, so marks only grow) and flushes the context; the mark has
+ * passed once all work queued on the context before this call is done.
+ * Take one right after the last write to a frame you will compare (its
+ * upload, a copy into it), and pass it to aji_frame_diff_marked. Returns 0
+ * on the TensorRT backends and with an aji_dml.dll older than this call.
+ * Additive, no API_VERSION bump. */
+AJI_EXPORT uint64_t aji_d3d11_mark(aji_ctx *c);
+
+/* aji_frame_diff, but on DirectML it waits only for `mark` to pass, not
+ * for everything queued on the D3D11 context before the call. `mark` is
+ * the later of the two frames' marks (aji_d3d11_mark after each frame's
+ * last write); neither frame may be written again until this returns.
+ * That matters where the context carries other long work: NVENC encodes
+ * D3D11 frames on it, and a plain aji_frame_diff waits for every encode
+ * queued so far (15-18 ms at 4K p7 on an RTX 5090, against 1.5-2.7 ms
+ * for marks taken a few frames earlier). mark 0 behaves exactly like
+ * aji_frame_diff; a mark this context never issued is AJI_ERR. On the
+ * TensorRT backends (and an aji_dml.dll older than this call) the mark is
+ * ignored and this is aji_frame_diff, cu_stream included. Additive, no
+ * API_VERSION bump. */
+AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
+                                     const aji_frame *b,
+                                     aji_frame_diff_result *out,
+                                     void *cu_stream, uint64_t mark);
+
 /* Async builds: returns 1 (once) when a background engine build finished;
  * the caller should re-run aji_configure, which now finds the engine in
  * the cache (or logs the failure and stays passthrough). Cheap to call

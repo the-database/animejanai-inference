@@ -1,9 +1,11 @@
 // aji_frame_diff on DirectML (held-frame reuse in aji_encode): the cases of
 // frame_diff.cu for every format the DirectML backend takes (NV12, P010,
 // RGB10A2), through the dispatcher and shared D3D11 textures as aji_encode
-// passes them. Where CUDA works, every NV12/P010 comparison is also run
-// through kernels.cu's launcher on the same samples, and the two results
-// must be bit-identical.
+// passes them. Every comparison runs twice, plain (waiting for all D3D11
+// work) and with the frames' aji_d3d11_mark values (aji_frame_diff_marked,
+// as aji_encode calls it), and both must agree. Where CUDA works, every
+// NV12/P010 comparison is also run through kernels.cu's launcher on the
+// same samples, and the results must be bit-identical.
 //
 //   aji_frame_diff_dml_test [--adapter N]
 //       the synthetic cases (ctest -L gpu); N = DXGI adapter index
@@ -60,6 +62,7 @@ struct Frame {
     ComPtr<ID3D11Texture2D> tex, st;
     void *dev[2] = {nullptr, nullptr};
     size_t pitch[2] = {0, 0};
+    uint64_t mark = 0;             // aji_d3d11_mark after the last upload
 
     Frame(int w_, int h_, int fmt_) : w(w_), h(h_), fmt(fmt_)
     {
@@ -146,6 +149,7 @@ struct Frame {
         }
         g_ctx->Unmap(st.Get(), 0);
         g_ctx->CopyResource(tex.Get(), st.Get());
+        mark = aji_d3d11_mark(g_aji);
         return rgb || !g_cuda || upload_cuda();
     }
     bool upload_cuda()
@@ -210,6 +214,14 @@ int diff(const Frame &a, const Frame &b, aji_frame_diff_result *r)
     if (ret != AJI_OK) {
         std::fprintf(stderr, "aji_frame_diff: %d (%s)\n", ret,
                      aji_last_error(g_aji));
+        return -1;
+    }
+    aji_frame_diff_result mr;
+    const uint64_t m = a.mark > b.mark ? a.mark : b.mark;
+    if (!m || aji_frame_diff_marked(g_aji, &fa, &fb, &mr, nullptr, m) != AJI_OK ||
+        !same(*r, mr)) {
+        std::fprintf(stderr, "aji_frame_diff_marked (mark %llu) differs: %s\n",
+                     (unsigned long long)m, aji_last_error(g_aji));
         return -1;
     }
     if (!g_cuda || a.rgb)
@@ -404,6 +416,71 @@ int synthetic()
         aji_frame f444 = fa, g444 = fa;
         f444.format = g444.format = AJI_FMT_YUV444P16;   // CUDA only
         CHECK(aji_frame_diff(g_aji, &f444, &g444, &r, nullptr) == AJI_ERR_FORMAT);
+        // a mark this context never issued
+        const uint64_t next = aji_d3d11_mark(g_aji) + 1;
+        CHECK(aji_frame_diff_marked(g_aji, &fa, &fa, &r, nullptr, next) == AJI_ERR);
+        CHECK(aji_frame_diff_marked(g_aji, &fa, &fa, &r, nullptr, 0) == AJI_OK);
+    }
+
+    // marks: one increasing counter with the plain call's own signals; a
+    // marked comparison sees every write before its mark, also with more
+    // D3D11 work queued after the mark (which it need not wait for: the
+    // times are printed, not checked); a mark that passed long ago is fine
+    {
+        Frame a(1920, 1080, AJI_FMT_P010), b(1920, 1080, AJI_FMT_P010);
+        a.fill(5);
+        b.fill(5);
+        CHECK(a.upload() && b.upload());
+        CHECK(b.mark > a.mark);
+        const uint64_t m1 = aji_d3d11_mark(g_aji), m2 = aji_d3d11_mark(g_aji);
+        CHECK(m1 > b.mark && m2 == m1 + 1);
+        const aji_frame fa = a.frame(), fb = b.frame();
+        CHECK(aji_frame_diff(g_aji, &fa, &fb, &r, nullptr) == AJI_OK);
+        CHECK(r.max_tile == 0.0f);
+        CHECK(aji_d3d11_mark(g_aji) == m2 + 2);   // the plain call took m2 + 1
+
+        // filler: 4K RGBA16F copies on the context, after b's next upload
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = 3840;
+        td.Height = 2160;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> f0, f1;
+        CHECK(SUCCEEDED(g_dev->CreateTexture2D(&td, NULL, &f0)) &&
+              SUCCEEDED(g_dev->CreateTexture2D(&td, NULL, &f1)));
+        double t_marked = 0, t_plain = 0;
+        for (int round = 1; round <= 3; round++) {
+            for (auto &v : b.pl[0]) v = (uint16_t)(v + 2 * b.unit());
+            CHECK(b.upload());
+            for (int i = 0; i < 64; i++)
+                g_ctx->CopyResource(i & 1 ? f0.Get() : f1.Get(),
+                                    i & 1 ? f1.Get() : f0.Get());
+            g_ctx->Flush();
+            LARGE_INTEGER q0, q1, q2, fq;
+            QueryPerformanceFrequency(&fq);
+            QueryPerformanceCounter(&q0);
+            aji_frame_diff_result mr;
+            CHECK(aji_frame_diff_marked(g_aji, &fa, &fb, &mr, nullptr, b.mark) ==
+                  AJI_OK);
+            QueryPerformanceCounter(&q1);
+            CHECK(approx(mr.max_tile, 2.0f * round));
+            for (int i = 0; i < 64; i++)
+                g_ctx->CopyResource(i & 1 ? f0.Get() : f1.Get(),
+                                    i & 1 ? f1.Get() : f0.Get());
+            CHECK(diff(a, b, &r) == 0 && same(r, mr));   // plain, then marked
+            QueryPerformanceCounter(&q2);
+            t_marked += 1e3 * (q1.QuadPart - q0.QuadPart) / fq.QuadPart;
+            t_plain += 1e3 * (q2.QuadPart - q1.QuadPart) / fq.QuadPart;
+        }
+        CHECK(aji_frame_diff_marked(g_aji, &fa, &fb, &r, nullptr, 1) == AJI_OK);
+        CHECK(approx(r.max_tile, 6.0f));
+        std::printf("marks: behind 64 queued 4K copies, a marked comparison "
+                    "took %.2f ms, a plain one (and a marked) %.2f ms\n",
+                    t_marked / 3, t_plain / 3);
     }
 
     // 1080p: the grid regions cover the frame (a uniform +3 averages to 3);
