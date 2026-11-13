@@ -72,7 +72,9 @@ extern "C" AJI_EXPORT int aji_held_decide(aji_held *h, const aji_held_frame *p,
                                           const aji_held_frame *n2,
                                           void *cu_stream, aji_held_decision *out)
 {
-    if (!h || !p || !out)
+    using ajicore::HeldRule;
+    if (!h || !p || !out || !HeldRule::valid_frame(*p) ||
+        (n && !HeldRule::valid_frame(*n)) || (n2 && !HeldRule::valid_frame(*n2)))
         return AJI_ERR;
     h->cu_stream = cu_stream;
     h->rule.decide(*p, n, n2, out);
@@ -82,7 +84,8 @@ extern "C" AJI_EXPORT int aji_held_decide(aji_held *h, const aji_held_frame *p,
 
 extern "C" AJI_EXPORT int aji_held_set_anchor(aji_held *h, const aji_held_frame *copy)
 {
-    if (!h || !copy || copy->damaged)
+    if (!h || !copy || !ajicore::HeldRule::valid_frame(*copy) ||
+        (copy->flags & AJI_HELD_FRAME_DAMAGED))
         return AJI_ERR;
     h->rule.set_anchor(*copy);
     return AJI_OK;

@@ -182,7 +182,7 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_kernel_test` | EXE | `CUDA::cudart` | kernel unit tests |
 | `aji_image` | EXE | `aji` | image-ABI CLI (PNM in/out); the reference consumer of `aji_image.h` |
 | `aji_tiling_test` | EXE | — | CPU-only checks of `core/tiling` and the fp16/bf16 conversions |
-| `aji_held_test` | EXE | — | CPU-only checks of `core/held`, the held-frame reuse rule (`aji_held_*`) |
+| `aji_held_test` | EXE | — | CPU-only checks of `core/held`, the held-frame reuse rule, and its C ABI (`aji_held_*`) over a stub context |
 
 The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
 cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`, `aji_held_test`; what CI
@@ -453,12 +453,20 @@ the run, D(anchor, N+1) cached from the last look-ahead), makes the comparisons 
 counts them and writes the trace. The caller owns every frame, the queue and the anchor copy: it
 passes N, N+1, N+2 (NULL at the end of the stream) to `aji_held_decide`; on UPSCALE (which drops
 the anchor) it upscales N and hands a copy of N to `aji_held_set_anchor`, on REUSE it emits the
-anchor's output. One handle is one decision point. `aji_held_create` returns NULL for a backend
-without `aji_frame_diff` (an `aji_dml.dll` older than its port beside a new `aji.dll`):
-`aji_encode` then logs `held frames: not reused (the backend can't compare frames)` and encodes
-every frame. `aji_held_test` (`ctest -L cpu`) drives the rule with synthetic comparisons: every
-veto alone, the 0.5 floor, damage, the comparison order and counts, errors, reset, and the trace
-text against a golden string.
+anchor's output; `aji_held_set_anchor` starts a new run. One handle is one decision point;
+`aji_held_reset` is for a seek, a discontinuity or a change of device or context. A change of
+size or format without one is no error: an anchor unlike N counts as none, and a look-ahead
+frame unlike N means an upscale without comparisons. Frames carry `flags`
+(`AJI_HELD_FRAME_DAMAGED`) and `reserved[3]`, so `aji_held_frame` can grow: unknown flags or
+nonzero reserved words are refused with `AJI_ERR`. A comparison error (`decision.error`) turns
+the engine off until a reset. `aji_held_create` returns NULL for a backend without
+`aji_frame_diff` (an `aji_dml.dll` older than its port beside a new `aji.dll`): `aji_encode` then
+logs `held frames: not reused (the backend can't compare frames)` and encodes every frame.
+`aji_held_test` (`ctest -L cpu`) drives the rule with synthetic comparisons: every veto alone,
+the 0.5 floor, damage, the look-ahead's cached D and fade, size and format changes, the run after
+a new anchor, the comparison order and counts, errors, reset, and the trace text (with cached
+decisions) against a golden string. It also runs `src/aji_held.cpp` over a stub context (mark
+selection, `cu_stream`, argument and flag checks, partial `get_stats`).
 
 **In `aji_encode`.** `src/encode.c` keeps what touches frames (the comment above `push_reuse`):
 frames are decided `ring_depth + 2` frames late and compared on a non-blocking stream that waits

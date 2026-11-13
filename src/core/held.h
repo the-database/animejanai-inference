@@ -31,6 +31,8 @@ public:
     HeldRule &operator=(const HeldRule &) = delete;
 
     static bool valid_params(const aji_held_params *p);
+    // flags known, reserved 0
+    static bool valid_frame(const aji_held_frame &f);
 
     // Takes the file (closes the one before; NULL: no trace).
     void set_trace(std::FILE *f);
