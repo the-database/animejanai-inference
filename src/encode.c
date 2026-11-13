@@ -313,11 +313,13 @@ typedef struct {
     int64_t   pts;       /* output PTS in the video stream time_base */
 } slot;
 
-/* held-frame reuse: a decoded frame waiting for its decision, and (CUDA)
- * the event recorded on the legacy stream when it arrived */
+/* held-frame reuse: a decoded frame waiting for its decision, and what
+ * marks its arrival (see reuse_arrived) */
 typedef struct {
     AVFrame     *f;
-    cudaEvent_t  ev;         /* NULL on DirectML (see reuse_arrived) */
+    cudaEvent_t  ev;         /* CUDA: an event on the legacy stream */
+    uint64_t     mark;       /* DirectML: an aji_d3d11_mark */
+    AVFrame     *copy;       /* DirectML: f's copy, the anchor if f is upscaled */
 } held_frame;
 
 /* a still-image encoder (scaler + PNG/MJPEG), kept across frames */
@@ -518,8 +520,10 @@ typedef struct {
     /* held-frame reuse (see push_reuse) */
     int              reuse;          /* on: requested, and a plain upscale chain */
     cudaStream_t     diff_stream;    /* CUDA: aji_frame_diff and anchor copies only */
-    AVBufferRef     *anchor_pool;    /* one source-format frame: */
+    AVBufferRef     *anchor_pool;    /* source-format frames (CUDA: one; DirectML:
+                                        each queued frame's copy) for: */
     AVFrame         *anchor_src;     /* a copy of the last upscaled source frame */
+    uint64_t         anchor_mark;    /* DirectML: aji_d3d11_mark after the copy */
     AVFrame         *anchor_out;     /* a ref of its upscaled output */
     int              have_anchor;
     held_frame       hq[REUSE_QMAX]; /* frames not yet decided, oldest first */
@@ -529,6 +533,7 @@ typedef struct {
     float            next_d, next_fade;  /* against the anchor, if known */
     int              skip_run;       /* frames reused since the anchor */
     int64_t          reused, reuse_seen;
+    int64_t          cmp_n, cmp_us;  /* comparisons, and their wall time */
     FILE            *reuse_trace;    /* AJI_REUSE_TRACE: every comparison, CSV */
 } enc_ctx;
 
@@ -3328,11 +3333,12 @@ static AVFrame *infer_enqueue(enc_ctx *c, AVFrame *dec)
  * contrast or less (an anti-aliased caret) can be held for up to
  * REUSE_MAX_RUN frames. Speed: where inference is the limit (-preset p1)
  * wall time fell 24-31%, about in proportion to the reuse rate; where NVENC
- * is (VideoJaNai's p7 at 4K on a fast GPU), it doesn't change.
+ * is (VideoJaNai's p7 at 4K on a fast GPU), it changes little (CUDA: none;
+ * DirectML: 1-4% faster).
  *
  * The rule, the queue and the anchor are the same on both backends; only
  * the three steps that touch the GPU differ (reuse_arrived, the waits in
- * reuse_cmp, reuse_copy_anchor).
+ * reuse_cmp, reuse_anchor_copy).
  *
  * CUDA: libav's decoder copies (and uploads) frames on CUDA's legacy
  * default stream, which waits for all work queued on c->stream before it.
@@ -3348,23 +3354,29 @@ static AVFrame *infer_enqueue(enc_ctx *c, AVFrame *dec)
  *
  * DirectML: frames are D3D11 textures that libav uploads (and the anchor
  * copy copies) on the D3D11 immediate context, which never waits for
- * libaji's D3D12 inference queue (libaji only signals a shared fence from
- * it, and aji_encode waits for outputs on the CPU). aji_frame_diff signals
- * that fence after everything queued on the context so far and compares on
- * a D3D12 queue of its own that waits for the signal, so a frame is
- * compared only after its upload, the anchor only after its copy, and
- * neither waits for queued inference. No events are needed; the decision
- * lag is the same as on CUDA. It does wait for whatever else is queued on
- * the D3D11 context, and NVENC's zero-copy encodes of D3D11 frames are:
- * with NVENC a comparison waits for the queued encodes (about 15 ms at p7
- * 4K on the RTX 5090, against 1.2-1.7 ms with a CPU encoder or p1), so
- * where NVENC is the limit reuse costs time instead of saving it.
+ * libaji's D3D12 inference queue. The same context carries NVENC's
+ * zero-copy encodes of D3D11 frames, though, so waiting for "everything
+ * queued on it so far" (plain aji_frame_diff) waits for the queued encodes
+ * too: about 15-18 ms a comparison at p7 4K on the RTX 5090, which made
+ * reuse 6-8% slower there. So every frame is copied as it arrives, right
+ * after its upload (the copy becomes the anchor if the frame is upscaled,
+ * and is dropped otherwise), and then marked (aji_d3d11_mark: a signal of
+ * libaji's shared fence on that context, flushed); aji_frame_diff_marked
+ * waits for the later of the two frames' marks only, on a D3D12 queue of
+ * its own. Frames are decided reuse_lag frames after they arrive, so their
+ * marks have long passed by then, and the comparison waits neither for
+ * queued inference nor for the encodes queued since. (Copying the anchor at
+ * decision time, as on CUDA, put the copy behind every encode queued so far
+ * and the next comparison waited for all of them again.)
  * Evidence (2878 frames of two 1080p clips, 2x to 4K): every decision, D
  * and region mean is the same as on CUDA (238 and 904 frames reused), and
- * frame counts and timestamps match an encode without reuse. RTX 5090,
- * NVENC p7: 6-8% slower; p1: 6% and 23% faster. Intel UHD 770 (the
- * Performance model, QSV, 480 frames, 15% and 32% reused): 11% and 24%
- * faster, with the same decisions as the RTX 5090.
+ * frame counts and timestamps match an encode without reuse. RTX 5090: a
+ * comparison takes 1.5-2.7 ms at NVENC p7 (15-18 ms without marks) and
+ * 0.7-1.1 ms at p1; wall time at p7 1% and 4% faster (6-8% slower without
+ * marks), at p1 7% and 23% faster. Intel UHD 770 (the Performance model,
+ * QSV, 480 frames, 15% and 32% reused): 12% and 26% faster, a
+ * comparison ~6 ms (~14 ms without marks), with the same decisions as
+ * the RTX 5090.
  *
  * The anchor's source is a copy, in a pool of its own (keeping the
  * decoder's frame through a long still would starve NVDEC's pool; on
@@ -3394,12 +3406,37 @@ static int frame_damaged(const AVFrame *f)
            f->opaque == DMG_TAG;
 }
 
-/* a decoded frame joined the reuse queue: CUDA records its arrival on the
- * legacy stream (after libav's copy or upload of it); DirectML needs
- * nothing, as aji_frame_diff orders itself after the D3D11 upload */
-static int reuse_arrived(enc_ctx *c, held_frame *h)
+/* dec joins the reuse queue as h, just after libav's copy or upload of
+ * it: CUDA records an event on the legacy stream; DirectML copies it on
+ * the D3D11 context, for the anchor, and marks the context */
+static int reuse_arrived(enc_ctx *c, held_frame *h, AVFrame *dec)
 {
-    if (c->dml) return 0;
+    if (c->dml) {
+#ifdef _WIN32
+        if (!c->anchor_pool &&
+            !(c->anchor_pool = make_pool(c, src_sw_fmt(c), c->src_w, c->src_h, 1)))
+            return -1;
+        h->copy = av_frame_alloc();
+        if (!h->copy || av_hwframe_get_buffer(c->anchor_pool, h->copy, 0) < 0) {
+            loge("held frames: no texture for a frame's copy");
+            av_frame_free(&h->copy);
+            return -1;
+        }
+        AVHWDeviceContext *dc = (AVHWDeviceContext *)c->hw_device->data;
+        AVD3D11VADeviceContext *dx = (AVD3D11VADeviceContext *)dc->hwctx;
+        dx->lock(dx->lock_ctx);
+        ID3D11DeviceContext_CopySubresourceRegion(
+            dx->device_context, (ID3D11Resource *)h->copy->data[0],
+            (UINT)(intptr_t)h->copy->data[1], 0, 0, 0,
+            (ID3D11Resource *)dec->data[0], (UINT)(intptr_t)dec->data[1], NULL);
+        dx->unlock(dx->lock_ctx);
+        h->mark = aji_d3d11_mark(c->aji);
+        return 0;
+#else
+        (void)dec;
+        return -1;
+#endif
+    }
     if (cudaEventRecord(h->ev, 0) != cudaSuccess) {
         loge("held frames: cudaEventRecord failed");
         return -1;
@@ -3407,24 +3444,40 @@ static int reuse_arrived(enc_ctx *c, held_frame *h)
     return 0;
 }
 
-/* D(a, b) and fade(a, b) (NULL: not wanted); 0, or -1 if aji_frame_diff
- * failed (logged, and reuse stops). ev_a/ev_b: the frames' arrival events
- * (NULL: the anchor, which diff_stream wrote itself; always NULL on
- * DirectML) */
-static int reuse_cmp(enc_ctx *c, AVFrame *a, cudaEvent_t ev_a, AVFrame *b,
-                     cudaEvent_t ev_b, const char *pair, float *d, float *fade)
+/* the anchor as a queued frame: CUDA needs no event (diff_stream wrote
+ * it), DirectML has the mark of the frame it was copied from */
+static held_frame reuse_anchor_frame(const enc_ctx *c)
 {
-    if ((ev_a && cudaStreamWaitEvent(c->diff_stream, ev_a, 0) != cudaSuccess) ||
-        (ev_b && cudaStreamWaitEvent(c->diff_stream, ev_b, 0) != cudaSuccess)) {
+    held_frame h = {c->anchor_src, NULL, c->anchor_mark, NULL};
+    return h;
+}
+
+/* D(a, b) and fade(a, b) (NULL: not wanted); 0, or -1 if aji_frame_diff
+ * failed (logged, and reuse stops). Each frame comes with its arrival
+ * (see reuse_arrived). */
+static int reuse_cmp(enc_ctx *c, const held_frame *a, const held_frame *b,
+                     const char *pair, float *d, float *fade)
+{
+    if (!c->dml &&
+        ((a->ev && cudaStreamWaitEvent(c->diff_stream, a->ev, 0) != cudaSuccess) ||
+         (b->ev && cudaStreamWaitEvent(c->diff_stream, b->ev, 0) != cudaSuccess))) {
         loge("held frames: cudaStreamWaitEvent failed; reusing no more frames");
         c->reuse = 0;
         return -1;
     }
     aji_frame fa, fb;
-    fill_aji_frame(c, &fa, a, 0);
-    fill_aji_frame(c, &fb, b, 0);
+    fill_aji_frame(c, &fa, a->f, 0);
+    fill_aji_frame(c, &fb, b->f, 0);
     aji_frame_diff_result r;
-    const int ret = aji_frame_diff(c->aji, &fa, &fb, &r, c->diff_stream);
+    const int64_t t0 = av_gettime_relative();
+    /* DirectML: wait for the later mark only (0, no mark: for everything
+     * queued on the D3D11 context, as the plain call does) */
+    const int ret = c->dml
+        ? aji_frame_diff_marked(c->aji, &fa, &fb, &r, NULL,
+                                a->mark && b->mark ? FFMAX(a->mark, b->mark) : 0)
+        : aji_frame_diff(c->aji, &fa, &fb, &r, c->diff_stream);
+    c->cmp_us += av_gettime_relative() - t0;
+    c->cmp_n++;
     if (ret != AJI_OK) {
         loge("held frames: aji_frame_diff: %d (%s); reusing no more frames",
              ret, aji_last_error(c->aji));
@@ -3447,51 +3500,18 @@ static int reuse_cmp(enc_ctx *c, AVFrame *a, cudaEvent_t ev_a, AVFrame *b,
     return 0;
 }
 
-/* copy dec (arrived at ev) into c->anchor_src */
-static int reuse_copy_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev)
+/* make h's frame, being upscaled, the anchor's source: on DirectML its
+ * copy from arrival; on CUDA a copy now, on diff_stream */
+static int reuse_anchor_copy(enc_ctx *c, held_frame *h)
 {
     if (c->dml) {
-#ifdef _WIN32
-        /* on the D3D11 immediate context, after dec's upload; the next
-         * aji_frame_diff waits for it (see push_reuse), and a later upload
-         * into dec's texture, once it is back in its pool, comes after it
-         * on the same context */
-        AVHWDeviceContext *dc = (AVHWDeviceContext *)c->hw_device->data;
-        AVD3D11VADeviceContext *dx = (AVD3D11VADeviceContext *)dc->hwctx;
-        dx->lock(dx->lock_ctx);
-        ID3D11DeviceContext_CopySubresourceRegion(
-            dx->device_context, (ID3D11Resource *)c->anchor_src->data[0],
-            (UINT)(intptr_t)c->anchor_src->data[1], 0, 0, 0,
-            (ID3D11Resource *)dec->data[0], (UINT)(intptr_t)dec->data[1], NULL);
-        dx->unlock(dx->lock_ctx);
+        if (!h->copy) return -1;
+        av_frame_free(&c->anchor_src);
+        c->anchor_src = h->copy;
+        c->anchor_mark = h->mark;
+        h->copy = NULL;
         return 0;
-#else
-        return -1;
-#endif
     }
-    const enum AVPixelFormat sw = src_sw_fmt(c);
-    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(sw);
-    int row[4];
-    if (av_image_fill_linesizes(row, sw, dec->width) < 0 ||
-        cudaStreamWaitEvent(c->diff_stream, ev, 0) != cudaSuccess)
-        return -1;
-    for (int p = 0; p < av_pix_fmt_count_planes(sw); p++) {
-        const int h = p ? AV_CEIL_RSHIFT(dec->height, d->log2_chroma_h)
-                        : dec->height;
-        if (cudaMemcpy2DAsync(c->anchor_src->data[p], c->anchor_src->linesize[p],
-                              dec->data[p], dec->linesize[p], row[p], h,
-                              cudaMemcpyDeviceToDevice, c->diff_stream)
-            != cudaSuccess)
-            return -1;
-    }
-    /* done before dec can go back to its pool: its ring slot only waits
-     * for c->stream */
-    return cudaStreamSynchronize(c->diff_stream) == cudaSuccess ? 0 : -1;
-}
-
-/* make dec, just enqueued for upscaling into out, the anchor */
-static int reuse_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev, AVFrame *out)
-{
     if (!c->anchor_src) {
         if (!c->anchor_pool &&
             !(c->anchor_pool = make_pool(c, src_sw_fmt(c), c->src_w, c->src_h, 1)))
@@ -3503,7 +3523,30 @@ static int reuse_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev, AVFrame *out)
             return -1;
         }
     }
-    if (reuse_copy_anchor(c, dec, ev) < 0) return -1;
+    AVFrame *dec = h->f;
+    const enum AVPixelFormat sw = src_sw_fmt(c);
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(sw);
+    int row[4];
+    if (av_image_fill_linesizes(row, sw, dec->width) < 0 ||
+        cudaStreamWaitEvent(c->diff_stream, h->ev, 0) != cudaSuccess)
+        return -1;
+    for (int p = 0; p < av_pix_fmt_count_planes(sw); p++) {
+        const int ph = p ? AV_CEIL_RSHIFT(dec->height, d->log2_chroma_h)
+                         : dec->height;
+        if (cudaMemcpy2DAsync(c->anchor_src->data[p], c->anchor_src->linesize[p],
+                              dec->data[p], dec->linesize[p], row[p], ph,
+                              cudaMemcpyDeviceToDevice, c->diff_stream)
+            != cudaSuccess)
+            return -1;
+    }
+    /* done before dec can go back to its pool: its ring slot only waits
+     * for c->stream */
+    return cudaStreamSynchronize(c->diff_stream) == cudaSuccess ? 0 : -1;
+}
+
+/* out, the upscale of the frame just copied, is the anchor's output */
+static int reuse_anchor_set(enc_ctx *c, AVFrame *out)
+{
     av_frame_unref(c->anchor_out);
     if (av_frame_ref(c->anchor_out, out) < 0) return -1;
     c->have_anchor = 1;
@@ -3514,14 +3557,15 @@ static int reuse_anchor(enc_ctx *c, AVFrame *dec, cudaEvent_t ev, AVFrame *out)
  * 1 when p may still be reused, 0 when not (or a comparison failed).
  * d_ap is D(anchor, p); D(anchor, n) and fade(anchor, n) go to *d_an and
  * *f_an. */
-static int reuse_ahead(enc_ctx *c, AVFrame *p, cudaEvent_t ev_p, float d_ap,
-                       AVFrame *n, cudaEvent_t ev_n, const char *an,
-                       const char *pn, float *d_an, float *f_an)
+static int reuse_ahead(enc_ctx *c, const held_frame *p, float d_ap,
+                       const held_frame *n, const char *an, const char *pn,
+                       float *d_an, float *f_an)
 {
     const float T = c->o.reuse_t;
+    const held_frame a = reuse_anchor_frame(c);
     float d_pn;
-    if (reuse_cmp(c, c->anchor_src, NULL, n, ev_n, an, d_an, f_an) < 0 ||
-        reuse_cmp(c, p, ev_p, n, ev_n, pn, &d_pn, NULL) < 0)
+    if (reuse_cmp(c, &a, n, an, d_an, f_an) < 0 ||
+        reuse_cmp(c, p, n, pn, &d_pn, NULL) < 0)
         return 0;
     if (*d_an > T && d_pn <= T)
         return 0;     /* the change starts at p */
@@ -3530,26 +3574,24 @@ static int reuse_ahead(enc_ctx *c, AVFrame *p, cudaEvent_t ev_p, float d_ap,
     return 1;
 }
 
-/* upscale p (owned) or reuse the anchor's output for it; n and n2 are the
- * two frames after it (NULL past the end); the events are their arrival
- * events (NULL when reuse is off) */
-static int reuse_decide(enc_ctx *c, AVFrame *p, cudaEvent_t ev_p, AVFrame *n,
-                        cudaEvent_t ev_n, AVFrame *n2, cudaEvent_t ev_n2)
+/* upscale p (its frame owned) or reuse the anchor's output for it; n and
+ * n2 are the two frames after it (NULL past the end, or with reuse off) */
+static int reuse_decide(enc_ctx *c, held_frame p, const held_frame *n,
+                        const held_frame *n2)
 {
     int skip = 0;
     const int known = c->next_known;
     float d_ap = c->next_d, f_ap = c->next_fade;
+    const held_frame a = reuse_anchor_frame(c);
     c->next_known = 0;
     c->reuse_seen++;
     if (c->reuse && c->have_anchor && c->skip_run < REUSE_MAX_RUN && n && n2 &&
-        !frame_damaged(p) && !frame_damaged(n) && !frame_damaged(n2) &&
-        (known || reuse_cmp(c, c->anchor_src, NULL, p, ev_p, "ap", &d_ap,
-                            &f_ap) == 0) &&
+        !frame_damaged(p.f) && !frame_damaged(n->f) && !frame_damaged(n2->f) &&
+        (known || reuse_cmp(c, &a, &p, "ap", &d_ap, &f_ap) == 0) &&
         d_ap <= c->o.reuse_t && f_ap <= c->o.reuse_fade) {
         float d_an, f_an, d_an2, f_an2;
-        skip = reuse_ahead(c, p, ev_p, d_ap, n, ev_n, "an", "pn", &d_an, &f_an) &&
-               reuse_ahead(c, p, ev_p, d_ap, n2, ev_n2, "an2", "pn2", &d_an2,
-                           &f_an2);
+        skip = reuse_ahead(c, &p, d_ap, n, "an", "pn", &d_an, &f_an) &&
+               reuse_ahead(c, &p, d_ap, n2, "an2", "pn2", &d_an2, &f_an2);
         if (skip) {           /* the anchor stays: D(anchor, n) is known */
             c->next_known = 1;
             c->next_d = d_an;
@@ -3559,27 +3601,34 @@ static int reuse_decide(enc_ctx *c, AVFrame *p, cudaEvent_t ev_p, AVFrame *n,
     if (c->reuse_trace)
         fprintf(c->reuse_trace, "%lld,%s\n", (long long)c->reuse_seen - 1,
                 skip ? "reuse" : "upscale");
-    if (ring_make_room(c) < 0) { av_frame_free(&p); return -1; }
+    if (ring_make_room(c) < 0) {
+        av_frame_free(&p.f);
+        av_frame_free(&p.copy);
+        return -1;
+    }
     if (skip) {
         AVFrame *out = av_frame_clone(c->anchor_out);
-        if (!out) { loge("av_frame_clone failed"); av_frame_free(&p); return -1; }
-        out->pts = p->pts;
-        av_frame_free(&p);
+        if (!out) { loge("av_frame_clone failed"); av_frame_free(&p.f); av_frame_free(&p.copy); return -1; }
+        out->pts = p.f->pts;
+        av_frame_free(&p.f);
+        av_frame_free(&p.copy);
         ring_commit(c, NULL, out, 0);
         c->skip_run++;
         c->reused++;
         return 0;
     }
-    AVFrame *out = infer_enqueue(c, p);
-    if (!out) { av_frame_free(&p); return -1; }
+    AVFrame *out = infer_enqueue(c, p.f);
+    if (!out) { av_frame_free(&p.f); av_frame_free(&p.copy); return -1; }
     c->skip_run = 0;
     c->have_anchor = 0;
-    if (c->reuse && !frame_damaged(p) && reuse_anchor(c, p, ev_p, out) < 0) {
+    if (c->reuse && !frame_damaged(p.f) &&
+        (reuse_anchor_copy(c, &p) < 0 || reuse_anchor_set(c, out) < 0)) {
         loge("held frames: keeping the anchor frame failed; reusing no more "
              "frames");
         c->reuse = 0;
     }
-    ring_commit(c, p, out, aji_flush(c->aji, c->stream));
+    av_frame_free(&p.copy);       /* DirectML: not the anchor after all */
+    ring_commit(c, p.f, out, aji_flush(c->aji, c->stream));
     return 0;
 }
 
@@ -3591,7 +3640,7 @@ static int push_reuse(enc_ctx *c, AVFrame *dec)
     int queued = 0;
     if (dec && c->reuse) {
         held_frame *h = &c->hq[(c->hq_head + c->hq_n) % REUSE_QMAX];
-        if (reuse_arrived(c, h) < 0) {
+        if (reuse_arrived(c, h, dec) < 0) {
             av_frame_free(&dec);
             return -1;
         }
@@ -3606,18 +3655,20 @@ static int push_reuse(enc_ctx *c, AVFrame *dec)
                                     : NULL;
         held_frame *n2 = c->hq_n > 2 ? &c->hq[(c->hq_head + 2) % REUSE_QMAX]
                                      : NULL;
-        AVFrame *pf = p->f;
+        const held_frame pf = *p;
         p->f = NULL;
+        p->copy = NULL;
         c->hq_head = (c->hq_head + 1) % REUSE_QMAX;
         c->hq_n--;
-        if (reuse_decide(c, pf, p->ev, n ? n->f : NULL, n ? n->ev : NULL,
-                         n2 ? n2->f : NULL, n2 ? n2->ev : NULL) < 0) {
+        if (reuse_decide(c, pf, n, n2) < 0) {
             av_frame_free(&dec);
             return -1;
         }
     }
-    if (dec)      /* reuse is off */
-        return reuse_decide(c, dec, NULL, NULL, NULL, NULL, NULL);
+    if (dec) {    /* reuse is off */
+        const held_frame h = {dec, NULL, 0, NULL};
+        return reuse_decide(c, h, NULL, NULL);
+    }
     return queued ? 0 : ring_drain(c);
 }
 
@@ -4111,6 +4162,9 @@ static int run(enc_ctx *c)
     if (c->o.reuse_held && c->reuse_seen)
         loge("held frames: reused %lld of %lld (%.1f%%)", (long long)c->reused,
              (long long)c->reuse_seen, 100.0 * c->reused / c->reuse_seen);
+    if (c->o.reuse_held && c->cmp_n)
+        loge("held frames: %lld comparisons, %.2f ms each on average",
+             (long long)c->cmp_n, c->cmp_us / 1000.0 / c->cmp_n);
     if (c->damage_spots)
         loge("damaged video: %lld spot(s), encoded past (concealed frames "
              "kept, data the decoder rejected dropped)",
@@ -4313,6 +4367,7 @@ static void cleanup(enc_ctx *c)
     av_frame_free(&c->src_prev);
     for (int i = 0; i < REUSE_QMAX; i++) {
         av_frame_free(&c->hq[i].f);
+        av_frame_free(&c->hq[i].copy);
         if (c->hq[i].ev) cudaEventDestroy(c->hq[i].ev);
     }
     av_frame_free(&c->anchor_src);

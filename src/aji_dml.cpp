@@ -3298,24 +3298,29 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
 // back to the host, so this is synchronous like aji_infer_rife.
 //
 // Ordering: a and b are D3D11 textures the caller wrote (uploads, copies)
-// on its immediate context. As for aji_infer, a signal of the shared fence
-// on that context after a Flush covers every write queued before this
-// call, and the comparison waits for it on the GPU. The comparison runs on
-// a COMPUTE queue of its own (high priority), not on `queue`: it waits for
-// nothing queued for inference there, only for the D3D11 work before it.
+// on its immediate context. Without a mark, as for aji_infer, a signal of
+// the shared fence on that context after a Flush covers every write queued
+// before this call, and the comparison waits for it on the GPU. With a mark
+// (aji_d3d11_mark, taken by the caller after both frames were written) it
+// waits for that value only, so not for later work on the context (NVENC's
+// encodes of D3D11 frames). The comparison runs on a COMPUTE queue of its
+// own (high priority), not on `queue`: it waits for nothing queued for
+// inference there.
 // The textures are read through implicit promotion from COMMON to
 // COPY_SOURCE (decaying back at the end of the submission) rather than
 // explicit transitions, so this queue never changes a frame's state under
 // the inference queue. Uses its own staging and accumulator, apart from
 // the chain's: any time after aji_create, configured or not.
-extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
-                                         const aji_frame *b,
-                                         aji_frame_diff_result *out,
-                                         void *cu_stream)
+static int frame_diff(aji_ctx *c, const aji_frame *a, const aji_frame *b,
+                      aji_frame_diff_result *out, uint64_t mark)
 {
-    (void)cu_stream;
     if (!c || !a || !b || !out)
         return AJI_ERR;
+    if (mark > c->fence_val) {
+        c->set_error("aji_frame_diff_marked: mark %llu was not issued by "
+                     "this context", (unsigned long long)mark);
+        return AJI_ERR;
+    }
     const int fmt = a->format;
     if (fmt != AJI_FMT_NV12 && fmt != AJI_FMT_P010 && fmt != AJI_FMT_RGB10A2) {
         c->set_error("aji_frame_diff: unsupported format %d", fmt);
@@ -3432,11 +3437,15 @@ extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
     const UINT sub[2] = {(UINT)(intptr_t)a->plane[1],
                          (UINT)(intptr_t)b->plane[1]};
 
-    // the frames are ready once the caller's D3D11 work before this call is
-    c->fence_val++;
-    c->ctx11_4->Signal(c->fence11.Get(), c->fence_val);
-    c->ctx11->Flush();
-    F.queue->Wait(c->fence.Get(), c->fence_val);
+    // the frames are ready once the D3D11 work before the mark is done (no
+    // mark: the work before this call)
+    if (!mark) {
+        c->fence_val++;
+        c->ctx11_4->Signal(c->fence11.Get(), c->fence_val);
+        c->ctx11->Flush();
+        mark = c->fence_val;
+    }
+    F.queue->Wait(c->fence.Get(), mark);
 
     ID3D12GraphicsCommandList *cl = F.cl.Get();
     if (FAILED(F.alloc->Reset()) || FAILED(cl->Reset(F.alloc.Get(), NULL))) {
@@ -3538,6 +3547,36 @@ extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
         sum[i] = (long long)(int32_t)acc[17 + i] * 65536 + (long long)acc[1 + i];
     aji_frame_diff_regions(w, h, fmt, rgb ? 3 : 1, sum, out->region_mean);
     return AJI_OK;
+}
+
+extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
+                                         const aji_frame *b,
+                                         aji_frame_diff_result *out,
+                                         void *cu_stream)
+{
+    (void)cu_stream;
+    return frame_diff(c, a, b, out, 0);
+}
+
+extern "C" AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
+                                                const aji_frame *b,
+                                                aji_frame_diff_result *out,
+                                                void *cu_stream, uint64_t mark)
+{
+    (void)cu_stream;
+    return frame_diff(c, a, b, out, mark);
+}
+
+// A signal of the shared fence on the caller's D3D11 context, flushed so
+// it reaches the GPU now; aji_frame_diff_marked waits for it.
+extern "C" AJI_EXPORT uint64_t aji_d3d11_mark(aji_ctx *c)
+{
+    if (!c || !c->ctx11_4)
+        return 0;
+    c->fence_val++;
+    c->ctx11_4->Signal(c->fence11.Get(), c->fence_val);
+    c->ctx11->Flush();
+    return c->fence_val;
 }
 
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)
