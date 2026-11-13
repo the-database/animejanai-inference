@@ -54,6 +54,9 @@ struct aji_backend {
     int (*resize_frame)(aji_ctx *, const aji_frame *, const aji_frame *, void *);
     int (*frame_diff)(aji_ctx *, const aji_frame *, const aji_frame *,
                       aji_frame_diff_result *, void *);
+    int (*frame_diff_marked)(aji_ctx *, const aji_frame *, const aji_frame *,
+                             aji_frame_diff_result *, void *, uint64_t);
+    uint64_t (*d3d11_mark)(aji_ctx *);
     int (*poll)(aji_ctx *);
     int (*infer_rife)(aji_ctx *, const aji_frame *, const aji_frame *,
                       double, const aji_frame *, void *);
@@ -206,9 +209,13 @@ static bool load_backend(const char *stem, aji_backend *be,
     // Optional: do not make old backends unusable for existing callers.
     *(void **)&be->infer_rife_with_scene = lib_sym(be->lib, "aji_infer_rife_with_scene");
     *(void **)&be->rife_enhanced_scene = lib_sym(be->lib, "aji_rife_enhanced_scene");
-    // Optional too: TensorRT backends only (DirectML has none).
+    // Optional too: aji_resize_frame is TensorRT-only (DirectML has none);
+    // aji_frame_diff is in every backend since its DirectML port.
     *(void **)&be->resize_frame = lib_sym(be->lib, "aji_resize_frame");
     *(void **)&be->frame_diff = lib_sym(be->lib, "aji_frame_diff");
+    // DirectML only; the forwarders below stand in for the rest
+    *(void **)&be->frame_diff_marked = lib_sym(be->lib, "aji_frame_diff_marked");
+    *(void **)&be->d3d11_mark = lib_sym(be->lib, "aji_d3d11_mark");
     SYM(temporal_radius, "aji_temporal_radius");
     SYM(ingest,       "aji_ingest");
     SYM(infer_seq,    "aji_infer_seq");
@@ -473,6 +480,30 @@ extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
                                          void *cu_stream)
 {
     if (!c || !c->be.frame_diff)
+        return AJI_ERR;
+    return c->be.frame_diff(c->inner, a, b, out, cu_stream);
+}
+
+extern "C" AJI_EXPORT uint64_t aji_d3d11_mark(aji_ctx *c)
+{
+    if (!c || !c->be.d3d11_mark)
+        return 0;
+    return c->be.d3d11_mark(c->inner);
+}
+
+// A backend without marks (TensorRT) needs none: the plain call, with its
+// stream. Waiting for everything is always safe, so it also stands in for
+// a DirectML backend older than marks.
+extern "C" AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
+                                                const aji_frame *b,
+                                                aji_frame_diff_result *out,
+                                                void *cu_stream, uint64_t mark)
+{
+    if (!c)
+        return AJI_ERR;
+    if (c->be.frame_diff_marked)
+        return c->be.frame_diff_marked(c->inner, a, b, out, cu_stream, mark);
+    if (!c->be.frame_diff)
         return AJI_ERR;
     return c->be.frame_diff(c->inner, a, b, out, cu_stream);
 }
