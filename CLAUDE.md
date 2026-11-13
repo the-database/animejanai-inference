@@ -185,7 +185,9 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 
 The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
 cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`; what CI runs) and `-L gpu`
-(`aji_pre_fusion_test`, `aji_msb444_test`, `aji_frame_diff_test`; needs an NVIDIA GPU). A new test that needs no GPU,
+(`aji_pre_fusion_test`, `aji_msb444_test`, `aji_frame_diff_test`; needs an NVIDIA GPU; on Windows
+also `aji_frame_diff_dml_test`, which runs on any DirectML GPU from `dml-test/`, beside copies of
+`aji.dll`, `aji_dml.dll`, ONNX Runtime and DirectML). A new test that needs no GPU,
 models or fixtures goes in the `cpu` list at the end of `CMakeLists.txt`, and CI runs it on both
 platforms.
 
@@ -413,15 +415,15 @@ On by default (`--no-reuse-held-frames` turns it off, for debugging and A/B test
 `--reuse-held-frames` is still accepted). A frame that is the same picture as the last frame
 that was upscaled (the anchor) skips inference: the anchor's output is encoded again under the
 frame's timestamp. Anime holds drawings for 2-3 frames; slides, screen recordings and still
-shots repeat frames exactly. The comparison is `aji_frame_diff` (TensorRT backends; additive
-export, DirectML returns `AJI_ERR`): D is the largest 8x8-tile mean |diff| over all planes, in
+shots repeat frames exactly. The comparison is `aji_frame_diff` (every backend; additive
+export): D is the largest 8x8-tile mean |diff| over all planes, in
 8-bit levels, and the fade measure the largest signed mean of a 4x4 luma region grid. Frame N is
 reused when D(anchor, N) <= 2.5 and fade <= 0.15, fewer than 24 frames in a row were reused, the
 two frames after it exist (the last two frames are always upscaled) and are undamaged, and a
 two-frame look-ahead sees no motion starting: D from the anchor crossing 2.5 while N is already
 close to the later frame, or growing past 1.5x (floor 0.5). The thresholds can be overridden
-(`--reuse-held-threshold`, `--reuse-held-fade-threshold`; tuning/debug only). Only plain upscale
-chains on CUDA frames use it; RIFE, temporal chains, passthrough, DirectML and
+(`--reuse-held-threshold`, `--reuse-held-fade-threshold`; tuning/debug only). Plain upscale
+chains use it, on CUDA and DirectML alike; RIFE, temporal chains, passthrough and
 `--preview-session` encode every frame, with a log line saying why.
 
 Evidence (RTX 5090): full episodes reuse 16-57% (a 1999 DVD 16%, 1080p web 30-57%); frame
@@ -431,8 +433,8 @@ closest calls (clouds, a title-card fade, smoke, a blurred concert background) s
 synthetic slow pans (0.1-1 px a frame, sharp and blurred) and drifting patches reuse nothing
 inside the motion when clean. Speed: where inference is the limit (`-preset p1` on the 5090) wall time fell
 24-31%, about in proportion to the reuse rate; at VideoJaNai's default p7 on a fast GPU NVENC is
-the limit and wall time doesn't change. Known limits: slow motion buried in codec noise can
-still be held for single frames (a sub-pixel shift; with x264 noise added, a blurred 0.1 px a
+the limit and wall time barely changes (CUDA: not at all; DirectML: 1-4% faster). Known limits:
+slow motion buried in codec noise can still be held for single frames (a sub-pixel shift; with x264 noise added, a blurred 0.1 px a
 frame pan held 26 of 120 frames and a 0.25 px drifting patch 5, each alone); a faint one-pixel change at
 half contrast or less (an anti-aliased caret in a screen recording) can be held for up to 24
 frames.
@@ -440,9 +442,60 @@ frames.
 The comment above `push_reuse` in `src/encode.c` has the rule's reasoning and the stream design:
 frames are decided `ring_depth + 2` frames late and compared on a non-blocking stream that waits
 for each frame's arrival event, because libav's decoder copies run on the legacy default stream
-behind the queued inference. `AJI_REUSE_TRACE=<file>` writes every comparison (frame, pair, D,
-the 16 region means) and decision (frame, `reuse` or `upscale`) as CSV. The last line says
-`held frames: reused N of M (P%)`.
+behind the queued inference. Only three steps differ per backend (`reuse_arrived`, the waits in
+`reuse_cmp`, `reuse_anchor_copy`); the rule, the queue and the anchor bookkeeping are shared.
+
+**DirectML.** `aji_frame_diff` in `aji_dml` is `cs_frame_diff` (`dml_shaders.h`), a port of
+`k_tile_diff` that gives **bit-identical** results: integer sums, the per-tile `scale / n` table
+computed on the host exactly as the CUDA kernel computes it (`src/frame_diff.h`, shared by both
+backends with the region finish), and the 64-bit region sums carried as two 32-bit halves
+(`cs_5_0` has no 64-bit atomics). It takes NV12, P010 and RGB10A2 (R, G, B as three components,
+divided by 4). It runs on a high-priority D3D12 COMPUTE queue of its own, which waits on the
+shared fence, copies both frames' planes to staging buffers and runs the kernel; then the CPU waits
+for that queue alone, so a compare never waits for queued inference. Textures are read through
+implicit promotion (COMMON -> COPY_SOURCE, decaying back), never with explicit transitions that
+could race the inference queue. The opened textures are cached with a reference to the D3D11
+texture: a cache keyed by address alone (like `open_shared`'s) misreads once a freed texture's
+address comes back as another's. Frames may sit in larger textures (decoder surfaces are padded,
+1920x1088 for 1080p): every DirectML read of a frame (`copy_plane`) copies a box of the frame's
+plane size, never the whole subresource. The staging buffers carry slack past each plane (4 KiB,
+or 8 rows if more): drivers widen the kernel's dword loads past the plane's end (a page fault on
+the UHD 770, a hang on the 5090, where nothing else was mapped after the buffer).
+
+**Marks.** libav uploads frames on the D3D11 immediate context, and NVENC's zero-copy encodes of
+D3D11 frames are on it too. The plain `aji_frame_diff` signals the fence on that context at call
+time, so it waits for every encode queued so far: ~15-18 ms a compare at p7 4K on the RTX 5090,
+which made reuse 6-8% slower there. So `aji_encode` uses marks (additive exports, no API_VERSION
+bump): `aji_d3d11_mark` signals the fence with the context's next value, flushes and returns it
+(0 on TensorRT), and `aji_frame_diff_marked(..., mark)` waits only for that value (0: like the plain
+call; a value the context never issued: `AJI_ERR`; the dispatcher falls back to the plain call on
+backends without marks). Every frame, as it arrives, is copied on the context into a texture of
+the anchor's pool (`reuse_arrived`) and then marked; the copy becomes the anchor if the frame is
+upscaled and is dropped otherwise, so the anchor's mark is its frame's. A compare waits for the
+later of its two frames' marks; frames are decided `ring_depth + 2` late, so those have passed and
+nothing queued since is waited for. Copying the anchor at decision time, as on CUDA, would mark it
+behind every encode queued by then; keeping a reference to the uploaded frame instead of a copy
+would have the compare queue read a texture the inference queue may still be reading. The plain
+call stays for other callers (mpv).
+
+`aji_frame_diff_dml_test` checks the cases of `aji_frame_diff_test` on DirectML, each both plain
+and marked, plus the marks themselves (one increasing counter, unknown marks refused, a marked
+compare sees writes before its mark while copies are queued after it, and prints how long it
+took next to a plain one) and frames in padded textures (equal to exact-size ones bit for bit);
+with CUDA present, every result must be bit-identical to `kernels.cu`'s. `--raw FILE W H
+nv12|p010` runs that cross-check on real frames.
+
+Evidence (first 2878 frames of tongari11 and testclip, 2x Balanced to 4K): the DirectML and
+CUDA traces are byte-identical (238 and 904 reused); frame counts and timestamps match
+`--no-reuse-held-frames`. On the RTX 5090 a compare takes 1.5-2.7 ms at NVENC p7 (15-18 ms
+without marks) and 0.7-1.1 ms at p1 (CUDA: ~0.1 ms). Wall time, RTX 5090: 1% and 4% faster at
+NVENC p7 (NVENC the limit; 6-8% slower without marks), 7% and 23% faster at p1. Intel UHD 770
+(Performance model, QSV as VideoJaNai sets it, 480 frames, 15% and 32% reused): 12% and 26%
+faster (11% and 24% without marks), same decisions as on the 5090; a compare takes ~6 ms there
+(~14 ms without marks).
+`AJI_REUSE_TRACE=<file>` writes every comparison (frame, pair, D, the 16 region means) and
+decision (frame, `reuse` or `upscale`) as CSV. At the end `aji_encode` logs `held frames: reused
+N of M (P%)` and `held frames: K comparisons, X ms each on average`.
 
 ## Damaged input in `aji_encode`
 

@@ -280,17 +280,52 @@ typedef struct aji_frame_diff_result {
 } aji_frame_diff_result;
 
 /* Compare frames a and b (same format and dims; any format aji_infer takes
- * as input on CUDA: NV12, P010, YUV444P16, YUV444P10MSB, YUV444P12MSB) and
- * write *out. The documented synchronous exception, like aji_infer_rife:
- * the result is a CPU readback, so this synchronizes cu_stream and returns
- * with *out written. Uses its own scratch, apart from the chain's; give it
- * a stream of its own to keep it from waiting for queued inference (both
- * frames must be complete on that stream, as for aji_infer).
- * TensorRT backends only: DirectML (and libaji before this call) returns
- * AJI_ERR. Additive, no API_VERSION bump. */
+ * as input: on CUDA NV12, P010, YUV444P16, YUV444P10MSB, YUV444P12MSB; on
+ * DirectML NV12, P010 and RGB10A2, whose R, G and B count as three
+ * components of one plane, divided by 4, regions their mean) and write
+ * *out. Both backends give the same values for the same frames. The
+ * documented synchronous exception, like aji_infer_rife: the result is a
+ * CPU readback, so this returns with *out written. Uses its own scratch,
+ * apart from the chain's.
+ *  - TensorRT: synchronizes cu_stream. Give it a stream of its own to keep
+ *    it from waiting for queued inference (both frames must be complete on
+ *    that stream, as for aji_infer).
+ *  - DirectML: cu_stream is ignored. Like aji_infer, it reads the frames
+ *    after all work queued on the caller's D3D11 immediate context before
+ *    the call (a shared-fence signal), on a queue of its own, so it never
+ *    waits for queued inference.
+ * libaji before this call returns AJI_ERR. Additive, no API_VERSION
+ * bump. */
 AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, aji_frame_diff_result *out,
                               void *cu_stream);
+
+/* DirectML: put a mark on the caller's D3D11 immediate context and return
+ * it. Signals libaji's shared fence there with the next value (one counter
+ * per context, so marks only grow) and flushes the context; the mark has
+ * passed once all work queued on the context before this call is done.
+ * Take one right after the last write to a frame you will compare (its
+ * upload, a copy into it), and pass it to aji_frame_diff_marked. Returns 0
+ * on the TensorRT backends and with an aji_dml.dll older than this call.
+ * Additive, no API_VERSION bump. */
+AJI_EXPORT uint64_t aji_d3d11_mark(aji_ctx *c);
+
+/* aji_frame_diff, but on DirectML it waits only for `mark` to pass, not
+ * for everything queued on the D3D11 context before the call. `mark` is
+ * the later of the two frames' marks (aji_d3d11_mark after each frame's
+ * last write); neither frame may be written again until this returns.
+ * That matters where the context carries other long work: NVENC encodes
+ * D3D11 frames on it, and a plain aji_frame_diff waits for every encode
+ * queued so far (15-18 ms at 4K p7 on an RTX 5090, against 1.5-2.7 ms
+ * for marks taken a few frames earlier). mark 0 behaves exactly like
+ * aji_frame_diff; a mark this context never issued is AJI_ERR. On the
+ * TensorRT backends (and an aji_dml.dll older than this call) the mark is
+ * ignored and this is aji_frame_diff, cu_stream included. Additive, no
+ * API_VERSION bump. */
+AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
+                                     const aji_frame *b,
+                                     aji_frame_diff_result *out,
+                                     void *cu_stream, uint64_t mark);
 
 /* Async builds: returns 1 (once) when a background engine build finished;
  * the caller should re-run aji_configure, which now finds the engine in

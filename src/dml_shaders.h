@@ -594,4 +594,86 @@ void cs_rs_v(uint3 id : SV_DispatchThreadID)
     d1.Store((e + 1u) * 4u, asuint(a[1]));
 #endif
 }
+)hlsl"
+R"hlsl(// ---- cs_frame_diff: aji_frame_diff's 8x8 tiles (k_tile_diff) ----
+// One thread per 8x8 tile of a plane with C interleaved components (each
+// component its own tile): the tile's mean |b - a| (the larger of the C),
+// max-reduced over the group and folded into the accumulator with one
+// InterlockedMax on the float's bits (they order like the floats for
+// values >= 0). The mean is float(sum) * weights[n] for a tile of n
+// pixels, where the host computed weights[n] = scale / (float)n exactly as
+// k_tile_diff computes its inv, so both backends give the same floats.
+// With regions, each tile's signed sum also goes to its cell of the 4x4
+// grid (region rx holds tiles tx * 4 / tiles_x == rx), summed per group in
+// groupshared memory (|sum| < 2^31 for 256 tiles of 16-bit samples).
+// cs_5_0 has no 64-bit atomics, so the group's sum s is added as two
+// halves: its low 16 bits (unsigned) and s >> 16 (arithmetic); the host
+// recombines hi * 65536 + lo.
+// di = {w, h, C, regions}, dj = {pitch a, pitch b, sample kind: 0 u8,
+// 1 u16, 2 packed R10G10B10A2 (C = 3)}. weights = the scale / n table
+// (t1). d0 = plane a, d1 = plane b, d2 = accumulator: dword 0 the max
+// bits, 1-16 the low halves, 17-32 the high halves (zeroed by the host).
+groupshared float fd_max[256];
+groupshared int fd_rsum[16];
+
+uint fd_load(RWByteAddressBuffer b, uint row, uint x, uint k, uint c)
+{
+    uint kind = (uint)dj.z;
+    if (kind == 2u)
+        return (b.Load(row + x * 4u) >> (k * 10u)) & 0x3ffu;
+    if (kind == 1u)
+        return load_u16(b, row + (x * c + k) * 2u);
+    return load_u8(b, row + x * c + k);
+}
+
+[numthreads(32, 8, 1)]
+void cs_frame_diff(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    if (gi < 16u)
+        fd_rsum[gi] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint w = (uint)di.x, h = (uint)di.y, c = (uint)di.z;
+    const uint tiles_x = (w + 7u) >> 3, tiles_y = (h + 7u) >> 3;
+    float m = 0.0f;
+    if (id.x < tiles_x && id.y < tiles_y) {
+        const uint x0 = id.x * 8u, y0 = id.y * 8u;
+        const uint nx = min(8u, w - x0), ny = min(8u, h - y0);
+        uint asum[3] = {0u, 0u, 0u};
+        int ssum = 0;
+        for (uint y = 0; y < ny; y++) {
+            const uint ra = (y0 + y) * (uint)dj.x, rb = (y0 + y) * (uint)dj.y;
+            for (uint x = 0; x < nx; x++) {
+                for (uint k = 0; k < c; k++) {
+                    const int d = (int)fd_load(d1, rb, x0 + x, k, c) -
+                                  (int)fd_load(d0, ra, x0 + x, k, c);
+                    asum[k] += (uint)abs(d);
+                    ssum += d;
+                }
+            }
+        }
+        const float inv = weights[nx * ny];
+        for (uint k = 0; k < c; k++)
+            m = max(m, (float)asum[k] * inv);
+        if (di.w != 0 && ssum != 0) {
+            const uint r = (id.y * 4u / tiles_y) * 4u + id.x * 4u / tiles_x;
+            InterlockedAdd(fd_rsum[r], ssum);
+        }
+    }
+    fd_max[gi] = m;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint n = 128; n > 0; n >>= 1) {
+        if (gi < n)
+            fd_max[gi] = max(fd_max[gi], fd_max[gi + n]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0u && fd_max[0] > 0.0f)
+        d2.InterlockedMax(0, asuint(fd_max[0]));
+    if (di.w != 0 && gi < 16u && fd_rsum[gi] != 0) {
+        const int s = fd_rsum[gi];
+        d2.InterlockedAdd((1u + gi) * 4u, (uint)s & 0xffffu);
+        d2.InterlockedAdd((17u + gi) * 4u, (uint)(s >> 16));
+    }
+}
 )hlsl";
