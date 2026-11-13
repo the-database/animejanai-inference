@@ -368,6 +368,10 @@ target_include_directories(aji_tiling_test PRIVATE include src)
 add_executable(aji_runtime_packs_test sanity/runtime_packs_test.cpp
     src/core/runtime_packs.cpp src/core/fileio.cpp)
 target_include_directories(aji_runtime_packs_test PRIVATE include src)
+
+# The held-frame reuse rule (aji_held_*) against synthetic comparisons.
+add_executable(aji_held_test sanity/held_test.cpp src/core/held.cpp)
+target_include_directories(aji_held_test PRIVATE include src)
 target_link_libraries(aji_runtime_packs_test PRIVATE ${CMAKE_DL_LIBS})
 
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
@@ -396,7 +400,8 @@ endif()
 enable_testing()
 add_executable(aji_rife_conf_test sanity/rife_conf_test.cpp src/aji_conf.cpp)
 target_include_directories(aji_rife_conf_test PRIVATE src)
-foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test)
+foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
+                     aji_held_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS cpu)
 endforeach()
