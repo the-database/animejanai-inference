@@ -294,6 +294,9 @@ struct aji_ctx {
         ComPtr<ID3D12Fence> fence;
         HANDLE event = NULL;
         uint64_t val = 0;
+        // a comparison timed out with its list still queued: its allocator
+        // and staging stay in use until the fence reaches val
+        bool stuck = false;
         ComPtr<ID3D12Resource> y[2], uv[2];  // planes of a and b, pitched
         uint32_t pitch = 0;
         int key[3] = {0};                    // format, w, h of the staging
@@ -1032,8 +1035,11 @@ ComPtr<ID3D12Resource> make_readback(ID3D12Device *dev, uint64_t bytes)
     return res;
 }
 
-// copy one plane between a shared texture and a staging buffer (recorded
-// on cl, by default the current recording's)
+// copy one plane of the frame's w x h top-left corner between a shared
+// texture and a staging buffer (recorded on cl, by default the current
+// recording's). The texture may be larger than the frame (decoder surfaces
+// are padded, 1920x1088 for 1080p): reads take a box of the plane's size,
+// never the whole subresource, which would run past the buffer's footprint.
 void copy_plane(aji_ctx *c, bool to_buffer, ID3D12Resource *tex, UINT subres,
                 int plane, int format, int w, int h, ID3D12Resource *buf,
                 uint32_t pitch, ID3D12GraphicsCommandList *cl = nullptr)
@@ -1046,19 +1052,37 @@ void copy_plane(aji_ctx *c, bool to_buffer, ID3D12Resource *tex, UINT subres,
     t.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     t.SubresourceIndex = subres + (UINT)plane * td.DepthOrArraySize;
 
+    const UINT pw = plane ? w / 2 : w, ph = plane ? h / 2 : h;
     D3D12_TEXTURE_COPY_LOCATION b = {};
     b.pResource = buf;
     b.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     b.PlacedFootprint.Footprint.Format = plane_fmt(format, plane);
-    b.PlacedFootprint.Footprint.Width = plane ? w / 2 : w;
-    b.PlacedFootprint.Footprint.Height = plane ? h / 2 : h;
+    b.PlacedFootprint.Footprint.Width = pw;
+    b.PlacedFootprint.Footprint.Height = ph;
     b.PlacedFootprint.Footprint.Depth = 1;
     b.PlacedFootprint.Footprint.RowPitch = pitch;
 
-    if (to_buffer)
-        cl->CopyTextureRegion(&b, 0, 0, 0, &t, NULL);
-    else
+    if (to_buffer) {
+        // in the plane's own texels (the CbCr plane of NV12/P010 is a
+        // half-size R8G8/R16G16 subresource)
+        const D3D12_BOX box = {0, 0, 0, pw, ph, 1};
+        cl->CopyTextureRegion(&b, 0, 0, 0, &t, &box);
+    } else {
         cl->CopyTextureRegion(&t, 0, 0, 0, &b, NULL);
+    }
+}
+
+// whether a shared texture is at least w x h (copy_plane's read box must
+// lie inside it; a larger texture is fine)
+bool tex_covers(aji_ctx *c, ID3D12Resource *tex, int w, int h,
+                const char *what)
+{
+    const D3D12_RESOURCE_DESC rd = tex->GetDesc();
+    if (rd.Width >= (UINT64)w && rd.Height >= (UINT)h)
+        return true;
+    c->set_error("%s: a %llux%u texture cannot hold a %dx%d frame", what,
+                 (unsigned long long)rd.Width, rd.Height, w, h);
+    return false;
 }
 
 /* ---------------- ORT session handling ---------------- */
@@ -2216,6 +2240,8 @@ static int run_pre(aji_ctx *c, const aji_frame *in)
     ID3D12Resource *in_tex = open_shared(c, in->plane[0]);
     if (!in_tex)
         return AJI_ERR;
+    if (!tex_covers(c, in_tex, in->width, in->height, "input frame"))
+        return AJI_ERR_SHAPE;
     const UINT in_sub = (UINT)(intptr_t)in->plane[1];
 
     // input-ready handoff: D3D11's queued work (the caller's copy into
@@ -2799,6 +2825,8 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
     ID3D12Resource *out_tex = open_shared(c, out->plane[0]);
     if (!in_tex || !out_tex)
         return AJI_ERR;
+    if (!tex_covers(c, in_tex, in->width, in->height, "input frame"))
+        return AJI_ERR_SHAPE;
     const UINT in_sub = (UINT)(intptr_t)in->plane[1];
     const UINT out_sub = (UINT)(intptr_t)out->plane[1];
 
@@ -3099,6 +3127,9 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
     ID3D12Resource *o_tex = open_shared(c, out->plane[0]);
     if (!a_tex || !b_tex || !o_tex)
         return AJI_ERR;
+    if (!tex_covers(c, a_tex, R.w, R.h, "RIFE frame a") ||
+        !tex_covers(c, b_tex, R.w, R.h, "RIFE frame b"))
+        return AJI_ERR_SHAPE;
     const UINT a_sub = (UINT)(intptr_t)a->plane[1];
     const UINT b_sub = (UINT)(intptr_t)b->plane[1];
     const UINT o_sub = (UINT)(intptr_t)out->plane[1];
@@ -3342,6 +3373,14 @@ static int frame_diff(aji_ctx *c, const aji_frame *a, const aji_frame *b,
         return AJI_ERR;
     }
     auto &F = c->fd;
+    if (F.stuck) {
+        if (F.fence->GetCompletedValue() < F.val) {
+            c->set_error("aji_frame_diff: an earlier comparison never "
+                         "finished on the GPU");
+            return AJI_ERR;
+        }
+        F.stuck = false;
+    }
     const int w = a->width, h = a->height;
     const int bpp = rgb ? 4 : (fmt == AJI_FMT_P010 ? 2 : 1);
 
@@ -3371,12 +3410,14 @@ static int frame_diff(aji_ctx *c, const aji_frame *a, const aji_frame *b,
     if (memcmp(key, F.key, sizeof(key)) != 0) {
         F.key[0] = 0;
         F.pitch = align256((uint32_t)(w * bpp));
-        // 4 KiB of slack past each plane: root UAVs have no bounds checks,
-        // and drivers widen cs_frame_diff's dword loads of a tile row past
-        // the plane's end (without it: a page fault right past the last
-        // row on the UHD 770, a hang on the RTX 5090, wherever nothing
-        // else was mapped after the buffer)
-        const uint64_t slack = 4096;
+        // slack past each plane: root UAVs have no bounds checks, and
+        // drivers widen cs_frame_diff's dword loads of a tile row past the
+        // plane's end (without it: a page fault right past the last row on
+        // the UHD 770, a hang on the RTX 5090, wherever nothing else was
+        // mapped after the buffer). At least a whole 8-row tile of rows,
+        // so a load widened to the full tile past the last row stays inside.
+        const uint64_t slack =
+            std::max<uint64_t>(4096, (uint64_t)F.pitch * 8);
         for (int i = 0; i < 2; i++) {
             F.y[i] = make_buffer(c->dev.Get(), (uint64_t)F.pitch * h + slack,
                                  false);
@@ -3518,10 +3559,21 @@ static int frame_diff(aji_ctx *c, const aji_frame *a, const aji_frame *b,
     F.queue->Signal(F.fence.Get(), F.val);
     if (F.fence->GetCompletedValue() < F.val) {
         F.fence->SetEventOnCompletion(F.val, F.event);
-        if (WaitForSingleObject(F.event, 10000) != WAIT_OBJECT_0) {
-            c->set_error("GPU timeout in aji_frame_diff");
-            diagnose_device(c, "aji_frame_diff fence wait");
-            return AJI_ERR;
+        // checked again on waking: a comparison that timed out and then
+        // finished may have left the (auto-reset) event set
+        const ULONGLONG until = GetTickCount64() + 10000;
+        while (F.fence->GetCompletedValue() < F.val) {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= until ||
+                WaitForSingleObject(F.event, (DWORD)(until - now)) !=
+                    WAIT_OBJECT_0) {
+                // the list is still queued: no later call may reset its
+                // allocator or touch its buffers before the fence passes it
+                F.stuck = true;
+                c->set_error("GPU timeout in aji_frame_diff");
+                diagnose_device(c, "aji_frame_diff fence wait");
+                return AJI_ERR;
+            }
         }
     }
     if (FAILED(c->dev->GetDeviceRemovedReason())) {

@@ -54,8 +54,12 @@ int g_cross;                  // comparisons cross-checked bit-exactly
 // A host frame in one format, uploaded into a shared D3D11 texture (and,
 // for the cross-check, into pitched CUDA memory). NV12/P010: plane 0 luma,
 // plane 1 interleaved CbCr; RGB10A2: plane 0 holds R, G, B per pixel.
+// The texture may be larger than the frame (tw x th, as decoders pad their
+// surfaces); the frame is its top-left corner and the rest holds `pad`.
 struct Frame {
     int w, h, fmt;
+    int tw, th;
+    uint16_t pad = 0;              // padding samples (8-bit formats: low byte)
     bool wide, rgb;
     std::vector<uint16_t> pl[2];   // samples; 8-bit formats use the low byte
     int pw[2] = {0, 0}, ph[2] = {0, 0};
@@ -64,7 +68,8 @@ struct Frame {
     size_t pitch[2] = {0, 0};
     uint64_t mark = 0;             // aji_d3d11_mark after the last upload
 
-    Frame(int w_, int h_, int fmt_) : w(w_), h(h_), fmt(fmt_)
+    Frame(int w_, int h_, int fmt_, int tw_ = 0, int th_ = 0)
+        : w(w_), h(h_), fmt(fmt_), tw(tw_ ? tw_ : w_), th(th_ ? th_ : h_)
     {
         wide = fmt == AJI_FMT_P010;
         rgb = fmt == AJI_FMT_RGB10A2;
@@ -103,8 +108,8 @@ struct Frame {
     {
         if (!tex) {
             D3D11_TEXTURE2D_DESC td = {};
-            td.Width = w;
-            td.Height = h;
+            td.Width = tw;
+            td.Height = th;
             td.MipLevels = 1;
             td.ArraySize = 1;
             td.Format = rgb ? DXGI_FORMAT_R10G10B10A2_UNORM
@@ -128,24 +133,31 @@ struct Frame {
             return false;
         uint8_t *d = (uint8_t *)m.pData;
         for (int p = 0; p < (rgb ? 1 : 2); p++) {
-            for (int y = 0; y < ph[p]; y++) {
+            // the texture's plane: rows of tpw samples, tph of them
+            const int tpw = rgb ? tw * 3 : p ? tw / 2 * 2 : tw;
+            const int tph = p ? th / 2 : th;
+            std::vector<uint16_t> line(tpw);
+            for (int y = 0; y < tph; y++) {
                 uint8_t *row = d + (size_t)y * m.RowPitch;
-                const uint16_t *s = &pl[p][(size_t)y * pw[p]];
+                for (int x = 0; x < tpw; x++)
+                    line[x] = y < ph[p] && x < pw[p]
+                                  ? pl[p][(size_t)y * pw[p] + x] : pad;
+                const uint16_t *s = line.data();
                 if (rgb) {
-                    for (int x = 0; x < w; x++) {
+                    for (int x = 0; x < tw; x++) {
                         const uint32_t v = s[x * 3] | (s[x * 3 + 1] << 10) |
                                            ((uint32_t)s[x * 3 + 2] << 20) |
                                            (3u << 30);
                         std::memcpy(row + x * 4, &v, 4);
                     }
                 } else if (wide) {
-                    std::memcpy(row, s, (size_t)pw[p] * 2);
+                    std::memcpy(row, s, (size_t)tpw * 2);
                 } else {
-                    for (int x = 0; x < pw[p]; x++)
+                    for (int x = 0; x < tpw; x++)
                         row[x] = (uint8_t)s[x];
                 }
             }
-            d += (size_t)m.RowPitch * h;   // the CbCr plane follows the luma
+            d += (size_t)m.RowPitch * th;  // the CbCr plane follows the luma
         }
         g_ctx->Unmap(st.Get(), 0);
         g_ctx->CopyResource(tex.Get(), st.Get());
@@ -493,6 +505,51 @@ int synthetic()
         CHECK(a.upload() && b.upload() && diff(a, b, &r) == 0);
         CHECK(approx(r.max_tile, 3.0f));
         for (int i = 0; i < 16; i++) CHECK(approx(r.region_mean[i], 3.0f));
+    }
+
+    // frames held in textures larger than the frame (decoder surfaces are
+    // padded: 1920x1088 for 1080p): only the frame is read, so the results
+    // equal those of exact-size textures bit for bit, whatever the padding
+    // holds (a's padding near white, b's near black)
+    {
+        struct { int fmt, w, h, tw, th; } pads[] = {
+            {AJI_FMT_NV12, 1920, 1080, 1920, 1088},
+            {AJI_FMT_P010, 1920, 1080, 1920, 1088},
+            {AJI_FMT_NV12, 1918, 1078, 1920, 1088},   // width padded too
+            {AJI_FMT_P010, 70, 46, 96, 64},
+            {AJI_FMT_NV12, 70, 46, 72, 46},           // width only
+            {AJI_FMT_RGB10A2, 69, 45, 77, 51},        // odd padding
+        };
+        for (const auto &pc : pads) {
+            Frame a(pc.w, pc.h, pc.fmt), b(pc.w, pc.h, pc.fmt);
+            Frame pa(pc.w, pc.h, pc.fmt, pc.tw, pc.th),
+                  pb(pc.w, pc.h, pc.fmt, pc.tw, pc.th);
+            pa.pad = (uint16_t)(250 * pa.unit());
+            pb.pad = (uint16_t)(5 * pb.unit());
+            for (unsigned s = 1; s <= 3; s++) {
+                // s 1: the same picture (D 0 only if no padding is read);
+                // then noise against noise
+                a.fill(s);
+                b.fill(s == 1 ? s : s * 77);
+                pa.pl[0] = a.pl[0]; pa.pl[1] = a.pl[1];
+                pb.pl[0] = b.pl[0]; pb.pl[1] = b.pl[1];
+                CHECK(a.upload() && b.upload() && pa.upload() && pb.upload());
+                aji_frame_diff_result re, rp, rm;
+                CHECK(diff(a, b, &re) == 0);
+                CHECK(diff(pa, pb, &rp) == 0);
+                CHECK(diff(pa, b, &rm) == 0);
+                if (!same(re, rp) || !same(re, rm)) {
+                    std::fprintf(stderr, "%dx%d format %d in %dx%d textures "
+                                 "differs from exact-size textures:\n",
+                                 pc.w, pc.h, pc.fmt, pc.tw, pc.th);
+                    print("exact", re);
+                    print("padded", rp);
+                    print("padded a, exact b", rm);
+                    return 1;
+                }
+                CHECK(s == 1 ? re.max_tile == 0.0f : re.max_tile > 0.0f);
+            }
+        }
     }
 
     // noise: random frames against each other, at odd tile counts (the

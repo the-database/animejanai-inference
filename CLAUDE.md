@@ -456,9 +456,11 @@ for that queue alone, so a compare never waits for queued inference. Textures ar
 implicit promotion (COMMON -> COPY_SOURCE, decaying back), never with explicit transitions that
 could race the inference queue. The opened textures are cached with a reference to the D3D11
 texture: a cache keyed by address alone (like `open_shared`'s) misreads once a freed texture's
-address comes back as another's. The staging buffers carry 4 KiB of slack past each plane: drivers
-widen the kernel's dword loads past the plane's end (a page fault on the UHD 770, a hang on the
-5090, where nothing else was mapped after the buffer).
+address comes back as another's. Frames may sit in larger textures (decoder surfaces are padded,
+1920x1088 for 1080p): every DirectML read of a frame (`copy_plane`) copies a box of the frame's
+plane size, never the whole subresource. The staging buffers carry slack past each plane (4 KiB,
+or 8 rows if more): drivers widen the kernel's dword loads past the plane's end (a page fault on
+the UHD 770, a hang on the 5090, where nothing else was mapped after the buffer).
 
 **Marks.** libav uploads frames on the D3D11 immediate context, and NVENC's zero-copy encodes of
 D3D11 frames are on it too. The plain `aji_frame_diff` signals the fence on that context at call
@@ -479,8 +481,9 @@ call stays for other callers (mpv).
 `aji_frame_diff_dml_test` checks the cases of `aji_frame_diff_test` on DirectML, each both plain
 and marked, plus the marks themselves (one increasing counter, unknown marks refused, a marked
 compare sees writes before its mark while copies are queued after it, and prints how long it
-took next to a plain one); with CUDA present, every result must be bit-identical to
-`kernels.cu`'s. `--raw FILE W H nv12|p010` runs that cross-check on real frames.
+took next to a plain one) and frames in padded textures (equal to exact-size ones bit for bit);
+with CUDA present, every result must be bit-identical to `kernels.cu`'s. `--raw FILE W H
+nv12|p010` runs that cross-check on real frames.
 
 Evidence (first 2878 frames of tongari11 and testclip, 2x Balanced to 4K): the DirectML and
 CUDA traces are byte-identical (238 and 904 reused); frame counts and timestamps match
