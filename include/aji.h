@@ -380,6 +380,38 @@ typedef struct aji_held_stats {
     int64_t  comparisons, compare_ns;
 } aji_held_stats;
 
+/* The rule version this library implements (AJI_HELD_RULE_VERSION). */
+AJI_EXPORT int aji_held_version(void);
+/* NULL on bad params, or when c's backend has no aji_frame_diff. Destroy
+ * before aji_destroy(c). */
+AJI_EXPORT aji_held *aji_held_create(aji_ctx *c, const aji_held_params *p);
+/* CSV trace of every comparison (frame,pair,D,16 region means) and decision
+ * (frame,reuse|upscale); frame = 0-based count of decisions. path is UTF-8.
+ * AJI_ERR if the file can't be opened (the trace before stays). NULL
+ * closes. */
+AJI_EXPORT int aji_held_set_trace(aji_held *h, const char *path);
+/* Decide frame p. n, n2 = the two source frames after it (NULL: not there /
+ * caller forces an upscale). Synchronous, up to 5 comparisons. TensorRT: on
+ * cu_stream, where p, n, n2 and the anchor must be complete. DirectML: waits
+ * for the frames' marks. Descriptors read during the call only. Returns AJI_OK
+ * with *out written (also when out->error is set); AJI_ERR only for bad args.
+ * UPSCALE drops the anchor: upscale p and, unless damaged, give a copy to
+ * aji_held_set_anchor. REUSE: emit the anchor's output for p. */
+AJI_EXPORT int aji_held_decide(aji_held *h, const aji_held_frame *p,
+                               const aji_held_frame *n, const aji_held_frame *n2,
+                               void *cu_stream, aji_held_decision *out);
+/* The frame just upscaled, as a copy (not a decoder surface) the caller
+ * keeps valid and unwritten until the engine drops it: the next UPSCALE,
+ * set_anchor, reset or destroy. Descriptor is copied. copy->id = source
+ * frame's id; copy->mark = the copy's mark. AJI_ERR for a damaged frame. */
+AJI_EXPORT int aji_held_set_anchor(aji_held *h, const aji_held_frame *copy);
+/* Seek / discontinuity: forget anchor, look-ahead cache and run; clear a
+ * comparison error. Counters and trace stay. */
+AJI_EXPORT void aji_held_reset(aji_held *h);
+/* Fills out up to out->struct_size. */
+AJI_EXPORT void aji_held_get_stats(aji_held *h, aji_held_stats *out);
+AJI_EXPORT void aji_held_destroy(aji_held **h);
+
 /* Async builds: returns 1 (once) when a background engine build finished;
  * the caller should re-run aji_configure, which now finds the engine in
  * the cache (or logs the failure and stays passthrough). Cheap to call
