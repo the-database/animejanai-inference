@@ -69,7 +69,7 @@ set(AJI_PACK_DEFS AJI_PACK_CUDART="${_pack_cudart}" AJI_PACK_NVINFER="${_pack_nv
 # conf's [global] backend key and forwards the C ABI to the sibling
 # backend library. No CUDA/TRT/ORT dependencies of its own.
 add_library(aji SHARED src/aji_dispatch.cpp src/aji_conf.cpp src/core/fileio.cpp
-    src/core/runtime_packs.cpp src/aji_img_dispatch.cpp)
+    src/core/runtime_packs.cpp src/aji_img_dispatch.cpp src/aji_held.cpp src/core/held.cpp)
 target_compile_definitions(aji PRIVATE ${AJI_PACK_DEFS})
 target_include_directories(aji PUBLIC include)
 target_link_libraries(aji PRIVATE ${CMAKE_DL_LIBS})
