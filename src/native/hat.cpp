@@ -32,7 +32,7 @@ struct Ln {
 struct Attn {
     TMat *qkv = nullptr, *proj = nullptr;
     float scale = 1.f, *rtab = nullptr;
-    int rt_w = 0, rt_off = 0, shift = 0;
+    int rt_w = 0, rt_offy = 0, rt_offx = 0, shift = 0;
 };
 struct Mlp {
     TMat *fc1 = nullptr, *fc2 = nullptr;
@@ -124,7 +124,8 @@ bool attn(const Reader &rd, DevRes &r, const std::string &pre, const char *scale
     const int Tq = ws * ws, Tk = kws ? kws * kws : Tq;
     if (!init_input(rd, rd.node(pre + "Add"), &bias, &d) || d != std::vector<int64_t>{1, heads, Tq, Tk}) return refuse(why, pre + ": bias");
     std::vector<float> tab;
-    if (!tbias_table(bias, heads, ws, kws, kpad, &tab, &a->rt_w, &a->rt_off)) return refuse(why, pre + ": bias is not a relative-position table");
+    if (!tbias_table(bias, heads, ws, ws, kws, kws, kpad, &tab, &a->rt_w, &a->rt_offy, &a->rt_offx))
+        return refuse(why, pre + ": bias is not a relative-position table");
     a->rtab = r.dfl(tab);
     return true;
 }
@@ -340,7 +341,7 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         TWinAttn t;
         t.qkv = QKV; t.sq = QS; t.qo = 0; t.ko = C; t.vo = 2 * C; t.H = h; t.W = w; t.heads = heads; t.hd = hd;
         t.wh = t.ww = ws; t.scale = a.scale; t.out = AT; t.so = CP;
-        t.rtab = a.rtab; t.rt_w = a.rt_w; t.rt_off = a.rt_off;
+        t.rtab = a.rtab; t.rt_w = a.rt_w; t.rt_offy = a.rt_offy; t.rt_offx = a.rt_offx;
         if (overlap) {
             t.kwh = t.kww = kws;
             t.kpad = kpad;

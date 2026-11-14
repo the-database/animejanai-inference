@@ -81,12 +81,15 @@ struct TWinAttn {
     int kwh = 0, kww = 0, kpad = 0;
     bool mask = false;
     const float *rtab = nullptr;
-    int rt_w = 0, rt_off = 0;
+    int rt_w = 0, rt_offy = 0, rt_offx = 0;  // index (ky - kpad - qy + rt_offy) * rt_w + (kx - kpad - qx + rt_offx)
+    // A padded size the windows, the shift and the mask are laid out on (0: H, W): tokens beyond H x W
+    // are zero (DAT pads q, k, v to its windows' multiple with zeros).
+    int Hp = 0, Wp = 0;
 };
-// The relative-position table behind a full bias [heads][wh*ww][kwh*kww] (square windows; kwh = 0:
-// the query window), if the bias is one (each relative offset one value): rt_w, rt_off as above.
-bool tbias_table(const std::vector<float> &bias, int heads, int ws, int kws, int kpad, std::vector<float> *tab, int *rt_w,
-                 int *rt_off);
+// The relative-position table behind a full bias [heads][wh*ww][Tk] (key windows kwh x kww with kpad,
+// or kwh = 0: the query window), if the bias is one (each relative offset one value).
+bool tbias_table(const std::vector<float> &bias, int heads, int wh, int ww, int kwh, int kww, int kpad, std::vector<float> *tab,
+                 int *rt_w, int *rt_offy, int *rt_offx);
 cudaError_t twinattn(const TWinAttn &a, cudaStream_t s);
 
 // Depthwise 3x3 (zero padding, no bias) over the first C channels; w: [C][9] floats (device).
@@ -94,6 +97,10 @@ cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, 
 // The same, also adding the channel sums of the output to sums[C] (float device, zeroed by the caller).
 cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu, float *sums,
                     cudaStream_t s);
+// With a bias [C] (device, or null) before the GELU, and the result multiplied by mul (fp16 [H*W][smul],
+// or null) after it; C a multiple of 8, strides too.
+cudaError_t tdwconv2(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, const float *bias, bool gelu,
+                     const void *mul, int smul, float *sums, cudaStream_t s);
 // sums[c] += sum over tokens of in[t][c] for c < C (sums: float device, zeroed by the caller).
 cudaError_t tcolsum(const void *in, int sin, int M, int C, float *sums, cudaStream_t s);
 

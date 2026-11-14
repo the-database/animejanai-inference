@@ -300,17 +300,19 @@ cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, in
 
 std::unique_ptr<ImgNet> build_fdat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
 std::unique_ptr<ImgNet> build_hat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
+std::unique_ptr<ImgNet> build_dat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
 
 std::unique_ptr<ImgNet> ImgNet::create(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
 {
     if (g.inputs.size() != 1) return refuse(why, "one input expected"), nullptr;
     std::string w;
     if (auto n = Esrgan::build(g, max_w, max_h, s, &w)) return n;
-    std::string w2, w3;
+    std::string w2, w3, w4;
     if (auto n = build_fdat(g, max_w, max_h, s, &w2)) return n;
     if (auto n = build_hat(g, max_w, max_h, s, &w3)) return n;
+    if (auto n = build_dat(g, max_w, max_h, s, &w4)) return n;
     // the reason of the family the graph belongs to (the others say "not a ... graph")
-    if (why) *why = w3.rfind("not a", 0) ? w3 : w2.rfind("not a", 0) ? w2 : w;
+    if (why) *why = w4.rfind("not a", 0) ? w4 : w3.rfind("not a", 0) ? w3 : w2.rfind("not a", 0) ? w2 : w;
     return nullptr;
 }
 
