@@ -13,11 +13,11 @@ using GFn = cudaError_t (*)(const gdev::GParams &, int, cudaStream_t);
 constexpr int kGVariants = 3;
 constexpr int kWarps[kGVariants] = {8, 4, 2};
 
-template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS>
+template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0>
 cudaError_t run_g(const gdev::GParams &p, int zdim, cudaStream_t s)
 {
     constexpr int smem = gdev::gconv_smem_bytes<KCH, COUTP, S, WARPS>();
-    auto k = gdev::k_gconv<KCH, COUTP, S, IN, OUT, WARPS>;
+    auto k = gdev::k_gconv<KCH, COUTP, S, IN, OUT, WARPS, ACC>;
     if constexpr (smem > 48 * 1024) {
         static bool set = false;
         if (!set) {
@@ -32,15 +32,20 @@ cudaError_t run_g(const gdev::GParams &p, int zdim, cudaStream_t s)
 }
 
 struct GKey {
-    int kch, coutp, s, in, out;
-    bool operator==(const GKey &o) const { return kch == o.kch && coutp == o.coutp && s == o.s && in == o.in && out == o.out; }
+    int kch, coutp, s, in, out, acc;
+    bool operator==(const GKey &o) const
+    {
+        return kch == o.kch && coutp == o.coutp && s == o.s && in == o.in && out == o.out && acc == o.acc;
+    }
 };
 struct GEntry {
     GKey key;
     GFn fn[kGVariants];
 };
 
-#define AJI_G(K, C, S, IN, OUT) {{K, C, S, IN, OUT}, {&run_g<K, C, S, IN, OUT, 8>, &run_g<K, C, S, IN, OUT, 4>, &run_g<K, C, S, IN, OUT, 2>}}
+#define AJI_G(K, C, S, IN, OUT) {{K, C, S, IN, OUT, 0}, {&run_g<K, C, S, IN, OUT, 8>, &run_g<K, C, S, IN, OUT, 4>, &run_g<K, C, S, IN, OUT, 2>}}
+#define AJI_G32(K, C) {{K, C, 1, 0, 0, 1}, {&run_g<K, C, 1, 0, 0, 8, 1>, &run_g<K, C, 1, 0, 0, 4, 1>, &run_g<K, C, 1, 0, 0, 2, 1>}}
+#define AJI_G32_COUT(K) AJI_G32(K, 16), AJI_G32(K, 32), AJI_G32(K, 48), AJI_G32(K, 64)
 #define AJI_G_COUT(K, S, IN, OUT) AJI_G(K, 16, S, IN, OUT), AJI_G(K, 32, S, IN, OUT), AJI_G(K, 48, S, IN, OUT), AJI_G(K, 64, S, IN, OUT)
 
 const GEntry kG[] = {
@@ -50,6 +55,8 @@ const GEntry kG[] = {
     AJI_G_COUT(16, 1, 0, 1), AJI_G_COUT(32, 1, 0, 1), AJI_G_COUT(64, 1, 0, 1),
     // stride 2, NHWC and NCHW planes
     AJI_G_COUT(16, 2, 0, 0), AJI_G_COUT(32, 2, 0, 0), AJI_G_COUT(16, 2, 1, 0),
+    // stride 1, NHWC, fp32 accumulation
+    AJI_G32_COUT(16), AJI_G32_COUT(32), AJI_G32_COUT(64),
 };
 
 bool gfail(std::string *why, const char *m)
@@ -72,6 +79,7 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
     if (!w.frag) return gfail(why, "no weights"), nullptr;
     if (a.stride != 1 && a.stride != 2) return gfail(why, "stride must be 1 or 2"), nullptr;
     if (a.nchw && (a.stride != 2 || w.cin != 3)) return gfail(why, "NCHW input: 3 channels, stride 2"), nullptr;
+    if (a.up2 && (a.nchw || a.stride != 1 || a.IH % 2 || a.IW % 2)) return gfail(why, "upsampled input: NHWC, stride 1, even size"), nullptr;
     const bool res = a.r1 || a.r2;
     if (res && (a.stride != 1 || a.R)) return gfail(why, "residuals need stride 1 and NHWC output"), nullptr;
     if (a.R && (a.stride != 1 || (a.R != 2 && a.R != 4) || w.coutp != w.cout_pad || (w.coutp / a.R) % 8))
@@ -79,7 +87,8 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
     if (!a.nchw && (a.src_stride % 8 || a.src_stride < w.cin_pad)) return gfail(why, "input pixel stride"), nullptr;
     if (a.dst_stride % 8 || a.dst_stride < (a.R ? w.coutp / a.R : w.coutp)) return gfail(why, "output pixel stride"), nullptr;
     if ((a.r1 && a.r1_stride % 2) || (a.r2 && a.r2_stride % 2)) return gfail(why, "residual stride"), nullptr;
-    const GKey k{kch_for(w, a), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0};
+    if (a.acc32 && (a.stride != 1 || a.nchw || a.R)) return gfail(why, "fp32 accumulation: stride 1, NHWC in and out"), nullptr;
+    const GKey k{kch_for(w, a), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0};
     if (!k.kch) return gfail(why, "input channels"), nullptr;
     for (const GEntry &e : kG)
         if (e.key == k) return &e;
@@ -142,6 +151,7 @@ gdev::GParams params(const GWeights &w, const GConvArgs &a, int ksplit)
     p.coutp_all = w.cout_pad;
     p.ksplit = ksplit;
     p.ws = a.ws;
+    p.up2 = a.up2 ? 1 : 0;
     return p;
 }
 

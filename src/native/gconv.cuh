@@ -37,6 +37,7 @@ struct GParams {
     float c1f, c2f, slopef;
     int act, R, sy;
     int coutp_all, ksplit;              // all output channels; K splits (1: no workspace)
+    int up2;                            // input is nearest-upsampled by 2 (IH, IW: the upsampled size)
     float *ws;                          // [ksplit][H*W][coutp_all]
 };
 
@@ -55,6 +56,12 @@ __device__ __forceinline__ void g_mma(uint32_t (&d)[2], const uint32_t (&a)[4], 
 {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
                  : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void g_mma32(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 __device__ __forceinline__ void g_cp16(void *s, const void *g, int bytes)
 {
@@ -87,7 +94,8 @@ __device__ __forceinline__ half2 g_epi(const GParams &p, half2 v, int y, int x, 
 }
 
 // IN: 0 NHWC, 1 NCHW planes (3 channels, KCH 16). OUT: 0 NHWC, 1 phase scatter (R from params).
-template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS>
+// ACC: 0 fp16 accumulation (full rate), 1 fp32 accumulation (half rate on GeForce, for deep sums).
+template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0>
 __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
 {
 #if AJI_GCONV_ARCH_OK
@@ -106,8 +114,13 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
     const int units = p.nchunks * 9, u0 = kz * units / p.ksplit, u1 = (kz + 1) * units / p.ksplit;
 
     uint32_t acc[NT][2];
+    [[maybe_unused]] float accf[NT][4];
 #pragma unroll
-    for (int n = 0; n < NT; n++) acc[n][0] = acc[n][1] = 0u;
+    for (int n = 0; n < NT; n++) {
+        acc[n][0] = acc[n][1] = 0u;
+#pragma unroll
+        for (int k = 0; k < 4; k++) accf[n][k] = 0.f;
+    }
 
 #pragma unroll 1
     for (int c = u0 / 9; c < p.nchunks && c * 9 < u1; c++) {
@@ -117,8 +130,8 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
                 const int gc = S == 1 ? col : (col < TW + 1 ? 2 * col : 2 * (col - (TW + 1)) + 1);
                 const int yy = iy0 + r, xx = ix0 + gc;
                 const bool ok = yy >= 0 && yy < p.IH && xx >= 0 && xx < p.IW;
-                g_cp16(sm + px * CP + v * 8, ok ? p.src + ((size_t)yy * p.IW + xx) * p.sstride + c * KCH + v * 8 : p.src,
-                       ok ? 16 : 0);
+                const size_t sp = p.up2 ? (size_t)(yy >> 1) * (p.IW >> 1) + (xx >> 1) : (size_t)yy * p.IW + xx;
+                g_cp16(sm + px * CP + v * 8, ok ? p.src + sp * p.sstride + c * KCH + v * 8 : p.src, ok ? 16 : 0);
             }
             g_cp_wait();
         } else {
@@ -155,8 +168,13 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
                 g_ldsm_x4(a, ab + kc * 16);
 #pragma unroll
                 for (int j = 0; j < NJ; j++) {
-                    g_mma(acc[2 * j], a, b[j].x, b[j].y);
-                    g_mma(acc[2 * j + 1], a, b[j].z, b[j].w);
+                    if constexpr (ACC) {
+                        g_mma32(accf[2 * j], a, b[j].x, b[j].y);
+                        g_mma32(accf[2 * j + 1], a, b[j].z, b[j].w);
+                    } else {
+                        g_mma(acc[2 * j], a, b[j].x, b[j].y);
+                        g_mma(acc[2 * j + 1], a, b[j].z, b[j].w);
+                    }
                 }
             }
         }
@@ -173,7 +191,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
             for (int h = 0; h < 2; h++) {
                 const int ox = tx0 + g + h * 8;
                 if (oy >= p.H || ox >= p.W) continue;
-                const float2 f = __half22float2(u2h(acc[n][h]));
+                const float2 f = ACC ? make_float2(accf[n][2 * h], accf[n][2 * h + 1]) : __half22float2(u2h(acc[n][h]));
                 *reinterpret_cast<float2 *>(p.ws + ((size_t)kz * p.H * p.W + (size_t)oy * p.W + ox) * p.coutp_all + och * COUTP + n * 8 +
                                             tq * 2) = f;
             }
@@ -189,7 +207,13 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
 #pragma unroll
         for (int h = 0; h < 2; h++) {
             const int ox = tx0 + g + h * 8;
-            half2 v = __hadd2(u2h(acc[n][h]), bb);
+            half2 v;
+            if constexpr (ACC) {
+                const float2 bf = __half22float2(bb);
+                v = __floats2half2_rn(accf[n][2 * h] + bf.x, accf[n][2 * h + 1] + bf.y);
+            } else {
+                v = __hadd2(u2h(acc[n][h]), bb);
+            }
             if (oy < p.H && ox < p.W) v = g_epi(q, v, oy, ox, n * 8 + tq * 2);
             *reinterpret_cast<half2 *>(sm + (warp * TW + g + h * 8) * SP + n * 8 + tq * 2) = v;
         }

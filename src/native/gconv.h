@@ -55,6 +55,8 @@ struct GConvArgs {
     float slope = 0.2f;          // LeakyReLU
     int stride = 1;              // 1 or 2
     bool nchw = false;           // input is 3 NCHW planes (stride 2 only)
+    bool up2 = false;            // input is nearest-upsampled by 2 on the fly (IH, IW: the upsampled size)
+    bool acc32 = false;          // fp32 accumulation (stride 1, NHWC output): deep sums that fp16 loses
     int R = 0, sy = 0;           // phase scatter when R > 0 (2 or 4); dst is (R*H) x (R*W)
     float *ws = nullptr;         // split-K workspace (gworkspace floats); null: no split
     size_t ws_floats = 0;
