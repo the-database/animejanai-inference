@@ -199,3 +199,121 @@ frame; RIFE-first pays 1080p RIFE plus a second cheap upscale pass. The RIFE
 factor scales the margin (5x widens it) but never flips the winner; a much
 heavier upscale model eventually would. Measured synchronous/single-stream (the
 harness model); real playback pipelines, but the per-frame ordering cost carries.
+
+## Native kernels vs TensorRT (`[global] native=on`, 2026-11-14)
+
+Branch `experimental/native-span`. RTX 5090 at a 402 W power limit (default 575 W), driver 621.14,
+TensorRT 11.4.0.106 and TensorRT-RTX 1.7.1, every run with no other process on the GPU. The same
+build with `native=off` and `native=on`; engines cached. Models: the shipped V3.1 non-sharp
+`Performance` (SPANF3 b5f48) and `Balanced` (b8f64), and `SD_V1beta34_Compact` (SRVGG 64 ch).
+
+`aji_harness`, device chain time (NV12 in → pre → model → post → NV12 out, CUDA graph), ms/frame,
+1000 frames, two or three interleaved rounds:
+
+| Case | TensorRT | native | |
+|---|---|---|---|
+| Performance 1920x1080 | 3.60–3.63 | 2.04–2.06 | 1.76x |
+| Performance 1918x1078 | 3.55–3.58 | 2.13–2.14 | 1.67x |
+| Performance 1280x642 (live action) | 1.24–1.25 | 0.86–0.87 | 1.44x |
+| Performance 960x540 (50% resize first) | 0.84–0.85 | 0.67 | 1.26x |
+| Performance 854x480 | 0.68–0.69 | 0.58 | 1.18x |
+| Balanced 1920x1080 | 7.33–7.45 | 4.50–4.60 | 1.62x |
+| Balanced 1918x1078 | 7.25–7.36 | 4.53–4.61 | 1.60x |
+| Balanced 1440x1080 | 4.83–4.91 | 3.08–3.15 | 1.57x |
+| Balanced 1280x720 | 2.67–2.73 | 1.87–1.90 | 1.43x |
+| Balanced then Performance, 854x480 → 3416x1920 | 3.99–4.01 | 2.57–2.59 | 1.55x |
+| Compact 1920x1080 (live action) | 16.0–16.2 | 11.4–11.5 | 1.41x |
+| Compact 1280x720 | 6.93–7.10 | 4.63–5.05 | 1.4–1.5x |
+| Compact 854x480 | 2.83–2.87 | 1.95–1.99 | 1.44x |
+| Compact 768x576 (DVD) | 3.25–3.31 | 2.10–2.15 | 1.54x |
+| Compact 720x480 | 2.33–2.38 | 1.60–1.64 | 1.45x |
+| TensorRT-RTX: Performance 1920x1080 | 3.11–3.14 | 2.02 | 1.55x |
+| TensorRT-RTX: Balanced 1920x1080 | 6.97–7.06 | 4.43–4.48 | 1.58x |
+| TensorRT-RTX: Compact 768x576 | 3.36–3.38 | 2.15–2.16 | 1.56x |
+
+Every case's output frames (12 per case, plus P010 input, a temporal + Performance chain and
+4:2:0/4:4:4 `aji_encode` output) are within 1–2 8-bit levels of TensorRT's (Y 58–65 dB).
+
+Playback, mpv-AnimeJaNai 3.10.0's mpv with the branch's `aji.dll` (`lib=`), NVDEC,
+`--vo=null --untimed`, fps = frames / (Exiting − Configured slot), two rounds:
+
+| 1080p source → 4K | TensorRT | native |
+|---|---|---|
+| Balanced, anime (1200 frames) | 129.2–130.8 | 177.8–179.2 |
+| Compact, live action (600 frames) | 59.1–59.7 | 83.2–83.9 |
+| Performance, anime (1200 frames) | 173.9–184.3 | 192.6–195.2 (decode-bound) |
+
+`aji_encode`, 928-frame 1080p live-action clip → 4K `hevc_nvenc`, wall seconds, two rounds:
+Compact 12.4–12.6 → 9.6–9.7; Balanced 8.0–8.1 → 7.6; Performance 7.3 → 7.2 (NVENC-bound at ~129 fps).
+RIFE 2x after Performance (`--rife-chain`): 19.68 → 18.03 ms per source frame.
+
+Linux (Ubuntu 26.04, gcc 15.2, CUDA 13.2 nvcc, TensorRT 11.4.0.106, driver 615.71, a second RTX 5090
+at a 400 W limit), `experimental/native-span/phase3/matrix-linux.sh`, one run on cached engines: the
+same 15 cases all within 1–2 8-bit levels of TensorRT, the native tests pass, and the speed-ups match
+Windows (TensorRT itself is ~6% faster on Linux):
+
+| Case | TensorRT | native | speed-up |
+|---|---|---|---|
+| Performance 1920x1080 | 3.40 | 2.02 | 1.68x |
+| Balanced 1920x1080 | 6.80 | 4.29 | 1.58x |
+| Balanced 1440x1080 | 4.65 | 3.04 | 1.53x |
+| Performance 1280x642 | 1.19 | 0.83 | 1.43x |
+| Performance 854x480 | 0.64 | 0.52 | 1.22x |
+| Compact 1920x1080 (live action) | 14.52 | 10.15 | 1.43x |
+| Compact 768x576 (DVD) | 3.00 | 2.06 | 1.46x |
+| Balanced then Performance, 854x480 | 3.66 | 2.42 | 1.51x |
+| RIFE 2x after Performance, per source frame | 19.01 | 17.55 | |
+
+### RTX 4090 (Phase 4)
+
+Runpod pod: RTX 4090 at its 450 W default, driver 595.91 (CUDA 13.2), Ubuntu 24.04, gcc 13.3,
+nvcc 13.2, TensorRT 11.4.0.106 (CUDA 13.4 build, running under minor-version compatibility).
+`experimental/native-span/phase4/matrix-pod.sh`; the P010 and 1918x1078 / 1440x1080 inputs are
+generated on the pod from the 1080p NV12 frames (8-bit shifted up; top-left crops). The native
+tests pass (worst conv error 0.0077 against 0.02), and all 15 cases are within 1–2 8-bit levels of
+TensorRT. Two rounds on cached engines:
+
+| Case | TensorRT | native | speed-up |
+|---|---|---|---|
+| Performance 1920x1080 | 4.90–5.05 | 2.87 | 1.71–1.76x |
+| Performance 1918x1078 | 5.03 | 3.02–3.08 | 1.63–1.67x |
+| Balanced 1920x1080 | 8.15–8.17 | 5.74 | 1.42x |
+| Balanced 1440x1080 | 6.19–6.21 | 4.41–4.53 | 1.37–1.40x |
+| Performance 1280x642 | 1.67 | 1.01 | 1.65x |
+| Performance 854x480 | 0.81 | 0.62 | 1.31x |
+| Compact 1920x1080 (live action) | 15.02–15.04 | 11.13–11.14 | 1.35x |
+| Compact 854x480 | 3.16–3.17 | 2.74 | 1.15x |
+| Compact 768x576 (DVD) | 3.36 | 2.85–2.86 | 1.18x |
+| Balanced then Performance, 854x480 | 5.20–5.21 | 3.15 | 1.65x |
+| RIFE 2x after Performance, per source frame | 37.18–37.24 | 35.20–35.30 | |
+
+Faster everywhere, but the 64-channel models (Balanced, Compact) gain less than on the 5090
+(Compact at SD sizes 1.15–1.18x against 1.44–1.54x): the two tile variants were tuned on sm_120,
+so this is the first place to look when tuning for Ada.
+
+### RTX A5000 (Ampere, Phase 4)
+
+Runpod pod: RTX A5000 (GA102, 64 SMs, 6 MB L2, 230 W), driver 595.91, same image, script and inputs
+as the 4090. The native tests pass (worst conv error 0.0077), all 15 cases are within 1–2 8-bit
+levels of TensorRT. Two rounds on cached engines:
+
+| Case | TensorRT | native | speed-up |
+|---|---|---|---|
+| Performance 1920x1080 | 10.19–10.26 | 5.96–5.97 | 1.71x |
+| Performance 1280x642 | 4.33 | 2.77 | 1.56x |
+| Performance 854x480 | 2.27 | 1.56 | 1.46x |
+| Balanced 1920x1080 | 16.72–17.12 | 14.82–14.88 | 1.13–1.15x |
+| Balanced 1440x1080 | 12.83–12.89 | 11.16–11.20 | 1.15x |
+| Balanced then Performance, 854x480 | 11.81–11.85 | 8.05–8.06 | 1.47x |
+| Compact 1920x1080 (live action) | 40.13–40.28 | 33.03–33.30 | 1.21x |
+| Compact 854x480 | 7.66–7.67 | 7.55–7.61 | 1.01x |
+| Compact 768x576 (DVD) | 8.28–8.51 | 8.10–8.14 | 1.02–1.05x |
+| RIFE 2x after Performance, per source frame | 62.85 | 58.23 | |
+
+Why the 64-channel models gain less off Blackwell: Compact is ~1.2 MFLOP per input pixel (16 64→64
+3x3 convs), so 854x480 is ~0.5 TFLOP a frame. The native kernels run it at ~60% of dense fp16
+tensor-core peak on every card measured (A5000 ~67 of 111 TFLOPS, 4090 ~187 of ~330, 5090 ~265 of
+~419). TensorRT is at the same ~60% on the A5000, ~49% on the 4090 and ~43% on the 5090: the big
+Blackwell gain on 64 channels is mostly TensorRT's weaker sm_120 kernels, and on Ampere both are
+compute-bound, so native ties. The 48-channel Performance model is bound by memory traffic, which
+the fusion removes, and gains ~1.7x on all three generations. Nothing is slower than TensorRT.

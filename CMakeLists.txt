@@ -100,12 +100,30 @@ set_target_properties(aji_trt_common PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     CUDA_VISIBILITY_PRESET hidden)
 
+# Native tensor-core kernels and their ONNX lowering/executor (src/native), linked into both
+# TensorRT backends (used with [global] native=on) and the native tests.
+add_library(aji_native OBJECT src/native/conv.cu src/native/pack.cpp src/native/onnx_graph.cpp
+    src/native/lower.cpp src/native/executor.cpp)
+target_include_directories(aji_native PRIVATE src)
+target_link_libraries(aji_native PRIVATE CUDA::cudart)
+# The kernels need sm_80+ (device_supported refuses older GPUs before any launch), so skip
+# sm_75, and the datacenter Hopper/Blackwell targets the players never see: real code for the
+# GeForce generations plus compute_80 PTX, which those and future GPUs JIT. Each target is a
+# full copy of every kernel (~1.3 MB).
+set(AJI_NATIVE_CUDA_ARCHITECTURES 80-real 86-real 89-real 120-real 80-virtual
+    CACHE STRING "CUDA architectures for the native kernels (src/native)")
+set_target_properties(aji_native PROPERTIES
+    CUDA_ARCHITECTURES "${AJI_NATIVE_CUDA_ARCHITECTURES}"
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    CUDA_VISIBILITY_PRESET hidden)
+
 # aji_trt: TensorRT/CUDA backend (the former aji.dll).
 add_library(aji_trt SHARED src/aji_trt.cpp src/core/trt_engine.cpp
-    src/aji_img_trt.cpp $<TARGET_OBJECTS:aji_trt_common>)
+    src/aji_img_trt.cpp $<TARGET_OBJECTS:aji_trt_common> $<TARGET_OBJECTS:aji_native>)
 target_include_directories(aji_trt
     PUBLIC include
-    PRIVATE ${AJI_TRT_INCLUDE})
+    PRIVATE ${AJI_TRT_INCLUDE} src)
 target_link_directories(aji_trt PRIVATE ${AJI_TRT_LIB})
 target_link_libraries(aji_trt PRIVATE ${AJI_NVINFER} CUDA::cuda_driver CUDA::cudart)
 set_target_properties(aji_trt PROPERTIES
@@ -194,11 +212,11 @@ if(AJI_TRTRTX_ROOT)
     message(STATUS "aji_trtrtx: TensorRT-RTX ${_rtx_major}.${_rtx_minor} "
                    "(${_rtx_libs})")
     add_library(aji_trtrtx SHARED src/aji_trt.cpp src/core/trt_engine.cpp
-        src/aji_img_trt.cpp $<TARGET_OBJECTS:aji_trt_common>)
+        src/aji_img_trt.cpp $<TARGET_OBJECTS:aji_trt_common> $<TARGET_OBJECTS:aji_native>)
     target_compile_definitions(aji_trtrtx PRIVATE AJI_TRTRTX)
     target_include_directories(aji_trtrtx
         PUBLIC include
-        PRIVATE "${_rtx_root}/include")
+        PRIVATE "${_rtx_root}/include" src)
     target_link_directories(aji_trtrtx PRIVATE ${AJI_TRTRTX_LIB})
     target_link_libraries(aji_trtrtx PRIVATE ${_rtx_libs}
         CUDA::cuda_driver CUDA::cudart)
@@ -386,6 +404,21 @@ add_executable(aji_frame_diff_test sanity/frame_diff.cu src/kernels.cu)
 target_include_directories(aji_frame_diff_test PRIVATE include src)
 target_link_libraries(aji_frame_diff_test PRIVATE CUDA::cudart)
 
+# Native kernels (aji_native, above): CPU checks of the packing and the ONNX lowering, and the
+# kernels against a CPU reference on the GPU.
+add_executable(aji_native_pack_test sanity/native_pack_test.cpp src/native/pack.cpp)
+target_include_directories(aji_native_pack_test PRIVATE src)
+add_executable(aji_native_lower_test sanity/native_lower_test.cpp src/native/onnx_graph.cpp
+    src/native/lower.cpp src/native/pack.cpp)
+target_include_directories(aji_native_lower_test PRIVATE src)
+add_executable(aji_native_conv_test sanity/native_conv_test.cu $<TARGET_OBJECTS:aji_native>)
+target_include_directories(aji_native_conv_test PRIVATE src)
+target_link_libraries(aji_native_conv_test PRIVATE CUDA::cudart)
+# Whole-model timing on prepared data (experimental/native-span); built on request.
+add_executable(aji_native_bench EXCLUDE_FROM_ALL experimental/native-span/lib/native_bench.cu $<TARGET_OBJECTS:aji_native>)
+target_include_directories(aji_native_bench PRIVATE src)
+target_link_libraries(aji_native_bench PRIVATE CUDA::cudart)
+
 # Regression for concurrent first CUDA runtime loading in separate DLLs.
 if(WIN32)
     foreach(probe IN ITEMS aji_cuda_init_a aji_cuda_init_b)
@@ -404,11 +437,11 @@ enable_testing()
 add_executable(aji_rife_conf_test sanity/rife_conf_test.cpp src/aji_conf.cpp)
 target_include_directories(aji_rife_conf_test PRIVATE src)
 foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
-                     aji_held_test)
+                     aji_held_test aji_native_pack_test aji_native_lower_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS cpu)
 endforeach()
-foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test)
+foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test aji_native_conv_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS gpu)
 endforeach()
