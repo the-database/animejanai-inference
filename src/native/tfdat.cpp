@@ -415,9 +415,15 @@ cudaError_t Tfdat::exec(const void *in, void *out, cudaStream_t s, std::vector<s
 
 }  // namespace
 
+std::unique_ptr<VidNet> build_tfix(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why);
+
 std::unique_ptr<VidNet> VidNet::create(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why)
 {
-    return Tfdat::build(g, w, h, s, why);
+    std::string w1, w2;
+    if (auto n = Tfdat::build(g, w, h, s, &w1)) return n;
+    if (auto n = build_tfix(g, w, h, s, &w2)) return n;
+    if (why) *why = w2.rfind("not a", 0) ? w2 : w1;
+    return nullptr;
 }
 
 }  // namespace ajinative
