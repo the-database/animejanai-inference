@@ -147,10 +147,11 @@ its load and warm-up runs, less the ONNX file's size. On Windows the free memory
 processes' (WDDM pages them out instead of failing, at a heavy cost in speed), so apps take NVML's
 device-wide figure where lower.
 
-### Native kernels (`src/native`, `[global] native=on`)
+### Native kernels (`src/native`, on by default; `[global] native=off` disables)
 
-`native=on` in `[global]` (default off) runs each chain model the native path supports on
-hand-written CUDA kernels instead of TensorRT, inside `aji_trt` and `aji_trtrtx` alike. In
+`aji_trt` and `aji_trtrtx` run each chain model the native path supports on hand-written CUDA
+kernels instead of TensorRT (sm_80+; older GPUs and other models use TensorRT, with the reason
+logged). `native=off` (or `no`) in `[global]` turns it off; any other value, or no key, is on. In
 `aji_configure` (`try_native` in `aji_trt.cpp`) the model's ONNX is parsed (`native/onnx_graph`,
 no onnx dependency), lowered (`native/lower`) and instantiated for the chain's size
 (`native/executor`): it becomes a `Step::NATIVE`, run by `run_steps` like a TensorRT `MODEL`

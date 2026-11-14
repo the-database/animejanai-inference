@@ -49,9 +49,9 @@ struct AjiConf {
     std::string backend = "TensorRT";
     bool logging = true;
     std::string trt_engine_settings;           // empty = code default
-    bool native = false;                       // [global] native=on: run supported models
-                                               // on the native kernels (src/native) instead
-                                               // of TensorRT, falling back per model
+    bool native = true;                        // run supported models on the native kernels
+                                               // (src/native) instead of TensorRT, falling
+                                               // back per model; [global] native=off disables
     std::map<int, AjiSlotConf> slots;
 };
 

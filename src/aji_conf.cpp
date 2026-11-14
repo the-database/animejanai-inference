@@ -407,7 +407,7 @@ bool aji_conf_load(const char *path, AjiConf *out, std::string *err)
         auto nit = g.find("native");
         if (nit != g.end()) {
             const std::string v = lower(strip(nit->second));
-            out->native = v == "on" || parse_yes(v);
+            out->native = !(v == "off" || v == "no");  // on, yes, auto, empty: native
         }
         auto tit = g.find("trt_engine_settings");
         if (tit != g.end()) {

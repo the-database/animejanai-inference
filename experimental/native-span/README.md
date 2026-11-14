@@ -145,6 +145,18 @@ Not covered: slot or resolution changes during playback (each configure rebuilds
 steps, like TensorRT's), odd frame sizes (unshuffle models refuse them with a reason), GPUs other
 than the 5090 (Phase 4).
 
+## Phase 4: other GPUs (`phase4/`)
+
+The Phase 3 matrix on Linux (the user's Ubuntu 26.04 box, a second 5090) and on rented Runpod
+pods (`phase4/matrix-pod.sh`): RTX 4090 (Ada) and RTX A5000 (Ampere). Everywhere the native
+tests pass and every case is within 1–2 levels of TensorRT; nothing is slower. Performance
+(48 ch, memory-bound, which the fusion removes) gains ~1.7x on all three generations. The
+64-channel models are compute-bound: the native kernels reach ~60% of fp16 tensor peak on every
+card, TensorRT the same on Ampere but less on Ada and Blackwell, so Balanced/Compact gain
+1.4–1.6x on the 5090, 1.15–1.4x on the 4090 and 1.0–1.2x on the A5000. Numbers in `BENCHMARKS.md`.
+With that, native is on by default (`native=off` disables). Not measured: a small card
+(3050/4060 class).
+
 ## Notes
 
 - SPANF3's `SPABV2` uses `nn.ReLU(inplace=True)`, so the exported `last_mid` fed to `conv_cat` is
