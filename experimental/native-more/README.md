@@ -89,3 +89,32 @@ Cost: the largest of the candidates. New kernel kinds (fused LayerNorm-GEMM, win
 global reductions for the channel attention and channel gate, depthwise convs), lowering for a
 ~2,400-node graph whose data path is mostly reshapes and transposes, and FDAT-specific patterns
 (a new transformer variant would need its own work). Like ESRGAN it runs in the image path.
+
+## TFDAT (bndl animefilm v3, `tfdat/`)
+
+`2x_bndl_animefilm_v3_1x27xHxW`: a 9-frame temporal model. Not traiNNer-redux's `tfdat` exactly:
+its alignment is heavier (a 3-level 32/64/96-channel per-frame encoder `enc*`, per-neighbour
+flow heads, an `align_refine` step and an occlusion mask, bilinear warping as `GatherElements`),
+but the backbone is the same FDAT body as FDAT_M (120 channels, 24 blocks, window + channel
+attention) on the pixel-unshuffled centre frame. In libaji it is a temporal model (video path,
+`t > 1`), which the native path does not attempt today.
+
+TensorRT (`--builderOptimizationLevel=5`, libaji's video default), per output frame: **1280x736
+87.3 ms (11 fps), 1920x1088 205 ms (5 fps)**. By sub-network (`split.py`, from the layer metadata):
+
+| | 1280x736 | 1920x1088 |
+|---|---|---|
+| FDAT body (24 blocks) | 62.0 ms (71%) | 146.2 ms (72%) |
+| alignment (flow, warp, refine) | 9.0 ms (10%) | 19.2 ms (10%) |
+| temporal fusion + conv_first | 7.1 ms (8%) | 16.6 ms (8%) |
+| upsampler + hr_refine | 3.8 ms (4%) | 8.8 ms (4%) |
+| per-frame encoder | 1.5 ms (2%) | 2.8 ms (1%) |
+| other | 3.9 ms | 8.8 ms |
+
+The body is FDAT_M's at 3.6x the tokens (640x368 vs a 256x256 tile body): 62 ms against FDAT_M's
+14.75 ms x 3.6 = 53 ms, the same ~8%-of-peak profile, with 56 MB activations that leave L2. So a
+native FDAT body serves both IllustrationJaNai and bndl. With the body at the FDAT estimate (3–4x
+at this size) and the rest left on TensorRT, 720p would go from ~87 to ~40 ms (~2x); with the
+alignment and fusion native too, ~25–30 ms (~3x), i.e. from 11 fps to 25–35 fps at 720p. The
+per-frame encoder's features could be cached across frames (8 of 9 inputs repeat), but that is
+only ~2%.
