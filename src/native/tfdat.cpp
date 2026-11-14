@@ -1,10 +1,12 @@
-// native/tfdat.cpp — TFDAT as exported for bndl animefilm (2x, 9 frames) on native kernels.
+// native/tfdat.cpp — TFDAT v2 (traiNNer-redux dis2-tfdat2 tfdat_arch; bndl animefilm is 2x, 9 frames) on
+// native kernels, at 1x, 2x and 4x: the frames are pixel-unshuffled by U = 4, 2 or 1 before conv_first,
+// so the features and the body run at H/U x W/U and the 4x upsampler brings them to the output size.
 //
 // Per frame a 3-level encoder (stride-2 conv + conv, 32/64/96 channels). Per neighbour of the centre
 // frame: a coarse-to-fine flow (dec3 on [enc3 nb, enc3 ctr]; at each finer level the flow is
 // upsampled x2, warps the neighbour's encoder features, and [warped, enc ctr, flow] predicts a
 // delta), the full-resolution warp of the neighbour frame and an occlusion estimate (mean |warped -
-// centre|, 2x2 average), conv_first on the pixel-unshuffled warped frame, align_refine ([nb, ctr]
+// centre|, U x U average), conv_first on the pixel-unshuffled warped frame, align_refine ([nb, ctr]
 // 1x1 + 3x3 + nb), and a confidence (embedding similarity and occlusion -> two 3x3 convs ->
 // sigmoid) that weights it. The fusion (a 1x1 over the 9 slots, accumulated slot by slot, a 3x3,
 // an SE gate) feeds the FDAT body (fdat_body.h); then conv_after plus the fused features, two
@@ -30,9 +32,41 @@ using namespace onnxread;
 class Tfdat : public VidNet {
 public:
     static std::unique_ptr<VidNet> build(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why);
-    cudaError_t run(const void *in, void *out, cudaStream_t s) override { return exec(in, out, s, nullptr); }
+    ~Tfdat() override
+    {
+        if (graph) cudaGraphExecDestroy(graph);
+    }
+    // A run is several hundred launches, many of them small: captured once per (in, out) as a CUDA
+    // graph and replayed (AJI_NATIVE_PROFILE runs it directly, for the per-phase times).
+    cudaError_t run(const void *in, void *out, cudaStream_t s) override
+    {
+        static const bool prof = std::getenv("AJI_NATIVE_PROFILE") != nullptr;
+        if (prof) return exec(in, out, s, nullptr);
+        if (!graph || in != g_in || out != g_out) {
+            if (graph) cudaGraphExecDestroy(graph);
+            graph = nullptr;
+            cudaGraph_t g = nullptr;
+            cudaError_t e = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) return exec(in, out, s, nullptr);
+            const cudaError_t er = exec(in, out, s, nullptr);
+            e = cudaStreamEndCapture(s, &g);
+            if (er != cudaSuccess || e != cudaSuccess) {
+                if (g) cudaGraphDestroy(g);
+                return er != cudaSuccess ? er : e;
+            }
+            e = cudaGraphInstantiate(&graph, g, 0);
+            cudaGraphDestroy(g);
+            if (e != cudaSuccess) {
+                graph = nullptr;
+                return exec(in, out, s, nullptr);
+            }
+            g_in = in;
+            g_out = out;
+        }
+        return cudaGraphLaunch(graph, s);
+    }
     int frames() const override { return nf; }
-    int scale() const override { return 2; }
+    int scale() const override { return SC; }
     std::string describe() const override { return what; }
     size_t device_bytes() const override { return res.bytes + body.device_bytes(); }
 
@@ -40,6 +74,7 @@ private:
     DevRes res;
     FdatBody body;
     int nf = 0, C = 0, CP = 0, W = 0, H = 0;
+    int U = 2, SC = 2, UC = 16;  // unshuffle, scale, unshuffled frame stride
     float sim_scale = 1.f;
     // gconv steps
     GOp enc[6], dec3[3], dec2[3], dec1[3], cf0, cf2, ar2, conf0, conf2, fuse2, after, up0, up2[2], up4[2], up6, hr0, hr2;
@@ -55,6 +90,8 @@ private:
     void *U0, *V1, *V2, *RZ, *S, *HR, *O16;
     size_t ws_floats = 0;
     std::string what;
+    cudaGraphExec_t graph = nullptr;
+    const void *g_in = nullptr, *g_out = nullptr;
 
     // One run; with collect, the gconv steps are gathered into *collect instead of launched (and the
     // other kernels skipped): setup's workspace sizing and kernel picks.
@@ -116,10 +153,17 @@ std::unique_ptr<VidNet> Tfdat::build(const OnnxGraph &g, int w, int h, cudaStrea
         if (!cv(rd, n + ".4/Conv", &c, 0, d.ch, 2, why)) return nullptr;
         G(d.ops[2], c, d.ch, 16);
     }
-    if (!cv(rd, P + "conv_first/conv_first.0/Conv", &c, 0.2f, 12, 0, why)) return nullptr;
+    if (!cv(rd, P + "conv_first/conv_first.0/Conv", &c, 0.2f, 0, 0, why)) return nullptr;
+    if (c.cin == 3) f->U = 1;
+    else if (c.cin == 12) f->U = 2;
+    else if (c.cin == 48) f->U = 4;
+    else return refuse(why, "TFDAT conv_first input channels"), nullptr;
+    f->SC = 4 / f->U;
+    f->UC = pad16(c.cin);
+    const int U = f->U, UC = f->UC;
     const int C = f->C = c.cout, CP = f->CP = pad16(C);
     if (CP > 128) return refuse(why, "TFDAT channels"), nullptr;
-    G(f->cf0, c, 16, CP);
+    G(f->cf0, c, UC, CP);
     if (!cv(rd, P + "conv_first/conv_first.2/Conv", &c, 0, C, C, why)) return nullptr;
     G(f->cf2, c, CP, CP);
     // align_refine: 1x1 over [nb, ctr] (rows 0.. and 128..), LeakyReLU, 3x3, plus nb
@@ -205,11 +249,12 @@ std::unique_ptr<VidNet> Tfdat::build(const OnnxGraph &g, int w, int h, cudaStrea
     // Buffers: the small and persistent ones (flows, gates, X0 = the body input, also conv_after's
     // residual) in res; the rest in one arena shared by the three phases, which never overlap in
     // time: alignment + fusion, the body (its scratch, its output G first), and the tail (after G).
-    const size_t M1 = (size_t)(w / 2) * (h / 2), M2 = M1 / 4, M3 = M2 / 4, MO = (size_t)4 * w * h;
+    // M1..M3 the flow pyramid (always H/2, H/4, H/8); MF the features and the body (H/U); MO the output
+    const size_t M1 = (size_t)(w / 2) * (h / 2), M2 = M1 / 4, M3 = M2 / 4, MF = (size_t)(w / U) * (h / U), MO = 16 * MF;
     DevRes &r = f->res;
     auto Fl = [&](size_t n) { return (float *)r.alloc(n * 8); };
     f->F3 = Fl(M3); f->U2 = Fl(M2); f->F2 = Fl(M2); f->U1 = Fl(M1); f->F1 = Fl(M1);
-    f->X0 = r.alloc(M1 * CP * 2);
+    f->X0 = r.alloc(MF * CP * 2);
     f->sums = (float *)r.alloc(CP * 4);
     f->cm = (float *)r.alloc(CP * 4);
     if (r.failed) return refuse(why, "out of GPU memory"), nullptr;
@@ -222,26 +267,26 @@ std::unique_ptr<VidNet> Tfdat::build(const OnnxGraph &g, int w, int h, cudaStrea
         f->D3a = B(M3, 96); f->D3b = B(M3, 96); f->D3 = B(M3, 16);
         f->D2a = B(M2, 64); f->D2b = B(M2, 64); f->D2 = B(M2, 16);
         f->D1a = B(M1, 32); f->D1b = B(M1, 32); f->D1 = B(M1, 16);
-        f->US = B(M1, 16); f->WUS = B(M1, 16); f->CONF = B(M1, 16); f->CF1 = B(M1, 16); f->CF2 = B(M1, 16);
-        f->T1 = B(M1, CP); f->CATB = B(M1, CAT); f->AR1 = B(M1, CP); f->AL = B(M1, CP); f->EC = B(M1, CP); f->EN = B(M1, CP);
-        f->SLOT = B(M1, CP); f->ACC = B(M1, CP); f->FU = B(M1, CP);
+        f->US = B(MF, UC); f->WUS = B(MF, UC); f->CONF = B(MF, 16); f->CF1 = B(MF, 16); f->CF2 = B(MF, 16);
+        f->T1 = B(MF, CP); f->CATB = B(MF, CAT); f->AR1 = B(MF, CP); f->AL = B(MF, CP); f->EC = B(MF, CP); f->EN = B(MF, CP);
+        f->SLOT = B(MF, CP); f->ACC = B(MF, CP); f->FU = B(MF, CP);
         const size_t p1 = bp.off;
-        // phase 3: the tail, after the body's output (the first M1 x CP of the arena)
+        // phase 3: the tail, after the body's output (the first MF x CP of the arena)
         bp.off = 0;
-        B(M1, CP);
-        f->TT = B(M1, CP); f->U0 = B(M1, 64); f->V1 = B(4 * M1, 64); f->V2 = B(MO, 64); f->RZ = B(MO, 16); f->S = B(MO, 16);
+        B(MF, CP);
+        f->TT = B(MF, CP); f->U0 = B(MF, 64); f->V1 = B(4 * MF, 64); f->V2 = B(MO, 64); f->RZ = B(MO, 16); f->S = B(MO, 16);
         f->HR = f->V2;   // V2 is dead once up6 has run
         f->O16 = f->RZ;  // RZ is dead once up6 has run
         bp.off = std::max(bp.off, p1);
     };
     Bump cnt;
     carve(cnt);
-    const size_t arena = std::max(cnt.off, f->body.scratch_bytes(w / 2, h / 2));
+    const size_t arena = std::max(cnt.off, f->body.scratch_bytes(w / U, h / U));
     Bump bp;
     bp.base = (char *)r.alloc(arena);
     if (!bp.base) return refuse(why, "out of GPU memory"), nullptr;
     carve(bp);
-    if (!f->body.setup(w / 2, h / 2, s, why, bp.base)) return nullptr;
+    if (!f->body.setup(w / U, h / U, s, why, bp.base)) return nullptr;
     // kernel picks on a zero input
     void *zin = nullptr;
     if (cudaMalloc(&zin, (size_t)3 * f->nf * w * h * 2) != cudaSuccess) return refuse(why, "out of GPU memory"), nullptr;
@@ -261,13 +306,14 @@ std::unique_ptr<VidNet> Tfdat::build(const OnnxGraph &g, int w, int h, cudaStrea
     cudaFree(zin);
     if (!ok) return nullptr;
     if (cudaGetLastError() != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
-    f->what = "TFDAT 2x, " + std::to_string(f->nf) + " frames, " + f->body.describe();
+    f->what = "TFDAT " + std::to_string(f->SC) + "x, " + std::to_string(f->nf) + " frames, " + f->body.describe();
     return std::unique_ptr<VidNet>(f.release());
 }
 
 cudaError_t Tfdat::exec(const void *in, void *out, cudaStream_t s, std::vector<std::pair<GOp *, GConvArgs>> *collect)
 {
     const int w1 = W / 2, h1 = H / 2, w2 = W / 4, h2 = H / 4, w3 = W / 8, h3 = H / 8, M1 = w1 * h1, M2 = w2 * h2, M3 = w3 * h3;
+    const int wf = W / U, hf = H / U, MF = wf * hf, OW = 4 * wf, OH = 4 * hf;  // features; output
     const size_t plane = (size_t)W * H;
     const uint16_t *frames = (const uint16_t *)in;
     const int ctr = nf / 2;
@@ -317,16 +363,16 @@ cudaError_t Tfdat::exec(const void *in, void *out, cudaStream_t s, std::vector<s
         CK(Gc(ops[2], ga(b, ch, hh, ww, d, 16, hh, ww)));
         return cudaSuccess;
     };
-    // conv_first of an unshuffled frame (16 channels at h1 x w1) into dst (stride CAT)
+    // conv_first of an unshuffled frame (stride UC at hf x wf) into dst (stride CAT)
     auto first = [&](const void *us, void *dst) -> cudaError_t {
-        CK(Gc(cf0, act(ga(us, 16, h1, w1, T1, CP, h1, w1), 0.2f)));
-        CK(Gc(cf2, ga(T1, CP, h1, w1, dst, CAT, h1, w1)));
+        CK(Gc(cf0, act(ga(us, UC, hf, wf, T1, CP, hf, wf), 0.2f)));
+        CK(Gc(cf2, ga(T1, CP, hf, wf, dst, CAT, hf, wf)));
         return cudaSuccess;
     };
     auto gemm = [&](const TMat &m, const void *a, int sa, void *o, TAct ac, const void *add, bool last) -> cudaError_t {
         if (collect) return cudaSuccess;
         TGemm g;
-        g.a = a; g.sa = sa; g.M = M1; g.out = o; g.so = CP; g.act = ac;
+        g.a = a; g.sa = sa; g.M = MF; g.out = o; g.so = CP; g.act = ac;
         if (add) { g.add1 = add; g.s1 = CP; }
         g.act_last = last;
         return tgemm(m, g, s);
@@ -335,7 +381,7 @@ cudaError_t Tfdat::exec(const void *in, void *out, cudaStream_t s, std::vector<s
     // centre frame: encoder into the concat buffers' centre slices, features, embedding, slot 0
     CK(encode(ctrp, off(C1, 32), CS1, off(C2, 64), CS2, off(C3, 96), CS3));
     pr.mark(P_ENC);
-    K(img_to_nhwc(ctrp, false, W, H, true, US, 16, s));
+    K(tf_unshuffle(ctrp, H, W, U, US, UC, s));
     CK(first(US, off(CATB, 128)));
     CK(gemm(*embc, off(CATB, 128), CAT, EC, TAct::None, nullptr, false));
     CK(gemm(*fuse[0], off(CATB, 128), CAT, ACC, TAct::None, nullptr, false));
@@ -356,52 +402,52 @@ cudaError_t Tfdat::exec(const void *in, void *out, cudaStream_t s, std::vector<s
         CK(dec(dec1, C1, CS1, D1a, D1b, D1, 32, h1, w1));
         K(tf_flow_add(U1, D1, 16, F1, M1, s));
         pr.mark(P_FLOW);
-        K(tf_frame_warp(F1, nbp, ctrp, H, W, WUS, CONF, s));
+        K(tf_frame_warp(F1, nbp, ctrp, H, W, U, WUS, UC, CONF, s));
         pr.mark(P_WARP);
         // features, alignment refinement
         CK(first(WUS, CATB));
         CK(gemm(*ar0, CATB, CAT, AR1, TAct::LRelu, nullptr, false));
-        CK(Gc(ar2, r1(ga(AR1, CP, h1, w1, AL, CP, h1, w1), CATB, CAT)));
+        CK(Gc(ar2, r1(ga(AR1, CP, hf, wf, AL, CP, hf, wf), CATB, CAT)));
         pr.mark(P_ALIGN);
         // confidence-weighted slot into the fusion 1x1
         CK(gemm(*embn, AL, CP, EN, TAct::None, nullptr, false));
-        K(tf_sim(EC, EN, CP, C, sim_scale, CONF, M1, s));
-        CK(Gc(conf0, act(ga(CONF, 16, h1, w1, CF1, 16, h1, w1), 0.2f)));
-        CK(Gc(conf2, ga(CF1, 16, h1, w1, CF2, 16, h1, w1)));
-        K(tf_gate(AL, CF2, 16, SLOT, CP, C, M1, s));
+        K(tf_sim(EC, EN, CP, C, sim_scale, CONF, MF, s));
+        CK(Gc(conf0, act(ga(CONF, 16, hf, wf, CF1, 16, hf, wf), 0.2f)));
+        CK(Gc(conf2, ga(CF1, 16, hf, wf, CF2, 16, hf, wf)));
+        K(tf_gate(AL, CF2, 16, SLOT, CP, C, MF, s));
         const bool last = slot + 1 == nf;
         CK(gemm(*fuse[slot], SLOT, CP, ACC, last ? TAct::LRelu : TAct::None, ACC, last));
         slot++;
         pr.mark(P_FUSE);
     }
-    CK(Gc(fuse2, act(ga(ACC, CP, h1, w1, FU, CP, h1, w1), 0.2f)));
+    CK(Gc(fuse2, act(ga(ACC, CP, hf, wf, FU, CP, hf, wf), 0.2f)));
     K(cudaMemsetAsync(sums, 0, CP * 4, s));
-    K(tcolsum(FU, CP, M1, C, sums, s));
-    K(fdat_aim_cg(sums, M1, C, ser, se1, se2, cm, CP, s));
-    K(tf_colscale(FU, cm, X0, CP, C, M1, s));
+    K(tcolsum(FU, CP, MF, C, sums, s));
+    K(fdat_aim_cg(sums, MF, C, ser, se1, se2, cm, CP, s));
+    K(tf_colscale(FU, cm, X0, CP, C, MF, s));
     pr.mark(P_FUSE);
-    if (!collect) CK(body.run(X0, w1, h1, s, &pr));
+    if (!collect) CK(body.run(X0, wf, hf, s, &pr));
     // tail
-    CK(Gc(after, r1(ga(body.out(), CP, h1, w1, TT, CP, h1, w1), X0, CP)));
-    CK(Gc(up0, act(ga(TT, CP, h1, w1, U0, 64, h1, w1), 0.01f)));
+    CK(Gc(after, r1(ga(body.out(), CP, hf, wf, TT, CP, hf, wf), X0, CP)));
+    CK(Gc(up0, act(ga(TT, CP, hf, wf, U0, 64, hf, wf), 0.01f)));
     for (int sy = 0; sy < 2; sy++) {
-        GConvArgs a = ga(U0, 64, h1, w1, V1, 64, h1, w1);
+        GConvArgs a = ga(U0, 64, hf, wf, V1, 64, hf, wf);
         a.R = 2;
         a.sy = sy;
         CK(Gc(up2[sy], a));
     }
     for (int sy = 0; sy < 2; sy++) {
-        GConvArgs a = ga(V1, 64, H, W, V2, 64, H, W);
+        GConvArgs a = ga(V1, 64, 2 * hf, 2 * wf, V2, 64, 2 * hf, 2 * wf);
         a.R = 2;
         a.sy = sy;
         CK(Gc(up4[sy], a));
     }
-    K(tf_resize2x(ctrp, H, W, RZ, s));
-    CK(Gc(up6, r1(ga(V2, 64, 2 * H, 2 * W, S, 16, 2 * H, 2 * W), RZ, 16)));
-    CK(Gc(hr0, act(ga(S, 16, 2 * H, 2 * W, HR, 32, 2 * H, 2 * W), 0.2f)));
-    CK(Gc(hr2, r1(ga(HR, 32, 2 * H, 2 * W, O16, 16, 2 * H, 2 * W), S, 16)));
+    K(tf_resize(ctrp, H, W, SC, RZ, s));
+    CK(Gc(up6, r1(ga(V2, 64, OH, OW, S, 16, OH, OW), RZ, 16)));
+    CK(Gc(hr0, act(ga(S, 16, OH, OW, HR, 32, OH, OW), 0.2f)));
+    CK(Gc(hr2, r1(ga(HR, 32, OH, OW, O16, 16, OH, OW), S, 16)));
     pr.mark(P_UP);
-    K(img_from_nhwc(O16, 16, 2 * W, 2 * H, out, false, s));
+    K(img_from_nhwc(O16, 16, OW, OH, out, false, s));
     pr.mark(P_IO);
 #undef K
 #undef CK
