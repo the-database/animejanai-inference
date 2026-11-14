@@ -35,12 +35,26 @@ random-init SPANF3 variants against TensorRT:
 The untuned kernels lose at 64+ channels; NeoRTX still gets ~1.35× over TensorRT on its 64-channel
 Compact model (`2x_AnimeJaNai_SD_V1beta34_Compact`), so that is a tuning gap.
 
-## Phase 0 gate
+## Phase 0 gate: passed (2026-11-13)
 
-On the 5090, interleaved with TensorRT:
+`v2/` runs whole models on one shared kernel family (`native_kernels.cuh`): `mma.sync` m16n8k16 with fp16
+accumulation, A tiles from padded shared memory via `ldmatrix`, weights pre-packed in fragment order (one
+16-byte `__ldg` per lane per fragment pair), `cp.async` halo loads, the SPANF3 1x1 attention fed straight from
+the conv accumulators, and the input/output layout work (pixel-unshuffle, depth-to-space, Compact's
+upsampled-input add) folded into the first and last convs. Input and output are NCHW fp16, the same as
+NeoRTX's GPU-resident path. RTX 5090, 402 W power limit, three interleaved rounds with the GPU otherwise idle:
 
-- SPANF3 Performance, 1080p, whole model: at or below NeoRTX's 2.37–2.54 ms.
-- SD V1beta34 Compact, 720x480: at or below NeoRTX's 1.75–1.81 ms.
+| Model | TensorRT 11.4 | NeoRTX | native | output vs ORT-CUDA fp16 |
+|---|---|---|---|---|
+| SPANF3 Performance, 1920x1080 → 4K | 3.62–3.67 | 2.38–2.45 | **2.00–2.03** | 58.6 dB, max 1 level (NeoRTX: 58.6 dB, 1) |
+| SD V1beta34 Compact (64 ch), 720x480 | 2.42–2.45 | 1.79–1.82 | **1.71–1.74** | 61.6 dB, max 2 levels |
+| SD V1beta34 Compact (64 ch), 1280x720 | 7.38–7.41 | 5.43–5.45 | **5.23–5.24** | 62.8 dB, max 1 level |
+
+Best tile shapes: 8 warps x 2 rows for SPANF3 (48 ch), 4 warps x 4 rows for Compact (64 ch). Only tuned and
+measured on the 5090 (sm_120).
+
+Build: `v2\build.bat` (MSVC + CUDA 13.3). Data: `v2\prep_full.py` (SPANF3) and `v2\prep_compact.py` (Compact)
+write weights, a real-frame input and the ORT reference into `v2\data\<name>`; `v2\cmp_out.py` compares.
 
 ## Notes
 
