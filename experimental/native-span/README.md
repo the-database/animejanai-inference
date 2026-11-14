@@ -155,7 +155,15 @@ tests pass and every case is within 1–2 levels of TensorRT; nothing is slower.
 card, TensorRT the same on Ampere but less on Ada and Blackwell, so Balanced/Compact gain
 1.4–1.6x on the 5090, 1.15–1.4x on the 4090 and 1.0–1.2x on the A5000. Numbers in `BENCHMARKS.md`.
 With that, native is on by default (`native=off` disables). Not measured: a small card
-(3050/4060 class).
+(3050/4060 class; none available to rent).
+
+Mid-playback changes in mpv (`phase4/midplay.sh` + `switch.lua`, 5090, the app's own
+`vf-command aji slot N`): slot switches every ~190 frames through Balanced, Compact, Performance,
+off, Balanced+Performance, TemporalFix+Performance, Performance+RIFE and back each reconfigure in
+0.05–0.3 s with no errors; 16 switches between native slots leave GPU memory where the first cycle
+was. A stream that changes resolution four times (1080p, 768x576, 1280x642, 1080p live, 768x576)
+is upscaled throughout on native with Performance, Compact and Balanced, where TensorRT passes
+through each size it has no engine for until a background build finishes.
 
 ## Notes
 
