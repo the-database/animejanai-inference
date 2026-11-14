@@ -174,3 +174,36 @@ reads the frames once and fuses the thin convs with the elementwise work around 
 in the ~1.5–2.5 ms range at 1080p (**~5–8x**) and ~1 ms at 720p (~4–5x). Estimate only. It is one
 model rather than a family, so the lowering would be specific to it (or written by hand, as
 NeoRTX does per model), and it needs the temporal (multi-frame) input path.
+
+## DAT-2 and HAT-L (IllustrationJaNai V3 4x, bf16; `dathat/`)
+
+Both ship in the `models-illustrationjanai-bf16` pack as bf16 ONNX (fp32 input, bf16 weights,
+casts in the graph): these archs are in traiNNer's `ARCHS_WITHOUT_FP16`. That matters for native
+kernels: bf16 tensor-core maths only exists with fp32 accumulation, which GeForce runs at half the
+fp16-accumulate rate, and it would be a second kernel family (bf16 fragments, fp32 accumulators).
+
+- DAT-2: 180 channels, 6 groups x 6 blocks alternating rectangle-window spatial attention (8x32 /
+  32x8, dynamic position bias) and channel attention, each mixed with a depthwise-conv branch, and
+  an SGFN feed-forward; ~25 MFLOP per token, ~6.4 TFLOP per 4x 512 tile.
+- HAT-L: 180 channels, 12 groups x 6 Swin blocks (16x16 shifted windows) each with a channel-
+  attention conv branch (3x3 180→60→180), plus an overlapping cross-attention block per group;
+  ~93 MFLOP per token, ~24 TFLOP per tile.
+
+TensorRT (level 3), 4x, 512x512 tile: **DAT-2 331 ms (~20 TFLOPS), HAT-L 572 ms (~43 TFLOPS)**,
+against a bf16/fp32-accumulate peak of ~210 TFLOPS. Profiles (2,200–2,400 layers each):
+
+| | DAT-2 | HAT-L |
+|---|---|---|
+| GEMMs (`sm80_xmma_gemm_bf16bf16_bf16f32_f32`) | 60.6 ms (18%) | 166 ms (30%, ~60 TFLOPS) |
+| convs (`sm86_xmma_fprop_..._bf16`) | 32.9 ms (10%) | 70 ms (12.5%, ~105 TFLOPS) |
+| reshape/transpose/slice/concat (window partition, shift as slice + concat) | ~90 ms (27%) | ~175 ms (31%) |
+| LayerNorm, GELU, softmax and gate fusions | the rest | the rest |
+
+Over a quarter of each is pure data layout (window partition and reverse, HAT's shifted windows
+exported as slices and concats); a native kernel addresses windows directly, so that disappears.
+Rough native estimate with bf16 GEMMs at ~150 TFLOPS plus the memory passes: DAT-2 ~70–90 ms
+(**~4x**), HAT-L ~170–200 ms (**~3x**). Not prototyped. Cost: the highest here; two more transformer
+variants (rectangle windows, shifted windows, overlapping cross-attention, dynamic position bias)
+on top of FDAT's pieces, a bf16 kernel family, and the image path. They share FDAT's building
+blocks (LayerNorm-fused GEMM, window attention, channel attention, depthwise convs), so they are
+cheapest as a follow-on to FDAT.
