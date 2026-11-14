@@ -52,3 +52,40 @@ the RRDB's `x + 0.2·(y + 0.2·conv)`; a nearest-x2 input mode for the upsampler
 output with cout 3; lowering for the dense-block pattern; and native support in the image path
 (`aji_img_trt`, tiled), which today has none. That last part is what MangaJaNai GUI, the CLI and
 yosh would use.
+
+## FDAT_M (IllustrationJaNai V3, `fdat/`)
+
+traiNNer-redux `fdat_medium`: 120 channels, 4 groups x 6 blocks, alternating 8x8-window spatial
+attention (4 heads, head dim 30, learned relative bias) and channel attention (per head a 30x30
+Gram matrix over all tokens, L2-normalised q/k, learned temperature). Each block also has a
+depthwise 3x3 + GELU branch mixed in by an AIM gate (a 1x1 sigmoid spatial gate, or a global-pool
+channel gate), LayerNorms, and an FFN (120→240, GELU, depthwise 3x3 on 240, 240→120). The 2x model
+pixel-unshuffles by 2 and upsamples by 4; the 4x model runs the body at full resolution.
+~7.75 MFLOP per body token, 71% of it in the four GEMMs per block (qkv, proj, fc1, fc2).
+
+TensorRT, 512x512 tile: **2x 14.75 ms (~34 TFLOPS, ~8% of fp16 tensor peak), 4x 73.8 ms
+(~28 TFLOPS)**. Unlike ESRGAN this is nowhere near compute-bound. Where the 2x time goes
+(`profile_cats.py`, 553 layers, ~23 kernels per block):
+
+| | ms | share |
+|---|---|---|
+| GEMMs (`sm80_xmma_gemm`, 256x128 tiles; K = 120) | 6.55 | 39% (~55 TFLOPS) |
+| depthwise convs (`implicit_gemm_indexed_wo_smem`) | 2.22 | 13% |
+| attention as slice/reshape/mul/sum (`SlicReshMoveMulSum`, 24) | 1.98 | 12% |
+| GELU + LayerNorm + gate fusions, transposes, copies (Myelin) | ~5.9 | 36% |
+
+So most of the time is memory traffic between ~550 small kernels (one 120-channel activation of
+a 512 tile is 15.7 MB; at 4x it is 63 MB and leaves L2) and GEMMs too thin for the 256x128 tiles
+TensorRT picks. A native FDAT would fuse each block into ~5 kernels: LayerNorm in the prologue of
+the GEMM that follows it (K = 120, so a row fits), GELU and residuals in epilogues, the window
+attention as one kernel per 8x8 window (64x64 scores in registers), the channel attention as a
+split reduction for the Gram matrices then an apply, and the FFN's fc1 + GELU written once for its
+depthwise conv. Rough ceiling: 2x ~3–5 ms, 4x ~12–16 ms (GEMMs at 150–200 TFLOPS plus the
+remaining passes); realistically **2–3x (2x model) and 3–4x (4x model)**, more on every GPU
+generation than for ESRGAN since TensorRT's problem here is traffic, not conv kernel tuning.
+Not measured with a prototype: these are estimates from the profile and the FLOP count.
+
+Cost: the largest of the candidates. New kernel kinds (fused LayerNorm-GEMM, window attention,
+global reductions for the channel attention and channel gate, depthwise convs), lowering for a
+~2,400-node graph whose data path is mostly reshapes and transposes, and FDAT-specific patterns
+(a new transformer variant would need its own work). Like ESRGAN it runs in the image path.
