@@ -10,6 +10,8 @@ Usage: python tools/test-encode-reuse-chains.py --runtime <dir> --ffmpeg-bin <di
 ffprobe.exe. The models: --model (default the 2x Balanced V3.1 model) in --model-dir, RIFE 4.22
 in --rife-model-dir. Needs a GPU (NVIDIA for NVENC; engines are built on first use).
 
+Reuse in RIFE chains is opt-in (--reuse-held-frames-rife), so the reuse runs pass it, and one run
+per clip checks that a RIFE chain reuses nothing without it.
 For each clip it encodes the plain upscale chain once with AJI_REUSE_TRACE, then each RIFE chain
 (R = RIFE only, UR = upscale then RIFE, RU = RIFE first, RUpre = RIFE first with a pre-resize to
 720 lines) at each factor twice, with reuse (traced) and with --no-reuse-held-frames, and checks:
@@ -98,7 +100,7 @@ def conf(path, chain, num=2, den=1):
     return path
 
 
-def run(src, cfg, out, trace=None, reuse=True, extra=(), vq=None):
+def run(src, cfg, out, trace=None, reuse=True, extra=(), vq=None, opt_in=True):
     args = [encode, "--input", src, "--output", out, "--conf", cfg, "--slot", "1",
             "--model-dir", a.model_dir, "--rife-model-dir", a.rife_model_dir,
             "--backend", a.backend, "--vcodec", "hevc_nvenc", "--vquality", vq or VQ,
@@ -110,6 +112,8 @@ def run(src, cfg, out, trace=None, reuse=True, extra=(), vq=None):
         args += ["--device", a.device]
     if not reuse:
         args.append("--no-reuse-held-frames")
+    elif opt_in:
+        args.append("--reuse-held-frames-rife")   # RIFE chains: off by default
     env = dict(os.environ)
     env.pop("AJI_REUSE_TRACE", None)
     if trace:
@@ -193,6 +197,14 @@ for clip in a.clip:
     plain = plain_trace.read_bytes()
     held = held_set(plain_trace)
     print(f"{name}: plain chain reused {len(held)} frames", flush=True)
+    if chains:
+        # without --reuse-held-frames-rife a RIFE chain reuses nothing and says why
+        cfg = conf(work / f"{chains[0]}_2-1.conf", chains[0])
+        p = run(clip, cfg, work / f"{name}_default.mkv", opt_in=False)
+        check(p.returncode == 0 and "held frames: not reused (RIFE chain" in p.stderr
+              and "held pairs" not in p.stderr,
+              f"{name} {chains[0]}: off by default without --reuse-held-frames-rife")
+        (work / f"{name}_default.mkv").unlink(missing_ok=True)
     for chain in chains:
         for num, den in factors:
             tag = f"{name}_{chain}_{num}-{den}"

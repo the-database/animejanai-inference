@@ -142,6 +142,7 @@ typedef struct {
     int session;            /* --preview-session: serve a player, no encode */
     enum damage_mode on_damage;
     int reuse_held;         /* held-frame reuse: on unless --no-reuse-held-frames */
+    int reuse_rife;         /* ... in RIFE chains too: --reuse-held-frames-rife */
     float reuse_t;          /* --reuse-held-threshold: largest 8x8 tile mean |diff| */
     float reuse_fade;       /* --reuse-held-fade-threshold: largest region signed mean */
 
@@ -4036,16 +4037,19 @@ static int push_frame(enc_ctx *c, AVFrame *fr)
     return reuse_consume(c, h, 0);       /* every frame, as it comes */
 }
 
-/* held-frame reuse: on by default for a plain upscale chain and for RIFE
+/* held-frame reuse: on by default for a plain upscale chain; for RIFE
  * chains without a temporal model (RIFE only, upscale then RIFE, RIFE
- * first), CUDA or DirectML (see push_reuse); otherwise off, with a line
- * saying why */
+ * first) with --reuse-held-frames-rife (off by default until A/B-tested);
+ * CUDA or DirectML (see push_reuse); otherwise off, with a line saying
+ * why */
 static int reuse_setup(enc_ctx *c)
 {
     if (!c->o.reuse_held) return 0;
     const char *why = c->o.session ? "--preview-session"
                     : c->passthrough && !c->rife_only ? "no upscale chain is active"
                     : c->temporal_r ? "the chain is temporal"
+                    : c->rife && !c->o.reuse_rife
+                        ? "RIFE chain; --reuse-held-frames-rife turns it on"
                     : NULL;
     if (why) {
         loge("held frames: not reused (%s)", why);
@@ -4514,8 +4518,10 @@ static void usage(void)
 "                           past it; each spot prints DAMAGE t=<s> frame=<n|-1>)\n"
 "           [--no-reuse-held-frames] (upscale every frame: by default a frame that\n"
 "                           is the same picture as the last upscaled one reuses its\n"
-"                           upscale, and RIFE repeats it instead of interpolating\n"
-"                           towards it; not with a temporal model)\n"
+"                           upscale; not with RIFE or a temporal model)\n"
+"           [--reuse-held-frames-rife] (reuse in RIFE chains too: RIFE repeats a\n"
+"                           held frame instead of interpolating towards it; not\n"
+"                           with a temporal model)\n"
 "           tuning/debug: [--reuse-held-threshold D] (largest 8x8 tile mean difference,\n"
 "                           8-bit levels; default 2.5) [--reuse-held-fade-threshold F]\n"
 "                           (largest region brightness change; default %.2f)\n"
@@ -4571,6 +4577,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-zerocopy")) c.o.no_zerocopy = 1;
         else if (!strcmp(a, "--reuse-held-frames")) c.o.reuse_held = 1;   /* the default */
         else if (!strcmp(a, "--no-reuse-held-frames")) c.o.reuse_held = 0;
+        else if (!strcmp(a, "--reuse-held-frames-rife")) c.o.reuse_rife = 1;
         else if (!strcmp(a, "--probe-encoders")) { probe_encoders(); return 0; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (i >= argc - 1) { usage(); return 2; }
