@@ -263,3 +263,30 @@ Windows (TensorRT itself is ~6% faster on Linux):
 | Compact 768x576 (DVD) | 3.00 | 2.06 | 1.46x |
 | Balanced then Performance, 854x480 | 3.66 | 2.42 | 1.51x |
 | RIFE 2x after Performance, per source frame | 19.01 | 17.55 | |
+
+### RTX 4090 (Phase 4)
+
+Runpod pod: RTX 4090 at its 450 W default, driver 595.91 (CUDA 13.2), Ubuntu 24.04, gcc 13.3,
+nvcc 13.2, TensorRT 11.4.0.106 (CUDA 13.4 build, running under minor-version compatibility).
+`experimental/native-span/phase4/matrix-pod.sh`; the P010 and 1918x1078 / 1440x1080 inputs are
+generated on the pod from the 1080p NV12 frames (8-bit shifted up; top-left crops). The native
+tests pass (worst conv error 0.0077 against 0.02), and all 15 cases are within 1–2 8-bit levels of
+TensorRT. Two rounds on cached engines:
+
+| Case | TensorRT | native | speed-up |
+|---|---|---|---|
+| Performance 1920x1080 | 4.90–5.05 | 2.87 | 1.71–1.76x |
+| Performance 1918x1078 | 5.03 | 3.02–3.08 | 1.63–1.67x |
+| Balanced 1920x1080 | 8.15–8.17 | 5.74 | 1.42x |
+| Balanced 1440x1080 | 6.19–6.21 | 4.41–4.53 | 1.37–1.40x |
+| Performance 1280x642 | 1.67 | 1.01 | 1.65x |
+| Performance 854x480 | 0.81 | 0.62 | 1.31x |
+| Compact 1920x1080 (live action) | 15.02–15.04 | 11.13–11.14 | 1.35x |
+| Compact 854x480 | 3.16–3.17 | 2.74 | 1.15x |
+| Compact 768x576 (DVD) | 3.36 | 2.85–2.86 | 1.18x |
+| Balanced then Performance, 854x480 | 5.20–5.21 | 3.15 | 1.65x |
+| RIFE 2x after Performance, per source frame | 37.18–37.24 | 35.20–35.30 | |
+
+Faster everywhere, but the 64-channel models (Balanced, Compact) gain less than on the 5090
+(Compact at SD sizes 1.15–1.18x against 1.44–1.54x): the two tile variants were tuned on sm_120,
+so this is the first place to look when tuning for Ada.
