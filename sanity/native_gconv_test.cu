@@ -31,6 +31,8 @@ struct Case {
     int nres;
     GAct act;
     int R;
+    bool up2 = false;
+    bool acc32 = false;
 };
 
 static int fails = 0, checks = 0;
@@ -39,6 +41,8 @@ static double worst = 0;
 static void run(const Case &c, int variant, bool split)
 {
     const int cin_pad = (c.cin + 15) / 16 * 16;
+    // up2: the source buffer is IH/2 x IW/2, read nearest-upsampled to IH x IW
+    const int SH = c.up2 ? c.IH / 2 : c.IH, SW = c.up2 ? c.IW / 2 : c.IW;
     const int OH = c.stride == 2 ? (c.IH + 1) / 2 : c.IH, OW = c.stride == 2 ? (c.IW + 1) / 2 : c.IW;
     const int cout_pad = (c.cout + 15) / 16 * 16;
     const int CH = c.R ? cout_pad / c.R : 0;  // phase: channels per output pixel
@@ -55,13 +59,14 @@ static void run(const Case &c, int variant, bool split)
     }
     // input
     const int sstride = c.nchw ? c.IH * c.IW : cin_pad + c.src_extra;
-    std::vector<uint16_t> in(c.nchw ? (size_t)3 * c.IH * c.IW : (size_t)c.IH * c.IW * sstride);
+    std::vector<uint16_t> in(c.nchw ? (size_t)3 * c.IH * c.IW : (size_t)SH * SW * sstride);
     for (auto &x : in) x = h(urand(1.f));
     if (!c.nchw)
-        for (int p = 0; p < c.IH * c.IW; p++)
+        for (int p = 0; p < SH * SW; p++)
             for (int k = c.cin; k < cin_pad; k++) in[(size_t)p * sstride + k] = 0;  // padded channels are zero
     auto inv = [&](int y, int x, int k) -> float {
         if (y < 0 || y >= c.IH || x < 0 || x >= c.IW) return 0.f;
+        if (c.up2) return f(in[((size_t)(y / 2) * SW + x / 2) * sstride + k]);
         return c.nchw ? f(in[(size_t)k * c.IH * c.IW + (size_t)y * c.IW + x]) : f(in[((size_t)y * c.IW + x) * sstride + k]);
     };
     // residuals
@@ -99,6 +104,8 @@ static void run(const Case &c, int variant, bool split)
     a.stride = c.stride;
     a.nchw = c.nchw;
     a.R = c.R;
+    a.up2 = c.up2;
+    a.acc32 = c.acc32;
     float *dws = nullptr;
     if (split) {
         a.ws_floats = gworkspace(gw, a);
@@ -209,8 +216,13 @@ int main()
         {"phase R2 32->32", 32, 32, 1, 0, 0, false, 0, 0, 0, 0, GAct::None, 2},
         {"phase R4 192->64", 192, 64, 1, 0, 0, false, 0, 0, 0, 0, GAct::None, 4},
         {"phase R4 64->32", 64, 32, 1, 0, 0, false, 0, 0, 0, 0, GAct::None, 4},
+        {"up2 64->64 lrelu", 64, 64, 1, 0, 0, false, 0, 0, 0, 0, GAct::LRelu, 0, true},
+        {"up2 64->64 prefix", 64, 64, 1, 0, 0, false, 64, 0, 0, 0, GAct::None, 0, true},
+        {"acc32 192->64 two residuals", 192, 64, 1, 0, 0, false, 0, 0, 0, 2, GAct::None, 0, false, true},
+        {"acc32 96->32 prefix + slice", 96, 32, 1, 0, 0, false, 96, 64, 32, 0, GAct::LRelu, 0, false, true},
+        {"acc32 up2 64->64", 64, 64, 1, 0, 0, false, 0, 0, 0, 0, GAct::LRelu, 0, true, true},
     };
-    const int sizes[][2] = {{37, 23}, {64, 32}};
+    const int sizes[][2] = {{37, 23}, {38, 24}, {64, 32}};
     for (const Case &c0 : cases)
         for (const auto &sz : sizes)
             for (int v = 0; v < gvariant_count(); v++)
@@ -218,6 +230,7 @@ int main()
                     Case c = c0;
                     c.IW = sz[0];
                     c.IH = sz[1];
+                    if (c.up2 && (c.IW % 2 || c.IH % 2)) continue;
                     run(c, v, split != 0);
                 }
     printf("native gconv: %s (%d checks; worst max %.4f)\n", fails ? "FAIL" : "OK", checks, worst);

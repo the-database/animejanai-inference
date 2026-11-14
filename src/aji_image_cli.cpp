@@ -86,7 +86,7 @@ bool write_pnm(const char *path, const Image &im)
 
 void log_cb(void *, int level, const char *msg)
 {
-    if (level <= 2)
+    if (level <= 2 || std::getenv("AJI_IMAGE_VERBOSE"))
         fprintf(stderr, "[aji:%d] %s\n", level, msg);
 }
 

@@ -102,7 +102,7 @@ set_target_properties(aji_trt_common PROPERTIES
 
 # Native tensor-core kernels and their ONNX lowering/executor (src/native), linked into both
 # TensorRT backends (used with [global] native=on) and the native tests.
-add_library(aji_native OBJECT src/native/conv.cu src/native/gconv.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/pack.cpp src/native/onnx_graph.cpp
+add_library(aji_native OBJECT src/native/conv.cu src/native/gconv.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/esrgan.cpp src/native/img_kernels.cu src/native/pack.cpp src/native/onnx_graph.cpp
     src/native/lower.cpp src/native/executor.cpp)
 target_include_directories(aji_native PRIVATE src)
 target_link_libraries(aji_native PRIVATE CUDA::cudart)
@@ -417,6 +417,10 @@ target_link_libraries(aji_native_conv_test PRIVATE CUDA::cudart)
 add_executable(aji_native_gconv_test sanity/native_gconv_test.cu $<TARGET_OBJECTS:aji_native>)
 target_include_directories(aji_native_gconv_test PRIVATE src)
 target_link_libraries(aji_native_gconv_test PRIVATE CUDA::cudart)
+# Native image model on a raw tile (parity against an fp32 reference, timing); built on request.
+add_executable(aji_native_img_run EXCLUDE_FROM_ALL sanity/native_img_run.cu $<TARGET_OBJECTS:aji_native>)
+target_include_directories(aji_native_img_run PRIVATE src)
+target_link_libraries(aji_native_img_run PRIVATE CUDA::cudart)
 # Native RIFE on a raw input tensor (parity against an fp32 reference, timing); built on request.
 add_executable(aji_native_rife_run EXCLUDE_FROM_ALL sanity/native_rife_run.cu $<TARGET_OBJECTS:aji_native>)
 target_include_directories(aji_native_rife_run PRIVATE src)
