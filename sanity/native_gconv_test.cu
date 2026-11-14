@@ -134,7 +134,10 @@ static void run(const Case &c, int variant, bool split)
         fails++;
         return;
     }
-    double maxe = 0, se = 0;
+    // max error limit: 0.03 plus two fp16 roundings of the value (the output is fp16, the sum fp16-accumulated
+    // over up to 9 x 192 terms, and tensor cores of different generations round that sum differently)
+    const double tol_rel = 2.0 / 1024;
+    double maxe = 0, maxx = 0, se = 0;
     long n = 0;
     bool clobber = false;
     for (int y = 0; y < OH; y++)
@@ -160,6 +163,7 @@ static void run(const Case &c, int variant, bool split)
                         idx = ((size_t)(c.R * y + s2) * DW + c.R * x + sx) * dstride + c.dst_off + ch;
                         const double d = std::fabs(f(out[idx]) - v);
                         maxe = std::max(maxe, d);
+                        maxx = std::max(maxx, d - tol_rel * std::fabs(v));
                         se += d * d;
                         n++;
                     }
@@ -168,6 +172,7 @@ static void run(const Case &c, int variant, bool split)
                 idx = ((size_t)y * OW + x) * dstride + c.dst_off + o;
                 const double d = std::fabs(f(out[idx]) - v);
                 maxe = std::max(maxe, d);
+                maxx = std::max(maxx, d - tol_rel * std::fabs(v));
                 se += d * d;
                 n++;
             }
@@ -177,7 +182,7 @@ static void run(const Case &c, int variant, bool split)
             for (int k = 0; k < dstride; k++)
                 if ((k < c.dst_off || k >= c.dst_off + cout_pad) && out[(size_t)p * dstride + k] != h(7.f)) clobber = true;
     const double rms = std::sqrt(se / std::max(n, 1L));
-    const bool ok = maxe < 0.03 && rms < 0.004 && !clobber;
+    const bool ok = maxx < 0.03 && rms < 0.004 && !clobber;
     checks++;
     worst = std::max(worst, maxe);
     if (!ok) {

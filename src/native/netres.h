@@ -140,6 +140,16 @@ inline bool gprepare(std::vector<std::pair<GOp *, GConvArgs>> &ops, cudaStream_t
         if (it == picked.end()) it = picked.emplace(key, gpick(*o.first->w, o.second, s)).first;
         if (it->second < 0) return onnxread::refuse(why, "kernel timing failed");
         o.first->variant = it->second;
+        // AJI_NATIVE_GVARIANT=n: every gconv step on variant n; with AJI_NATIVE_GVARIANT_OP=i only step
+        // i (the others on variant 2); AJI_NATIVE_GDEBUG lists the steps (for testing the variants)
+        static const char *fv = std::getenv("AJI_NATIVE_GVARIANT"), *fo = std::getenv("AJI_NATIVE_GVARIANT_OP");
+        const int idx = (int)(&o - &ops[0]);
+        if (fv && *fv) o.first->variant = (fo && *fo) ? (idx == std::atoi(fo) ? std::atoi(fv) : 2) : std::atoi(fv);
+        if (std::getenv("AJI_NATIVE_GDEBUG"))
+            std::fprintf(stderr, "gconv %d: %d->%d %dx%d R%d sy%d stride%d nchw%d up2%d r1 %d r1f %d outf %d act %d acc32 %d: variant %d (picked %d) ss %d ds %d in %dx%d ws %p %zu src %p dst %p\n", idx,
+                         o.first->w->cin_pad, o.first->w->cout_pad, o.second.W, o.second.H, o.second.R, o.second.sy, o.second.stride,
+                         (int)o.second.nchw, (int)o.second.up2, o.second.r1 != nullptr, o.second.r1f != nullptr, (int)o.second.out_f32,
+                         (int)o.second.act, (int)o.second.acc32, o.first->variant, it->second, o.second.src_stride, o.second.dst_stride, o.second.IW, o.second.IH, (void *)o.second.ws, o.second.ws_floats, o.second.src, o.second.dst);
     }
     return true;
 }
