@@ -9,6 +9,7 @@ R=${R:-/workspace}; B=$R/build; SDK=$R/sdk; I=$R/in; C=$R/conf; O=$R/bench; mkdi
 export LD_LIBRARY_PATH=$SDK/trt/usr/lib/x86_64-linux-gnu:$SDK/cudart/lib
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 TRTEXEC=$SDK/trt/usr/bin/trtexec
+PY=${PY:-python3}  # with numpy, for the output comparisons
 
 vid() {  # vid NAME CLIP W H FRAMES CONF SLOT MODELDIR [harness args]
   local name=$1 clip=$2 w=$3 h=$4 n=$5 conf=$6 slot=$7 md=$8; shift 8
@@ -24,14 +25,14 @@ vid() {  # vid NAME CLIP W H FRAMES CONF SLOT MODELDIR [harness args]
   t_on=$(echo "$on" | grep -oE 'device chain time: [0-9.]+|rife time: [0-9.]+' | head -1 | grep -oE '[0-9.]+' | head -1)
   nat=$(echo "$on" | grep -cE 'Native kernels: ')
   err=$(echo "$on$off" | grep -iE 'error|failed|not used' | head -1)
-  r=$( [ -n "$dims" ] && python3 -I $C/cmp.py $O/o_off.raw $O/o_on.raw ${dims%x*} ${dims#*x} nv12 )
+  r=$( [ -n "$dims" ] && $PY -I $C/cmp.py $O/o_off.raw $O/o_on.raw ${dims%x*} ${dims#*x} nv12 )
   echo "$name | ${w}x$h -> $dims | native steps $nat | TensorRT $t_off ms | native $t_on ms | $(python3 -c "print('%.2fx' % ($t_off / $t_on))" 2>/dev/null) | $r ${err:+| NOTE: $err}"
   rm -f $O/o_off.raw $O/o_on.raw
 }
 
 img() {  # img NAME MODEL.onnx [tile]
   local name=$1 model=$2 tile=${3:-512}
-  run() { (cd $B && AJI_NATIVE=$1 ./aji_image --model $model --tile $tile --cache $R/imgcache --trtexec $TRTEXEC --repeat 4 \
+  run() { (cd $B && AJI_IMAGE_VERBOSE=1 AJI_NATIVE=$1 ./aji_image --model $model --tile $tile --cache $R/imgcache --trtexec $TRTEXEC --repeat 4 \
           $I/page.ppm $O/i_$1.ppm 2>&1); }
   local off on t_off t_on nat err
   off=$(run off); on=$(run on)
@@ -40,14 +41,14 @@ img() {  # img NAME MODEL.onnx [tile]
   t_on=$(echo "$on" | grep -E '^upscale' | tail -1 | grep -oE '[0-9.]+ ms' | grep -oE '[0-9.]+')
   nat=$(echo "$on" | grep -ciE 'native kernels: ')
   err=$(echo "$on$off" | grep -iE 'error|failed|not used' | head -1)
-  r=$(python3 -I $C/ppmcmp.py $O/i_off.ppm $O/i_on.ppm)
+  r=$($PY -I $C/ppmcmp.py $O/i_off.ppm $O/i_on.ppm)
   echo "$name | page 1200x1000, tile $tile | native $nat | TensorRT $t_off ms | native $t_on ms | $(python3 -c "print('%.2fx' % ($t_off / $t_on))" 2>/dev/null) | $r ${err:+| NOTE: $err}"
   rm -f $O/i_off.ppm $O/i_on.ppm
 }
 
 M=$R/models; G=$R/models/img
 {
-echo "# $(nvidia-smi --query-gpu=name,compute_cap,power.limit,clocks.max.sm,memory.total,driver_version --format=csv,noheader)"
+echo "# $(nvidia-smi -i ${GPU:-0} --query-gpu=name,compute_cap,power.limit,clocks.max.sm,memory.total,driver_version --format=csv,noheader)"
 echo "# $(date -u +%FT%TZ), branch $(git -C $R/src log --oneline -1)"
 echo "== native tests"
 (cd $B && for t in aji_native_pack_test aji_native_lower_test aji_native_conv_test aji_native_gconv_test aji_native_tfm_test; do
