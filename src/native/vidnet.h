@@ -1,8 +1,9 @@
 /*
  * native/vidnet.h — temporal (multi-frame) video models on native kernels, for libaji's temporal
  * stages (aji_trt): today TFDAT (bndl animefilm: per-neighbour flow alignment, temporal fusion,
- * the FDAT body). create() recognises the model from its ONNX graph and builds it for one padded
- * frame size; anything else is refused with a reason and the caller builds a TensorRT engine.
+ * the FDAT body) and TemporalFix (pifroggi's temporal stabiliser, same-size output). create()
+ * recognises the model from its ONNX graph and builds it for one padded frame size; anything else
+ * is refused with a reason and the caller builds a TensorRT engine.
  * run() takes the stage's model input (fp16 [3 * frames][h][w], frames oldest first) and writes
  * its output (fp16 [3][scale * h][scale * w]).
  */
