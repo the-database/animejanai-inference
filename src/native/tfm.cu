@@ -56,6 +56,7 @@ struct GemmP {
     float slope;
     int act_last, out_f32, add1_f32;
     const float *add2scale;
+    int k;  // A's real columns: those from k up to kpad load as zeros (A may be a slice whose row ends sooner)
 };
 
 __global__ void __launch_bounds__(128) k_gemm(GemmP p)
@@ -75,8 +76,9 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
         const int kn = min(KC, p.kpad - k0);
         for (int i = tid; i < BM * (KC / 8); i += 128) {
             const int r = i / (KC / 8), v = i % (KC / 8);
-            const bool ok = m0 + r < p.M && v * 8 < kn;
-            cp16(sa + r * AP + v * 8, ok ? p.a + (size_t)(m0 + r) * p.sa + k0 + v * 8 : p.a, ok ? 16 : 0);
+            const int rem = p.k - (k0 + v * 8);  // real columns left from this chunk
+            const bool ok = m0 + r < p.M && v * 8 < kn && rem > 0;
+            cp16(sa + r * AP + v * 8, ok ? p.a + (size_t)(m0 + r) * p.sa + k0 + v * 8 : p.a, ok ? min(16, 2 * rem) : 0);
         }
         cp_wait();
         __syncthreads();
@@ -981,6 +983,7 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
         return cudaErrorInvalidValue;
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
             (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0, g.out_f32 ? 1 : 0, g.add1_f32 ? 1 : 0, g.add2scale};
+    p.k = w.K;
     const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);
     k_gemm<<<grid, 128, 0, s>>>(p);
     return cudaGetLastError();
