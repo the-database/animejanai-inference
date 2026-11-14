@@ -98,6 +98,31 @@ aji_native_bench spanf3 v2\data\perf1080 1920 1080
 aji_native_bench compact v2\data\compact480 720 480
 ```
 
+## Phase 2: in libaji (`[global] native=on`)
+
+`aji_trt` / `aji_trtrtx` lower each chain model's ONNX at configure and run it as a native step
+when they can (see CLAUDE.md, "Native kernels"); otherwise they log why and use TensorRT. End to
+end through `aji_harness` (NV12 in, pre-kernel, model, post-kernel, NV12 out, CUDA graph), the same
+build with `native=off` and `native=on`, `lib/phase2_e2e.sh`. RTX 5090 at 402 W, three idle rounds:
+
+| Model | TensorRT | native | speed-up | output vs TensorRT (NV12) |
+|---|---|---|---|---|
+| SD V1beta34 Compact, 720x480 | 2.33–2.38 | 1.60–1.64 | 1.45× | Y 62.4 dB, UV 67.6 dB, max 1 level |
+| SD V1beta34 Compact, 1280x720 | 6.93–7.10 | 4.63–5.05 | 1.4–1.5× | Y 63.4 dB, UV 67.8 dB, max 1 level |
+| SPANF3 Balanced, 1280x720 | 2.67–2.73 | 1.87–1.90 | 1.43× | Y 60.3 dB, UV 66.0 dB, max 1 level |
+| SPANF3 Balanced, 1920x1080 | 7.33–7.45 | 4.50–4.60 | 1.62× | Y 58.9 dB, UV 64.3 dB, max 2 levels |
+| SPANF3 Performance, 1920x1080 | 3.60–3.63 | 2.04–2.06 | 1.76× | Y 59.1 dB, UV 64.5 dB, max 1 level |
+| V2 UltraCompact (fp32 export), 1280x720 | 12.17–12.34 | 2.56–2.61 | 4.7×* | Y 65.1 dB, UV 69.7 dB, max 1 level |
+
+\* TensorRT 11 runs an fp32 export in fp32; the native kernels compute in fp16 (logged as "fp32
+model computed in fp16"). The other rows are fp16 models on both sides.
+
+Configure with native kernels takes ~50 ms (parse, lower, upload, time the tile variants) against
+~85 ms to load a cached TensorRT engine; there is no build. A MangaJaNai ESRGAN model is refused
+("unsupported op Unsqueeze on the data path") and runs on TensorRT; temporal models are not
+attempted. NV12/P010 conversion is not folded into the native kernels: libaji's pre/post kernels
+resample chroma with Spline36 (needs a halo) and cost ~0.05 ms at 1080p, so that is deferred.
+
 ## Notes
 
 - SPANF3's `SPABV2` uses `nn.ReLU(inplace=True)`, so the exported `last_mid` fed to `conv_cat` is

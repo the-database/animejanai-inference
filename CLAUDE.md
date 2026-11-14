@@ -147,11 +147,27 @@ its load and warm-up runs, less the ONNX file's size. On Windows the free memory
 processes' (WDDM pages them out instead of failing, at a heavy cost in speed), so apps take NVML's
 device-wide figure where lower.
 
-### Native kernels (`src/native`, not used by the backends yet)
+### Native kernels (`src/native`, `[global] native=on`)
 
-Hand-written tensor-core convolutions for small SR convnets (SPAN, SPANF3, SRVGG Compact), the
-building blocks of a planned native executor that runs recognised models without TensorRT. One
-kernel family, `k_conv3x3` (`native/conv_kernels.cuh`): a 3x3 conv on fp16 NHWC activations with
+`native=on` in `[global]` (default off) runs each chain model the native path supports on
+hand-written CUDA kernels instead of TensorRT, inside `aji_trt` and `aji_trtrtx` alike. In
+`aji_configure` (`try_native` in `aji_trt.cpp`) the model's ONNX is parsed (`native/onnx_graph`,
+no onnx dependency), lowered (`native/lower`) and instantiated for the chain's size
+(`native/executor`): it becomes a `Step::NATIVE`, run by `run_steps` like a TensorRT `MODEL`
+step (same fp16 NCHW RGB in and out), so graph capture, RIFE, temporal steps and mixed chains are
+unchanged. Nothing is built: configure takes tens of milliseconds, including timing the tile
+variants. The log gets `Native kernels: <model> (<n> kernels, ...)` before the usual `Applied
+Model` line, or `Native kernels not used for <model>: <why>; using TensorRT`, and the model goes
+through `ensure_engine` as before. Temporal (multi-frame) models are not attempted. The lowering
+works op by op on the graph's data path and folds into each Conv what follows it (activation,
+SPAN gate with the residual, depth-to-space and SRVGG's upsampled-input add); `Concat` + 1x1 `Conv`
+is the concat kernel; pixel-unshuffle (reshape/transpose or `SpaceToDepth`) and `DepthToSpace`
+(CRD or DCR, by reordering weights) fold into the first and last convs. Shape-only plumbing,
+casts, and pads/slices that align to the unshuffle factor are ignored; any other op refuses the
+model with its reason. `aji_native_lower_test` (cpu) checks the plans for SPANF3-, Compact- and
+span_s-shaped graphs written in memory, and the refusals.
+
+The kernels: one family, `k_conv3x3` (`native/conv_kernels.cuh`), a 3x3 conv on fp16 NHWC activations with
 `mma.sync` m16n8k16 and **fp16 accumulation** (fp32 accumulation was slower than TensorRT), A
 tiles from padded shared memory via `ldmatrix`, and weights packed on the host into B-fragment
 order (`native/pack.cpp`; the layout is in `pack.h` and checked by `aji_native_pack_test` against
@@ -216,14 +232,15 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_image` | EXE | `aji` | image-ABI CLI (PNM in/out); the reference consumer of `aji_image.h` |
 | `aji_tiling_test` | EXE | — | CPU-only checks of `core/tiling` and the fp16/bf16 conversions |
 | `aji_held_test` | EXE | — | CPU-only checks of `core/held`, the held-frame reuse rule, and its C ABI (`aji_held_*`) over a stub context |
-| `aji_native` | OBJECT | — | `src/native`'s kernels; not linked into a backend yet |
+| `aji_native` | OBJECT | `CUDA::cudart` | `src/native`: kernels, ONNX lowering, executor; linked into `aji_trt` and `aji_trtrtx` |
 | `aji_native_pack_test` | EXE | — | CPU-only check of the native weight packing and fp16 conversion |
+| `aji_native_lower_test` | EXE | — | CPU-only check of the ONNX reader and lowering on in-memory graphs |
 | `aji_native_conv_test` | EXE | `aji_native`, `CUDA::cudart` | every native kernel against a CPU reference (sm_80+, skips below) |
 | `aji_native_bench` | EXE | `aji_native`, `CUDA::cudart` | **EXCLUDE_FROM_ALL**; whole-model native timing on `experimental/native-span` data |
 
 The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
 cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`, `aji_held_test`,
-`aji_native_pack_test`; what CI runs) and `-L gpu` (`aji_pre_fusion_test`, `aji_msb444_test`,
+`aji_native_pack_test`, `aji_native_lower_test`; what CI runs) and `-L gpu` (`aji_pre_fusion_test`, `aji_msb444_test`,
 `aji_frame_diff_test`, `aji_native_conv_test`; needs an
 NVIDIA GPU; on Windows also `aji_frame_diff_dml_test`, which runs on any DirectML GPU from
 `dml-test/`, beside copies of `aji.dll`, `aji_dml.dll`, ONNX Runtime and DirectML). A new test
