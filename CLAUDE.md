@@ -147,6 +147,29 @@ its load and warm-up runs, less the ONNX file's size. On Windows the free memory
 processes' (WDDM pages them out instead of failing, at a heavy cost in speed), so apps take NVML's
 device-wide figure where lower.
 
+### Native kernels (`src/native`, not used by the backends yet)
+
+Hand-written tensor-core convolutions for small SR convnets (SPAN, SPANF3, SRVGG Compact), the
+building blocks of a planned native executor that runs recognised models without TensorRT. One
+kernel family, `k_conv3x3` (`native/conv_kernels.cuh`): a 3x3 conv on fp16 NHWC activations with
+`mma.sync` m16n8k16 and **fp16 accumulation** (fp32 accumulation was slower than TensorRT), A
+tiles from padded shared memory via `ldmatrix`, and weights packed on the host into B-fragment
+order (`native/pack.cpp`; the layout is in `pack.h` and checked by `aji_native_pack_test` against
+the PTX ISA's table). The model's elementwise work is folded into the conv: activations (ReLU,
+PReLU, SiLU; LeakyReLU = PReLU with a constant slope), SPAN gates with the residual (tanh of a 1x1
+conv fed straight from the accumulators, sigmoid−0.5, plain residual), NCHW / pixel-unshuffled
+model input, and depth-to-space output with SRVGG's upsampled-input add. `k_concat1x1` is
+`conv_cat` without the concat buffer. `native/conv.h` is the API; `conv.cu`'s `kConv` table is the
+set of instantiated shapes (32/48/64 channels), each with two tile variants that `pick_variant`
+times on the running GPU. Needs sm_80+ (the kernels trap below it; `device_supported` says so).
+
+`aji_native_conv_test` (gpu) checks every table entry and variant at a ragged and an aligned size
+against a CPU reference, with guard bands. `aji_native_bench` (built on request) assembles whole
+SPANF3 / Compact models from `conv.h` calls on data from `experimental/native-span/v2/prep_*.py`;
+on an RTX 5090 it runs SPANF3 Performance 1080p→4K in ~2.0 ms vs ~3.6 ms on TensorRT 11.4, at
+58.6 dB vs ORT fp16 (`experimental/native-span/README.md` has the numbers and the NeoRTX
+comparison). Tile variants are only tuned on the 5090.
+
 ## Build system
 
 CMake only (`cmake_minimum_required(VERSION 3.24)`, C11 / C++17, `LANGUAGES C CXX CUDA`).
@@ -193,10 +216,15 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_image` | EXE | `aji` | image-ABI CLI (PNM in/out); the reference consumer of `aji_image.h` |
 | `aji_tiling_test` | EXE | — | CPU-only checks of `core/tiling` and the fp16/bf16 conversions |
 | `aji_held_test` | EXE | — | CPU-only checks of `core/held`, the held-frame reuse rule, and its C ABI (`aji_held_*`) over a stub context |
+| `aji_native` | OBJECT | — | `src/native`'s kernels; not linked into a backend yet |
+| `aji_native_pack_test` | EXE | — | CPU-only check of the native weight packing and fp16 conversion |
+| `aji_native_conv_test` | EXE | `aji_native`, `CUDA::cudart` | every native kernel against a CPU reference (sm_80+, skips below) |
+| `aji_native_bench` | EXE | `aji_native`, `CUDA::cudart` | **EXCLUDE_FROM_ALL**; whole-model native timing on `experimental/native-span` data |
 
 The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
-cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`, `aji_held_test`; what CI
-runs) and `-L gpu` (`aji_pre_fusion_test`, `aji_msb444_test`, `aji_frame_diff_test`; needs an
+cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`, `aji_held_test`,
+`aji_native_pack_test`; what CI runs) and `-L gpu` (`aji_pre_fusion_test`, `aji_msb444_test`,
+`aji_frame_diff_test`, `aji_native_conv_test`; needs an
 NVIDIA GPU; on Windows also `aji_frame_diff_dml_test`, which runs on any DirectML GPU from
 `dml-test/`, beside copies of `aji.dll`, `aji_dml.dll`, ONNX Runtime and DirectML). A new test
 that needs no GPU, models or fixtures goes in the `cpu` list at the end of `CMakeLists.txt`, and

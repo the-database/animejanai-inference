@@ -56,6 +56,33 @@ measured on the 5090 (sm_120).
 Build: `v2\build.bat` (MSVC + CUDA 13.3). Data: `v2\prep_full.py` (SPANF3) and `v2\prep_compact.py` (Compact)
 write weights, a real-frame input and the ORT reference into `v2\data\<name>`; `v2\cmp_out.py` compares.
 
+## Phase 1: kernel library (`src/native`)
+
+The v2 kernels, generalised and moved into libaji as the `aji_native` object library: 32/48/64
+channels, NHWC / NCHW / pixel-unshuffled inputs, none / ReLU / PReLU / SiLU, residual / tanh(1x1) /
+sigmoid−0.5 gates, NHWC or depth-to-space 2/4 outputs (with the upsampled-input add), arbitrary
+widths and heights, two tile variants chosen at load time by `pick_variant`, and the multi-source
+1x1 for `conv_cat`. Not linked into a backend yet. Tests: `aji_native_pack_test` (cpu),
+`aji_native_conv_test` (gpu, 198 op/variant/size checks against a CPU reference, worst error
+0.0056 against a 0.02 limit; a deliberately broken depth-to-space mapping fails it).
+
+`lib/native_bench.cu` (`aji_native_bench`, built on request) assembles the gate models from
+`conv.h` calls only, with variants picked by `pick_variant`. RTX 5090, two runs:
+
+| Model | ms/frame | output vs ORT-CUDA fp16 |
+|---|---|---|
+| SPANF3 Performance 1920x1080 → 4K | 1.98–2.01 | 58.6 dB, max 1 level |
+| SD V1beta34 Compact 720x480 | 1.64–1.69 | 61.6 dB, max 2 levels |
+| SD V1beta34 Compact 1280x720 | 5.02–5.13 | 62.8 dB, max 1 level |
+
+`pick_variant` chose 8x2 for every 48-channel conv and 4x4 for the 64-channel body, the shapes the
+v2 spike had settled on by hand.
+
+```
+aji_native_bench spanf3 v2\data\perf1080 1920 1080
+aji_native_bench compact v2\data\compact480 720 480
+```
+
 ## Notes
 
 - SPANF3's `SPABV2` uses `nn.ReLU(inplace=True)`, so the exported `last_mid` fed to `conv_cat` is
