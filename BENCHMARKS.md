@@ -290,3 +290,30 @@ TensorRT. Two rounds on cached engines:
 Faster everywhere, but the 64-channel models (Balanced, Compact) gain less than on the 5090
 (Compact at SD sizes 1.15–1.18x against 1.44–1.54x): the two tile variants were tuned on sm_120,
 so this is the first place to look when tuning for Ada.
+
+### RTX A5000 (Ampere, Phase 4)
+
+Runpod pod: RTX A5000 (GA102, 64 SMs, 6 MB L2, 230 W), driver 595.91, same image, script and inputs
+as the 4090. The native tests pass (worst conv error 0.0077), all 15 cases are within 1–2 8-bit
+levels of TensorRT. Two rounds on cached engines:
+
+| Case | TensorRT | native | speed-up |
+|---|---|---|---|
+| Performance 1920x1080 | 10.19–10.26 | 5.96–5.97 | 1.71x |
+| Performance 1280x642 | 4.33 | 2.77 | 1.56x |
+| Performance 854x480 | 2.27 | 1.56 | 1.46x |
+| Balanced 1920x1080 | 16.72–17.12 | 14.82–14.88 | 1.13–1.15x |
+| Balanced 1440x1080 | 12.83–12.89 | 11.16–11.20 | 1.15x |
+| Balanced then Performance, 854x480 | 11.81–11.85 | 8.05–8.06 | 1.47x |
+| Compact 1920x1080 (live action) | 40.13–40.28 | 33.03–33.30 | 1.21x |
+| Compact 854x480 | 7.66–7.67 | 7.55–7.61 | 1.01x |
+| Compact 768x576 (DVD) | 8.28–8.51 | 8.10–8.14 | 1.02–1.05x |
+| RIFE 2x after Performance, per source frame | 62.85 | 58.23 | |
+
+Why the 64-channel models gain less off Blackwell: Compact is ~1.2 MFLOP per input pixel (16 64→64
+3x3 convs), so 854x480 is ~0.5 TFLOP a frame. The native kernels run it at ~60% of dense fp16
+tensor-core peak on every card measured (A5000 ~67 of 111 TFLOPS, 4090 ~187 of ~330, 5090 ~265 of
+~419). TensorRT is at the same ~60% on the A5000, ~49% on the 4090 and ~43% on the 5090: the big
+Blackwell gain on 64 channels is mostly TensorRT's weaker sm_120 kernels, and on Ampere both are
+compute-bound, so native ties. The 48-channel Performance model is bound by memory traffic, which
+the fusion removes, and gains ~1.7x on all three generations. Nothing is slower than TensorRT.
