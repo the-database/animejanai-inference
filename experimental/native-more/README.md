@@ -41,9 +41,12 @@ What came out differently from the spikes:
 - **The bf16 models outgrow fp16.** HAT-L's last group conv reaches ~8.6e5 and DAT-2's ~1.4e5, so
   their residual stream is fp32. Everything inside the blocks stays far below fp16's range and runs
   in fp16.
-- **TFDAT (bndl) is not the public traiNNer-redux `tfdat_arch`**. Its alignment front end was
-  reconstructed from the graph. Its FDAT body adds shifted windows and a pre-scaled norm clip that
-  FDAT_M does not have.
+- **TFDAT (bndl) is TFDAT v2, not the `tfdat_arch` on traiNNer-redux master.** Its alignment front
+  end was reconstructed from the graph and later checked against the v2 source
+  (Kim2091/traiNNer-redux-1, branch `dis2-tfdat2`, `traiNNer/archs/tfdat_arch.py`): it matches.
+  Its FDAT body adds shifted windows and a pre-scaled norm clip that FDAT_M does not have. The
+  native parser covers the 2x config only (pixel-unshuffle 2, `flow_base_ch` 32, `mid_dim` 64,
+  pixelshuffle upsampler); 1x and 4x TFDAT are refused and run on TensorRT.
 - **The DAT-2 exports are dynamo graphs with no module names.** The parser walks the data-path ops
   in order. The dynamic position bias is evaluated at load from the graph's constant subgraph.
 - **TemporalFix's export nudges output pixel (0, 0)** by at most 2^-11, a tanh of the warped
