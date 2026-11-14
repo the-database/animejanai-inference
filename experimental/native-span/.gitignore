@@ -1,0 +1,10 @@
+*.exe
+*.exp
+*.lib
+*.obj
+*.bin
+*.onnx
+*.engine
+*.log
+*.rgba
+data/
