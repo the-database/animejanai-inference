@@ -41,6 +41,8 @@ struct ImgBackend {
     void (*destroy)(aji_img_ctx **);
     // optional (libaji 0.24.0): NULL in an older backend
     int (*release_device)(int, uint64_t) = nullptr;
+    // optional (libaji 0.28.0)
+    int (*memory)(aji_img_ctx *, aji_img_model *, aji_img_memory *) = nullptr;
 };
 
 std::mutex g_mu;
@@ -112,6 +114,8 @@ ImgBackend *backend_for(int backend, std::string *err)
 #undef SYM
         if (ok)
             *(void **)&b.release_device = sym(b.lib, "aji_img_release_device");
+        if (ok)
+            *(void **)&b.memory = sym(b.lib, "aji_img_memory_get");
         if (!ok)
             b.lib = nullptr;  // leaked handle is harmless; never retried
     }
@@ -222,4 +226,14 @@ extern "C" AJI_IMG_EXPORT void aji_img_destroy(aji_img_ctx **pc)
     (*pc)->be->destroy(&(*pc)->inner);
     delete *pc;
     *pc = nullptr;
+}
+
+extern "C" AJI_IMG_EXPORT int aji_img_memory_get(aji_img_ctx *c, aji_img_model *m,
+                                                 aji_img_memory *out)
+{
+    if (!c || (m && m->c != c))
+        return AJI_IMG_ERR_ARGS;
+    if (!c->be->memory)
+        return AJI_IMG_ERR;
+    return c->be->memory(c->inner, m ? m->inner : nullptr, out);
 }

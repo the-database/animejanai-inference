@@ -149,6 +149,8 @@ struct aji_img_ctx {
     aji_img_log_fn log = nullptr;
     void *log_opaque = nullptr;
     ComPtr<ID3D12Device> dev;
+    ComPtr<IDXGIAdapter3> adapter;  // for aji_img_memory_get
+    uint64_t vram = 0;               // its dedicated memory
     ComPtr<IDMLDevice> dml_dev;
     ComPtr<ID3D12CommandQueue> queue;
     OrtEnv *env = nullptr;
@@ -179,6 +181,8 @@ struct aji_img_model : TileModel {
     int overlap = DEFAULT_OVERLAP;
     std::mutex run_mu;
     OrtSession *session = nullptr;
+    uint64_t weights = 0;      // the ONNX file's size, an estimate
+    uint64_t activations = 0;  // what loading it took on the device, past that
     std::string in_name, out_name;
     bool fp16 = false;  // tensor element type (fp32 otherwise)
     std::vector<uint16_t> in16, out16;
@@ -325,6 +329,14 @@ void copy_err(const std::string &e, char *err, size_t n)
         snprintf(err, n, "%s", e.c_str());
 }
 
+// This process's local video memory use and budget on the context's adapter;
+// false if the adapter can't say.
+bool video_memory(aji_img_ctx *c, DXGI_QUERY_VIDEO_MEMORY_INFO *info)
+{
+    return c->adapter &&
+           SUCCEEDED(c->adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, info));
+}
+
 void release_model(aji_img_model *m)
 {
     if (m->session)
@@ -382,6 +394,12 @@ extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_param
     auto c = std::make_unique<aji_img_ctx>();
     c->log = p->log;
     c->log_opaque = p->log_opaque;
+    adapter.As(&c->adapter);  // IDXGIAdapter3: Windows 10 and newer
+    {
+        DXGI_ADAPTER_DESC1 d = {};
+        adapter->GetDesc1(&d);
+        c->vram = d.DedicatedVideoMemory;
+    }
     if (c->log) {
         DXGI_ADAPTER_DESC1 d = {};
         adapter->GetDesc1(&d);
@@ -429,6 +447,10 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
     std::string e;
     bool ok = false;
     OrtSessionOptions *so = nullptr;
+    // what the session and its warm-up runs take (loads are serialized on
+    // the context by c->mu; another context's on this adapter could blur it)
+    DXGI_QUERY_VIDEO_MEMORY_INFO before = {};
+    const bool measured = video_memory(c, &before);
     do {
         if (!c->ck(g_ort->CreateSessionOptions(&so), "CreateSessionOptions", &e))
             break;
@@ -521,6 +543,13 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
                               std::min(m->tile_w, m->tile_h) / 2);
         if (!discover(m, &e))
             break;
+        DXGI_QUERY_VIDEO_MEMORY_INFO after = {};
+        const long long onnx = file_size(p->onnx_path);
+        m->weights = onnx > 0 ? (uint64_t)onnx : 0;
+        if (measured && video_memory(c, &after) && after.CurrentUsage > before.CurrentUsage)
+            m->activations = after.CurrentUsage - before.CurrentUsage > m->weights
+                                 ? after.CurrentUsage - before.CurrentUsage - m->weights
+                                 : 0;
         const size_t ni = (size_t)m->in_ch * m->tile_w * m->tile_h;
         const size_t no = (size_t)m->out_ch * m->tile_w * m->scale * m->tile_h * m->scale;
         try {
@@ -626,4 +655,22 @@ extern "C" AJI_IMG_EXPORT void aji_img_destroy(aji_img_ctx **pc)
         g_ort->ReleaseEnv(c->env);
     delete c;
     *pc = nullptr;
+}
+
+extern "C" AJI_IMG_EXPORT int aji_img_memory_get(aji_img_ctx *c, aji_img_model *m,
+                                                 aji_img_memory *out)
+{
+    if (!c || !out || (m && m->c != c))
+        return AJI_IMG_ERR_ARGS;
+    *out = {};
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (!video_memory(c, &info))
+        return AJI_IMG_ERR;
+    out->device_free = info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
+    out->device_total = c->vram ? c->vram : info.Budget;
+    if (m) {
+        out->model_weights = m->weights;
+        out->model_activations = m->activations;
+    }
+    return AJI_IMG_OK;
 }

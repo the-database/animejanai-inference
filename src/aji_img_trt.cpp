@@ -162,6 +162,8 @@ struct aji_img_model : TileModel {
     ModelEngine me;
     bool oom = false;       // the last finalize ran out of memory
     int64_t act_need = 0;   // the engine's activation memory (c->run_mu)
+    int64_t weights = 0;    // the engine file's size, for aji_img_memory_get
+    size_t buf_bytes = 0;   // d_in + d_out
     uint64_t act_gen = 0;   // c->act_gen when me.exec was pointed at c->act
     nvinfer1::DataType in_dt = nvinfer1::DataType::kFLOAT;
     nvinfer1::DataType out_dt = nvinfer1::DataType::kFLOAT;
@@ -396,6 +398,8 @@ bool finalize_locked(aji_img_model *m, std::string *err, bool *keep)
     m->out_elems = (size_t)m->out_ch * m->me.out_w * m->me.out_h;
     const size_t ib = m->in_elems * dtype_size(m->in_dt);
     const size_t ob = m->out_elems * dtype_size(m->out_dt);
+    m->weights = std::max(0LL, file_size(m->engine_path));
+    m->buf_bytes = ib + ob;
     if (cudaStreamCreateWithFlags(&m->stream, cudaStreamNonBlocking) != cudaSuccess ||
         cudaMalloc(&m->d_in, ib) != cudaSuccess ||
         cudaMalloc(&m->d_out, ob) != cudaSuccess ||
@@ -1068,4 +1072,34 @@ extern "C" AJI_IMG_EXPORT int aji_img_release_device(int, uint64_t device_id)
     if (cudaSetDevice(ordinal) != cudaSuccess)
         return -1;
     return cudaDeviceReset() == cudaSuccess ? 0 : -1;
+}
+
+extern "C" AJI_IMG_EXPORT int aji_img_memory_get(aji_img_ctx *c, aji_img_model *m,
+                                                 aji_img_memory *out)
+{
+    if (!c || !out || (m && m->c != c))
+        return AJI_IMG_ERR_ARGS;
+    *out = {};
+    std::lock_guard<std::mutex> lock(c->mu);
+    if (m)
+        pump(c);
+    CtxGuard guard(c->cu_ctx);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        cudaGetLastError();
+        return AJI_IMG_ERR;
+    }
+    out->device_free = free_b;
+    out->device_total = total_b;
+    out->activations_shared = 1;
+    std::lock_guard<std::mutex> run(c->run_mu);
+    out->ctx_activations = (uint64_t)c->act_cap;
+    const GpuTileScratch &g = c->gpu;
+    out->ctx_scratch = g.img_cap + g.band_cap + g.rows_cap + g.wx_cap + g.wy_cap;
+    if (m && m->state == AJI_IMG_STATE_READY) {
+        out->model_weights = (uint64_t)m->weights;
+        out->model_activations = (uint64_t)m->act_need;
+        out->model_buffers = m->buf_bytes;
+    }
+    return AJI_IMG_OK;
 }
