@@ -246,3 +246,20 @@ Playback, mpv-AnimeJaNai 3.10.0's mpv with the branch's `aji.dll` (`lib=`), NVDE
 `aji_encode`, 928-frame 1080p live-action clip → 4K `hevc_nvenc`, wall seconds, two rounds:
 Compact 12.4–12.6 → 9.6–9.7; Balanced 8.0–8.1 → 7.6; Performance 7.3 → 7.2 (NVENC-bound at ~129 fps).
 RIFE 2x after Performance (`--rife-chain`): 19.68 → 18.03 ms per source frame.
+
+Linux (Ubuntu 26.04, gcc 15.2, CUDA 13.2 nvcc, TensorRT 11.4.0.106, driver 615.71, a second RTX 5090
+at a 400 W limit), `experimental/native-span/phase3/matrix-linux.sh`, one run on cached engines: the
+same 15 cases all within 1–2 8-bit levels of TensorRT, the native tests pass, and the speed-ups match
+Windows (TensorRT itself is ~6% faster on Linux):
+
+| Case | TensorRT | native | speed-up |
+|---|---|---|---|
+| Performance 1920x1080 | 3.40 | 2.02 | 1.68x |
+| Balanced 1920x1080 | 6.80 | 4.29 | 1.58x |
+| Balanced 1440x1080 | 4.65 | 3.04 | 1.53x |
+| Performance 1280x642 | 1.19 | 0.83 | 1.43x |
+| Performance 854x480 | 0.64 | 0.52 | 1.22x |
+| Compact 1920x1080 (live action) | 14.52 | 10.15 | 1.43x |
+| Compact 768x576 (DVD) | 3.00 | 2.06 | 1.46x |
+| Balanced then Performance, 854x480 | 3.66 | 2.42 | 1.51x |
+| RIFE 2x after Performance, per source frame | 19.01 | 17.55 | |
