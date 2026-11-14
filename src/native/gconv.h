@@ -25,7 +25,7 @@
 
 namespace ajinative {
 
-enum class GAct { None = 0, Relu = 1, LRelu = 2 };
+enum class GAct { None = 0, Relu = 1, LRelu = 2, Gelu = 3 };  // GELU: exact (erf), divisor 1.4140625
 
 // Packed weights of one conv (all output chunks), device memory.
 struct GWeights {

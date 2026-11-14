@@ -1,0 +1,78 @@
+/*
+ * native/tfm.h — transformer building blocks on fp16 token maps (NHWC [H][W][stride]), for the
+ * native image transformers (FDAT, and the window-attention models built on the same pieces).
+ *
+ *   - LayerNorm over the first C channels of each token (padded channels written zero);
+ *   - GEMM: out = epi(A[M][K] x W[K][N]), W packed in mma fragment order, fp32 accumulation; the
+ *     epilogue adds a bias, applies GELU, scales by a per-column vector, adds up to two tensors;
+ *   - window attention: per (window, head), softmax(q k^T * scale + bias) v, flash style (online
+ *     softmax over 64-key blocks), windows of any shape over the image with an optional cyclic
+ *     shift, tokens outside the image treated as zero (zero padding before attention);
+ *   - depthwise 3x3 (optional GELU), channel sums (global average pools), the channel attention's
+ *     Gram matrix and norms, and small device-side folds.
+ * GELU is exact (erf) with the divisor 1.4140625, as the fp16 exports have it.
+ */
+#ifndef AJI_NATIVE_TFM_H
+#define AJI_NATIVE_TFM_H
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <cuda_runtime.h>
+
+namespace ajinative {
+
+struct TMat {
+    void *frag = nullptr;  // uint4[Kpad/16][Npad/16][32] (pack.h, taps = 1)
+    void *bias = nullptr;  // float[Npad] or null
+    int K = 0, Kpad = 0, N = 0, Npad = 0;
+};
+// w: [K][N] floats (row k, column n). bias: N floats or null.
+cudaError_t tmat_upload(TMat &m, const float *w, const float *bias, int K, int N);
+void tmat_release(TMat &m);
+
+enum class TAct { None = 0, Gelu = 1 };
+
+struct TGemm {
+    const void *a = nullptr;   // [M][sa] fp16, the first Kpad channels read (padding must be zero)
+    int sa = 0, M = 0;
+    void *out = nullptr;       // [M][so] fp16, columns [0, Npad) written at out + col0
+    int so = 0;
+    TAct act = TAct::None;
+    const float *colscale = nullptr;          // [Npad] device, or null
+    const void *add1 = nullptr, *add2 = nullptr;  // [M][s] fp16, or null (added after the scale)
+    int s1 = 0, s2 = 0;
+};
+cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
+
+// LayerNorm of the first C channels (gamma, beta: C floats in device memory), zeros to pad.
+cudaError_t tlayernorm(const void *in, int sin, void *out, int sout, int M, int C, int cpad, const float *gamma,
+                       const float *beta, float eps, cudaStream_t s);
+
+struct TWinAttn {
+    const void *qkv = nullptr;  // tokens [H][W][sq]: q at qo + h*hd, k at ko + h*hd, v at vo + h*hd
+    int sq = 0, qo = 0, ko = 0, vo = 0;
+    int H = 0, W = 0, heads = 0, hd = 0;  // hd <= 32
+    int wh = 0, ww = 0;                   // window size (wh*ww tokens, a multiple of 16, <= 1024)
+    int shift_y = 0, shift_x = 0;         // cyclic shift (HAT-style), 0 for none
+    float scale = 1.f;
+    const float *bias = nullptr;          // [heads][T][T] (T = wh*ww), or null
+    void *out = nullptr;                  // tokens [H][W][so], head h at h*hd
+    int so = 0;
+};
+cudaError_t twinattn(const TWinAttn &a, cudaStream_t s);
+
+// Depthwise 3x3 (zero padding, no bias) over the first C channels; w: [C][9] floats (device).
+cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu, cudaStream_t s);
+// sums[c] += sum over tokens of in[t][c] for c < C (sums: float device, zeroed by the caller).
+cudaError_t tcolsum(const void *in, int sin, int M, int C, float *sums, cudaStream_t s);
+
+// Channel attention statistics per head (q, k at qo/ko + h*hd of each token): gram[h][d][e] =
+// sum_t q_d k_e, nq[h][d] = sum_t q_d^2, nk[h][e] = sum_t k_e^2 (float device, zeroed by the caller;
+// layout gram [heads][hd][hd], then nq [heads][hd], then nk [heads][hd]).
+cudaError_t tchanstats(const void *qkv, int sq, int qo, int ko, int M, int heads, int hd, float *stats, cudaStream_t s);
+
+}  // namespace ajinative
+
+#endif

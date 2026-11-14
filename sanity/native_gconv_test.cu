@@ -149,6 +149,7 @@ static void run(const Case &c, int variant, bool split)
                 if (c.nres >= 2) v += c2 * f(r2[((size_t)y * OW + x) * cout_pad + o]);
                 if (c.act == GAct::Relu) v = v > 0 ? v : 0;
                 if (c.act == GAct::LRelu) v = v > 0 ? v : 0.2 * v;
+                if (c.act == GAct::Gelu) v = 0.5 * v * (1.0 + std::erf(v / 1.4140625));
                 size_t idx;
                 if (c.R) {
                     const int sy = o / CH / c.R, sx = (o / CH) % c.R, ch = o % CH;  // layout per launch: sx*CH + ch
@@ -221,6 +222,8 @@ int main()
         {"acc32 192->64 two residuals", 192, 64, 1, 0, 0, false, 0, 0, 0, 2, GAct::None, 0, false, true},
         {"acc32 96->32 prefix + slice", 96, 32, 1, 0, 0, false, 96, 64, 32, 0, GAct::LRelu, 0, false, true},
         {"acc32 up2 64->64", 64, 64, 1, 0, 0, false, 0, 0, 0, 0, GAct::LRelu, 0, true, true},
+        {"phase R2 128->256 gelu (4 chunks)", 128, 256, 1, 0, 0, false, 0, 0, 0, 0, GAct::Gelu, 2},
+        {"s1 120->120 gelu", 120, 120, 1, 0, 0, false, 8, 0, 0, 1, GAct::Gelu, 0},
     };
     const int sizes[][2] = {{37, 23}, {38, 24}, {64, 32}};
     for (const Case &c0 : cases)

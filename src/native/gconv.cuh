@@ -90,6 +90,10 @@ __device__ __forceinline__ half2 g_epi(const GParams &p, half2 v, int y, int x, 
     if (p.r2) v = __hfma2(p.c2, __ldg(reinterpret_cast<const half2 *>(p.r2 + pix * p.r2s + ch)), v);
     if (p.act == 1) v = __hmax2(v, z2);
     else if (p.act == 2) v = __hfma2(__hmin2(v, z2), p.slope, __hmax2(v, z2));
+    else if (p.act == 3) {
+        const float2 f = __half22float2(v);
+        v = __floats2half2_rn(0.5f * f.x * (1.f + erff(f.x / 1.4140625f)), 0.5f * f.y * (1.f + erff(f.y / 1.4140625f)));
+    }
     return v;
 }
 
@@ -230,14 +234,17 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
                 *reinterpret_cast<const uint4 *>(sm + (r * TW + px) * SP + v * 8);
         }
     } else {
-        // phase scatter: channels sx*CHP + c -> dst[R*y + sy][R*x + sx][c]
-        const int R = p.R, CHP = COUTP / R, VO = CHP / 8, OW = R * p.W;
-        for (int q2 = tid; q2 < TH * TW * R * VO; q2 += WARPS * 32) {
-            const int v = q2 % VO, sx = (q2 / VO) % R, px = (q2 / (VO * R)) % TW, r = q2 / (VO * R * TW);
+        // phase scatter: channel sx*CHP + c of all output channels -> dst[R*y + sy][R*x + sx][c]; this CTA
+        // holds channels [och*COUTP, och*COUTP + COUTP) (CHP a multiple of 8, so no vector straddles sx)
+        const int R = p.R, CHP = p.coutp_all / R, OW = R * p.W;
+        constexpr int VO = COUTP / 8;
+        for (int q2 = tid; q2 < TH * TW * VO; q2 += WARPS * 32) {
+            const int v = q2 % VO, px = (q2 / VO) % TW, r = q2 / (VO * TW);
             const int yy = ty0 + r, xx = tx0 + px;
             if (yy >= p.H || xx >= p.W) continue;
-            *reinterpret_cast<uint4 *>(p.dst + ((size_t)(R * yy + p.sy) * OW + R * xx + sx) * p.dstride + v * 8) =
-                *reinterpret_cast<const uint4 *>(sm + (r * TW + px) * SP + sx * CHP + v * 8);
+            const int gc = och * COUTP + v * 8, sx = gc / CHP, ch = gc % CHP;
+            *reinterpret_cast<uint4 *>(p.dst + ((size_t)(R * yy + p.sy) * OW + R * xx + sx) * p.dstride + ch) =
+                *reinterpret_cast<const uint4 *>(sm + (r * TW + px) * SP + v * 8);
         }
     }
 #else
