@@ -52,6 +52,9 @@
 #include "onnx_shape.h"
 #include "core/fileio.h"
 #include "core/trt_engine.h"
+#include "native/executor.h"
+#include "native/lower.h"
+#include "native/onnx_graph.h"
 
 namespace fs = std::filesystem;
 
@@ -82,10 +85,17 @@ using Logger = ajicore::TrtLogger;
 
 
 struct Step {
-    enum Kind { RESIZE, MODEL, TEMPORAL } kind;
+    enum Kind { RESIZE, MODEL, TEMPORAL, NATIVE } kind;
     int out_w, out_h;
-    int engine_idx;             // MODEL, TEMPORAL
+    int engine_idx;             // MODEL, TEMPORAL: engines[]; NATIVE: natives[]
     aji_plan *plan = nullptr;   // RESIZE
+};
+
+// A model lowered for the native kernels (native=on), or why it can't be.
+struct NativePlan {
+    bool ok = false;
+    std::string why;
+    ajinative::Plan plan;
 };
 
 } // namespace
@@ -110,6 +120,8 @@ struct aji_ctx {
     int slot = 1;
     bool engines_cleaned = false;
     std::vector<ModelEngine> engines;
+    std::vector<std::unique_ptr<ajinative::Executor>> natives;  // NATIVE steps
+    std::map<std::string, NativePlan> native_plans;              // by ONNX path
     std::vector<Step> steps;
     bool active = false;
     int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
@@ -806,6 +818,38 @@ bool push_resize_step(aji_ctx *c, int *cw, int *ch, int nw, int nh)
     return true;
 }
 
+// native=on: the model `name` on the native kernels at w x h, or null with *why (the caller
+// then uses TensorRT). Lowering is cached per ONNX path for the context's lifetime.
+std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &name, int w, int h,
+                                                std::string *why, std::string *what)
+{
+    const std::string path = (fs::u8path(c->model_dir) / fs::u8path(name + ".onnx")).u8string();
+    auto it = c->native_plans.find(path);
+    if (it == c->native_plans.end()) {
+        NativePlan np;
+        std::vector<char> bytes;
+        ajinative::OnnxGraph g;
+        if (!read_file_bytes(path, &bytes))
+            np.why = "cannot read the model";
+        else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &np.why))
+            np.ok = ajinative::lower(g, &np.plan, &np.why);
+        it = c->native_plans.emplace(path, std::move(np)).first;
+    }
+    if (!it->second.ok) {
+        *why = it->second.why;
+        return nullptr;
+    }
+    cudaStream_t s = nullptr;
+    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+        *why = "cannot create a CUDA stream";
+        return nullptr;
+    }
+    auto ex = ajinative::Executor::create(it->second.plan, w, h, s, why);
+    cudaStreamDestroy(s);
+    if (ex) *what = ajinative::describe(it->second.plan);
+    return ex;
+}
+
 void finalize_log(aji_ctx *c)
 {
     std::string out;
@@ -1071,6 +1115,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     cudaDeviceSynchronize();
 
     c->engines.clear();
+    c->natives.clear();
     for (Step &st : c->steps)
         aji_plan_destroy(st.plan);
     c->steps.clear();
@@ -1297,6 +1342,28 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         // the exported graphs only accept their alignment (TFDAT: 8-32 by
         // scale), and the output is cropped back.
         const int t = model_frames[mi].frames;
+
+        // native=on: the native kernels when they can run this model, else TensorRT below
+        if (c->conf.native && t <= 1) {
+            std::string why, what;
+            auto ex = try_native(c, m.name, cw, ch, &why, &what);
+            if (ex) {
+                c->log_steps.push_back("Native kernels: " + m.name + " (" + what + ")");
+                cw = ex->out_w(); ch = ex->out_h();
+                c->natives.push_back(std::move(ex));
+                c->steps.push_back({Step::NATIVE, cw, ch, (int)c->natives.size() - 1});
+                snprintf(buf, sizeof(buf),
+                         "Applied Model: %s;    New Video Resolution: %dx%d",
+                         m.name.c_str(), cw, ch);
+                any_model = true;
+                c->log_steps.push_back(buf);
+                max_bytes = std::max(max_bytes, (size_t)3 * cw * ch * 2);
+                continue;
+            }
+            c->log_steps.push_back("Native kernels not used for " + m.name + ": " + why +
+                                   "; using " AJI_TRT_PRODUCT);
+        }
+
         const bool rank5 = t > 1 && model_frames[mi].rank5;
         const int bw = t > 1 ? (cw + 31) / 32 * 32 : cw;
         const int bh = t > 1 ? (ch + 31) / 32 * 32 : ch;
@@ -1830,6 +1897,13 @@ static int run_steps(aji_ctx *c, size_t first, size_t last, int *cur,
             if (err) {
                 c->set_error("resize kernel failed: %s",
                              cudaGetErrorString((cudaError_t)err));
+                return AJI_ERR_CUDA;
+            }
+        } else if (st.kind == Step::NATIVE) {
+            cudaError_t err = c->natives[st.engine_idx]->run(
+                c->buf[*cur], c->buf[*cur ^ 1], stream);
+            if (err != cudaSuccess) {
+                c->set_error("native kernels failed: %s", cudaGetErrorString(err));
                 return AJI_ERR_CUDA;
             }
         } else {
@@ -2868,6 +2942,7 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         cudaFree(c->stage_in);
         cudaFree(c->stage_out);
         c->engines.clear();
+        c->natives.clear();
         c->direct.exec.reset();
         c->direct.engine.reset();
 #ifdef AJI_TRTRTX
