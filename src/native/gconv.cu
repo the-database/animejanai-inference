@@ -82,10 +82,10 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
     if (a.up2 && (a.nchw || a.stride != 1 || a.IH % 2 || a.IW % 2)) return gfail(why, "upsampled input: NHWC, stride 1, even size"), nullptr;
     const bool res = a.r1 || a.r2;
     if (res && (a.stride != 1 || a.R)) return gfail(why, "residuals need stride 1 and NHWC output"), nullptr;
-    if (a.R && (a.stride != 1 || (a.R != 2 && a.R != 4) || w.coutp != w.cout_pad || (w.coutp / a.R) % 8))
-        return gfail(why, "phase scatter: stride 1, R 2 or 4, one launch, 8-channel groups"), nullptr;
+    if (a.R && (a.stride != 1 || (a.R != 2 && a.R != 4) || (w.cout_pad / a.R) % 8 || (w.cout_pad / a.R) % w.coutp && w.coutp % (w.cout_pad / a.R)))
+        return gfail(why, "phase scatter: stride 1, R 2 or 4, 8-channel groups"), nullptr;
     if (!a.nchw && (a.src_stride % 8 || a.src_stride < w.cin_pad)) return gfail(why, "input pixel stride"), nullptr;
-    if (a.dst_stride % 8 || a.dst_stride < (a.R ? w.coutp / a.R : w.coutp)) return gfail(why, "output pixel stride"), nullptr;
+    if (a.dst_stride % 8 || a.dst_stride < (a.R ? w.cout_pad / a.R : w.coutp)) return gfail(why, "output pixel stride"), nullptr;
     if ((a.r1 && a.r1_stride % 2) || (a.r2 && a.r2_stride % 2)) return gfail(why, "residual stride"), nullptr;
     if (a.acc32 && (a.stride != 1 || a.nchw || a.R)) return gfail(why, "fp32 accumulation: stride 1, NHWC in and out"), nullptr;
     const GKey k{kch_for(w, a), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0};
