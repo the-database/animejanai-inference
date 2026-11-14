@@ -48,7 +48,7 @@ NeoRTX's GPU-resident path. RTX 5090, 402 W power limit, three interleaved round
 |---|---|---|---|---|
 | SPANF3 Performance, 1920x1080 → 4K | 3.62–3.67 | 2.38–2.45 | **2.00–2.03** | 58.6 dB, max 1 level (NeoRTX: 58.6 dB, 1) |
 | SD V1beta34 Compact (64 ch), 720x480 | 2.42–2.45 | 1.79–1.82 | **1.71–1.74** | 61.6 dB, max 2 levels |
-| SD V1beta34 Compact (64 ch), 1280x720 | 7.38–7.41 | 5.43–5.45 | **5.23–5.24** | 62.8 dB, max 1 level |
+| SD V1beta34 Compact (64 ch), 1280x720 | 7.38–7.42 | 5.43–5.46 | **5.23–5.24** | 62.8 dB, max 1 level |
 
 Best tile shapes: 8 warps x 2 rows for SPANF3 (48 ch), 4 warps x 4 rows for Compact (64 ch). Only tuned and
 measured on the 5090 (sm_120).
