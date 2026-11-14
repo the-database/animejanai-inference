@@ -78,6 +78,21 @@ widths and heights, two tile variants chosen at load time by `pick_variant`, and
 `pick_variant` chose 8x2 for every 48-channel conv and 4x4 for the 64-channel body, the shapes the
 v2 spike had settled on by hand.
 
+### Against libaji's TensorRT path
+
+`lib/compare_libaji.sh`: `aji_harness` from the mpv-AnimeJaNai 3.10.0 install (TensorRT 11.4,
+libaji's own engine settings, same weights and frames; its time includes the NV12→RGB→NV12
+conversions, which cost ~0.05 ms at 1080p) alternated with `aji_native_bench` (model only, NCHW fp16
+in/out). RTX 5090 at a 402 W power limit, three rounds, GPU otherwise idle:
+
+| Model | libaji TensorRT | native | speed-up | native vs ORT fp16 |
+|---|---|---|---|---|
+| SD V1beta34 Compact (64 ch), 720x480 | 2.36–2.40 | 1.67–1.71 | 1.40× | 61.6 dB, max 2 levels |
+| SD V1beta34 Compact (64 ch), 1280x720 | 7.06–7.17 | 5.13–5.19 | 1.38× | 62.8 dB, max 1 level |
+| SPANF3 Balanced (64 ch x 8), 1280x720 | 2.73–2.76 | 1.92–1.94 | 1.43× | 58.1 dB, max 1 level |
+| SPANF3 Balanced (64 ch x 8), 1920x1080 | 7.46–7.55 | 4.82–4.86 | 1.55× | 58.1 dB, max 2 levels |
+| SPANF3 Performance (48 ch x 5), 1920x1080 | 3.64–3.65 | 2.07–2.09 | 1.76× | 58.6 dB, max 1 level |
+
 ```
 aji_native_bench spanf3 v2\data\perf1080 1920 1080
 aji_native_bench compact v2\data\compact480 720 480
