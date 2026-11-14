@@ -106,24 +106,25 @@ __global__ void k_up_warp(const float *F, int h, int w, const half *feat, int fs
     }
 }
 
-// One thread per output (half-resolution) pixel: its 2x2 full-resolution block.
-__global__ void k_frame_warp(const float *F, const half *nb, const half *ctr, int H, int W, half *wus, half *conf)
+// One thread per feature pixel (H/U x W/U): its U x U full-resolution block, warped and
+// pixel-unshuffled (channel c*U*U + dy*U + dx, stride UC), and the block's mean |warped - centre|.
+// The flow F is at H/2 x W/2 whatever U is.
+template <int U>
+__global__ void k_frame_warp(const float *F, const half *nb, const half *ctr, int H, int W, half *wus, int UC, half *conf)
 {
-    const int h = H / 2, w = W / 2;
+    const int h = H / U, w = W / U;
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= h * w) return;
     const int qy = q / w, qx = q % w;
     const size_t plane = (size_t)H * W;
-    half o[16];
-#pragma unroll
-    for (int j = 0; j < 16; j++) o[j] = __float2half(0.f);
+    half *po = wus + (size_t)q * UC;
     float occ = 0.f;
 #pragma unroll
-    for (int dy = 0; dy < 2; dy++)
+    for (int dy = 0; dy < U; dy++)
 #pragma unroll
-        for (int dx = 0; dx < 2; dx++) {
-            const int y = 2 * qy + dy, x = 2 * qx + dx;
-            const float2 u = upflow(F, h, w, y, x);
+        for (int dx = 0; dx < U; dx++) {
+            const int y = U * qy + dy, x = U * qx + dx;
+            const float2 u = upflow(F, H / 2, W / 2, y, x);
             const Taps t = warp_taps(y, x, u, H, W);
             float d = 0.f;
 #pragma unroll
@@ -132,21 +133,37 @@ __global__ void k_frame_warp(const float *F, const half *nb, const half *ctr, in
                 const float v = t.w[0] * __half2float(pl[t.i[0]]) + t.w[1] * __half2float(pl[t.i[1]]) + t.w[2] * __half2float(pl[t.i[2]]) +
                                 t.w[3] * __half2float(pl[t.i[3]]);
                 const half vh = __float2half(v);
-                o[c * 4 + dy * 2 + dx] = vh;
+                po[c * U * U + dy * U + dx] = vh;
                 d += fabsf(__half2float(vh) - __half2float(ctr[c * plane + (size_t)y * W + x]));
             }
             occ += d / 3.f;
         }
-    uint4 *pw = reinterpret_cast<uint4 *>(wus + (size_t)q * 16);
-    pw[0] = *reinterpret_cast<uint4 *>(&o[0]);
-    pw[1] = *reinterpret_cast<uint4 *>(&o[8]);
+    for (int k = 3 * U * U; k < UC; k++) po[k] = __float2half(0.f);
     half cr[16];
 #pragma unroll
     for (int j = 0; j < 16; j++) cr[j] = __float2half(0.f);
-    cr[1] = __float2half(occ * 0.25f);  // channel 0: the similarity, written later
+    cr[1] = __float2half(occ / (U * U));  // channel 0: the similarity, written later
     uint4 *pc = reinterpret_cast<uint4 *>(conf + (size_t)q * 16);
     pc[0] = *reinterpret_cast<uint4 *>(&cr[0]);
     pc[1] = *reinterpret_cast<uint4 *>(&cr[8]);
+}
+
+// pixel_unshuffle(U) of 3 fp16 planes into NHWC (stride UC, zero-padded).
+template <int U>
+__global__ void k_unshuffle(const half *pl, int H, int W, half *dst, int UC)
+{
+    const int h = H / U, w = W / U;
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= h * w) return;
+    const int qy = q / w, qx = q % w;
+    half *po = dst + (size_t)q * UC;
+#pragma unroll
+    for (int c = 0; c < 3; c++)
+#pragma unroll
+        for (int dy = 0; dy < U; dy++)
+#pragma unroll
+            for (int dx = 0; dx < U; dx++) po[c * U * U + dy * U + dx] = pl[(size_t)c * H * W + (size_t)(U * qy + dy) * W + U * qx + dx];
+    for (int k = 3 * U * U; k < UC; k++) po[k] = __float2half(0.f);
 }
 
 // One warp per token.
@@ -190,16 +207,27 @@ __global__ void k_colscale(const half *x, const float *cm, half *out, int st, in
     *reinterpret_cast<half2 *>(out + (size_t)t * st + c) = __floats2half2_rn(v.x, v.y);
 }
 
-__global__ void k_resize2x(const half *pl, int H, int W, half *dst)
+// Bilinear resize by an integer factor S (half-pixel, clamped: torch's align_corners=False).
+__device__ __forceinline__ void srcs(int o, int n, float inv, int *i0, int *i1, float *f)
 {
-    const int OW = 2 * W;
+    float v = (o + 0.5f) * inv - 0.5f;
+    v = fminf(fmaxf(v, 0.f), (float)(n - 1));
+    *i0 = (int)v;
+    *i1 = min(*i0 + 1, n - 1);
+    *f = v - *i0;
+}
+
+__global__ void k_resize(const half *pl, int H, int W, int S, half *dst)
+{
+    const int OW = S * W;
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= 4 * H * W) return;
+    if (p >= S * S * H * W) return;
     const int y = p / OW, x = p % OW;
+    const float inv = 1.f / S;
     int y0, y1, x0, x1;
     float fy, fx;
-    src2(y, H, &y0, &y1, &fy);
-    src2(x, W, &x0, &x1, &fx);
+    srcs(y, H, inv, &y0, &y1, &fy);
+    srcs(x, W, inv, &x0, &x1, &fx);
     half o[8];
 #pragma unroll
     for (int j = 0; j < 8; j++) o[j] = __float2half(0.f);
@@ -232,10 +260,28 @@ cudaError_t tf_up_warp(const float *F, int h, int w, const void *feat, int fs, i
     return cudaGetLastError();
 }
 
-cudaError_t tf_frame_warp(const float *F, const void *nbp, const void *ctr, int H, int W, void *wus, void *conf, cudaStream_t s)
+cudaError_t tf_frame_warp(const float *F, const void *nbp, const void *ctr, int H, int W, int U, void *wus, int UC, void *conf,
+                          cudaStream_t s)
 {
-    if (H % 2 || W % 2) return cudaErrorInvalidValue;
-    k_frame_warp<<<nb((long long)H * W / 4, 128), 128, 0, s>>>(F, (const half *)nbp, (const half *)ctr, H, W, (half *)wus, (half *)conf);
+    if (H % (2 * U) || W % (2 * U) || UC < 3 * U * U) return cudaErrorInvalidValue;
+    const unsigned g = nb((long long)H * W / (U * U), 128);
+    const half *n = (const half *)nbp, *c = (const half *)ctr;
+    if (U == 1) k_frame_warp<1><<<g, 128, 0, s>>>(F, n, c, H, W, (half *)wus, UC, (half *)conf);
+    else if (U == 2) k_frame_warp<2><<<g, 128, 0, s>>>(F, n, c, H, W, (half *)wus, UC, (half *)conf);
+    else if (U == 4) k_frame_warp<4><<<g, 128, 0, s>>>(F, n, c, H, W, (half *)wus, UC, (half *)conf);
+    else return cudaErrorInvalidValue;
+    return cudaGetLastError();
+}
+
+cudaError_t tf_unshuffle(const void *planes, int H, int W, int U, void *dst, int UC, cudaStream_t s)
+{
+    if (H % U || W % U || UC < 3 * U * U) return cudaErrorInvalidValue;
+    const unsigned g = nb((long long)H * W / (U * U), 128);
+    const half *p = (const half *)planes;
+    if (U == 1) k_unshuffle<1><<<g, 128, 0, s>>>(p, H, W, (half *)dst, UC);
+    else if (U == 2) k_unshuffle<2><<<g, 128, 0, s>>>(p, H, W, (half *)dst, UC);
+    else if (U == 4) k_unshuffle<4><<<g, 128, 0, s>>>(p, H, W, (half *)dst, UC);
+    else return cudaErrorInvalidValue;
     return cudaGetLastError();
 }
 
@@ -259,9 +305,10 @@ cudaError_t tf_colscale(const void *x, const float *cm, void *out, int st, int C
     return cudaGetLastError();
 }
 
-cudaError_t tf_resize2x(const void *planes, int H, int W, void *dst, cudaStream_t s)
+cudaError_t tf_resize(const void *planes, int H, int W, int S, void *dst, cudaStream_t s)
 {
-    k_resize2x<<<nb(4ll * H * W, 256), 256, 0, s>>>((const half *)planes, H, W, (half *)dst);
+    if (S < 1) return cudaErrorInvalidValue;
+    k_resize<<<nb((long long)S * S * H * W, 256), 256, 0, s>>>((const half *)planes, H, W, S, (half *)dst);
     return cudaGetLastError();
 }
 

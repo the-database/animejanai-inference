@@ -15,6 +15,8 @@ The spikes that chose them follow the results. RTX 5090 (402 W), TensorRT 11.4.0
 | RIFE v4.14, v4.22 lite, v4.7, ensembles | video | (all 28 models) | | 1.4–2.4x | as above |
 | TemporalFix s1–s3 | video, temporal | 4.70 / 11.6 / 21.7 / 48.0 ms @720p / 1080p / 1440p / 4K | 4.51 / 10.4 / 17.7 / 41.8 ms | 1.04x / 1.11x / 1.22x / 1.15x | 77–83 dB / ~53 dB |
 | TFDAT (bndl, 9 frames) | video, temporal | 84.5 ms @720p (chain), 205 @1080p | 57.0 / 129 ms | 1.48x / 1.58x | 57–74 dB / 49–60 dB |
+| TFDAT v2 1x (5 frames, random weights) | video, temporal | 18.1 ms @720p (chain); 4.81 / 7.41 / 41.4 ms @640x352 / 736x480 / 1080p | 13.75; 5.55 / 6.97 / 31.1 ms | 1.32x; 0.87x / 1.06x / 1.33x | 68–70 dB / — |
+| TFDAT v2 4x (5 frames, random weights) | video, temporal | 331 ms @720p (chain), 69.1 @640x352 | 203 / 44 ms | 1.63x / 1.57x | 70 dB / ~45 dB apart |
 | ESRGAN 2x / 4x | image | 180 / 745 ms per 1200x1000 page | 147 / 475 ms | 1.22x / 1.57x | about equal (both fp16-accumulated) |
 | FDAT_M 2x / 4x | image | 140 / 675 ms per page (512 tiles) | 99 / 412 ms | 1.41x / 1.64x | 67 dB / 53 dB (4x, 512 tile) |
 | HAT-L 4x (V3, V3.5 aligned) | image | 4937 ms per page | 3419 ms | 1.44x (even tiles 1.58x) | 70 dB / ~55 dB apart |
@@ -44,9 +46,11 @@ What came out differently from the spikes:
 - **TFDAT (bndl) is TFDAT v2, not the `tfdat_arch` on traiNNer-redux master.** Its alignment front
   end was reconstructed from the graph and later checked against the v2 source
   (Kim2091/traiNNer-redux-1, branch `dis2-tfdat2`, `traiNNer/archs/tfdat_arch.py`): it matches.
-  Its FDAT body adds shifted windows and a pre-scaled norm clip that FDAT_M does not have. The
-  native parser covers the 2x config only (pixel-unshuffle 2, `flow_base_ch` 32, `mid_dim` 64,
-  pixelshuffle upsampler); 1x and 4x TFDAT are refused and run on TensorRT.
+  Its FDAT body adds shifted windows and a pre-scaled norm clip that FDAT_M does not have. All three
+  v2 scales run natively (1x, 2x, 4x: the frames are pixel-unshuffled by 4, 2 or 1, and the 4x
+  upsampler is the same for all), checked on random-weight exports from the source
+  (`tfdat-v2/`). 4x runs its body at the input resolution, so it is heavy above SD. 1x is the one
+  case slower than TensorRT on the 5090, below DVD size (640x352: 0.87x); at 736x480 it is level.
 - **The DAT-2 exports are dynamo graphs with no module names.** The parser walks the data-path ops
   in order. The dynamic position bias is evaluated at load from the graph's constant subgraph.
 - **TemporalFix's export nudges output pixel (0, 0)** by at most 2^-11, a tanh of the warped
