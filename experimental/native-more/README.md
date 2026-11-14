@@ -1,13 +1,67 @@
-# Native kernels for more networks (spikes)
+# Native kernels for more networks
+
+Native kernels for RIFE, TemporalFix, TFDAT (bndl animefilm), ESRGAN (MangaJaNai 2x/4x), FDAT_M
+(IllustrationJaNai) and DAT-2 / HAT-L (IllustrationJaNai 4x, bf16), on branch
+`experimental/native-more`. They follow the SPAN/Compact executor's rules: each model is
+recognised from its ONNX graph and runs whole on native kernels, or is refused with a reason and
+built with TensorRT as before. `native=off` (video) and `AJI_NATIVE=off` (image path) turn them off.
+The spikes that chose them follow the results. RTX 5090 (402 W), TensorRT 11.4.0.106.
+
+## Implemented (RTX 5090)
+
+| Model | Path | TensorRT | Native | Speedup | vs fp32: native / TensorRT |
+|---|---|---|---|---|---|
+| RIFE v4.26 | video | 3.91 / 15.98 ms @1080p / 4K | 2.06 / 6.61 ms | 1.9x / 2.4x | 73–75 dB / — (66–73 dB apart) |
+| RIFE v4.14, v4.22 lite, v4.7, ensembles | video | (all 28 models) | | 1.4–2.4x | as above |
+| TemporalFix s1–s3 | video, temporal | 4.70 / 11.6 / 21.7 / 48.0 ms @720p / 1080p / 1440p / 4K | 4.51 / 10.4 / 17.7 / 41.8 ms | 1.04x / 1.11x / 1.22x / 1.15x | 77–83 dB / ~53 dB |
+| TFDAT (bndl, 9 frames) | video, temporal | 84.5 ms @720p (chain), 205 @1080p | 57.0 / 129 ms | 1.48x / 1.58x | 57–74 dB / 49–60 dB |
+| ESRGAN 2x / 4x | image | 180 / 745 ms per 1200x1000 page | 147 / 475 ms | 1.22x / 1.57x | about equal (both fp16-accumulated) |
+| FDAT_M 2x / 4x | image | 140 / 675 ms per page (512 tiles) | 99 / 412 ms | 1.41x / 1.64x | 67 dB / 53 dB (4x, 512 tile) |
+| HAT-L 4x (V3, V3.5 aligned) | image | 4937 ms per page | 3419 ms | 1.44x (even tiles 1.58x) | 70 dB / ~55 dB apart |
+| DAT-2 4x (detail, denoise) | image | 3003 ms per page | 1531 ms | 1.96x (even tiles 1.88x) | 69–71 dB / ~55 dB apart |
+
+Speeds are libaji-level: aji_harness device time per frame for video (720p clips, anime and live
+action), aji_image on a 1200x1000 manga page for images, the standalone runners where noted (RIFE
+per interpolated frame, TemporalFix and TFDAT at 1080p+). "vs fp32" is PSNR against ONNX Runtime on
+the model converted to fp32, worst tile or frame; TensorRT's figure comes from its own engine on the
+same input.
+
+What came out differently from the spikes:
+
+- **Gains are smaller than estimated** for RIFE (1.9–2.4x, estimate 4–6x) and TemporalFix (about 1.1x,
+  estimate 5–8x). Both are mostly full-resolution resampling and warps, which are bandwidth-bound for
+  native kernels too, plus many tiny low-resolution convs that are latency-bound. TemporalFix runs
+  its six support frames as concurrent streams at 720p and below, and replays as a CUDA graph.
+- **Native is more accurate than TensorRT's fp16 engines** on every transformer and temporal model:
+  FDAT, TFDAT, HAT, DAT and TemporalFix all land at 57–83 dB against fp32, TensorRT at 49–60 dB
+  (FDAT_M 4x at 512 tiles: max 31 levels off). Native keeps fp32 accumulation and statistics.
+  MangaJaNai ESRGAN is the exception: its shipped fp16 model is far from fp32 on both (2x ~36 dB,
+  4x ~27 dB), because its activations grow past what fp16 accumulation holds. `AJI_NATIVE_ACC32=1`
+  accumulates in fp32 (about +9 dB) at roughly TensorRT's speed.
+- **The bf16 models outgrow fp16.** HAT-L's last group conv reaches ~8.6e5 and DAT-2's ~1.4e5, so
+  their residual stream is fp32. Everything inside the blocks stays far below fp16's range and runs
+  in fp16.
+- **TFDAT (bndl) is not the public traiNNer-redux `tfdat_arch`**. Its alignment front end was
+  reconstructed from the graph. Its FDAT body adds shifted windows and a pre-scaled norm clip that
+  FDAT_M does not have.
+- **The DAT-2 exports are dynamo graphs with no module names.** The parser walks the data-path ops
+  in order. The dynamic position bias is evaluated at load from the graph's constant subgraph.
+- **TemporalFix's export nudges output pixel (0, 0)** by at most 2^-11, a tanh of the warped
+  frames' means that keeps them alive in the graph. Native leaves it out.
+
+Memory: TFDAT uses one arena shared by alignment, body and tail (2.4 GB at 1080p). The image models
+allocate for their tile, e.g. HAT-L 2.7 GB and DAT-2 2.9 GB at 512.
+
+## Spikes
 
 Which networks beyond SPAN/SPANF3/Compact (`src/native`) are worth native kernels: ESRGAN
 (MangaJaNai 2x/4x), TFDAT v2 (bndl animefilm), FDAT_M (IllustrationJaNai), RIFE, TemporalFix.
 Each spike measures TensorRT on the shipped model, works out where its time goes, and times the
-existing native kernel template on the network's shapes. Nothing here ships. RTX 5090, 402 W
+existing native kernel template on the network's shapes. RTX 5090, 402 W
 limit, TensorRT 11.4.0.106 with libaji's image-path build settings (`--builderOptimizationLevel=3`;
 level 5 measured the same), cached engines, a 512x512 input tile (the image path's default tile).
 
-## Summary (RTX 5090, TensorRT 11.4)
+### Summary (RTX 5090, TensorRT 11.4)
 
 | Model | Path | TensorRT | Where TensorRT loses | Native estimate | Effort |
 |---|---|---|---|---|---|
@@ -20,9 +74,9 @@ level 5 measured the same), cached engines, a 512x512 input tile (the image path
 | ESRGAN 2x/4x | image | 19.1 / 82.5 ms per 512 tile | generic sm80 convs; 276 concat copies | 1.5–1.9x (kernels measured) | medium |
 
 Only ESRGAN's estimate rests on measured native kernels; the rest come from profiles and FLOP
-counts. All image-path models also need native support in `aji_img_trt`, which has none today.
+counts. (The image-path models needed native support in `aji_img_trt` first, which this branch adds.)
 
-## ESRGAN (MangaJaNai V1, `esrgan/`)
+### ESRGAN (MangaJaNai V1, `esrgan/`)
 
 RRDBNet: 23 RRDB x 3 dense blocks, 64 features, growth 32, LeakyReLU 0.2, residual scale 0.2.
 2x has a 2x pixel-unshuffle in front (body at half resolution), 4x runs the body at full
@@ -68,7 +122,7 @@ output with cout 3; lowering for the dense-block pattern; and native support in 
 (`aji_img_trt`, tiled), which today has none. That last part is what MangaJaNai GUI, the CLI and
 yosh would use.
 
-## FDAT_M (IllustrationJaNai V3, `fdat/`)
+### FDAT_M (IllustrationJaNai V3, `fdat/`)
 
 traiNNer-redux `fdat_medium`: 120 channels, 4 groups x 6 blocks, alternating 8x8-window spatial
 attention (4 heads, head dim 30, learned relative bias) and channel attention (per head a 30x30
@@ -105,7 +159,7 @@ global reductions for the channel attention and channel gate, depthwise convs), 
 ~2,400-node graph whose data path is mostly reshapes and transposes, and FDAT-specific patterns
 (a new transformer variant would need its own work). Like ESRGAN it runs in the image path.
 
-## TFDAT (bndl animefilm v3, `tfdat/`)
+### TFDAT (bndl animefilm v3, `tfdat/`)
 
 `2x_bndl_animefilm_v3_1x27xHxW`: a 9-frame temporal model. Not traiNNer-redux's `tfdat` exactly:
 its alignment is heavier (a 3-level 32/64/96-channel per-frame encoder `enc*`, per-neighbour
@@ -134,7 +188,7 @@ alignment and fusion native too, ~25–30 ms (~3x), i.e. from 11 fps to 25–35 
 per-frame encoder's features could be cached across frames (8 of 9 inputs repeat), but that is
 only ~2%.
 
-## RIFE (v4.14, v4.26; `rife/`)
+### RIFE (v4.14, v4.26; `rife/`)
 
 IFNet: 4 (v4.14) or 5 (v4.26) IFBlocks, coarse to fine. Each block warps both frames by the
 current flow (`GridSample`), resizes the warped frames (and the features) down to its scale, runs
@@ -174,7 +228,7 @@ stride-2 conv input mode, the transposed conv + depth-to-space tail, the per-cha
 epilogue, a fused warp/resample kernel and the final blend, plus wiring a native RIFE step next
 to the TensorRT RIFE engine in the video path.
 
-## TemporalFix (`temporalfix_s1_v1.1_op18_fp16`)
+### TemporalFix (`temporalfix_s1_v1.1_op18_fp16`)
 
 A 7-frame (21-channel) 1x model that runs before the upscale: a per-frame `encode`, an `aligner`
 (5 `GridSample` warps, resizes, cumulative sums) and a `conf_head`, 44 convs of 1–32 channels.
@@ -190,7 +244,7 @@ in the ~1.5–2.5 ms range at 1080p (**~5–8x**) and ~1 ms at 720p (~4–5x). E
 model rather than a family, so the lowering would be specific to it (or written by hand, as
 NeoRTX does per model), and it needs the temporal (multi-frame) input path.
 
-## DAT-2 and HAT-L (IllustrationJaNai V3 4x, bf16; `dathat/`)
+### DAT-2 and HAT-L (IllustrationJaNai V3 4x, bf16; `dathat/`)
 
 Both ship in the `models-illustrationjanai-bf16` pack as bf16 ONNX (fp32 input, bf16 weights,
 casts in the graph): these archs are in traiNNer's `ARCHS_WITHOUT_FP16`. That matters for native
