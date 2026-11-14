@@ -123,6 +123,28 @@ Configure with native kernels takes ~50 ms (parse, lower, upload, time the tile 
 attempted. NV12/P010 conversion is not folded into the native kernels: libaji's pre/post kernels
 resample chroma with Spline36 (needs a halo) and cost ~0.05 ms at 1080p, so that is deferred.
 
+## Phase 3: regression (`phase3/`)
+
+Everything on the 5090, the same build with `native=off` and `native=on`. Numbers are in
+`BENCHMARKS.md` ("Native kernels vs TensorRT").
+
+| Checked | Result |
+|---|---|
+| Output, `aji_harness` (`matrix.sh`): 15 cases, 12 frames each, every frame compared | all within 1–2 8-bit levels |
+| Sizes: 1918x1078 (959x539 inside), 1440x1080, 1280x642, 854x480, 768x576 | pass |
+| P010 input; 4:4:4 10-bit source and output (`aji_encode`) | pass |
+| Live action (concert, event), DVD, anime | pass |
+| Chains: two native models; resize before upscale; temporal model then native; RIFE after native | pass |
+| `--async-build`: a native model is active at once | pass |
+| mpv playback (NVDEC, `lib=` the branch's `aji.dll`) | plays; +37% (Balanced), +41% (Compact) |
+| `aji_encode` 4:2:0 / 4:4:4 FFV1 output vs TensorRT | 65–69 dB (10-bit) |
+| TensorRT-RTX (`aji_trtrtx`) | native used; 1.55–1.58x; output within 1 level |
+| Unsupported model (MangaJaNai ESRGAN), temporal model | TensorRT, with the reason logged |
+
+Not covered: slot or resolution changes during playback (each configure rebuilds the native
+steps, like TensorRT's), odd frame sizes (unshuffle models refuse them with a reason), GPUs other
+than the 5090 (Phase 4).
+
 ## Notes
 
 - SPANF3's `SPABV2` uses `nn.ReLU(inplace=True)`, so the exported `last_mid` fed to `conv_cat` is

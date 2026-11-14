@@ -199,3 +199,50 @@ frame; RIFE-first pays 1080p RIFE plus a second cheap upscale pass. The RIFE
 factor scales the margin (5x widens it) but never flips the winner; a much
 heavier upscale model eventually would. Measured synchronous/single-stream (the
 harness model); real playback pipelines, but the per-frame ordering cost carries.
+
+## Native kernels vs TensorRT (`[global] native=on`, 2026-11-14)
+
+Branch `experimental/native-span`. RTX 5090 at a 402 W power limit (default 575 W), driver 621.14,
+TensorRT 11.4.0.106 and TensorRT-RTX 1.7.1, every run with no other process on the GPU. The same
+build with `native=off` and `native=on`; engines cached. Models: the shipped V3.1 non-sharp
+`Performance` (SPANF3 b5f48) and `Balanced` (b8f64), and `SD_V1beta34_Compact` (SRVGG 64 ch).
+
+`aji_harness`, device chain time (NV12 in → pre → model → post → NV12 out, CUDA graph), ms/frame,
+1000 frames, two or three interleaved rounds:
+
+| Case | TensorRT | native | |
+|---|---|---|---|
+| Performance 1920x1080 | 3.60–3.63 | 2.04–2.06 | 1.76x |
+| Performance 1918x1078 | 3.55–3.58 | 2.13–2.14 | 1.67x |
+| Performance 1280x642 (live action) | 1.24–1.25 | 0.86–0.87 | 1.44x |
+| Performance 960x540 (50% resize first) | 0.84–0.85 | 0.67 | 1.26x |
+| Performance 854x480 | 0.68–0.69 | 0.58 | 1.18x |
+| Balanced 1920x1080 | 7.33–7.45 | 4.50–4.60 | 1.62x |
+| Balanced 1918x1078 | 7.25–7.36 | 4.53–4.61 | 1.60x |
+| Balanced 1440x1080 | 4.83–4.91 | 3.08–3.15 | 1.57x |
+| Balanced 1280x720 | 2.67–2.73 | 1.87–1.90 | 1.43x |
+| Balanced then Performance, 854x480 → 3416x1920 | 3.99–4.01 | 2.57–2.59 | 1.55x |
+| Compact 1920x1080 (live action) | 16.0–16.2 | 11.4–11.5 | 1.41x |
+| Compact 1280x720 | 6.93–7.10 | 4.63–5.05 | 1.4–1.5x |
+| Compact 854x480 | 2.83–2.87 | 1.95–1.99 | 1.44x |
+| Compact 768x576 (DVD) | 3.25–3.31 | 2.10–2.15 | 1.54x |
+| Compact 720x480 | 2.33–2.38 | 1.60–1.64 | 1.45x |
+| TensorRT-RTX: Performance 1920x1080 | 3.11–3.14 | 2.02 | 1.55x |
+| TensorRT-RTX: Balanced 1920x1080 | 6.97–7.06 | 4.43–4.48 | 1.58x |
+| TensorRT-RTX: Compact 768x576 | 3.36–3.38 | 2.15–2.16 | 1.56x |
+
+Every case's output frames (12 per case, plus P010 input, a temporal + Performance chain and
+4:2:0/4:4:4 `aji_encode` output) are within 1–2 8-bit levels of TensorRT's (Y 58–65 dB).
+
+Playback, mpv-AnimeJaNai 3.10.0's mpv with the branch's `aji.dll` (`lib=`), NVDEC,
+`--vo=null --untimed`, fps = frames / (Exiting − Configured slot), two rounds:
+
+| 1080p source → 4K | TensorRT | native |
+|---|---|---|
+| Balanced, anime (1200 frames) | 129.2–130.8 | 177.8–179.2 |
+| Compact, live action (600 frames) | 59.1–59.7 | 83.2–83.9 |
+| Performance, anime (1200 frames) | 173.9–184.3 | 192.6–195.2 (decode-bound) |
+
+`aji_encode`, 928-frame 1080p live-action clip → 4K `hevc_nvenc`, wall seconds, two rounds:
+Compact 12.4–12.6 → 9.6–9.7; Balanced 8.0–8.1 → 7.6; Performance 7.3 → 7.2 (NVENC-bound at ~129 fps).
+RIFE 2x after Performance (`--rife-chain`): 19.68 → 18.03 ms per source frame.
