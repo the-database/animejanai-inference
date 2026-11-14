@@ -91,7 +91,7 @@ struct Step {
     aji_plan *plan = nullptr;   // RESIZE
 };
 
-// A model lowered for the native kernels (native=on), or why it can't be.
+// A model lowered for the native kernels, or why it can't be.
 struct NativePlan {
     bool ok = false;
     std::string why;
@@ -818,7 +818,7 @@ bool push_resize_step(aji_ctx *c, int *cw, int *ch, int nw, int nh)
     return true;
 }
 
-// native=on: the model `name` on the native kernels at w x h, or null with *why (the caller
+// The model `name` on the native kernels at w x h, or null with *why (the caller
 // then uses TensorRT). Lowering is cached per ONNX path for the context's lifetime.
 std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &name, int w, int h,
                                                 std::string *why, std::string *what)
@@ -1343,7 +1343,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         // scale), and the output is cropped back.
         const int t = model_frames[mi].frames;
 
-        // native=on: the native kernels when they can run this model, else TensorRT below
+        // The native kernels when they can run this model (unless native=off), else TensorRT below
         if (c->conf.native && t <= 1) {
             std::string why, what;
             auto ex = try_native(c, m.name, cw, ch, &why, &what);
