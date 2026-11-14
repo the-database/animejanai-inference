@@ -22,9 +22,12 @@ For each clip it encodes the plain upscale chain once with AJI_REUSE_TRACE, then
   are at least --min-psnr dB from it. Output frame k sits in the pair (i, i+1) with
   i = floor(k * den / num) at phase acc = k * den mod num; a held frame H touches the frames of
   the pair that ends on it (they repeat i) and, unless the chain is RIFE only (whose frames go
-  out as they are), H itself and the in-betweens of the pair that starts on it.
+  out as they are), H itself and the in-betweens of the pair that starts on it. A held frame is
+  near-identical to its anchor, so the PSNR floor can't tell which of them a touched frame
+  repeats; which pairs are skipped is checked by the trace and the logged in-between count.
 --damage also encodes a clip with damaged packets (CPU decoder, --on-damage continue) through
-each chain: every frame a DAMAGE line names, and the frame after it, must be upscaled.
+each chain, with and without reuse: packet count and pts match, and the first frame of each
+damaged spot (DAMAGE line) and the frame after it are upscaled.
 """
 import argparse
 import os
@@ -122,6 +125,8 @@ def pts(path):
     out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                           "packet=pts", "-of", "csv=p=0", path], capture_output=True, text=True,
                          check=True).stdout
+    # sorted: NVENC picks frame types from content, and repeated frames change its picks
+    # (e.g. IIIBBBP with reuse, IBBBP without), so packet order can differ while pts can't
     return sorted(int(x) for x in out.split() if x.strip() and x.strip() != "N/A")
 
 
@@ -267,9 +272,16 @@ if a.damage:
     dmg.write_bytes(bytes(data))
     for chain in chains:
         tr = work / f"dmg_{chain}.csv"
-        out = work / f"dmg_{chain}.mkv"
-        p = run(dmg, conf(work / f"dmg_{chain}.conf", chain), out, tr, vq=a.vquality,
+        out, out0 = work / f"dmg_{chain}.mkv", work / f"dmg_{chain}_noreuse.mkv"
+        cfg = conf(work / f"dmg_{chain}.conf", chain)
+        p = run(dmg, cfg, out, tr, vq=a.vquality,
                 extra=("--decoder", "cpu", "--on-damage", "continue"))
+        p0 = run(dmg, cfg, out0, reuse=False, vq=a.vquality,
+                 extra=("--decoder", "cpu", "--on-damage", "continue"))
+        if p.returncode == 0 and p0.returncode == 0:
+            t1, t0 = pts(out), pts(out0)
+            check(t1 == t0, f"damage {chain}: packet count and pts match --no-reuse-held-frames "
+                  f"({len(t1)} / {len(t0)})")
         spots = [int(m.group(1)) for m in re.finditer(r"^DAMAGE t=\S+ frame=(\d+)$", p.stdout, re.M)]
         d = decisions(tr) if tr.exists() else {}
         reused = sum(1 for v in d.values() if v == "reuse")
@@ -278,6 +290,7 @@ if a.damage:
               f"damage {chain}: exit {p.returncode}, damaged frames {spots} and the frames after "
               f"them upscaled ({reused} others reused)")
         out.unlink(missing_ok=True)
+        out0.unlink(missing_ok=True)
 
 print(f"{len(failures)} failure(s)" if failures else "all passed")
 sys.exit(1 if failures else 0)

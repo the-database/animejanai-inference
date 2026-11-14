@@ -3577,6 +3577,14 @@ static int plain_consume(enc_ctx *c, held_frame p, int skip)
 /* what the active path does with a decided frame (its frames owned) */
 static int reuse_consume(enc_ctx *c, held_frame p, int skip)
 {
+    /* held implies a live anchor and a frame before it (the engine drops
+     * the anchor on every upscale); should that ever not hold, the frame
+     * is upscaled and its pair interpolated instead of repeating stale
+     * output */
+    if (skip && !(c->rife_only ? c->have_prev
+                  : c->rife_first ? c->src_prev && c->prev_anchor
+                                  : c->anchor_out->buf[0] != NULL))
+        skip = 0;
     if (!c->rife) return plain_consume(c, p, skip);
     if (c->rife_only) return rife_only_consume(c, p, skip);
     return c->rife_first ? rife_first_consume(c, p, skip)
@@ -3875,8 +3883,6 @@ static int rife_first_flush(enc_ctx *c)
 static int rife_first_consume(enc_ctx *c, held_frame p, int skip)
 {
     AVFrame *dec = p.f, *cur = dec;
-    if (skip && !(c->src_prev && c->prev_anchor))
-        skip = 0;                      /* (held implies both) */
     if (skip) {
         cur = NULL;
     } else if (c->pre_resize) {
@@ -4082,9 +4088,10 @@ static int reuse_setup(enc_ctx *c)
     if (trace && *trace && aji_held_set_trace(c->held, trace) != AJI_OK)
         loge("held frames: can't write %s", trace);
     c->reuse = 1;
-    loge("held frames: reusing the last upscale for unchanged frames "
+    loge("held frames: %s for unchanged frames "
          "(tile threshold %.2f, fade threshold %.3f, at most %d in a row; "
          "--no-reuse-held-frames turns it off)",
+         c->rife_only ? "repeating the last frame" : "reusing the last upscale",
          c->o.reuse_t, c->o.reuse_fade, hp.max_run);
     if (c->rife)
         loge("held frames: decided on the source frames; RIFE skips the pair "
