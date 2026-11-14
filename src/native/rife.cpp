@@ -162,7 +162,9 @@ void phase_weights(const Conv &c, int R, int sy, int CHP, std::vector<uint16_t> 
 }
 
 struct Step {
-    enum Kind { GCONV, GATHER, FINAL } kind;
+    enum Kind { GCONV, GATHER, MERGE, FINAL } kind;
+    RifeBlockOut mo;
+    const void *mr = nullptr;
     GWeights *w = nullptr;
     GConvArgs a;
     int variant = 0;
@@ -231,8 +233,8 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     if (sp && parts.empty() && sp->attr("split")) parts = sp->attr("split")->ints;
     if (!sp || g.inputs.size() != 1 || sp->in[0] != g.inputs[0])
         return refuse(why, "not the vs-mlrt RIFE input layout"), nullptr;
-    if (parts.size() == 5) return refuse(why, "ensemble models are not supported"), nullptr;
-    if (parts != std::vector<int64_t>{6, 1, 2, 2}) return refuse(why, "not the vs-mlrt RIFE input layout"), nullptr;
+    const bool ens = parts == std::vector<int64_t>{3, 3, 1, 2, 2};
+    if (!ens && parts != std::vector<int64_t>{6, 1, 2, 2}) return refuse(why, "not the vs-mlrt RIFE input layout"), nullptr;
 
     // encoder: the /encode/ convs in file order
     std::vector<Conv> enc;
@@ -291,6 +293,8 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     }
     void *sX = d.alloc(needX), *sT1 = d.alloc(needT1), *sA = d.alloc(needA), *sB = d.alloc(needA);
     if (!sX || !sT1 || !sA || !sB) return refuse(why, "out of GPU memory"), nullptr;
+    void *sR = ens ? d.alloc(plane * 16) : nullptr;  // ensemble: the reverse pass's block output
+    if (ens && !sR) return refuse(why, "out of GPU memory"), nullptr;
     // ---- encoder steps (per frame)
     void *feat[2] = {nullptr, nullptr};
     if (F) {
@@ -437,6 +441,7 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
             return refuse(why, pre + "input channels"), nullptr;
         }
         if (!d.scales.empty() && s > d.scales.back()) return refuse(why, "block scales must not increase"), nullptr;
+        if (ens && (feeds || K > 8)) return refuse(why, "ensemble with fed block features"), nullptr;
         d.scales.push_back(s);
 
         // buffers
@@ -452,6 +457,10 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
         bo.s = s;
         bo.kstride = KP;
 
+        GWeights *w0a = nullptr, *w0b = nullptr, *wlast[4] = {};
+        std::vector<GWeights *> wres;
+        for (int pass = 0; pass < (ens ? 2 : 1); pass++) {
+        void *Odst = pass ? sR : O;
         // gather
         Step ga{Step::GATHER};
         ga.g.nprev = b;
@@ -462,11 +471,14 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
         ga.g.dst = X;
         ga.g.dstride = cinp;
         ga.g.cin = c0a.cin;
+        ga.g.rev = pass == 1;
         d.steps.push_back(ga);
         // conv0
-        GWeights *w0a = d.upload(conv_taps(c0a, nullptr), c0a.b, c0a.cin, cinp, c0a.cout, pad16(c0a.cout));
-        GWeights *w0b = d.upload(conv_taps(c0b, nullptr), c0b.b, c0b.cin, pad16(c0b.cin), c, pad16(c));
-        if (!w0a || !w0b) return refuse(why, "weight upload failed"), nullptr;
+        if (pass == 0) {
+            w0a = d.upload(conv_taps(c0a, nullptr), c0a.b, c0a.cin, cinp, c0a.cout, pad16(c0a.cout));
+            w0b = d.upload(conv_taps(c0b, nullptr), c0b.b, c0b.cin, pad16(c0b.cin), c, pad16(c));
+            if (!w0a || !w0b) return refuse(why, "weight upload failed"), nullptr;
+        }
         Step s0{Step::GCONV};
         s0.w = w0a;
         s0.a.src = X;
@@ -496,10 +508,13 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
         // residual convs: lrelu(conv * beta + x), beta folded into weights and bias
         void *cur = A, *oth = B;
         for (size_t k = 0; k < res.size(); k++) {
-            std::vector<float> bb(c);
-            for (int o = 0; o < c; o++) bb[o] = res[k].b[o] * beta[k][o];
-            GWeights *wr = d.upload(conv_taps(res[k], &beta[k]), bb, c, pad16(c), c, pad16(c));
-            if (!wr) return refuse(why, "weight upload failed"), nullptr;
+            if (pass == 0) {
+                std::vector<float> bb(c);
+                for (int o = 0; o < c; o++) bb[o] = res[k].b[o] * beta[k][o];
+                wres.push_back(d.upload(conv_taps(res[k], &beta[k]), bb, c, pad16(c), c, pad16(c)));
+                if (!wres.back()) return refuse(why, "weight upload failed"), nullptr;
+            }
+            GWeights *wr = wres[k];
             Step sr{Step::GCONV};
             sr.w = wr;
             sr.a.src = cur;
@@ -519,11 +534,14 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
         }
         // lastconv (transposed) + depth-to-space as 4 row-phase convs
         for (int sy = 0; sy < 4; sy++) {
-            std::vector<uint16_t> w;
-            std::vector<float> bias;
-            phase_weights(last, 4, sy, KP, &w, &bias);
-            GWeights *wl = d.upload(w, bias, c, pad16(c), 4 * KP, 4 * KP);
-            if (!wl) return refuse(why, "weight upload failed"), nullptr;
+            if (pass == 0) {
+                std::vector<uint16_t> w;
+                std::vector<float> bias;
+                phase_weights(last, 4, sy, KP, &w, &bias);
+                wlast[sy] = d.upload(w, bias, c, pad16(c), 4 * KP, 4 * KP);
+                if (!wlast[sy]) return refuse(why, "weight upload failed"), nullptr;
+            }
+            GWeights *wl = wlast[sy];
             Step sl{Step::GCONV};
             sl.w = wl;
             sl.a.src = cur;
@@ -532,11 +550,18 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
             sl.a.IW = bw / 4;
             sl.a.H = bh / 4;
             sl.a.W = bw / 4;
-            sl.a.dst = O;
+            sl.a.dst = Odst;
             sl.a.dst_stride = KP;
             sl.a.R = 4;
             sl.a.sy = sy;
             d.steps.push_back(sl);
+        }
+        }
+        if (ens) {
+            Step mg{Step::MERGE};
+            mg.mo = bo;
+            mg.mr = sR;
+            d.steps.push_back(mg);
         }
         d.outs.push_back(bo);
         prevK = K;
@@ -583,7 +608,7 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     char buf[160];
     std::string sc;
     for (size_t i = 0; i < d.scales.size(); i++) sc += (i ? "/" : "") + std::to_string(d.scales[i]);
-    snprintf(buf, sizeof(buf), "%d blocks, scales %s, %d feature channels", nb, sc.c_str(), F);
+    snprintf(buf, sizeof(buf), "%d blocks, scales %s, %d feature channels%s", nb, sc.c_str(), F, ens ? ", ensemble" : "");
     d.what = buf;
     return r;
 }
@@ -623,6 +648,9 @@ cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bo
             e = rife_gather(fr, g, s);
             break;
         }
+        case Step::MERGE:
+            e = rife_merge(fr, st.mo, st.mr, s);
+            break;
         case Step::FINAL:
             e = rife_final(fr, d.nb, d.outs.data(), out3, s);
             break;
@@ -639,6 +667,7 @@ cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bo
             const Step &st = d.steps[i];
             std::string k = st.kind == Step::GATHER ? "gather s" + std::to_string(st.g.s)
                           : st.kind == Step::FINAL ? "final"
+                          : st.kind == Step::MERGE ? "merge"
                           : "conv " + std::to_string(st.w->cin) + "->" + std::to_string(st.w->cout) + " " +
                                 std::to_string(st.a.W) + "x" + std::to_string(st.a.H) + (st.a.stride == 2 ? " s2" : "") +
                                 (st.a.R ? " phase" + std::to_string(st.a.R) : "");

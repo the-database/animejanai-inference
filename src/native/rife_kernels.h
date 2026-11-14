@@ -24,6 +24,7 @@ struct RifeGather {
     int nprev = 0;               // blocks before this one (0: block 0's input)
     RifeBlockOut prev[kRifeMaxBlocks];
     bool feeds_feat = false;     // the previous block's features (channels 5..K-1) are fed in
+    bool rev = false;            // ensemble: the time-reversed input (frames swapped, 1 - t, -mask)
     int K = 0;                   // the previous block's output channels
     const float *t = nullptr;    // the timestep, in device memory (graph replay)
     int s = 1;                   // this block's scale
@@ -33,6 +34,8 @@ struct RifeGather {
 
 bool rife_gather_supported(const RifeFrame &f, const RifeGather &g);
 cudaError_t rife_gather(const RifeFrame &f, const RifeGather &g, cudaStream_t s);
+// Ensemble: o = merge(o, r) at block resolution: flow (o + swapped r) / 2, mask (o - r) / 2.
+cudaError_t rife_merge(const RifeFrame &f, const RifeBlockOut &o, const void *r, cudaStream_t s);
 // out: NCHW fp16 RGB, full size. Uses every block (flow) and the last one's mask.
 cudaError_t rife_final(const RifeFrame &f, int nblocks, const RifeBlockOut *blocks, void *out, cudaStream_t s);
 

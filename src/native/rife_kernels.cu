@@ -159,7 +159,7 @@ __device__ __forceinline__ void warp(const RifeFrame &f, int k, int X, int Y, fl
 
 // F: features per frame; NM: mask (+ fed features) channels; KV: 8-channel vectors of the last
 // block's output; NT: taps per axis (1 at scale 1, else 2); B0: block 0's input.
-template <int F, int NM, int KV, int NT, int B0>
+template <int F, int NM, int KV, int NT, int B0, int REV>
 __global__ void k_gather(Dev p)
 {
     constexpr int CIN = B0 ? 6 + 2 * F + 1 : 6 + 2 * F + 1 + NM + 4, CP8 = (CIN + 7) / 8 * 8;
@@ -172,7 +172,8 @@ __global__ void k_gather(Dev p)
 #pragma unroll
     for (int c = 0; c < CP8; c++) acc[c] = 0.f;
     constexpr float wt = NT == 1 ? 1.f : 0.25f;
-    const float tt = rh(*g.t);
+    const float tt = REV ? rh(1.f - rh(*g.t)) : rh(*g.t);
+    constexpr int A0 = REV ? 1 : 0;  // the frame that comes first
 #pragma unroll
     for (int ty = 0; ty < NT; ty++)
 #pragma unroll
@@ -183,13 +184,13 @@ __global__ void k_gather(Dev p)
                 const size_t plane = (size_t)f.W * f.H, pix = (size_t)Y * f.W + X;
                 const half *in = (const half *)f.in11;
 #pragma unroll
-                for (int c = 0; c < 6; c++) acc[c] += wt * h2f(__ldg(in + c * plane + pix));
+                for (int c = 0; c < 6; c++) acc[c] += wt * h2f(__ldg(in + ((c + 3 * A0) % 6) * plane + pix));
 #pragma unroll
                 for (int k = 0; k < 2; k++)
                     if constexpr (F > 0) {
                         float fv[16];
 #pragma unroll
-                        for (int v = 0; v * 8 < F; v++) h8((const half *)f.feat[k] + pix * f.fstride + v * 8, fv + v * 8);
+                        for (int v = 0; v * 8 < F; v++) h8((const half *)f.feat[k ^ A0] + pix * f.fstride + v * 8, fv + v * 8);
 #pragma unroll
                         for (int c = 0; c < F; c++) acc[6 + k * F + c] += wt * fv[c];
                     }
@@ -202,8 +203,13 @@ __global__ void k_gather(Dev p)
                 float fl[4];
                 flow_sum(g.prev, g.nprev, f.W, f.H, X, Y, lv, fl);
                 float wa[3 + F + 1], wb[3 + F + 1];
-                warp<F>(f, 0, X, Y, fl[0], fl[1], wa);
-                warp<F>(f, 1, X, Y, fl[2], fl[3], wb);
+                if constexpr (REV) {
+                    warp<F>(f, 1, X, Y, fl[2], fl[3], wa);
+                    warp<F>(f, 0, X, Y, fl[0], fl[1], wb);
+                } else {
+                    warp<F>(f, 0, X, Y, fl[0], fl[1], wa);
+                    warp<F>(f, 1, X, Y, fl[2], fl[3], wb);
+                }
 #pragma unroll
                 for (int c = 0; c < 3; c++) {
                     acc[c] += wt * wa[c];
@@ -216,9 +222,9 @@ __global__ void k_gather(Dev p)
                 }
                 acc[6 + 2 * F] += wt * tt;
 #pragma unroll
-                for (int c = 0; c < NM; c++) acc[7 + 2 * F + c] += wt * lv[4 + c];
+                for (int c = 0; c < NM; c++) acc[7 + 2 * F + c] += wt * (REV && c == 0 ? -lv[4] : lv[4 + c]);
 #pragma unroll
-                for (int c = 0; c < 4; c++) acc[7 + 2 * F + NM + c] += wt * rh(fl[c] * (1.0f / g.s));
+                for (int c = 0; c < 4; c++) acc[7 + 2 * F + NM + c] += wt * rh(fl[REV ? (c + 2) % 4 : c] * (1.0f / g.s));
             }
         }
     half *d = (half *)g.dst + ((size_t)y * bw + x) * g.dstride;
@@ -233,29 +239,48 @@ __global__ void k_gather(Dev p)
 }
 
 using GatherFn = void (*)(Dev);
-template <int F, int NM, int KV>
+template <int F, int NM, int KV, int REV>
 GatherFn pick_nt(int nt, bool b0)
 {
-    if (b0) return nt == 1 ? &k_gather<F, NM, KV, 1, 1> : &k_gather<F, NM, KV, 2, 1>;
-    return nt == 1 ? &k_gather<F, NM, KV, 1, 0> : &k_gather<F, NM, KV, 2, 0>;
+    if (b0) return nt == 1 ? &k_gather<F, NM, KV, 1, 1, REV> : &k_gather<F, NM, KV, 2, 1, REV>;
+    return nt == 1 ? &k_gather<F, NM, KV, 1, 0, REV> : &k_gather<F, NM, KV, 2, 0, REV>;
 }
 template <int F>
-GatherFn pick_f(int nm, int kv, int nt, bool b0)
+GatherFn pick_f(int nm, int kv, int nt, bool b0, bool rev)
 {
-    if (nm == 1 && kv == 1) return pick_nt<F, 1, 1>(nt, b0);
-    if (nm == 1 && kv == 2) return pick_nt<F, 1, 2>(nt, b0);
-    if (nm == 9 && kv == 2) return pick_nt<F, 9, 2>(nt, b0);
+    if (rev) {
+        // ensembles: six-channel block outputs, no fed features
+        if (nm == 1 && kv == 1) return pick_nt<F, 1, 1, 1>(nt, b0);
+        return nullptr;
+    }
+    if (nm == 1 && kv == 1) return pick_nt<F, 1, 1, 0>(nt, b0);
+    if (nm == 1 && kv == 2) return pick_nt<F, 1, 2, 0>(nt, b0);
+    if (nm == 9 && kv == 2) return pick_nt<F, 9, 2, 0>(nt, b0);
     return nullptr;
 }
-GatherFn gather_fn(int F, int nm, int kv, int nt, bool b0)
+GatherFn gather_fn(int F, int nm, int kv, int nt, bool b0, bool rev)
 {
     switch (F) {
-    case 0: return pick_f<0>(nm, kv, nt, b0);
-    case 4: return pick_f<4>(nm, kv, nt, b0);
-    case 8: return pick_f<8>(nm, kv, nt, b0);
-    case 16: return pick_f<16>(nm, kv, nt, b0);
+    case 0: return pick_f<0>(nm, kv, nt, b0, rev);
+    case 4: return pick_f<4>(nm, kv, nt, b0, rev);
+    case 8: return pick_f<8>(nm, kv, nt, b0, rev);
+    case 16: return pick_f<16>(nm, kv, nt, b0, rev);
     }
     return nullptr;
+}
+
+__global__ void k_merge(RifeBlockOut o, const half *r, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    half *a = (half *)o.b + (size_t)i * o.kstride;
+    const half *b = r + (size_t)i * o.kstride;
+    float fl[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) fl[k] = rh((h2f(a[k]) + h2f(b[(k + 2) % 4])) * 0.5f);
+#pragma unroll
+    for (int k = 0; k < 4; k++) a[k] = __float2half(fl[k]);
+    a[4] = __float2half((h2f(a[4]) - h2f(b[4])) * 0.5f);
 }
 
 int gather_nm(const RifeGather &g) { return g.nprev == 0 ? 1 : (g.feeds_feat ? g.K - 4 : 1); }
@@ -292,16 +317,23 @@ __global__ void k_final(FinalDev p)
 bool rife_gather_supported(const RifeFrame &f, const RifeGather &g)
 {
     return g.dstride % 8 == 0 && g.dstride >= (g.cin + 7) / 8 * 8 &&
-           gather_fn(f.F, gather_nm(g), gather_kv(g), g.s == 1 ? 1 : 2, g.nprev == 0) != nullptr;
+           gather_fn(f.F, gather_nm(g), gather_kv(g), g.s == 1 ? 1 : 2, g.nprev == 0, g.rev) != nullptr;
 }
 
 cudaError_t rife_gather(const RifeFrame &f, const RifeGather &g, cudaStream_t s)
 {
-    GatherFn fn = gather_fn(f.F, gather_nm(g), gather_kv(g), g.s == 1 ? 1 : 2, g.nprev == 0);
+    GatherFn fn = gather_fn(f.F, gather_nm(g), gather_kv(g), g.s == 1 ? 1 : 2, g.nprev == 0, g.rev);
     if (!fn || g.dstride % 8) return cudaErrorInvalidValue;
     Dev p{f, g};
     const dim3 blk(16, 8), grid((f.W / g.s + 15) / 16, (f.H / g.s + 7) / 8);
     fn<<<grid, blk, 0, s>>>(p);
+    return cudaGetLastError();
+}
+
+cudaError_t rife_merge(const RifeFrame &f, const RifeBlockOut &o, const void *r, cudaStream_t s)
+{
+    const int n = (f.W / o.s) * (f.H / o.s);
+    k_merge<<<(n + 255) / 256, 256, 0, s>>>(o, (const half *)r, n);
     return cudaGetLastError();
 }
 
