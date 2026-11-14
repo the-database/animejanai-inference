@@ -6,6 +6,10 @@
  * is refused with a reason and the caller builds a TensorRT engine.
  * run() takes the stage's model input (fp16 [3 * frames][h][w], frames oldest first) and writes
  * its output (fp16 [3][scale * h][scale * w]).
+ * Models whose per-frame work does not depend on the frame's place in the window (TemporalFix's
+ * encoder) can also keep it per frame: cache_entries() > 0 slots, encode() fills one from a frame
+ * (fp16 [3][h][w]), and run_cached() runs a window from the slots that sel (on the device, one per
+ * window position, oldest first) names. Which frame is in which slot is the caller's bookkeeping.
  */
 #ifndef AJI_NATIVE_VIDNET_H
 #define AJI_NATIVE_VIDNET_H
@@ -27,6 +31,17 @@ public:
     virtual int scale() const = 0;
     virtual std::string describe() const = 0;
     virtual size_t device_bytes() const = 0;
+    virtual int cache_entries() const { return 0; }
+    virtual cudaError_t encode(int entry, const void *frame, cudaStream_t s)
+    {
+        (void)entry, (void)frame, (void)s;
+        return cudaErrorNotSupported;
+    }
+    virtual cudaError_t run_cached(const int *sel, void *out, cudaStream_t s)
+    {
+        (void)sel, (void)out, (void)s;
+        return cudaErrorNotSupported;
+    }
 
     static std::unique_ptr<VidNet> create(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why);
 };

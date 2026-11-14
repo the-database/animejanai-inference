@@ -260,16 +260,23 @@ struct aji_ctx {
         void *ring = nullptr;        // nslots * 3*w*h fp16
         float *diff = nullptr;       // per slot: rgb diff vs seq-1
         std::vector<int64_t> seq;    // per slot, -1 = empty
+        std::vector<uint64_t> gen;   // per slot: which store put the frame there (never reused)
         std::vector<int> matrix, range;
         void *in_tensor = nullptr;   // 3t * pw*ph fp16
         void *out_tensor = nullptr;  // 3 * pow*poh fp16
         std::shared_ptr<ajinative::VidNet> native;  // native kernels in place of the engine
+        // native models that keep per-frame work (TemporalFix's encoder): the gen of the frame
+        // in each of its cache entries (0 = none), and the window's entries on the device
+        std::vector<uint64_t> cgen;
+        int *sel = nullptr;
         uint64_t runs = 0;           // model runs (AJI_TEMPORAL_STATS)
     };
     struct {
         bool enabled = false;
         int r = 0;                   // total radius: the sum over stages
         uint64_t ingests = 0;        // AJI_TEMPORAL_STATS
+        uint64_t encodes = 0;        // AJI_TEMPORAL_STATS: frames a native cache encoded
+        uint64_t gen_next = 1;       // the next ring store's gen
         std::vector<TemporalStage> st;
     } temporal;
 
@@ -962,6 +969,9 @@ void temporal_teardown(aji_ctx *c)
         for (size_t i = 0; i < TT.st.size(); i++)
             fprintf(stderr, "; stage %zu (%d frames): %llu runs", i,
                     TT.st[i].t, (unsigned long long)TT.st[i].runs);
+        if (TT.encodes)
+            fprintf(stderr, "; %llu native frame encodes",
+                    (unsigned long long)TT.encodes);
         fprintf(stderr, "\n");
     }
     for (auto &T : TT.st) {
@@ -969,6 +979,7 @@ void temporal_teardown(aji_ctx *c)
         cudaFree(T.diff);
         cudaFree(T.in_tensor);
         cudaFree(T.out_tensor);
+        cudaFree(T.sel);
     }
     TT = {};
 }
@@ -1000,6 +1011,16 @@ bool setup_temporal(aji_ctx *c)
         }
         cudaMemset(T.diff, 0, sizeof(float) * T.nslots);
         T.seq.assign(T.nslots, -1);
+        T.gen.assign(T.nslots, 0);
+        // AJI_NATIVE_FRAME_CACHE=off: every window encodes all its frames (for comparisons)
+        static const bool fcache = !getenv("AJI_NATIVE_FRAME_CACHE") || strcmp(getenv("AJI_NATIVE_FRAME_CACHE"), "off") != 0;
+        if (fcache && T.native && T.native->cache_entries() >= T.t) {
+            if (cudaMalloc((void **)&T.sel, sizeof(int) * T.t) != cudaSuccess) {
+                c->set_error("temporal buffer allocation failed");
+                return false;
+            }
+            T.cgen.assign(T.native->cache_entries(), 0);
+        }
         T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
         T.range.assign(T.nslots, AJI_RANGE_LIMITED);
     }
@@ -2176,6 +2197,7 @@ static int temporal_store(aji_ctx *c, size_t lv, const void *src,
         }
     }
     T.seq[slot] = seq;
+    T.gen[slot] = c->temporal.gen_next++;
     T.matrix[slot] = matrix;
     T.range[slot] = range;
     return AJI_OK;
@@ -2247,6 +2269,63 @@ static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
         if (j + 1 < T.t && held[j] && held[j + 1])
             args.cut[j] = &T.diff[slots[j + 1]];
     }
+    const Step &st = c->steps[T.step_idx];
+    if (T.sel) {
+        // Per-frame work kept across windows: each window frame not in the
+        // model's cache is padded (into in_tensor's first frame) and encoded
+        // into an entry no frame of this window holds; the device then picks
+        // each position's entry under the gather's scene-cut rule.
+        aji_select_args sa = {};
+        for (int j = 0; j < T.t; j++) {
+            const uint64_t g = T.gen[slots[j]];
+            int e = -1;
+            for (int k = 0; k < (int)T.cgen.size() && e < 0; k++)
+                if (T.cgen[k] == g)
+                    e = k;
+            if (e < 0) {
+                uint64_t oldest = UINT64_MAX;
+                for (int k = 0; k < (int)T.cgen.size(); k++) {
+                    bool used = false;
+                    for (int i = 0; i < T.t; i++)
+                        used = used || T.cgen[k] == T.gen[slots[i]];
+                    if (!used && T.cgen[k] < oldest) {
+                        oldest = T.cgen[k];
+                        e = k;
+                    }
+                }
+                aji_gather_args one = {};
+                one.src[0] = args.src[j];
+                int err = aji_temporal_gather(&one, 1, 0.0f, T.w, T.h, T.pw,
+                                              T.ph, T.in_tensor, stream);
+                if (err) {
+                    c->set_error("temporal gather kernel failed: %s",
+                                 cudaGetErrorString((cudaError_t)err));
+                    return AJI_ERR_CUDA;
+                }
+                const cudaError_t ce = T.native->encode(e, T.in_tensor, stream);
+                if (ce != cudaSuccess) {
+                    c->set_error("native kernels failed: %s", cudaGetErrorString(ce));
+                    return AJI_ERR_CUDA;
+                }
+                T.cgen[e] = g;
+                c->temporal.encodes++;
+            }
+            sa.ent[j] = e;
+            sa.cut[j] = args.cut[j];
+        }
+        int err = aji_temporal_select(&sa, T.t, T.threshold, T.w, T.h, T.sel,
+                                      stream);
+        if (err) {
+            c->set_error("temporal select kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+        const cudaError_t e = T.native->run_cached(T.sel, T.out_tensor, stream);
+        if (e != cudaSuccess) {
+            c->set_error("native kernels failed: %s", cudaGetErrorString(e));
+            return AJI_ERR_CUDA;
+        }
+    } else {
     int err = aji_temporal_gather(&args, T.t, T.threshold, T.w, T.h, T.pw,
                                   T.ph, T.in_tensor, stream);
     if (err) {
@@ -2255,7 +2334,6 @@ static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
         return AJI_ERR_CUDA;
     }
 
-    const Step &st = c->steps[T.step_idx];
     if (T.native) {
         const cudaError_t e = T.native->run(T.in_tensor, T.out_tensor, stream);
         if (e != cudaSuccess) {
@@ -2273,6 +2351,7 @@ static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
             c->set_error("enqueueV3 failed");
             return AJI_ERR_ENGINE;
         }
+    }
     }
     T.runs++;
 

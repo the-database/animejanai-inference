@@ -885,6 +885,48 @@ __global__ void k_temporal_gather(aji_gather_args args, int t, float thresh,
         dst[(size_t)(z * 3 + c) * dplane + di] = src[c * splane + si];
 }
 
+// sel[z] = ent[e] for the frame e that window position z reads (k_temporal_gather's rule).
+__global__ void k_temporal_select(aji_select_args args, int t, float thresh,
+                                  float inv_area, int *sel)
+{
+    const int z = threadIdx.x;
+    if (z >= t)
+        return;
+    const int center = (t - 1) / 2;
+    int e = center;
+    if (thresh > 0.0f) {
+        if (z > center) {
+            for (int k = center; k < z; k++) {
+                const float *cut = args.cut[k];
+                if (cut && *cut * inv_area > thresh)
+                    break;
+                e = k + 1;
+            }
+        } else {
+            for (int k = center - 1; k >= z; k--) {
+                const float *cut = args.cut[k];
+                if (cut && *cut * inv_area > thresh)
+                    break;
+                e = k;
+            }
+        }
+    } else {
+        e = z;
+    }
+    sel[z] = args.ent[e];
+}
+
+extern "C" int aji_temporal_select(const aji_select_args *args, int t,
+                                   float thresh, int w, int h, int *sel_dev,
+                                   void *stream)
+{
+    if (t < 1 || t > AJI_TEMPORAL_MAX)
+        return (int)cudaErrorInvalidValue;
+    k_temporal_select<<<1, 32, 0, (cudaStream_t)stream>>>(
+        *args, t, thresh, 1.0f / ((float)w * h), sel_dev);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int aji_temporal_gather(const aji_gather_args *args, int t,
                                    float thresh, int w, int h, int pw, int ph,
                                    void *dst_f16, void *stream)

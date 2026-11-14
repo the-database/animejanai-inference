@@ -13,7 +13,7 @@ The spikes that chose them follow the results. RTX 5090 (402 W), TensorRT 11.4.0
 |---|---|---|---|---|---|
 | RIFE v4.26 | video | 3.91 / 15.98 ms @1080p / 4K | 2.06 / 6.61 ms | 1.9x / 2.4x | 73–75 dB / — (66–73 dB apart) |
 | RIFE v4.14, v4.22 lite, v4.7, ensembles | video | (all 28 models) | | 1.4–2.4x | as above |
-| TemporalFix s1–s3 | video, temporal | 4.70 / 11.6 / 21.7 / 48.0 ms @720p / 1080p / 1440p / 4K | 4.51 / 10.4 / 17.7 / 41.8 ms | 1.04x / 1.11x / 1.22x / 1.15x | 77–83 dB / ~53 dB |
+| TemporalFix s1–s3 | video, temporal | 2.53 / 4.83 / 11.3 / 48.1 ms @DVD / 720p / 1080p / 4K (chain) | 1.91 / 3.41 / 8.1 / 31.9 ms | 1.33x / 1.42x / 1.39x / 1.50x | 77–91 dB / ~51–53 dB |
 | TFDAT (bndl, 9 frames) | video, temporal | 84.5 ms @720p (chain), 205 @1080p | 57.0 / 129 ms | 1.48x / 1.58x | 57–74 dB / 49–60 dB |
 | TFDAT v2 1x (5 frames, random weights) | video, temporal | 18.1 ms @720p (chain); 4.81 / 7.41 / 41.4 ms @640x352 / 736x480 / 1080p | 13.75; 5.55 / 6.97 / 31.1 ms | 1.32x; 0.87x / 1.06x / 1.33x | 68–70 dB / — |
 | TFDAT v2 4x (5 frames, random weights) | video, temporal | 331 ms @720p (chain), 69.1 @640x352 | 203 / 44 ms | 1.63x / 1.57x | 70 dB / ~45 dB apart |
@@ -30,10 +30,14 @@ same input.
 
 What came out differently from the spikes:
 
-- **Gains are smaller than estimated** for RIFE (1.9–2.4x, estimate 4–6x) and TemporalFix (about 1.1x,
+- **Gains are smaller than estimated** for RIFE (1.9–2.4x, estimate 4–6x) and TemporalFix (1.3–1.5x,
   estimate 5–8x). Both are mostly full-resolution resampling and warps, which are bandwidth-bound for
   native kernels too, plus many tiny low-resolution convs that are latency-bound. TemporalFix runs
-  its six support frames as concurrent streams at 720p and below, and replays as a CUDA graph.
+  its six support frames as concurrent streams at 720p and below, replays as a CUDA graph, and keeps
+  each frame's encoder output and pyramid across windows (one encode per frame instead of seven;
+  about 30% of a window). The temporal stage picks each window position's cache entry on the device,
+  under the same scene-cut rule as the gather; `AJI_NATIVE_FRAME_CACHE=off` encodes every window in
+  full. The standalone runner always runs full windows (1.04–1.22x).
 - **Native is more accurate than TensorRT's fp16 engines** on every transformer and temporal model:
   FDAT, TFDAT, HAT, DAT and TemporalFix all land at 57–83 dB against fp32, TensorRT at 49–60 dB
   (FDAT_M 4x at 512 tiles: max 31 levels off). Native keeps fp32 accumulation and statistics.
