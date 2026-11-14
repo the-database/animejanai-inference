@@ -137,6 +137,16 @@ keeps the default: its chains run upscale, RIFE and temporal steps that may over
 memory at load is reported as such and keeps the engine (TensorRT's own allocation failures are
 caught through `TrtLogger::oom_errors`), instead of deleting it as stale and rebuilding.
 
+**`aji_img_memory_get`** (0.28.0, probed like `aji_img_release_device`) reports the device's free
+memory, the context's shared activations and scratch, and a model's weights (its engine file's
+size), activations and tile buffers, so apps size tiles to fit (yosh-image's `tiles::Budget`).
+Activations grow linearly with the tile's area (TensorRT-RTX: ~1.1 KB per input pixel for 2x
+ESRGAN, ~4.5 KB for 4x), so one engine predicts another's. DirectML can't report per buffer: a
+model's activations are this process's local video memory growth (`QueryVideoMemoryInfo`) across
+its load and warm-up runs, less the ONNX file's size. On Windows the free memory leaves out other
+processes' (WDDM pages them out instead of failing, at a heavy cost in speed), so apps take NVML's
+device-wide figure where lower.
+
 ## Build system
 
 CMake only (`cmake_minimum_required(VERSION 3.24)`, C11 / C++17, `LANGUAGES C CXX CUDA`).
