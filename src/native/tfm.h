@@ -49,12 +49,20 @@ struct TGemm {
     int s1 = 0, s2 = 0;
     float slope = 0.2f;     // LRelu
     bool act_last = false;  // apply act after the adds instead of before the scale
+    // fp32 residual streams (bf16-trained models whose stream outgrows fp16): out and/or add1 as float
+    bool out_f32 = false, add1_f32 = false;
+    const float *add2scale = nullptr;  // [Npad] device: add2 scaled per column before it is added, or null
 };
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
 
 // LayerNorm of the first C channels (gamma, beta: C floats in device memory), zeros to pad.
 cudaError_t tlayernorm(const void *in, int sin, void *out, int sout, int M, int C, int cpad, const float *gamma,
                        const float *beta, float eps, cudaStream_t s);
+// The same with fp32 input and/or output (strides in elements; cpad a multiple of 8).
+cudaError_t tlayernorm2(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int C, int cpad,
+                        const float *gamma, const float *beta, float eps, cudaStream_t s);
+// Element copies between fp32 and fp16 token maps: n channels per token (a multiple of 8).
+cudaError_t tconvert(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int n, cudaStream_t s);
 
 struct TWinAttn {
     const void *qkv = nullptr;  // tokens [H][W][sq]: q at qo + h*hd, k at ko + h*hd, v at vo + h*hd
@@ -63,10 +71,22 @@ struct TWinAttn {
     int wh = 0, ww = 0;                   // window size (wh*ww tokens, a multiple of 16, <= 1024)
     int shift_y = 0, shift_x = 0;         // cyclic shift (HAT-style), 0 for none
     float scale = 1.f;
-    const float *bias = nullptr;          // [heads][T][T] (T = wh*ww), or null
+    const float *bias = nullptr;          // [heads][T][Tk] (T = wh*ww), or null
     void *out = nullptr;                  // tokens [H][W][so], head h at h*hd
     int so = 0;
+    // General form (another kernel): overlapping key windows of kwh x kww tokens at (wy*wh - kpad,
+    // wx*ww - kpad), zero outside the image (HAT's OCAB; Tk = kwh*kww <= 576); Swin's mask for
+    // shifted windows (-100 between the regions the roll joins); and the bias as a relative-position
+    // table: bias(q, k) = rtab[h][(ky - kpad - qy + rt_off) * rt_w + (kx - kpad - qx + rt_off)].
+    int kwh = 0, kww = 0, kpad = 0;
+    bool mask = false;
+    const float *rtab = nullptr;
+    int rt_w = 0, rt_off = 0;
 };
+// The relative-position table behind a full bias [heads][wh*ww][kwh*kww] (square windows; kwh = 0:
+// the query window), if the bias is one (each relative offset one value): rt_w, rt_off as above.
+bool tbias_table(const std::vector<float> &bias, int heads, int ws, int kws, int kpad, std::vector<float> *tab, int *rt_w,
+                 int *rt_off);
 cudaError_t twinattn(const TWinAttn &a, cudaStream_t s);
 
 // Depthwise 3x3 (zero padding, no bias) over the first C channels; w: [C][9] floats (device).

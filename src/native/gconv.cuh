@@ -39,6 +39,10 @@ struct GParams {
     int coutp_all, ksplit;              // all output channels; K splits (1: no workspace)
     int up2;                            // input is nearest-upsampled by 2 (IH, IW: the upsampled size)
     float *ws;                          // [ksplit][H*W][coutp_all]
+    int outf;                           // fp32 output through the workspace and k_gconv_reduce
+    float *dstf;
+    const float *r1f;
+    int r1fs;
 };
 
 __device__ __forceinline__ half2 u2h(uint32_t u) { return *reinterpret_cast<half2 *>(&u); }
@@ -187,7 +191,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
 
     // epilogue: lane holds pixels g, g+8 of row `warp`, channels n*8 + 2tq, +1
     const int g = lane >> 2, tq = lane & 3, oy = ty0 + warp;
-    if (p.ksplit > 1) {
+    if (p.ksplit > 1 || p.outf) {
         // fp32 partial sums to the workspace; k_gconv_reduce adds the bias and runs the epilogue
 #pragma unroll
         for (int n = 0; n < NT; n++)
@@ -269,6 +273,24 @@ __global__ void k_gconv_reduce(GParams p)
         s.y += v.y;
     }
     const float2 b = __half22float2(p.bias[ch / 2]);
+    if (p.outf) {
+        s.x += b.x;
+        s.y += b.y;
+        if (p.r1f) {
+            const float2 r = *reinterpret_cast<const float2 *>(p.r1f + pix * p.r1fs + ch);
+            s.x += r.x;
+            s.y += r.y;
+        }
+        if (p.act == 1) {
+            s.x = fmaxf(s.x, 0.f);
+            s.y = fmaxf(s.y, 0.f);
+        } else if (p.act == 2) {
+            s.x = s.x < 0.f ? s.x * p.slopef : s.x;
+            s.y = s.y < 0.f ? s.y * p.slopef : s.y;
+        }
+        *reinterpret_cast<float2 *>(p.dstf + pix * p.dstride + ch) = s;
+        return;
+    }
     half2 v = __floats2half2_rn(s.x + b.x, s.y + b.y);
     v = g_epi(p, v, y, x, ch);
     if (p.R == 0) {

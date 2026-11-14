@@ -116,7 +116,51 @@ __global__ void __launch_bounds__(256) k_aim_sg8(const half *attn, const half *c
     *reinterpret_cast<uint4 *>(x + o) = u;
 }
 
+__global__ void k_chan_gate(const float *sums, int M, int C, int r, const float *w1, const float *b1, const float *w2, const float *b2,
+                            int act, float in_scale, float *cm, int cpad)
+{
+    extern __shared__ float sh[];
+    float *mean = sh, *hid = sh + C;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) mean[c] = sums[c] / M * in_scale;
+    __syncthreads();
+    for (int j = threadIdx.x; j < r; j += blockDim.x) {
+        float s = b1 ? b1[j] : 0.f;
+        for (int c = 0; c < C; c++) s += w1[j * C + c] * mean[c];
+        hid[j] = act ? fmaxf(s, 0.f) : gelu(s);
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < cpad; c += blockDim.x) {
+        float s = c < C && b2 ? b2[c] : 0.f;
+        if (c < C)
+            for (int j = 0; j < r; j++) s += w2[c * r + j] * hid[j];
+        cm[c] = c < C ? sigm(s) : 0.f;
+    }
+}
+
+__global__ void k_sub3(half *x, int st, int M, float m0, float m1, float m2)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= M) return;
+    half *p = x + (size_t)t * st;
+    p[0] = __float2half(__half2float(p[0]) - m0);
+    p[1] = __float2half(__half2float(p[1]) - m1);
+    p[2] = __float2half(__half2float(p[2]) - m2);
+}
+
 }  // namespace
+
+cudaError_t chan_gate(const float *sums, int M, int C, int r, const float *w1, const float *b1, const float *w2, const float *b2, int act,
+                      float in_scale, float *cm, int cpad, cudaStream_t s)
+{
+    k_chan_gate<<<1, 256, (C + r) * sizeof(float), s>>>(sums, M, C, r, w1, b1, w2, b2, act, in_scale, cm, cpad);
+    return cudaGetLastError();
+}
+
+cudaError_t tok_sub3(void *x, int st, int M, float m0, float m1, float m2, cudaStream_t s)
+{
+    k_sub3<<<(M + 255) / 256, 256, 0, s>>>((half *)x, st, M, m0, m1, m2);
+    return cudaGetLastError();
+}
 
 cudaError_t fdat_chan_soft(const float *stats, const float *temp, int heads, int hd, float eps, float *attn, cudaStream_t s)
 {

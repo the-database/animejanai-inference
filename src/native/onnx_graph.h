@@ -14,7 +14,7 @@
 
 namespace ajinative {
 
-enum OnnxType { ONNX_FLOAT = 1, ONNX_INT32 = 6, ONNX_INT64 = 7, ONNX_FLOAT16 = 10, ONNX_DOUBLE = 11 };
+enum OnnxType { ONNX_FLOAT = 1, ONNX_INT32 = 6, ONNX_INT64 = 7, ONNX_FLOAT16 = 10, ONNX_DOUBLE = 11, ONNX_BFLOAT16 = 16 };
 
 struct OnnxTensor {
     std::string name;
