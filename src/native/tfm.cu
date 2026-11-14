@@ -53,6 +53,8 @@ struct GemmP {
     int so;
     const half *add1, *add2;
     int s1, s2, act;
+    float slope;
+    int act_last;
 };
 
 __global__ void __launch_bounds__(128) k_gemm(GemmP p)
@@ -105,9 +107,14 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
                 v0 += p.bias[c];
                 v1 += p.bias[c + 1];
             }
-            if (p.act == 1) {
-                v0 = gelu(v0);
-                v1 = gelu(v1);
+            if (!p.act_last) {
+                if (p.act == 1) {
+                    v0 = gelu(v0);
+                    v1 = gelu(v1);
+                } else if (p.act == 2) {
+                    v0 = v0 < 0.f ? v0 * p.slope : v0;
+                    v1 = v1 < 0.f ? v1 * p.slope : v1;
+                }
             }
             if (p.colscale) {
                 v0 *= p.colscale[c];
@@ -122,6 +129,15 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
                 const float2 f = __half22float2(*reinterpret_cast<const half2 *>(p.add2 + (size_t)r * p.s2 + c));
                 v0 += f.x;
                 v1 += f.y;
+            }
+            if (p.act_last) {
+                if (p.act == 1) {
+                    v0 = gelu(v0);
+                    v1 = gelu(v1);
+                } else if (p.act == 2) {
+                    v0 = v0 < 0.f ? v0 * p.slope : v0;
+                    v1 = v1 < 0.f ? v1 * p.slope : v1;
+                }
             }
             *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + c) = __floats2half2_rn(v0, v1);
         }
@@ -692,7 +708,7 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     if (g.sa % 8 || g.so % 2 || (g.add1 && g.s1 % 2) || (g.add2 && g.s2 % 2) || g.sa < w.Kpad || g.so < w.Npad)
         return cudaErrorInvalidValue;
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
-            (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act};
+            (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0};
     const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);
     k_gemm<<<grid, 128, 0, s>>>(p);
     return cudaGetLastError();

@@ -43,7 +43,7 @@ template <typename T> std::vector<T> host(const T *d, size_t n)
     return h;
 }
 
-static void test_gemm(int M, int K, int N, bool bias, bool gelu_, bool scale, bool add1, bool add2)
+static void test_gemm(int M, int K, int N, bool bias, bool gelu_, bool scale, bool add1, bool add2, bool lrelu_last = false)
 {
     const int Kp = (K + 15) / 16 * 16, Np = (N + 15) / 16 * 16, sa = Kp + 8, so = Np + 16;
     std::vector<uint16_t> a((size_t)M * sa, 0), a1((size_t)M * so), a2((size_t)M * so);
@@ -64,6 +64,7 @@ static void test_gemm(int M, int K, int N, bool bias, bool gelu_, bool scale, bo
     g.colscale = scale ? dcs : nullptr;
     if (add1) { g.add1 = d1; g.s1 = so; }
     if (add2) { g.add2 = d2; g.s2 = so; }
+    if (lrelu_last) { g.act = TAct::LRelu; g.act_last = true; g.slope = 0.2f; }
     tgemm(tm, g, nullptr);
     cudaDeviceSynchronize();
     auto o = host(dout, (size_t)M * so);
@@ -76,10 +77,11 @@ static void test_gemm(int M, int K, int N, bool bias, bool gelu_, bool scale, bo
             if (scale) v *= cs[n];
             if (add1) v += hf(a1[(size_t)m * so + n]);
             if (add2) v += hf(a2[(size_t)m * so + n]);
+            if (lrelu_last && v < 0) v *= 0.2;
             me = std::max(me, std::fabs(v - hf(o[(size_t)m * so + n])));
         }
     char nm[96];
-    snprintf(nm, sizeof(nm), "gemm %dx%dx%d%s%s%s%s%s", M, K, N, bias ? " bias" : "", gelu_ ? " gelu" : "", scale ? " scale" : "",
+    snprintf(nm, sizeof(nm), "gemm %dx%dx%d%s%s%s%s%s%s", M, K, N, lrelu_last ? " lrelu-last" : "", bias ? " bias" : "", gelu_ ? " gelu" : "", scale ? " scale" : "",
              add1 ? " add1" : "", add2 ? " add2" : "");
     report(nm, me, 0.02);
     tmat_release(tm);
@@ -281,6 +283,7 @@ int main()
     test_gemm(77, 120, 240, false, true, false, false, false);
     test_gemm(64, 240, 120, false, false, false, true, false);
     test_gemm(100, 180, 540, true, true, false, false, false);
+    test_gemm(90, 120, 120, true, false, false, true, false, true);
     test_ln(300, 120);
     test_ln(50, 180);
     test_win(16, 16, 4, 30, 8, 8, 0, 0, true);
