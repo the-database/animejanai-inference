@@ -118,3 +118,43 @@ at this size) and the rest left on TensorRT, 720p would go from ~87 to ~40 ms (~
 alignment and fusion native too, ~25–30 ms (~3x), i.e. from 11 fps to 25–35 fps at 720p. The
 per-frame encoder's features could be cached across frames (8 of 9 inputs repeat), but that is
 only ~2%.
+
+## RIFE (v4.14, v4.26; `rife/`)
+
+IFNet: 4 (v4.14) or 5 (v4.26) IFBlocks, coarse to fine. Each block warps both frames by the
+current flow (`GridSample`), resizes the warped frames (and the features) down to its scale, runs
+a stride-2 encoder and 8 residual 3x3 convs (`conv·β + x`, LeakyReLU; 32–192 channels), predicts a
+flow/mask delta with a transposed conv + depth-to-space, and resizes it back up to full resolution.
+The end warps both frames once more and blends them by a sigmoid mask. libaji feeds it 11 channels
+(both frames, the timestep, flow-scale and grid planes) at the padded output size; the ~40 shipped
+RIFE ONNX files (4.7–4.26, lite, ensemble) are all this family.
+
+TensorRT (libaji's RIFE settings: strongly typed, fp16 I/O), per interpolated frame:
+
+| | 1920x1088 | 3840x2176 |
+|---|---|---|
+| v4.14 | 4.8 ms | 21.0 ms |
+| v4.26 | 4.06 ms | 19.3 ms |
+
+At 4K, v4.26 spends 4.3 ms in convs (0.29 TFLOP, ~68 TFLOPS) and **14.0 ms (76%) in everything
+else**: Myelin kernels around `GridSample` + slice + resize at 2–3.5 ms each, i.e. the full-
+resolution warp → downsample → flow-upsample chain every block repeats. The convs are uneven: the
+deep 64–128-channel ones reach 110–250 TFLOPS, but the small-channel ones at full or half
+resolution are memory-bound and slow (v4.26's two 16→16 convs at 1920x1088: 2.08 ms at ~9 TFLOPS,
+where reading and writing their data takes ~0.1 ms).
+
+Why native should win big here: a block only needs its warped, downsampled input at its own
+resolution, and a bilinear downsample of a warp is just the warp evaluated at the downsample's
+sample points (identical maths, fewer pixels), with the flow itself bilinearly upsampled at those
+same points. So the full-resolution passes collapse to the final warp + blend (~0.1–0.2 ms at 4K),
+the small-channel convs become memory-bound fused kernels, and the deep convs run on the existing
+kernels. Rough estimate for v4.26 at 4K: **~3–5 ms against 19.3 (4–6x)**; at 1080p ~1–1.5 ms
+against 4.06 (~3x, where launch overheads matter more). Estimate only, not prototyped.
+
+In mpv that is the interpolated frame in every RIFE chain: Phase 3's Performance + RIFE 2x at 4K
+spent ~16 of its ~18 ms per source frame in RIFE.
+
+Cost: medium. Small graphs (~250 nodes) that are regular across versions; new pieces are a
+stride-2 conv input mode, the transposed conv + depth-to-space tail, the per-channel β residual
+epilogue, a fused warp/resample kernel and the final blend, plus wiring a native RIFE step next
+to the TensorRT RIFE engine in the video path.
