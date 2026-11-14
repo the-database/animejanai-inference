@@ -177,11 +177,25 @@ static void test_dw_sums(int H, int W, int C)
     for (auto &v : w) v = ur(0.5f);
     uint16_t *di = dev(in), *dout = dev(std::vector<uint16_t>((size_t)H * W * st, 0));
     float *dw = dev(w), *ds = dev(std::vector<float>(C, 0.f));
+    float *dfs = dev(std::vector<float>(C, 0.f));
+    uint16_t *dout2 = dev(std::vector<uint16_t>((size_t)H * W * st, 0));
     tdwconv(di, st, dout, st, H, W, C, dw, true, nullptr);
+    tdwconv(di, st, dout2, st, H, W, C, dw, true, dfs, nullptr);  // fused channel sums of the output
     tcolsum(di, st, H * W, C, ds, nullptr);
     cudaDeviceSynchronize();
     auto o = host(dout, (size_t)H * W * st);
+    auto o2 = host(dout2, (size_t)H * W * st);
     auto sums = host(ds, C);
+    auto fsums = host(dfs, C);
+    double mf = 0;
+    for (int c = 0; c < C; c++) {
+        double s = 0;
+        for (int t = 0; t < H * W; t++) {
+            s += hf(o2[(size_t)t * st + c]);
+            mf = std::max(mf, (double)std::fabs(hf(o2[(size_t)t * st + c]) - hf(o[(size_t)t * st + c])));
+        }
+        mf = std::max(mf, std::fabs(s - fsums[c]) / (1 + std::fabs(s)) > 2e-3 ? 1.0 : 0.0);
+    }
     double me = 0, ms = 0;
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++)
@@ -200,7 +214,8 @@ static void test_dw_sums(int H, int W, int C)
     }
     report("dwconv gelu", me, 0.01);
     report("colsum", ms, 1e-4);
-    cudaFree(di); cudaFree(dout); cudaFree(dw); cudaFree(ds);
+    report("dwconv + fused sums", mf, 1e-3);
+    cudaFree(di); cudaFree(dout); cudaFree(dw); cudaFree(ds); cudaFree(dfs); cudaFree(dout2);
 }
 
 static void test_chanstats(int M, int heads, int hd)
@@ -234,6 +249,26 @@ static void test_chanstats(int M, int heads, int hd)
     cudaFree(dq); cudaFree(dst);
 }
 
+static void test_pack(int K, int N)
+{
+    std::vector<float> w((size_t)K * N);
+    for (auto &v : w) v = hf(hb(ur(1.f)));
+    TMat a, b;
+    tmat_upload(a, w.data(), nullptr, K, N);
+    tmat_alloc(b, K, N, nullptr);
+    float *dw = dev(w);
+    tmat_pack(b, dw, nullptr);
+    cudaDeviceSynchronize();
+    const size_t n = (size_t)a.Kpad * a.Npad;
+    auto ha = host((const uint16_t *)a.frag, n), hb2 = host((const uint16_t *)b.frag, n);
+    double me = 0;
+    for (size_t i = 0; i < n; i++) me = std::max(me, (double)(ha[i] != hb2[i]));
+    report("device pack == host pack", me, 0);
+    tmat_release(a);
+    tmat_release(b);
+    cudaFree(dw);
+}
+
 int main()
 {
     cudaDeviceProp p{};
@@ -254,8 +289,15 @@ int main()
     test_win(16, 40, 6, 30, 8, 32, 0, 0, false);
     test_dw_sums(23, 19, 120);
     test_dw_sums(16, 16, 240);
+    test_dw_sums(9, 11, 30);  // scalar path
     test_chanstats(700, 4, 30);
     test_chanstats(300, 6, 30);
+    test_chanstats(5000, 4, 30);
+    test_chanstats(333, 8, 16);
+    test_chanstats(300, 2, 40);  // CUDA-core path
+    test_ln(77, 30);             // channels not a multiple of 8
+    test_pack(120, 120);
+    test_pack(180, 540);
     printf("native tfm: %s (%d checks)\n", fails ? "FAIL" : "OK", checks);
     return fails ? 1 : 0;
 }

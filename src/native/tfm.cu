@@ -1,6 +1,9 @@
 // native/tfm.cu — see tfm.h.
 #include "native/tfm.h"
 
+#include <algorithm>
+#include <cstdint>
+
 #include <cuda_fp16.h>
 
 #include "native/pack.h"
@@ -58,7 +61,8 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
     constexpr int BM = 64, KC = 64, AP = KC + 8;
     __shared__ __align__(16) half sa[BM * AP];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int m0 = blockIdx.x * BM, j0 = blockIdx.y * 4;  // 4 n16 chunks = 64 columns
+    // linear grid with the column tiles of a row block adjacent: they run together and share its A rows in L2
+    const int ncol = (p.njt + 3) / 4, m0 = (int)(blockIdx.x / ncol) * BM, j0 = (int)(blockIdx.x % ncol) * 4;  // 4 n16 chunks = 64 columns
     float acc[8][4];
 #pragma unroll
     for (int n = 0; n < 8; n++)
@@ -186,7 +190,7 @@ __global__ void __launch_bounds__(128) k_winattn(WinP p)
     half *sq = reinterpret_cast<half *>(smraw);
     const int T = p.wh * p.ww;
     half *sk = sq + T * HP, *sv = sk + T * HP;
-    const int win = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int win = (int)(blockIdx.x / p.heads), h = (int)(blockIdx.x % p.heads), tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     // gather q, k, v of this head (dims padded to 32 with zeros)
     for (int i = tid; i < T * 16; i += 128) {
         const int t = i / 16, d2 = (i % 16) * 2;
@@ -402,7 +406,258 @@ __global__ void __launch_bounds__(256) k_chanstats(const half *qkv, int sq, int 
     for (int id = threadIdx.x; id < total; id += 256, n++) atomicAdd(stats + id, acc[n]);
 }
 
+// ---- vector paths (8 channels per thread, uint4 access): strides and channel offsets multiples of 8
+
+__device__ __forceinline__ void unpack8(const uint4 &u, float (&v)[8])
+{
+    const half2 *h = reinterpret_cast<const half2 *>(&u);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const float2 f = __half22float2(h[j]);
+        v[2 * j] = f.x;
+        v[2 * j + 1] = f.y;
+    }
+}
+__device__ __forceinline__ uint4 pack8(const float (&v)[8])
+{
+    uint4 u;
+    uint32_t *p = reinterpret_cast<uint32_t *>(&u);
+#pragma unroll
+    for (int j = 0; j < 4; j++) p[j] = h2u(__floats2half2_rn(v[2 * j], v[2 * j + 1]));
+    return u;
+}
+
+// LayerNorm: L lanes per token (cpad <= 8 L), each one uint4 of channels.
+template <int L>
+__global__ void __launch_bounds__(256) k_ln8(const half *in, int sin, half *out, int sout, int M, int C, int cpad, const float *gm,
+                                             const float *bt, float eps)
+{
+    const int sub = threadIdx.x % L, t = (blockIdx.x * blockDim.x + threadIdx.x) / L, c = sub * 8;
+    const bool ok = t < M, live = ok && c < cpad;
+    float v[8] = {};
+    if (live) unpack8(*reinterpret_cast<const uint4 *>(in + (size_t)t * sin + c), v);
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        if (c + j >= C) v[j] = 0.f;
+        s += v[j];
+    }
+#pragma unroll
+    for (int o = L / 2; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    const float mean = s / C;
+    float q = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+        if (c + j < C) q += (v[j] - mean) * (v[j] - mean);
+#pragma unroll
+    for (int o = L / 2; o; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
+    const float rs = rsqrtf(q / C + eps);
+    if (!live) return;
+    float y[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) y[j] = c + j < C ? (v[j] - mean) * rs * gm[c + j] + bt[c + j] : 0.f;
+    *reinterpret_cast<uint4 *>(out + (size_t)t * sout + c) = pack8(y);
+}
+
+// Depthwise 3x3, one thread per (8 channels, column, strip of DW_R rows): the 3x3 window slides down
+// the strip so each output row loads one new input row (3 pixels), weights held in registers.
+constexpr int DW_R = 8;
+__global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out, int sout, int H, int W, int C, const float *w, int gelu_,
+                                              float *sums)
+{
+    __shared__ float ss[1024];
+    if (sums) {
+        for (int i = threadIdx.x; i < C; i += blockDim.x) ss[i] = 0.f;
+        __syncthreads();
+    }
+    const int G = C / 8, strips = (H + DW_R - 1) / DW_R;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool live = i < G * W * strips;
+    const int g = i % G, rest = i / G, x = rest % W, y0 = (rest / W) * DW_R, c = g * 8;
+    float part[8] = {};
+    if (live) {
+        float wr[9][8];
+#pragma unroll
+        for (int k = 0; k < 9; k++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) wr[k][j] = __ldg(w + (c + j) * 9 + k);
+        auto row = [&](int y, uint4 (&r)[3]) {
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                const int xx = x + dx - 1;
+                r[dx] = (y >= 0 && y < H && xx >= 0 && xx < W) ? *reinterpret_cast<const uint4 *>(in + ((size_t)y * W + xx) * sin + c)
+                                                               : make_uint4(0, 0, 0, 0);
+            }
+        };
+        uint4 r0[3], r1[3], r2[3];
+        row(y0 - 1, r0);
+        row(y0, r1);
+#pragma unroll 2
+        for (int y = y0; y < min(H, y0 + DW_R); y++) {
+            row(y + 1, r2);
+            float a[8] = {};
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                float v[8];
+                unpack8(r0[dx], v);
+#pragma unroll
+                for (int j = 0; j < 8; j++) a[j] += v[j] * wr[dx][j];
+                unpack8(r1[dx], v);
+#pragma unroll
+                for (int j = 0; j < 8; j++) a[j] += v[j] * wr[3 + dx][j];
+                unpack8(r2[dx], v);
+#pragma unroll
+                for (int j = 0; j < 8; j++) a[j] += v[j] * wr[6 + dx][j];
+            }
+            if (gelu_)
+#pragma unroll
+                for (int j = 0; j < 8; j++) a[j] = gelu(a[j]);
+            *reinterpret_cast<uint4 *>(out + ((size_t)y * W + x) * sout + c) = pack8(a);
+#pragma unroll
+            for (int j = 0; j < 8; j++) part[j] += a[j];
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                r0[dx] = r1[dx];
+                r1[dx] = r2[dx];
+            }
+        }
+    }
+    if (sums) {
+        if (live)
+#pragma unroll
+            for (int j = 0; j < 8; j++) atomicAdd(ss + c + j, part[j]);
+        __syncthreads();
+        for (int k = threadIdx.x; k < C; k += blockDim.x) atomicAdd(sums + k, ss[k]);
+    }
+}
+
+// Channel attention statistics on tensor cores: per head the Gram matrix q^T k over the CTA's tokens
+// (64-token chunks in shared memory, each head's dims padded to 32), warp w doing heads w and w + 4;
+// the squared norms on the CUDA cores while copying.
+constexpr int CS_MAXH = 8;
+__global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, int qo, int ko, int M, int heads, int hd, int tpc, float *stats)
+{
+#if TFM_OK
+    extern __shared__ __align__(16) unsigned char smraw[];
+    const int P = heads * 32 + 8, C = heads * hd, pairs = C / 2;
+    half *s_q = reinterpret_cast<half *>(smraw), *s_k = s_q + 64 * P;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    for (int i = tid; i < 64 * P; i += 128) s_q[i] = s_k[i] = __float2half(0.f);
+    float acc[2][2][4][4] = {};
+    float nrm[2][2] = {};
+    const int t0 = blockIdx.x * tpc, t1 = min(M, t0 + tpc);
+    for (int tb = t0; tb < t1; tb += 64) {
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int sl = tid + 128 * j;
+            if (sl >= 2 * pairs) continue;
+            const bool isk = sl >= pairs;
+            const int c = 2 * (sl - (isk ? pairs : 0)), h = c / hd, d = c % hd;
+            const half *src = qkv + (size_t)tb * sq + (isk ? ko : qo) + c;
+            half *dst = (isk ? s_k : s_q) + h * 32 + d;
+            float n0 = 0.f, n1 = 0.f;
+#pragma unroll 8
+            for (int r = 0; r < 64; r++) {
+                half2 v = __float2half2_rn(0.f);
+                if (tb + r < t1) v = *reinterpret_cast<const half2 *>(src + (size_t)r * sq);
+                *reinterpret_cast<half2 *>(dst + r * P) = v;
+                const float2 f = __half22float2(v);
+                n0 += f.x * f.x;
+                n1 += f.y * f.y;
+            }
+            nrm[j][0] += n0;
+            nrm[j][1] += n1;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int hi = 0; hi < 2; hi++) {
+            const int h = warp + 4 * hi;
+            if (h >= heads) continue;
+#pragma unroll
+            for (int ks = 0; ks < 4; ks++) {
+                const int r = ks * 16 + (lane & 7), mj = lane >> 3;
+                uint32_t a[2][4], b[2][4];
+#pragma unroll
+                for (int mt = 0; mt < 2; mt++)  // A[d][t] = s_q[t][d]: matrix j at k + (j>>1)*8, m + (j&1)*8
+                    ldsm_x4_t(a[mt], s_q + (size_t)(r + (mj >> 1) * 8) * P + h * 32 + mt * 16 + (mj & 1) * 8);
+#pragma unroll
+                for (int np = 0; np < 2; np++)  // B[t][e] = s_k[t][e]: matrix j at k + (j&1)*8, n + (j>>1)*8
+                    ldsm_x4_t(b[np], s_k + (size_t)(r + (mj & 1) * 8) * P + h * 32 + np * 16 + (mj >> 1) * 8);
+#pragma unroll
+                for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+                    for (int nt = 0; nt < 4; nt++) mma32(acc[hi][mt][nt], a[mt], b[nt >> 1][(nt & 1) * 2], b[nt >> 1][(nt & 1) * 2 + 1]);
+            }
+        }
+    }
+#pragma unroll
+    for (int hi = 0; hi < 2; hi++) {
+        const int h = warp + 4 * hi;
+        if (h >= heads) continue;
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    const int d = mt * 16 + lane / 4 + (q >> 1) * 8, e = nt * 8 + (lane % 4) * 2 + (q & 1);
+                    if (d < hd && e < hd) atomicAdd(stats + ((size_t)h * hd + d) * hd + e, acc[hi][mt][nt][q]);
+                }
+    }
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+        const int sl = tid + 128 * j;
+        if (sl >= 2 * pairs) continue;
+        const bool isk = sl >= pairs;
+        const int c = 2 * (sl - (isk ? pairs : 0));
+        float *dst = stats + heads * hd * hd + (isk ? C : 0) + c;
+        atomicAdd(dst, nrm[j][0]);
+        atomicAdd(dst + 1, nrm[j][1]);
+    }
+#endif
+}
+
+// pack.h's layout: per (k16 chunk kc, n16 chunk j, lane) one uint4 = {b0, b1} of n-tile 2j, then of
+// 2j + 1; b0 = {B[2t][g], B[2t+1][g]}, b1 = {B[2t+8][g], B[2t+9][g]}, lane = g*4 + t.
+__global__ void k_pack(const float *w, int K, int N, int Kpad, int Npad, half *frag)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)Kpad * Npad) return;
+    const int k = (int)(i / Npad), n = (int)(i % Npad);
+    const float v = k < K && n < N ? w[(size_t)k * N + n] : 0.f;
+    const int kc = k / 16, r = k % 16, nt = n / 8, g = n % 8, j = nt / 2, sub = nt % 2;
+    const int hi = r >= 8, rr = r % 8, t = rr / 2, lo = rr % 2, lane = g * 4 + t;
+    const size_t word = (((size_t)kc * (Npad / 16) + j) * 32 + lane) * 4 + sub * 2 + hi;
+    frag[word * 2 + lo] = __float2half(v);
+}
+
 }  // namespace
+
+cudaError_t tmat_alloc(TMat &m, int K, int N, const float *bias_dev)
+{
+    m = TMat{};
+    m.K = K;
+    m.N = N;
+    m.Kpad = (K + 15) / 16 * 16;
+    m.Npad = (N + 15) / 16 * 16;
+    cudaError_t e = cudaMalloc(&m.frag, (size_t)m.Kpad * m.Npad * 2);
+    if (e == cudaSuccess) e = cudaMemset(m.frag, 0, (size_t)m.Kpad * m.Npad * 2);
+    if (e == cudaSuccess && bias_dev) {
+        e = cudaMalloc(&m.bias, (size_t)m.Npad * 4);
+        if (e == cudaSuccess) e = cudaMemset(m.bias, 0, (size_t)m.Npad * 4);
+        if (e == cudaSuccess) e = cudaMemcpy(m.bias, bias_dev, (size_t)N * 4, cudaMemcpyDeviceToDevice);
+    }
+    if (e != cudaSuccess) tmat_release(m);
+    return e;
+}
+
+cudaError_t tmat_pack(TMat &m, const float *w_dev, cudaStream_t s)
+{
+    const size_t n = (size_t)m.Kpad * m.Npad;
+    k_pack<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(w_dev, m.K, m.N, m.Kpad, m.Npad, (half *)m.frag);
+    return cudaGetLastError();
+}
 
 cudaError_t tmat_upload(TMat &m, const float *w, const float *bias, int K, int N)
 {
@@ -438,7 +693,7 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
         return cudaErrorInvalidValue;
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
             (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act};
-    const dim3 grid((g.M + 63) / 64, (w.Npad / 16 + 3) / 4);
+    const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);
     k_gemm<<<grid, 128, 0, s>>>(p);
     return cudaGetLastError();
 }
@@ -447,7 +702,13 @@ cudaError_t tlayernorm(const void *in, int sin, void *out, int sout, int M, int 
                        float eps, cudaStream_t s)
 {
     if (C > 256) return cudaErrorInvalidValue;
-    k_ln<<<(M + 7) / 8, 256, 0, s>>>((const half *)in, sin, (half *)out, sout, M, C, cpad, gamma, beta, eps);
+    const bool vec = cpad % 8 == 0 && cpad <= 256 && sin % 8 == 0 && sout % 8 == 0 && ((uintptr_t)in | (uintptr_t)out) % 16 == 0;
+    if (vec && cpad <= 128)
+        k_ln8<16><<<(M + 15) / 16, 256, 0, s>>>((const half *)in, sin, (half *)out, sout, M, C, cpad, gamma, beta, eps);
+    else if (vec)
+        k_ln8<32><<<(M + 7) / 8, 256, 0, s>>>((const half *)in, sin, (half *)out, sout, M, C, cpad, gamma, beta, eps);
+    else
+        k_ln<<<(M + 7) / 8, 256, 0, s>>>((const half *)in, sin, (half *)out, sout, M, C, cpad, gamma, beta, eps);
     return cudaGetLastError();
 }
 
@@ -466,15 +727,31 @@ cudaError_t twinattn(const TWinAttn &a, cudaStream_t s)
             set = true;
         }
     }
-    k_winattn<<<dim3(nwx * nwy, a.heads), 128, smem, s>>>(p);
+    k_winattn<<<(unsigned)(nwx * nwy) * (unsigned)a.heads, 128, smem, s>>>(p);
     return cudaGetLastError();
+}
+
+cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, float *sums,
+                    cudaStream_t s)
+{
+    const bool vec = C % 8 == 0 && C <= 1024 && sin % 8 == 0 && sout % 8 == 0 && ((uintptr_t)in | (uintptr_t)out) % 16 == 0;
+    if (vec) {
+        const long long n = (long long)(C / 8) * W * ((H + DW_R - 1) / DW_R);
+        if (n < (1ll << 31)) {
+            k_dw8s<<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums);
+            return cudaGetLastError();
+        }
+    }
+    const size_t n = (size_t)H * W * ((C + 1) / 2);
+    k_dw<<<(unsigned)((n + 255) / 256), 256, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess && sums) e = tcolsum(out, sout, H * W, C, sums, s);
+    return e;
 }
 
 cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, cudaStream_t s)
 {
-    const size_t n = (size_t)H * W * ((C + 1) / 2);
-    k_dw<<<(unsigned)((n + 255) / 256), 256, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0);
-    return cudaGetLastError();
+    return tdwconv(in, sin, out, sout, H, W, C, w, gelu_, nullptr, s);
 }
 
 cudaError_t tcolsum(const void *in, int sin, int M, int C, float *sums, cudaStream_t s)
@@ -486,6 +763,17 @@ cudaError_t tcolsum(const void *in, int sin, int M, int C, float *sums, cudaStre
 cudaError_t tchanstats(const void *qkv, int sq, int qo, int ko, int M, int heads, int hd, float *stats, cudaStream_t s)
 {
     const int C = heads * hd, total = heads * hd * hd + 2 * C;
+    if (hd <= 32 && hd % 2 == 0 && heads <= CS_MAXH && C <= 256 && sq % 2 == 0 && qo % 2 == 0 && ko % 2 == 0 && (uintptr_t)qkv % 4 == 0) {
+        const int smem = 2 * 64 * (heads * 32 + 8) * 2;
+        static bool set = false;
+        if (!set) {
+            cudaFuncSetAttribute(k_chanstats_mma, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * 64 * (CS_MAXH * 32 + 8) * 2);
+            set = true;
+        }
+        const int tpc = std::max(64, ((M + 255) / 256 + 63) / 64 * 64);
+        k_chanstats_mma<<<(M + tpc - 1) / tpc, 128, smem, s>>>((const half *)qkv, sq, qo, ko, M, heads, hd, tpc, stats);
+        return cudaGetLastError();
+    }
     if ((total + 255) / 256 > 24) return cudaErrorInvalidValue;
     const int smem = 2 * 64 * C * 2;
     if (smem > 48 * 1024) cudaFuncSetAttribute(k_chanstats, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
