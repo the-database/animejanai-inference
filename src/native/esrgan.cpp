@@ -299,15 +299,18 @@ cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, in
 }  // namespace
 
 std::unique_ptr<ImgNet> build_fdat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
+std::unique_ptr<ImgNet> build_hat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
 
 std::unique_ptr<ImgNet> ImgNet::create(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
 {
     if (g.inputs.size() != 1) return refuse(why, "one input expected"), nullptr;
     std::string w;
     if (auto n = Esrgan::build(g, max_w, max_h, s, &w)) return n;
-    std::string w2;
+    std::string w2, w3;
     if (auto n = build_fdat(g, max_w, max_h, s, &w2)) return n;
-    if (why) *why = w2 == "not an FDAT graph" ? w : w2;
+    if (auto n = build_hat(g, max_w, max_h, s, &w3)) return n;
+    // the reason of the family the graph belongs to (the others say "not a ... graph")
+    if (why) *why = w3.rfind("not a", 0) ? w3 : w2.rfind("not a", 0) ? w2 : w;
     return nullptr;
 }
 

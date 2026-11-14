@@ -54,7 +54,8 @@ struct GemmP {
     const half *add1, *add2;
     int s1, s2, act;
     float slope;
-    int act_last;
+    int act_last, out_f32, add1_f32;
+    const float *add2scale;
 };
 
 __global__ void __launch_bounds__(128) k_gemm(GemmP p)
@@ -121,12 +122,17 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
                 v1 *= p.colscale[c + 1];
             }
             if (p.add1) {
-                const float2 f = __half22float2(*reinterpret_cast<const half2 *>(p.add1 + (size_t)r * p.s1 + c));
+                const float2 f = p.add1_f32 ? *reinterpret_cast<const float2 *>(reinterpret_cast<const float *>(p.add1) + (size_t)r * p.s1 + c)
+                                            : __half22float2(*reinterpret_cast<const half2 *>(p.add1 + (size_t)r * p.s1 + c));
                 v0 += f.x;
                 v1 += f.y;
             }
             if (p.add2) {
-                const float2 f = __half22float2(*reinterpret_cast<const half2 *>(p.add2 + (size_t)r * p.s2 + c));
+                float2 f = __half22float2(*reinterpret_cast<const half2 *>(p.add2 + (size_t)r * p.s2 + c));
+                if (p.add2scale) {
+                    f.x *= p.add2scale[c];
+                    f.y *= p.add2scale[c + 1];
+                }
                 v0 += f.x;
                 v1 += f.y;
             }
@@ -139,7 +145,10 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
                     v1 = v1 < 0.f ? v1 * p.slope : v1;
                 }
             }
-            *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + c) = __floats2half2_rn(v0, v1);
+            if (p.out_f32)
+                *reinterpret_cast<float2 *>(reinterpret_cast<float *>(p.out) + (size_t)r * p.so + c) = make_float2(v0, v1);
+            else
+                *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + c) = __floats2half2_rn(v0, v1);
         }
     }
 #else
@@ -475,6 +484,258 @@ __global__ void __launch_bounds__(256) k_ln8(const half *in, int sin, half *out,
     *reinterpret_cast<uint4 *>(out + (size_t)t * sout + c) = pack8(y);
 }
 
+// LayerNorm with fp32 and/or fp16 sides: L lanes per token, 8 channels each.
+template <int L, typename TI, typename TO>
+__global__ void __launch_bounds__(256) k_ln8x(const TI *in, int sin, TO *out, int sout, int M, int C, int cpad, const float *gm,
+                                              const float *bt, float eps)
+{
+    const int sub = threadIdx.x % L, t = (blockIdx.x * blockDim.x + threadIdx.x) / L, c = sub * 8;
+    const bool live = t < M && c < cpad;
+    float v[8] = {};
+    if (live) {
+        if constexpr (sizeof(TI) == 4) {
+            const float4 a = *reinterpret_cast<const float4 *>(in + (size_t)t * sin + c), b = *reinterpret_cast<const float4 *>(in + (size_t)t * sin + c + 4);
+            v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+        } else {
+            unpack8(*reinterpret_cast<const uint4 *>(in + (size_t)t * sin + c), v);
+        }
+    }
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        if (c + j >= C) v[j] = 0.f;
+        s += v[j];
+    }
+#pragma unroll
+    for (int o = L / 2; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    const float mean = s / C;
+    float q = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+        if (c + j < C) q += (v[j] - mean) * (v[j] - mean);
+#pragma unroll
+    for (int o = L / 2; o; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
+    const float rs = rsqrtf(q / C + eps);
+    if (!live) return;
+    float y[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) y[j] = c + j < C ? (v[j] - mean) * rs * gm[c + j] + bt[c + j] : 0.f;
+    if constexpr (sizeof(TO) == 4) {
+        *reinterpret_cast<float4 *>(out + (size_t)t * sout + c) = make_float4(y[0], y[1], y[2], y[3]);
+        *reinterpret_cast<float4 *>(out + (size_t)t * sout + c + 4) = make_float4(y[4], y[5], y[6], y[7]);
+    } else {
+        *reinterpret_cast<uint4 *>(out + (size_t)t * sout + c) = pack8(y);
+    }
+}
+
+// Copies between fp32 and fp16 token maps, 8 channels per thread.
+template <typename TI, typename TO>
+__global__ void k_convert(const TI *in, int sin, TO *out, int sout, int M, int n)
+{
+    const int G = n / 8;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)M * G) return;
+    const int t = (int)(i / G), c = (int)(i % G) * 8;
+    float v[8];
+    if constexpr (sizeof(TI) == 4) {
+        const float4 a = *reinterpret_cast<const float4 *>(in + (size_t)t * sin + c), b = *reinterpret_cast<const float4 *>(in + (size_t)t * sin + c + 4);
+        v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+    } else {
+        unpack8(*reinterpret_cast<const uint4 *>(in + (size_t)t * sin + c), v);
+    }
+    if constexpr (sizeof(TO) == 4) {
+        *reinterpret_cast<float4 *>(out + (size_t)t * sout + c) = make_float4(v[0], v[1], v[2], v[3]);
+        *reinterpret_cast<float4 *>(out + (size_t)t * sout + c + 4) = make_float4(v[4], v[5], v[6], v[7]);
+    } else {
+        *reinterpret_cast<uint4 *>(out + (size_t)t * sout + c) = pack8(v);
+    }
+}
+
+// ---- window attention, general form: overlapping key windows (HAT's OCAB), Swin's shifted-window
+// mask, and the bias as a relative-position table in shared memory. One CTA per (window, head); k and v
+// of the key window in shared memory, q fragments straight from global memory.
+struct WinG {
+    WinP b;
+    int kwh, kww, kpad;  // key window: kwh x kww tokens at (wy*wh - kpad, wx*ww - kpad); kwh = 0: the query window
+    int mask;            // Swin mask (-100 between the regions the shift joins)
+    const float *rtab;   // [heads][tw*tw]: bias(q, k) = rtab[(ky - kpad - qy + off) * tw + (kx - kpad - qx + off)]
+    int tw, off;
+};
+
+// The Swin region (0..2 per axis) of rolled coordinate v on an axis of n with window w and shift s.
+__device__ __forceinline__ int swin_rid(int v, int n, int w, int s) { return v < n - w ? 0 : (v < n - s ? 1 : 2); }
+
+__global__ void __launch_bounds__(128) k_winattn_g(WinG P)
+{
+#if TFM_OK
+    const WinP &p = P.b;
+    extern __shared__ __align__(16) unsigned char smraw[];
+    const int Tq = p.wh * p.ww, kw = P.kwh ? P.kww : p.ww, kh = P.kwh ? P.kwh : p.wh, Tk = kh * kw;
+    half *sk = reinterpret_cast<half *>(smraw), *sv = sk + Tk * HP;
+    float *stab = reinterpret_cast<float *>(sv + Tk * HP);
+    signed char *sreg = reinterpret_cast<signed char *>(stab + (P.rtab ? P.tw * P.tw : 0));
+    const int win = (int)(blockIdx.x / p.heads), h = (int)(blockIdx.x % p.heads), tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wy = win / p.nwx, wx = win % p.nwx;
+    // keys and values of this head (dims padded to 32 with zeros; tokens outside the image zero)
+    for (int i = tid; i < Tk * 16; i += 128) {
+        const int t = i / 16, d2 = (i % 16) * 2;
+        half2 k = __float2half2_rn(0.f), v = k;
+        int pix = -1;
+        if (P.kwh) {
+            const int y = wy * p.wh - P.kpad + t / kw, x = wx * p.ww - P.kpad + t % kw;
+            if (y >= 0 && y < p.H && x >= 0 && x < p.W) pix = y * p.W + x;
+        } else if (!win_tok(p, win, t, &pix)) {
+            pix = -1;
+        }
+        if (d2 < p.hd && pix >= 0) {
+            const half *src = p.qkv + (size_t)pix * p.sq + h * p.hd + d2;
+            k = *reinterpret_cast<const half2 *>(src + p.ko);
+            v = *reinterpret_cast<const half2 *>(src + p.vo);
+        }
+        *reinterpret_cast<half2 *>(sk + t * HP + d2) = k;
+        *reinterpret_cast<half2 *>(sv + t * HP + d2) = v;
+    }
+    if (P.rtab)
+        for (int i = tid; i < P.tw * P.tw; i += 128) stab[i] = P.rtab[(size_t)h * P.tw * P.tw + i];
+    if (P.mask)
+        for (int t = tid; t < Tk; t += 128)
+            sreg[t] = (signed char)(swin_rid(wy * p.wh + t / p.ww, p.H, p.wh, p.sy) * 3 + swin_rid(wx * p.ww + t % p.ww, p.W, p.ww, p.sx));
+    __syncthreads();
+    const int g = lane >> 2, tq = lane & 3;
+    const float *bias = p.bias ? p.bias + (size_t)h * Tq * Tk : nullptr;
+    for (int qb = warp; qb * 16 < Tq; qb += 4) {
+        const int r0 = qb * 16 + g, r1 = r0 + 8;
+        // q fragments: a0 (r0, 2tq), a1 (r1, 2tq), a2 (r0, 2tq + 8), a3 (r1, 2tq + 8) per 16-dim chunk
+        uint32_t qa[2][4];
+        int p0, p1;
+        const bool v0 = win_tok(p, win, r0, &p0), v1 = win_tok(p, win, r1, &p1);
+#pragma unroll
+        for (int kc = 0; kc < 2; kc++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int d = kc * 16 + 2 * tq + (j >> 1) * 8;
+                const bool ok = d < p.hd && ((j & 1) ? v1 : v0);
+                half2 q = __float2half2_rn(0.f);
+                if (ok) q = *reinterpret_cast<const half2 *>(p.qkv + (size_t)((j & 1) ? p1 : p0) * p.sq + p.qo + h * p.hd + d);
+                qa[kc][j] = h2u(q);
+            }
+        const int qy[2] = {r0 / p.ww, r1 / p.ww}, qx[2] = {r0 % p.ww, r1 % p.ww};
+        int qreg[2] = {0, 0};
+        if (P.mask)
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+                qreg[i] = swin_rid(wy * p.wh + qy[i], p.H, p.wh, p.sy) * 3 + swin_rid(wx * p.ww + qx[i], p.W, p.ww, p.sx);
+        float o[4][4], mrow[2] = {-1e30f, -1e30f}, lrow[2] = {0.f, 0.f};
+#pragma unroll
+        for (int n = 0; n < 4; n++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) o[n][k] = 0.f;
+        for (int kb = 0; kb < Tk; kb += 64) {
+            const int nk = min(64, Tk - kb);  // a multiple of 16
+            float s[8][4];
+#pragma unroll
+            for (int n = 0; n < 8; n++)
+#pragma unroll
+                for (int k = 0; k < 4; k++) s[n][k] = 0.f;
+#pragma unroll
+            for (int np = 0; np < 4; np++) {
+                if (np * 16 >= nk) break;
+#pragma unroll
+                for (int kc = 0; kc < 2; kc++) {
+                    uint32_t b[4];
+                    ldsm_x4(b, sk + (kb + np * 16 + (lane & 7) + (lane >> 4) * 8) * HP + kc * 16 + ((lane >> 3) & 1) * 8);
+                    mma32(s[2 * np], qa[kc], b[0], b[1]);
+                    mma32(s[2 * np + 1], qa[kc], b[2], b[3]);
+                }
+            }
+            float mx[2] = {mrow[0], mrow[1]};
+#pragma unroll
+            for (int n = 0; n < 8; n++) {
+                if (n * 8 >= nk) break;
+                const int c = kb + n * 8 + tq * 2;
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int ri = e >> 1, r = ri ? r1 : r0, cc = c + (e & 1);
+                    float v = s[n][e] * p.scale;
+                    if (P.rtab) {
+                        const int ky = cc / kw - P.kpad, kx = cc % kw - P.kpad;
+                        v += stab[(ky - qy[ri] + P.off) * P.tw + (kx - qx[ri] + P.off)];
+                    } else if (bias) {
+                        v += bias[(size_t)r * Tk + cc];
+                    }
+                    if (P.mask && sreg[cc] != qreg[ri]) v -= 100.f;
+                    s[n][e] = v;
+                    mx[ri] = fmaxf(mx[ri], v);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 1));
+                mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 2));
+            }
+            const float al0 = __expf(mrow[0] - mx[0]), al1 = __expf(mrow[1] - mx[1]);
+            mrow[0] = mx[0];
+            mrow[1] = mx[1];
+            float ls[2] = {0.f, 0.f};
+#pragma unroll
+            for (int n = 0; n < 8; n++) {
+                if (n * 8 >= nk) break;
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    s[n][e] = __expf(s[n][e] - mx[e >> 1]);
+                    ls[e >> 1] += s[n][e];
+                }
+            }
+            lrow[0] = lrow[0] * al0 + ls[0];
+            lrow[1] = lrow[1] * al1 + ls[1];
+#pragma unroll
+            for (int n = 0; n < 4; n++) {
+                o[n][0] *= al0;
+                o[n][1] *= al0;
+                o[n][2] *= al1;
+                o[n][3] *= al1;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (j * 16 >= nk) break;
+                uint32_t pa[4];
+                pa[0] = h2u(__floats2half2_rn(s[2 * j][0], s[2 * j][1]));
+                pa[1] = h2u(__floats2half2_rn(s[2 * j][2], s[2 * j][3]));
+                pa[2] = h2u(__floats2half2_rn(s[2 * j + 1][0], s[2 * j + 1][1]));
+                pa[3] = h2u(__floats2half2_rn(s[2 * j + 1][2], s[2 * j + 1][3]));
+#pragma unroll
+                for (int dp = 0; dp < 2; dp++) {
+                    uint32_t b[4];
+                    ldsm_x4_t(b, sv + (kb + j * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * HP + dp * 16 + (lane >> 4) * 8);
+                    mma32(o[2 * dp], pa, b[0], b[1]);
+                    mma32(o[2 * dp + 1], pa, b[2], b[3]);
+                }
+            }
+        }
+        lrow[0] += __shfl_xor_sync(0xffffffffu, lrow[0], 1);
+        lrow[0] += __shfl_xor_sync(0xffffffffu, lrow[0], 2);
+        lrow[1] += __shfl_xor_sync(0xffffffffu, lrow[1], 1);
+        lrow[1] += __shfl_xor_sync(0xffffffffu, lrow[1], 2);
+        const float i0 = 1.f / lrow[0], i1 = 1.f / lrow[1];
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            const int r = hh ? r1 : r0, pix = hh ? p1 : p0;
+            if (r >= Tq || !(hh ? v1 : v0)) continue;
+            const float inv = hh ? i1 : i0;
+#pragma unroll
+            for (int n = 0; n < 4; n++) {
+                const int d = n * 8 + tq * 2;
+                if (d >= p.hd) continue;
+                *reinterpret_cast<half2 *>(p.out + (size_t)pix * p.so + h * p.hd + d) =
+                    __floats2half2_rn(o[n][2 * hh] * inv, o[n][2 * hh + 1] * inv);
+            }
+        }
+    }
+#else
+    __trap();
+#endif
+}
+
 // Depthwise 3x3, one thread per (8 channels, column, strip of DW_R rows): the 3x3 window slides down
 // the strip so each output row loads one new input row (3 pixels), weights held in registers.
 constexpr int DW_R = 8;
@@ -705,10 +966,11 @@ void tmat_release(TMat &m)
 
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
 {
-    if (g.sa % 8 || g.so % 2 || (g.add1 && g.s1 % 2) || (g.add2 && g.s2 % 2) || g.sa < w.Kpad || g.so < w.Npad)
+    if (g.sa % 8 || g.so % 2 || (g.add1 && g.s1 % 2) || (g.add2 && g.s2 % 2) || g.sa < w.Kpad || g.so < w.Npad ||
+        (g.add2scale && !g.add2))
         return cudaErrorInvalidValue;
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
-            (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0};
+            (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0, g.out_f32 ? 1 : 0, g.add1_f32 ? 1 : 0, g.add2scale};
     const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);
     k_gemm<<<grid, 128, 0, s>>>(p);
     return cudaGetLastError();
@@ -728,9 +990,81 @@ cudaError_t tlayernorm(const void *in, int sin, void *out, int sout, int M, int 
     return cudaGetLastError();
 }
 
+cudaError_t tlayernorm2(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int C, int cpad,
+                        const float *gamma, const float *beta, float eps, cudaStream_t s)
+{
+    if (C > 256 || cpad % 8 || cpad > 256 || sin % 8 || sout % 8 || ((uintptr_t)in | (uintptr_t)out) % 16) return cudaErrorInvalidValue;
+    const bool l16 = cpad <= 128;
+    const unsigned grid = (unsigned)((M + (l16 ? 15 : 7)) / (l16 ? 16 : 8));
+#define LNX(TI, TO)                                                                                                                       \
+    do {                                                                                                                                  \
+        if (l16)                                                                                                                          \
+            k_ln8x<16, TI, TO><<<grid, 256, 0, s>>>((const TI *)in, sin, (TO *)out, sout, M, C, cpad, gamma, beta, eps);                \
+        else                                                                                                                              \
+            k_ln8x<32, TI, TO><<<grid, 256, 0, s>>>((const TI *)in, sin, (TO *)out, sout, M, C, cpad, gamma, beta, eps);                \
+    } while (0)
+    if (in_f32 && out_f32) LNX(float, float);
+    else if (in_f32) LNX(float, half);
+    else if (out_f32) LNX(half, float);
+    else LNX(half, half);
+#undef LNX
+    return cudaGetLastError();
+}
+
+cudaError_t tconvert(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int n, cudaStream_t s)
+{
+    if (n % 8 || sin % 8 || sout % 8 || ((uintptr_t)in | (uintptr_t)out) % 16) return cudaErrorInvalidValue;
+    const unsigned grid = (unsigned)(((size_t)M * (n / 8) + 255) / 256);
+    if (in_f32 && !out_f32) k_convert<float, half><<<grid, 256, 0, s>>>((const float *)in, sin, (half *)out, sout, M, n);
+    else if (!in_f32 && out_f32) k_convert<half, float><<<grid, 256, 0, s>>>((const half *)in, sin, (float *)out, sout, M, n);
+    else if (in_f32) k_convert<float, float><<<grid, 256, 0, s>>>((const float *)in, sin, (float *)out, sout, M, n);
+    else k_convert<half, half><<<grid, 256, 0, s>>>((const half *)in, sin, (half *)out, sout, M, n);
+    return cudaGetLastError();
+}
+
+bool tbias_table(const std::vector<float> &bias, int heads, int ws, int kws, int kpad, std::vector<float> *tab, int *rt_w, int *rt_off)
+{
+    const int kw = kws ? kws : ws, kp = kws ? kpad : 0, Tq = ws * ws, Tk = kw * kw, tw = kw + ws - 1, off = kp + ws - 1;
+    if ((int)bias.size() != heads * Tq * Tk) return false;
+    tab->assign((size_t)heads * tw * tw, 0.f);
+    std::vector<char> seen((size_t)heads * tw * tw, 0);
+    for (int h = 0; h < heads; h++)
+        for (int r = 0; r < Tq; r++)
+            for (int c = 0; c < Tk; c++) {
+                const int dy = c / kw - kp - r / ws + off, dx = c % kw - kp - r % ws + off;
+                if (dy < 0 || dy >= tw || dx < 0 || dx >= tw) return false;
+                const size_t ti = ((size_t)h * tw + dy) * tw + dx;
+                const float v = bias[((size_t)h * Tq + r) * Tk + c];
+                if (seen[ti] && (*tab)[ti] != v) return false;
+                seen[ti] = 1;
+                (*tab)[ti] = v;
+            }
+    *rt_w = tw;
+    *rt_off = off;
+    return true;
+}
+
 cudaError_t twinattn(const TWinAttn &a, cudaStream_t s)
 {
     const int T = a.wh * a.ww;
+    if (a.kwh || a.mask || a.rtab) {
+        const int Tk = a.kwh ? a.kwh * a.kww : T;
+        if (a.hd > 32 || a.hd % 2 || T % 16 || Tk % 16 || T > 1024 || a.sq % 2 || a.so % 2 || (a.kwh && (a.shift_y || a.shift_x)) ||
+            (a.mask && a.kwh))
+            return cudaErrorInvalidValue;
+        const int nwx = (a.W + a.ww - 1) / a.ww, nwy = (a.H + a.wh - 1) / a.wh;
+        WinG g{{(const half *)a.qkv, a.sq, a.qo, a.ko, a.vo, a.H, a.W, a.heads, a.hd, a.wh, a.ww, a.shift_y, a.shift_x, nwx, a.scale, a.bias,
+                (half *)a.out, a.so},
+               a.kwh, a.kww, a.kpad, a.mask ? 1 : 0, a.rtab, a.rt_w, a.rt_off};
+        const int smem = (Tk * HP * 2 * 2 + (a.rtab ? a.rt_w * a.rt_w * 4 : 0) + (a.mask ? Tk : 0) + 15) / 16 * 16;
+        static int set = 0;
+        if (smem > 48 * 1024 && smem > set) {
+            if (cudaFuncSetAttribute(k_winattn_g, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess) return cudaErrorInvalidValue;
+            set = smem;
+        }
+        k_winattn_g<<<(unsigned)(nwx * nwy) * (unsigned)a.heads, 128, smem, s>>>(g);
+        return cudaGetLastError();
+    }
     if (a.hd > 32 || a.hd % 2 || T % 16 || T > 256 || a.sq % 2 || a.so % 2) return cudaErrorInvalidValue;
     const int nwx = (a.W + a.ww - 1) / a.ww, nwy = (a.H + a.wh - 1) / a.wh;
     WinP p{(const half *)a.qkv, a.sq, a.qo, a.ko, a.vo, a.H, a.W, a.heads, a.hd, a.wh, a.ww, a.shift_y, a.shift_x, nwx, a.scale, a.bias,

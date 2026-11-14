@@ -88,6 +88,7 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
     if (a.dst_stride % 8 || a.dst_stride < (a.R ? w.cout_pad / a.R : w.coutp)) return gfail(why, "output pixel stride"), nullptr;
     if ((a.r1 && a.r1_stride % 2) || (a.r2 && a.r2_stride % 2)) return gfail(why, "residual stride"), nullptr;
     if (a.acc32 && (a.stride != 1 || a.nchw || a.R)) return gfail(why, "fp32 accumulation: stride 1, NHWC in and out"), nullptr;
+    if (a.out_f32 && (!a.acc32 || a.r1 || a.r2 || a.act == GAct::Gelu)) return gfail(why, "fp32 output: fp32 accumulation, r1f only, no GELU"), nullptr;
     const GKey k{kch_for(w, a), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0};
     if (!k.kch) return gfail(why, "input channels"), nullptr;
     for (const GEntry &e : kG)
@@ -152,6 +153,11 @@ gdev::GParams params(const GWeights &w, const GConvArgs &a, int ksplit)
     p.ksplit = ksplit;
     p.ws = a.ws;
     p.up2 = a.up2 ? 1 : 0;
+    p.outf = a.out_f32 ? 1 : 0;
+    p.dstf = (float *)a.dst;
+    p.r1f = a.r1f;
+    p.r1fs = a.r1f_stride;
+    p.slopef = a.slope;
     return p;
 }
 
@@ -210,7 +216,7 @@ size_t gworkspace(const GWeights &w, const GConvArgs &a)
     size_t m = 0;
     for (int v = 0; v < kGVariants; v++) {
         const int k = ksplit_for(w, a, kWarps[v]);
-        if (k > 1) m = std::max(m, (size_t)k * a.H * a.W * w.cout_pad);
+        if (k > 1 || a.out_f32) m = std::max(m, (size_t)k * a.H * a.W * w.cout_pad);
     }
     return m;
 }
@@ -222,9 +228,10 @@ cudaError_t glaunch(const GWeights &w, const GConvArgs &a, int variant, cudaStre
     if (variant < 0 || variant >= kGVariants) variant = 0;
     int ks = ksplit_for(w, a, kWarps[variant]);
     if (ks > 1 && (!a.ws || (size_t)ks * a.H * a.W * w.cout_pad > a.ws_floats)) ks = 1;
+    if (a.out_f32 && (!a.ws || (size_t)ks * a.H * a.W * w.cout_pad > a.ws_floats)) return cudaErrorInvalidValue;
     const gdev::GParams p = params(w, a, ks);
     cudaError_t r = e->fn[variant](p, (w.cout_pad / w.coutp) * ks, s);
-    if (r != cudaSuccess || ks == 1) return r;
+    if (r != cudaSuccess || (ks == 1 && !a.out_f32)) return r;
     const size_t n = (size_t)a.H * a.W * (w.cout_pad / 2);
     gdev::k_gconv_reduce<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(p);
     return cudaGetLastError();

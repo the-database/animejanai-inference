@@ -60,6 +60,11 @@ struct GConvArgs {
     int R = 0, sy = 0;           // phase scatter when R > 0 (2 or 4); dst is (R*H) x (R*W)
     float *ws = nullptr;         // split-K workspace (gworkspace floats); null: no split
     size_t ws_floats = 0;
+    // fp32 output (dst float NHWC, dst_stride in floats) for sums that outgrow fp16: needs acc32 and
+    // the workspace (the partials go through it); r1f: an fp32 residual added in fp32 (r1/r2 unused).
+    bool out_f32 = false;
+    const float *r1f = nullptr;
+    int r1f_stride = 0;
 };
 
 // Floats of workspace glaunch would use to split K for a (0: it would not split).

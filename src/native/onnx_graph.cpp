@@ -141,6 +141,7 @@ bool parse_tensor(Reader r, OnnxTensor *t)
         for (int64_t v : i32) { const int32_t x = (int32_t)v; append_bytes(&t->raw, &x, 4); }
         break;
     case ONNX_FLOAT16:  // stored in int32_data, one element per entry
+    case ONNX_BFLOAT16:  // likewise
         for (int64_t v : i32) { const uint16_t x = (uint16_t)v; append_bytes(&t->raw, &x, 2); }
         break;
     default: break;
@@ -251,6 +252,13 @@ bool OnnxTensor::floats(std::vector<float> *out) const
             uint16_t h;
             std::memcpy(&h, &raw[i * 2], 2);
             (*out)[i] = half_bits_to_float(h);
+        }
+    } else if (dtype == ONNX_BFLOAT16 && raw.size() == n * 2) {  // the top half of an fp32
+        for (size_t i = 0; i < n; i++) {
+            uint16_t h;
+            std::memcpy(&h, &raw[i * 2], 2);
+            const uint32_t u = (uint32_t)h << 16;
+            std::memcpy(&(*out)[i], &u, 4);
         }
     } else if (dtype == ONNX_DOUBLE && raw.size() == n * 8) {
         for (size_t i = 0; i < n; i++) {
