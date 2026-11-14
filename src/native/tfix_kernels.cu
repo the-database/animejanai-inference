@@ -10,6 +10,12 @@ namespace {
 
 __device__ __forceinline__ float sigm(float v) { return 1.f / (1.f + __expf(-v)); }
 
+// The map's buffer, its entry chosen on the device when it has one.
+__device__ __forceinline__ void *txr(const TxMap &m)
+{
+    return m.sel ? (void *)((char *)m.p + (long long)m.sel[m.pos] * m.fbytes) : m.p;
+}
+
 __device__ __forceinline__ float ld(const TxMap &m, size_t pix, int c)
 {
     const size_t i = pix * m.stride + m.off + c;
@@ -54,6 +60,8 @@ __device__ __forceinline__ uint4 pack8h(const float (&v)[8])
 
 __global__ void k_resize(TxMap src, int ih, int iw, TxMap dst, int oh, int ow, int C, float mx, float my, int add)
 {
+    src.p = txr(src);
+    dst.p = txr(dst);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= oh * ow) return;
     const int y = p / ow, x = p % ow;
@@ -91,6 +99,8 @@ __device__ __forceinline__ void taps6(int o, int n_in, float scale, int *base, f
 template <int VEC>
 __global__ void k_down(TxMap src, int ih, int iw, TxMap dst, int oh, int ow, int C, float mx, float my)
 {
+    src.p = txr(src);
+    dst.p = txr(dst);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= oh * ow) return;
     const int y = p / ow, x = p % ow;
@@ -132,6 +142,8 @@ __global__ void k_down(TxMap src, int ih, int iw, TxMap dst, int oh, int ow, int
 
 __global__ void k_lowpass(TxMap src, int h, int w, TxMap dst, int C)
 {
+    src.p = txr(src);
+    dst.p = txr(dst);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= h * w) return;
     const int y = p / w, x = p % w;
@@ -156,6 +168,9 @@ __global__ void k_lowpass(TxMap src, int h, int w, TxMap dst, int C)
 
 __global__ void k_warp(TxMap src, int C, const float *flow, int h, int w, TxMap dst, TxMap valid)
 {
+    src.p = txr(src);
+    dst.p = txr(dst);
+    valid.p = txr(valid);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= h * w) return;
     const int y = p / w, x = p % w;
@@ -183,6 +198,7 @@ __global__ void k_warp(TxMap src, int C, const float *flow, int h, int w, TxMap 
 
 __global__ void k_planes(const half *pl, int n, TxMap dst)
 {
+    dst.p = txr(dst);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n) return;
     for (int c = 0; c < 3; c++) st(dst, p, c, __half2float(pl[(size_t)c * n + p]));
@@ -213,8 +229,9 @@ __global__ void k_frame(const half *pl, const half *feat, int fs, int h, int w, 
     *reinterpret_cast<uint4 *>(dst + (size_t)p * 8) = pack8h(o);
 }
 
-__global__ void k_full(const float *F, const half *logit, int ls, int h, int w, const half *fr, float *ff, half *full, int H, int W)
+__global__ void k_full(const float *F, const half *logit, int ls, int h, int w, TxMap frm, float *ff, half *full, int H, int W)
 {
+    const half *fr = (const half *)txr(frm);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= H * W) return;
     const int y = p / W, x = p % W;
@@ -252,12 +269,16 @@ __global__ void k_full(const float *F, const half *logit, int ls, int h, int w, 
 
 __global__ void k_fill(TxMap dst, int n, float v)
 {
+    dst.p = txr(dst);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < n) st(dst, p, 0, v);
 }
 
 __global__ void k_conf_in(TxMap cen, TxMap wh, TxMap wf, const float *flow, float dt, half *out, int n)
 {
+    cen.p = txr(cen);
+    wh.p = txr(wh);
+    wf.p = txr(wf);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n) return;
     float o[32] = {};
@@ -285,6 +306,8 @@ __global__ void k_conf_in(TxMap cen, TxMap wh, TxMap wf, const float *flow, floa
 
 __global__ void k_accum(TxMap logit, int h2, int w2, TxMap full, int vch, float *acc, int H, int W, float thresh, float gslope)
 {
+    logit.p = txr(logit);
+    full.p = txr(full);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= H * W) return;
     const int y = p / W, x = p % W;
@@ -310,6 +333,7 @@ __global__ void k_accum(TxMap logit, int h2, int w2, TxMap full, int vch, float 
 
 __global__ void k_final(TxMap center, const float *acc, int H, int W, float minsup, float cslope, float eps, half *out)
 {
+    center.p = txr(center);
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= H * W) return;
     const float4 a0 = reinterpret_cast<const float4 *>(acc + (size_t)p * 8)[0], a1 = reinterpret_cast<const float4 *>(acc + (size_t)p * 8)[1];
@@ -335,8 +359,8 @@ cudaError_t tx_resize(TxMap src, int ih, int iw, TxMap dst, int oh, int ow, int 
 cudaError_t tx_down(TxMap src, int ih, int iw, TxMap dst, int oh, int ow, int C, float mx, float my, cudaStream_t s)
 {
     if (C > 8) return cudaErrorInvalidValue;
-    const bool vec = !src.f32 && src.stride % 8 == 0 && src.off % 8 == 0 && ((uintptr_t)src.p % 16) == 0;
-    const bool f2 = src.f32 && C == 2 && src.stride == 2 && src.off == 0 && ((uintptr_t)src.p % 8) == 0;
+    const bool vec = !src.f32 && src.stride % 8 == 0 && src.off % 8 == 0 && ((uintptr_t)src.p % 16) == 0 && src.fbytes % 16 == 0;
+    const bool f2 = src.f32 && C == 2 && src.stride == 2 && src.off == 0 && ((uintptr_t)src.p % 8) == 0 && src.fbytes % 8 == 0;
     if (vec)
         k_down<1><<<nb((long long)oh * ow), 256, 0, s>>>(src, ih, iw, dst, oh, ow, C, mx, my);
     else if (f2)
@@ -366,9 +390,9 @@ cudaError_t tx_frame(const void *planes, const void *feat, int fs, int h, int w,
     k_frame<<<nb((long long)H * W), 256, 0, s>>>((const half *)planes, (const half *)feat, fs, h, w, (half *)dst, H, W);
     return cudaGetLastError();
 }
-cudaError_t tx_full(const float *F, const void *logit, int ls, int h, int w, const void *fr, float *ff, void *full, int H, int W, cudaStream_t s)
+cudaError_t tx_full(const float *F, const void *logit, int ls, int h, int w, TxMap fr, float *ff, void *full, int H, int W, cudaStream_t s)
 {
-    k_full<<<nb((long long)H * W), 256, 0, s>>>(F, (const half *)logit, ls, h, w, (const half *)fr, ff, (half *)full, H, W);
+    k_full<<<nb((long long)H * W), 256, 0, s>>>(F, (const half *)logit, ls, h, w, fr, ff, (half *)full, H, W);
     return cudaGetLastError();
 }
 cudaError_t tx_fill(TxMap dst, int h, int w, float v, cudaStream_t s)

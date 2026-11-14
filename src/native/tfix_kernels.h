@@ -14,6 +14,11 @@ struct TxMap {
     void *p = nullptr;
     bool f32 = false;
     int stride = 0, off = 0;  // elements per pixel; first channel
+    // With sel: one of several same-size buffers spaced fbytes apart from p, entry sel[pos] (read on
+    // the device, so a CUDA graph can replay with a different choice).
+    const int *sel = nullptr;
+    int pos = 0;
+    long long fbytes = 0;
 };
 
 // dst[off + c] (=, or += with add) = resize(src[off + c]) for c < C; channels 0, 1 times mx, my (flows).
@@ -34,7 +39,7 @@ cudaError_t tx_frame(const void *planes, const void *feat, int fs, int h, int w,
 // One support at full resolution from its coarser flow F (fp32 [h][w][2]) and logit (fp16 [h][w][ls],
 // channel 0): ff = the flow resized (scaled by W/w, H/h; fp32 [H][W][2]); full (fp16 [H][W][8]) = the
 // frame (fr: rgb 0..2 of an 8-channel map) warped by ff, the resized logit, the warp's validity, 0...
-cudaError_t tx_full(const float *F, const void *logit, int ls, int h, int w, const void *fr, float *ff, void *full, int H, int W,
+cudaError_t tx_full(const float *F, const void *logit, int ls, int h, int w, TxMap fr, float *ff, void *full, int H, int W,
                     cudaStream_t s);
 // dst[off] = v for every pixel.
 cudaError_t tx_fill(TxMap dst, int h, int w, float v, cudaStream_t s);

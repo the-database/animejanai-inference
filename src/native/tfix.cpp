@@ -57,7 +57,10 @@ public:
     static std::unique_ptr<VidNet> build(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why);
     ~Tfix() override
     {
-        if (graph) cudaGraphExecDestroy(graph);
+        for (Replay *r : {&full, &win})
+            if (r->g) cudaGraphExecDestroy(r->g);
+        for (Replay &r : enc)
+            if (r.g) cudaGraphExecDestroy(r.g);
         for (Chain &c : ch) {
             if (c.st) cudaStreamDestroy(c.st);
             if (c.done) cudaEventDestroy(c.done);
@@ -65,32 +68,25 @@ public:
         for (cudaEvent_t e : ev)
             if (e) cudaEventDestroy(e);
     }
+    // The whole window from the model input: every frame encoded into the slot of its position.
     cudaError_t run(const void *in, void *out, cudaStream_t s) override
     {
-        static const bool prof = std::getenv("AJI_NATIVE_PROFILE") != nullptr;
-        if (prof) return exec(in, out, s, nullptr);
-        if (!graph || in != g_in || out != g_out) {
-            if (graph) cudaGraphExecDestroy(graph);
-            graph = nullptr;
-            cudaGraph_t g = nullptr;
-            cudaError_t e = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
-            if (e != cudaSuccess) return exec(in, out, s, nullptr);
-            const cudaError_t er = exec(in, out, s, nullptr);
-            e = cudaStreamEndCapture(s, &g);
-            if (er != cudaSuccess || e != cudaSuccess) {
-                if (g) cudaGraphDestroy(g);
-                return er != cudaSuccess ? er : e;
-            }
-            e = cudaGraphInstantiate(&graph, g, 0);
-            cudaGraphDestroy(g);
-            if (e != cudaSuccess) {
-                graph = nullptr;
-                return exec(in, out, s, nullptr);
-            }
-            g_in = in;
-            g_out = out;
-        }
-        return cudaGraphLaunch(graph, s);
+        const void *fr[NF];
+        for (int i = 0; i < NF; i++) fr[i] = (const uint16_t *)in + (size_t)i * 3 * W * H;
+        return replay(full, in, out, s, [&] { return exec(fr, dsel, out, s, nullptr); });
+    }
+    int cache_entries() const override { return NF; }
+    cudaError_t encode(int entry, const void *frame, cudaStream_t s) override
+    {
+        if (entry < 0 || entry >= NF) return cudaErrorInvalidValue;
+        const void *fr[NF] = {};
+        fr[entry] = frame;
+        return replay(enc[entry], frame, nullptr, s, [&] { return exec(fr, nullptr, nullptr, s, nullptr); });
+    }
+    cudaError_t run_cached(const int *sel, void *out, cudaStream_t s) override
+    {
+        const void *fr[NF] = {};
+        return replay(win, sel, out, s, [&] { return exec(fr, sel, out, s, nullptr); });
     }
     int frames() const override { return NF; }
     int scale() const override { return 1; }
@@ -105,16 +101,54 @@ private:
     Stage st[3];
     std::vector<Chain> ch;
     cudaEvent_t ev[7] = {};  // ev[0]: the encoder done; ev[1 + si]: support si accumulated
+    // Per frame (one slot each, frb / Stage pyb bytes apart): the 8-channel full-resolution map and
+    // its pyramid. run() fills slot i from window position i; encode() fills one slot.
     void *FR[NF] = {}, *E1 = nullptr, *E2 = nullptr, *EP = nullptr;
+    size_t frb = 0, pyb[3] = {};
+    int *dsel = nullptr;  // 0..NF-1: run()'s window, position i in slot i
     float *ACC = nullptr, *wsp = nullptr;
-    // a run is ~400 small launches: captured once per (in, out) as a CUDA graph and replayed
-    cudaGraphExec_t graph = nullptr;
-    const void *g_in = nullptr;
-    void *g_out = nullptr;
+    // A window is ~400 small launches, a frame's encoding ~10: each captured once per (key, out) as a
+    // CUDA graph and replayed (AJI_NATIVE_PROFILE runs them directly, for the per-phase times).
+    struct Replay {
+        cudaGraphExec_t g = nullptr;
+        const void *key = nullptr;
+        void *out = nullptr;
+    } full, win, enc[NF];
     size_t ws_floats = 0;
     std::string what;
 
-    cudaError_t exec(const void *in, void *out, cudaStream_t s, std::vector<std::pair<GOp *, GConvArgs>> *collect);
+    template <class Fn>
+    static cudaError_t replay(Replay &r, const void *key, void *out, cudaStream_t s, Fn fn)
+    {
+        static const bool prof = std::getenv("AJI_NATIVE_PROFILE") != nullptr;
+        if (prof) return fn();
+        if (!r.g || key != r.key || out != r.out) {
+            if (r.g) cudaGraphExecDestroy(r.g);
+            r.g = nullptr;
+            cudaGraph_t g = nullptr;
+            cudaError_t e = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+            if (e != cudaSuccess) return fn();
+            const cudaError_t er = fn();
+            e = cudaStreamEndCapture(s, &g);
+            if (er != cudaSuccess || e != cudaSuccess) {
+                if (g) cudaGraphDestroy(g);
+                return er != cudaSuccess ? er : e;
+            }
+            e = cudaGraphInstantiate(&r.g, g, 0);
+            cudaGraphDestroy(g);
+            if (e != cudaSuccess) {
+                r.g = nullptr;
+                return fn();
+            }
+            r.key = key;
+            r.out = out;
+        }
+        return cudaGraphLaunch(r.g, s);
+    }
+
+    // Encodes frame fr[i] into slot i for each non-null fr[i]; then, with sel, runs the window whose
+    // position j reads slot sel[j] (sel on the device) into out.
+    cudaError_t exec(const void *const *fr, const int *sel, void *out, cudaStream_t s, std::vector<std::pair<GOp *, GConvArgs>> *collect);
 };
 
 TxMap tm(void *p, int stride, int off = 0, bool f32 = false)
@@ -224,12 +258,19 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
 
     // buffers
     const size_t M = (size_t)w * h, M1 = (size_t)f->h1 * f->w1;
-    for (int i = 0; i < NF; i++) f->FR[i] = r.alloc(M * 8 * 2);
+    f->frb = M * 8 * 2;
+    f->FR[0] = r.alloc(NF * f->frb);
+    for (int i = 1; i < NF; i++) f->FR[i] = f->FR[0] ? (char *)f->FR[0] + i * f->frb : nullptr;
     f->E1 = r.alloc(M1 * 16 * 2);
     f->E2 = r.alloc(M1 * 16 * 2);
     f->EP = r.alloc(M1 * 16 * 2);
-    for (Stage &S : f->st)
-        for (int i = 0; i < NF; i++) S.pyr[i] = r.alloc((size_t)S.h * S.w * 8 * 2);
+    for (int k = 0; k < 3; k++) {
+        Stage &S = f->st[k];
+        f->pyb[k] = (size_t)S.h * S.w * 8 * 2;
+        S.pyr[0] = r.alloc(NF * f->pyb[k]);
+        for (int i = 1; i < NF; i++) S.pyr[i] = S.pyr[0] ? (char *)S.pyr[0] + i * f->pyb[k] : nullptr;
+    }
+    f->dsel = (int *)r.alloc(NF * sizeof(int));
     // concurrent chains while the frame is small enough for them to pay (and for their memory)
     const int nch = M <= (size_t)1500000 ? 3 : 1;  // 720p: 1.25x faster; from 1080p up bandwidth-bound
     f->ch.resize(nch);
@@ -265,11 +306,18 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
         if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return refuse(why, "cannot create a CUDA event"), nullptr;
     f->ACC = (float *)r.alloc(M * 8 * 4);
     if (r.failed) return refuse(why, "out of GPU memory"), nullptr;
+    {
+        int id[NF];
+        for (int i = 0; i < NF; i++) id[i] = i;
+        if (cudaMemcpy(f->dsel, id, sizeof(id), cudaMemcpyHostToDevice) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
+    }
     void *zin = nullptr;
     if (cudaMalloc(&zin, (size_t)3 * NF * M * 2) != cudaSuccess) return refuse(why, "out of GPU memory"), nullptr;
     cudaMemset(zin, 0, (size_t)3 * NF * M * 2);
     std::vector<std::pair<GOp *, GConvArgs>> ops;
-    f->exec(zin, nullptr, s, &ops);
+    const void *zf[NF];
+    for (int i = 0; i < NF; i++) zf[i] = (const uint16_t *)zin + (size_t)i * 3 * M;
+    f->exec(zf, f->dsel, nullptr, s, &ops);
     f->ws_floats = gworkspace_max(ops);
     bool ok = true;
     if (f->ws_floats) {  // one split-K workspace per stream
@@ -278,7 +326,7 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
     }
     if (ok) {
         ops.clear();
-        f->exec(zin, nullptr, s, &ops);
+        f->exec(zf, f->dsel, nullptr, s, &ops);
         ok = gprepare(ops, s, why);
     } else {
         refuse(why, "out of GPU memory");
@@ -293,10 +341,9 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
     return std::unique_ptr<VidNet>(f.release());
 }
 
-cudaError_t Tfix::exec(const void *in, void *out, cudaStream_t s, std::vector<std::pair<GOp *, GConvArgs>> *collect)
+cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cudaStream_t s, std::vector<std::pair<GOp *, GConvArgs>> *collect)
 {
     const size_t plane = (size_t)W * H;
-    const uint16_t *frames = (const uint16_t *)in;
     StepProf pr(s, !collect);
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) return e_; } while (0)
 #define K(x) do { if (!collect) CK(x); } while (0)
@@ -318,9 +365,25 @@ cudaError_t Tfix::exec(const void *in, void *out, cudaStream_t s, std::vector<st
         a.stride = 2;
         return a;
     };
+    // window position j's frame map and pyramid level k: the slot sel[j] names
+    auto frm = [&](int j, int off) {
+        TxMap m = tm(FR[0], 8, off);
+        m.sel = sel;
+        m.pos = j;
+        m.fbytes = (long long)frb;
+        return m;
+    };
+    auto pym = [&](int k, int j, int off) {
+        TxMap m = tm(st[k].pyr[0], 8, off);
+        m.sel = sel;
+        m.pos = j;
+        m.fbytes = (long long)pyb[k];
+        return m;
+    };
     // the encoder of frame i: rgb into FR channels 0..2, features into 3..6, then its pyramid
     for (int i = 0; i < NF; i++) {
-        const void *fp = frames + (size_t)i * 3 * plane;
+        const void *fp = fr_in[i];
+        if (!fp) continue;
         GConvArgs a = s2(lrelu(ga(fp, (int)plane, H, W, E1, 16, h1, w1)));
         a.nchw = true;
         CK(Gc(e0, a, s, wsp));
@@ -330,15 +393,20 @@ cudaError_t Tfix::exec(const void *in, void *out, cudaStream_t s, std::vector<st
         K(tx_frame(fp, EP, 16, h1, w1, FR[i], H, W, s));
         for (Stage &S : st) K(tx_down(tm(FR[i], 8), H, W, tm(S.pyr[i], 8), S.h, S.w, 7, 1.f, 1.f, s));
     }
+    pr.mark(P_ENC);
+    if (!sel) {
+        if (!collect) pr.report("temporalfix encode");
+        return cudaSuccess;
+    }
     // the centre's channels of each stage input, once per chain
     for (Chain &c : ch)
         for (int k = 0; k < 3; k++) {
             const Stage &S = st[k];
-            K(tx_resize(tm(S.pyr[CEN], 8, 0), S.h, S.w, tm(c.sb[k].X, S.xs, 0), S.h, S.w, 3, 1.f, 1.f, false, s));
-            K(tx_resize(tm(S.pyr[CEN], 8, 3), S.h, S.w, tm(c.sb[k].X, S.xs, 6), S.h, S.w, 4, 1.f, 1.f, false, s));
+            K(tx_resize(pym(k, CEN, 0), S.h, S.w, tm(c.sb[k].X, S.xs, 0), S.h, S.w, 3, 1.f, 1.f, false, s));
+            K(tx_resize(pym(k, CEN, 3), S.h, S.w, tm(c.sb[k].X, S.xs, 6), S.h, S.w, 4, 1.f, 1.f, false, s));
         }
     K(cudaMemsetAsync(ACC, 0, plane * 8 * 4, s));
-    pr.mark(P_ENC);
+    pr.mark(P_ALIGN);
     K(cudaEventRecord(ev[0], s));
     for (Chain &c : ch) K(cudaStreamWaitEvent(c.st, ev[0], 0));
     auto mcblock = [&](const Stage &Sc, Stage &S, Chain::Sb &b, cudaStream_t q, float *ws) -> cudaError_t {
@@ -373,16 +441,16 @@ cudaError_t Tfix::exec(const void *in, void *out, cudaStream_t s, std::vector<st
             Stage &S = st[k];
             Chain::Sb &b = c.sb[k];
             if (k == 0) {
-                K(tx_resize(tm(S.pyr[fr], 8, 0), S.h, S.w, tm(b.X, S.xs, 3), S.h, S.w, 3, 1.f, 1.f, false, q));
-                K(tx_resize(tm(S.pyr[fr], 8, 3), S.h, S.w, tm(b.X, S.xs, 10), S.h, S.w, 4, 1.f, 1.f, false, q));
+                K(tx_resize(pym(k, fr, 0), S.h, S.w, tm(b.X, S.xs, 3), S.h, S.w, 3, 1.f, 1.f, false, q));
+                K(tx_resize(pym(k, fr, 3), S.h, S.w, tm(b.X, S.xs, 10), S.h, S.w, 4, 1.f, 1.f, false, q));
             } else {
                 const Stage &P = st[k - 1];
                 Chain::Sb &pb = c.sb[k - 1];
                 K(tx_resize(tm(pb.F, 2, 0, true), P.h, P.w, tm(b.F, 2, 0, true), S.h, S.w, 2, (float)S.w / P.w, (float)S.h / P.h, false, q));
                 K(tx_resize(tm(pb.ST, 16), P.h, P.w, tm(b.X, S.xs, 15), S.h, S.w, 9, 1.f, 1.f, false, q));
                 K(tx_resize(tm(b.F, 2, 0, true), S.h, S.w, tm(b.X, S.xs, 24), S.h, S.w, 2, 1.f, 1.f, false, q));
-                K(tx_warp(tm(S.pyr[fr], 8, 0), 3, b.F, S.h, S.w, tm(b.X, S.xs, 3), TxMap(), q));
-                K(tx_warp(tm(S.pyr[fr], 8, 3), 4, b.F, S.h, S.w, tm(b.X, S.xs, 10), TxMap(), q));
+                K(tx_warp(pym(k, fr, 0), 3, b.F, S.h, S.w, tm(b.X, S.xs, 3), TxMap(), q));
+                K(tx_warp(pym(k, fr, 3), 4, b.F, S.h, S.w, tm(b.X, S.xs, 10), TxMap(), q));
             }
             K(tx_fill(tm(b.X, S.xs, 14), S.h, S.w, dt, q));
             CK(mcblock(S, S, b, q, c.wsp));
@@ -392,13 +460,13 @@ cudaError_t Tfix::exec(const void *in, void *out, cudaStream_t s, std::vector<st
         // full resolution: flow, logit, the warped support and its validity
         const Stage &L = st[2];
         const Chain::Sb &lb = c.sb[2];
-        K(tx_full(lb.F, lb.ST, 16, L.h, L.w, FR[fr], c.FF, c.FULL, H, W, q));
+        K(tx_full(lb.F, lb.ST, 16, L.h, L.w, frm(fr, 0), c.FF, c.FULL, H, W, q));
         // the confidence head at 1/2 on the low-passed results
         K(tx_down(tm(c.FF, 2, 0, true), H, W, tm(c.FH, 2, 0, true), h1, w1, 2, (float)w1 / W, (float)h1 / H, q));
         K(tx_down(tm(c.FULL, 8), H, W, tm(c.WH, 8, 0), h1, w1, 4, 1.f, 1.f, q));  // warped half 0..2, raw logit 3
         K(tx_resize(tm(c.WH, 8, 3), h1, w1, tm(c.RCH, 16, 0), h1, w1, 1, 1.f, 1.f, false, q));
-        K(tx_warp(tm(L.pyr[fr], 8, 3), 4, c.FH, h1, w1, tm(c.WF, 8, 0), TxMap(), q));
-        K(tx_conf_in(tm(L.pyr[CEN], 8, 0), tm(c.WH, 8, 0), tm(c.WF, 8, 0), c.FH, dt, c.CIN, h1, w1, q));
+        K(tx_warp(pym(2, fr, 3), 4, c.FH, h1, w1, tm(c.WF, 8, 0), TxMap(), q));
+        K(tx_conf_in(pym(2, CEN, 0), tm(c.WH, 8, 0), tm(c.WF, 8, 0), c.FH, dt, c.CIN, h1, w1, q));
         CK(Gc(h0, lrelu(ga(c.CIN, 32, h1, w1, c.C1, 32, h1, w1)), q, c.wsp));
         CK(Gc(hh1, lrelu(ga(c.C1, 32, h1, w1, c.C2, 32, h1, w1)), q, c.wsp));
         GConvArgs a = ga(c.C2, 32, h1, w1, c.C3, 16, h1, w1);
@@ -415,7 +483,7 @@ cudaError_t Tfix::exec(const void *in, void *out, cudaStream_t s, std::vector<st
         K(cudaStreamWaitEvent(s, c.done, 0));
     }
     pr.mark(P_FUSE);
-    K(tx_final(tm(FR[CEN], 8, 0), ACC, H, W, minsup, cslope, eps, out, s));
+    K(tx_final(frm(CEN, 0), ACC, H, W, minsup, cslope, eps, out, s));
     pr.mark(P_IO);
 #undef K
 #undef CK
