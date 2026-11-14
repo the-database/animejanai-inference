@@ -56,6 +56,7 @@
 #include "native/lower.h"
 #include "native/onnx_graph.h"
 #include "native/rife.h"
+#include "native/vidnet.h"
 
 namespace fs = std::filesystem;
 
@@ -88,7 +89,7 @@ using Logger = ajicore::TrtLogger;
 struct Step {
     enum Kind { RESIZE, MODEL, TEMPORAL, NATIVE } kind;
     int out_w, out_h;
-    int engine_idx;             // MODEL, TEMPORAL: engines[]; NATIVE: natives[]
+    int engine_idx;             // MODEL, TEMPORAL: engines[] (TEMPORAL on native kernels: -1); NATIVE: natives[]
     aji_plan *plan = nullptr;   // RESIZE
 };
 
@@ -262,6 +263,7 @@ struct aji_ctx {
         std::vector<int> matrix, range;
         void *in_tensor = nullptr;   // 3t * pw*ph fp16
         void *out_tensor = nullptr;  // 3 * pow*poh fp16
+        std::shared_ptr<ajinative::VidNet> native;  // native kernels in place of the engine
         uint64_t runs = 0;           // model runs (AJI_TEMPORAL_STATS)
     };
     struct {
@@ -883,6 +885,33 @@ std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &n
     return ex;
 }
 
+// The temporal model `name` on the native kernels at its padded input size, or null with *why.
+std::shared_ptr<ajinative::VidNet> try_native_temporal(aji_ctx *c, const std::string &name, int w, int h, int frames,
+                                                      std::string *why)
+{
+    const std::string path = (fs::u8path(c->model_dir) / fs::u8path(name + ".onnx")).u8string();
+    std::vector<char> bytes;
+    ajinative::OnnxGraph g;
+    if (!ajinative::device_supported(c->cuda_dev, why)) return nullptr;
+    if (!read_file_bytes(path, &bytes)) {
+        *why = "cannot read the model";
+        return nullptr;
+    }
+    if (!ajinative::parse_onnx(bytes.data(), bytes.size(), &g, why)) return nullptr;
+    cudaStream_t s = nullptr;
+    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+        *why = "cannot create a CUDA stream";
+        return nullptr;
+    }
+    std::shared_ptr<ajinative::VidNet> n(ajinative::VidNet::create(g, w, h, s, why).release());
+    cudaStreamDestroy(s);
+    if (n && n->frames() != frames) {
+        *why = "frame count differs from the model input";
+        n.reset();
+    }
+    return n;
+}
+
 void finalize_log(aji_ctx *c)
 {
     std::string out;
@@ -1400,6 +1429,44 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         const bool rank5 = t > 1 && model_frames[mi].rank5;
         const int bw = t > 1 ? (cw + 31) / 32 * 32 : cw;
         const int bh = t > 1 ? (ch + 31) / 32 * 32 : ch;
+        // Temporal models on the native kernels when they can (unless native=off), else TensorRT below
+        std::shared_ptr<ajinative::VidNet> tnative;
+        if (c->conf.native && t > 1) {
+            std::string why;
+            tnative = try_native_temporal(c, m.name, bw, bh, t, &why);
+            c->log_steps.push_back(tnative ? "Native kernels: " + m.name + " (" + tnative->describe() + ")"
+                                           : "Native kernels not used for " + m.name + ": " + why + "; using " AJI_TRT_PRODUCT);
+        }
+        if (tnative) {
+            const int sc = tnative->scale();
+            c->temporal.st.emplace_back();
+            auto &T = c->temporal.st.back();
+            T.t = t;
+            T.r = (t - 1) / 2;
+            T.w = cw; T.h = ch;
+            T.pw = bw; T.ph = bh;
+            T.pow = bw * sc; T.poh = bh * sc;
+            T.ow = cw * sc; T.oh = ch * sc;
+            T.threshold = (float)m.temporal_scene_threshold;
+            T.step_idx = c->steps.size();
+            T.native = tnative;
+            c->steps.push_back({Step::TEMPORAL, T.ow, T.oh, -1});
+            max_bytes = std::max(max_bytes, (size_t)3 * T.ow * T.oh * 2);
+            cw = T.ow; ch = T.oh;
+            if (T.threshold > 0)
+                snprintf(buf, sizeof(buf),
+                         "Applied Temporal Model: %s (%d frames, scene "
+                         "threshold %g);    New Video Resolution: %dx%d",
+                         m.name.c_str(), t, T.threshold, cw, ch);
+            else
+                snprintf(buf, sizeof(buf),
+                         "Applied Temporal Model: %s (%d frames);    "
+                         "New Video Resolution: %dx%d",
+                         m.name.c_str(), t, cw, ch);
+            any_model = true;
+            c->log_steps.push_back(buf);
+            continue;
+        }
         char dims[64];
         if (rank5)
             snprintf(dims, sizeof(dims), "1x%dx3x%dx%d", t, bh, bw);
@@ -2189,15 +2256,23 @@ static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
     }
 
     const Step &st = c->steps[T.step_idx];
-    ModelEngine &me = c->engines[st.engine_idx];
-    if (!me.exec->setTensorAddress(me.in_name, T.in_tensor) ||
-        !me.exec->setTensorAddress(me.out_name, T.out_tensor)) {
-        c->set_error("setTensorAddress failed");
-        return AJI_ERR_ENGINE;
-    }
-    if (!me.exec->enqueueV3(stream)) {
-        c->set_error("enqueueV3 failed");
-        return AJI_ERR_ENGINE;
+    if (T.native) {
+        const cudaError_t e = T.native->run(T.in_tensor, T.out_tensor, stream);
+        if (e != cudaSuccess) {
+            c->set_error("native kernels failed: %s", cudaGetErrorString(e));
+            return AJI_ERR_CUDA;
+        }
+    } else {
+        ModelEngine &me = c->engines[st.engine_idx];
+        if (!me.exec->setTensorAddress(me.in_name, T.in_tensor) ||
+            !me.exec->setTensorAddress(me.out_name, T.out_tensor)) {
+            c->set_error("setTensorAddress failed");
+            return AJI_ERR_ENGINE;
+        }
+        if (!me.exec->enqueueV3(stream)) {
+            c->set_error("enqueueV3 failed");
+            return AJI_ERR_ENGINE;
+        }
     }
     T.runs++;
 

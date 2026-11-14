@@ -1,0 +1,207 @@
+// native/netres.h — device resources and step helpers shared by the native nets built from
+// gconv and tfm steps (FDAT, TFDAT) (internal).
+#ifndef AJI_NATIVE_NETRES_H
+#define AJI_NATIVE_NETRES_H
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include <cuda_runtime.h>
+
+#include "native/gconv.h"
+#include "native/onnx_read.h"
+#include "native/tfm.h"
+
+namespace ajinative {
+
+// One gconv step: its weights and the kernel variant picked for its shape.
+struct GOp {
+    GWeights *w = nullptr;
+    int variant = -1;
+};
+
+inline GConvArgs ga(const void *src, int ss, int IH, int IW, void *dst, int ds, int H, int W)
+{
+    GConvArgs a;
+    a.src = src;
+    a.src_stride = ss;
+    a.IH = IH;
+    a.IW = IW;
+    a.dst = dst;
+    a.dst_stride = ds;
+    a.H = H;
+    a.W = W;
+    return a;
+}
+
+// Device memory and weights owned by a net; any failed allocation sets failed.
+class DevRes {
+public:
+    DevRes() = default;
+    DevRes(const DevRes &) = delete;
+    DevRes &operator=(const DevRes &) = delete;
+    ~DevRes()
+    {
+        for (GWeights *w : gw) {
+            grelease(*w);
+            delete w;
+        }
+        for (TMat *m : mats) {
+            tmat_release(*m);
+            delete m;
+        }
+        for (void *p : bufs) cudaFree(p);
+    }
+    // Zeroed device memory.
+    void *alloc(size_t n)
+    {
+        void *p = nullptr;
+        if (cudaMalloc(&p, n) != cudaSuccess) {
+            failed = true;
+            return nullptr;
+        }
+        cudaMemset(p, 0, n);
+        bufs.push_back(p);
+        bytes += n;
+        return p;
+    }
+    float *dfl(const std::vector<float> &v)
+    {
+        float *p = (float *)alloc(v.size() * 4);
+        if (p) cudaMemcpy(p, v.data(), v.size() * 4, cudaMemcpyHostToDevice);
+        return p;
+    }
+    GWeights *gup(const std::vector<uint16_t> &w, const std::vector<float> &b, int cin, int cin_pad, int cout, int cout_pad)
+    {
+        GWeights *g = new GWeights;
+        if (gupload(*g, w.data(), b.empty() ? nullptr : b.data(), cin, cin_pad, cout, cout_pad) != cudaSuccess) {
+            delete g;
+            failed = true;
+            return nullptr;
+        }
+        gw.push_back(g);
+        bytes += (size_t)9 * cin_pad * cout_pad * 2;
+        return g;
+    }
+    // A GEMM weight matrix, w [K][N] (row k, column n), bias N floats or null.
+    TMat *mat(const std::vector<float> &w, const std::vector<float> *bias, int K, int N)
+    {
+        TMat *m = new TMat;
+        if (tmat_upload(*m, w.data(), bias ? bias->data() : nullptr, K, N) != cudaSuccess) {
+            delete m;
+            failed = true;
+            return nullptr;
+        }
+        mats.push_back(m);
+        bytes += (size_t)m->Kpad * m->Npad * 2;
+        return m;
+    }
+    size_t bytes = 0;
+    bool failed = false;
+
+private:
+    std::vector<void *> bufs;
+    std::vector<GWeights *> gw;
+    std::vector<TMat *> mats;
+};
+
+// Carves 256-byte aligned pieces out of an arena (base null: only counts the bytes).
+struct Bump {
+    char *base = nullptr;
+    size_t off = 0;
+    void *take(size_t n)
+    {
+        off = (off + 255) / 256 * 256;
+        void *p = base ? base + off : nullptr;
+        off += n;
+        return p;
+    }
+};
+
+// Checks the ops are supported and picks each one's kernel variant by timing (one pick per
+// weight shape, output size and phase/residual mode). Writes the ops' outputs.
+inline bool gprepare(std::vector<std::pair<GOp *, GConvArgs>> &ops, cudaStream_t s, std::string *why)
+{
+    std::map<std::tuple<int, int, int, int, int, int, int>, int> picked;
+    for (auto &o : ops) {
+        std::string w2;
+        if (!o.first->w) return onnxread::refuse(why, "weight upload failed");
+        if (!gsupported(*o.first->w, o.second, &w2)) return onnxread::refuse(why, "kernel: " + w2);
+        const auto key = std::make_tuple(o.first->w->cin_pad, o.first->w->cout_pad, o.second.H, o.second.W, o.second.R,
+                                         o.second.r1 != nullptr, o.second.stride * 2 + (o.second.nchw ? 1 : 0));
+        auto it = picked.find(key);
+        if (it == picked.end()) it = picked.emplace(key, gpick(*o.first->w, o.second, s)).first;
+        if (it->second < 0) return onnxread::refuse(why, "kernel timing failed");
+        o.first->variant = it->second;
+    }
+    return true;
+}
+
+// Split-K workspace floats the ops need (the max over them).
+inline size_t gworkspace_max(const std::vector<std::pair<GOp *, GConvArgs>> &ops)
+{
+    size_t n = 0;
+    for (auto &o : ops)
+        if (o.first->w) n = std::max(n, gworkspace(*o.first->w, o.second));
+    return n;
+}
+
+// AJI_NATIVE_PROFILE: GPU time per step kind, from events between steps (printed to stderr).
+enum ProfKind {
+    P_IO, P_CONV, P_LN, P_QKV, P_DW, P_WIN, P_GATE, P_PROJ, P_CSTATS, P_CFOLD, P_CPROJ, P_FC1, P_SMIX, P_FC2,
+    P_ENC, P_FLOW, P_WARP, P_ALIGN, P_FUSE, P_UP, P_NKINDS
+};
+class StepProf {
+public:
+    explicit StepProf(cudaStream_t s_, bool allow = true) : s(s_)
+    {
+        static const bool env = std::getenv("AJI_NATIVE_PROFILE") != nullptr;
+        on = env && allow;
+        mark(P_IO);
+    }
+    void mark(int k)
+    {
+        if (!on) return;
+        cudaEvent_t e;
+        cudaEventCreate(&e);
+        cudaEventRecord(e, s);
+        evs.push_back({k, e});
+    }
+    void report(const char *what)
+    {
+        if (!on) return;
+        cudaStreamSynchronize(s);
+        static const char *const names[P_NKINDS] = {"io",   "conv3x3", "layernorm", "qkv",  "dwconv", "winattn", "gate",
+                                                    "proj", "chanstats", "chanfold", "chanproj", "fc1", "smix", "fc2",
+                                                    "encoder", "flow", "warp", "align", "fusion", "upsample"};
+        double t[P_NKINDS] = {}, total = 0;
+        for (size_t i = 1; i < evs.size(); i++) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, evs[i - 1].second, evs[i].second);
+            t[evs[i].first] += ms;
+            total += ms;
+        }
+        for (auto &e : evs) cudaEventDestroy(e.second);
+        evs.clear();
+        fprintf(stderr, "%s: %.3f ms:", what, total);
+        for (int k = 0; k < P_NKINDS; k++)
+            if (t[k] > 0) fprintf(stderr, " %s %.3f", names[k], t[k]);
+        fprintf(stderr, "\n");
+    }
+
+private:
+    cudaStream_t s;
+    bool on = false;
+    std::vector<std::pair<int, cudaEvent_t>> evs;
+};
+
+}  // namespace ajinative
+
+#endif

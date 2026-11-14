@@ -29,11 +29,13 @@ struct Conv {
     std::vector<float> w;  // ONNX layout: Conv [co][ci][k][k], ConvTranspose [ci][co][k][k]
     std::vector<float> b;
     bool lrelu = false;
+    float slope = 0.2f;  // of the LeakyReLU (only other than 0.2 when Reader::any_slope)
 };
 
 struct Reader {
     const OnnxGraph &g;
     std::map<std::string, const OnnxNode *> by_name, prod;
+    bool any_slope = false;  // accept LeakyReLU slopes other than 0.2 (Conv::slope)
     explicit Reader(const OnnxGraph &gr) : g(gr)
     {
         for (const OnnxNode &n : g.nodes) {
@@ -65,6 +67,7 @@ struct Reader {
     // A Conv / ConvTranspose node with constant weights; lrelu if a LeakyRelu(0.2) consumes it.
     bool conv(const std::string &name, Conv *c, std::string *why) const
     {
+        *c = Conv();
         const OnnxNode *n = node(name);
         if (!n || (n->op != "Conv" && n->op != "ConvTranspose")) return refuse(why, "missing " + name);
         c->transposed = n->op == "ConvTranspose";
@@ -107,8 +110,10 @@ struct Reader {
         for (const OnnxNode &m : g.nodes)
             if (m.op == "LeakyRelu" && !m.in.empty() && m.in[0] == n->out[0]) {
                 const OnnxAttr *a = m.attr("alpha");
-                if (!a || std::fabs(a->f - 0.2f) > 1e-6f) return refuse(why, name + ": LeakyReLU slope");
+                const float al = a ? a->f : 0.01f;
+                if (!any_slope && std::fabs(al - 0.2f) > 1e-6f) return refuse(why, name + ": LeakyReLU slope");
                 c->lrelu = true;
+                c->slope = al;
             }
         return true;
     }
@@ -156,6 +161,62 @@ inline void phase_weights(const Conv &c, int R, int sy, int CHP, std::vector<uin
                 }
         }
     }
+}
+
+// Input idx of node n as floats (an initializer or Constant).
+inline bool tensor_floats(const Reader &rd, const OnnxNode *n, int idx, std::vector<float> *v, std::vector<int64_t> *dims = nullptr)
+{
+    if (!n || (int)n->in.size() <= idx) return false;
+    const OnnxTensor *t = rd.tensor(n->in[idx]);
+    if (!t || !t->floats(v)) return false;
+    if (dims) *dims = t->dims;
+    return true;
+}
+// The constant input of a binary op (e.g. the bias of an Add).
+inline bool init_input(const Reader &rd, const OnnxNode *n, std::vector<float> *v, std::vector<int64_t> *dims = nullptr)
+{
+    if (!n) return false;
+    for (size_t i = 0; i < n->in.size(); i++)
+        if (rd.tensor(n->in[i])) return tensor_floats(rd, n, (int)i, v, dims);
+    return false;
+}
+
+// A 3x3 conv followed by DepthToSpace(2, CRD) as 2 row-phase convs: launch sy writes channels
+// sx*CHP + ch of pixel (2y + sy, 2x + sx) from conv output channel ch*4 + sy*2 + sx.
+inline void ps_weights(const Conv &c, int sy, int CHP, std::vector<uint16_t> *w, std::vector<float> *b)
+{
+    const int CH = c.cout / 4, cout = 2 * CHP;
+    w->assign((size_t)9 * c.cin * cout, 0);
+    b->assign(cout, 0.f);
+    for (int sx = 0; sx < 2; sx++)
+        for (int ch = 0; ch < CH; ch++) {
+            const int o = ch * 4 + sy * 2 + sx;
+            (*b)[sx * CHP + ch] = c.b[o];
+            for (int t = 0; t < 9; t++)
+                for (int i = 0; i < c.cin; i++) (*w)[((size_t)t * c.cin + i) * cout + sx * CHP + ch] = hb(c.w[((size_t)o * c.cin + i) * 9 + t]);
+        }
+}
+
+// A 1x1 conv's weights [co][ci][1][1] as a GEMM matrix [K][co]: input channel i at row map[i]
+// (rows not mapped are zero), K rows in all.
+inline bool conv1x1_matrix(const Reader &rd, const std::string &name, int K, const std::vector<int> *map, std::vector<float> *w,
+                           std::vector<float> *bias, int *cout, std::string *why)
+{
+    const OnnxNode *n = rd.node(name);
+    std::vector<float> v;
+    std::vector<int64_t> d;
+    if (!n || n->op != "Conv" || !tensor_floats(rd, n, 1, &v, &d) || d.size() != 4 || d[2] != 1 || d[3] != 1 ||
+        n->attr_i("group", 1) != 1)
+        return refuse(why, "missing 1x1 conv " + name);
+    const int co = (int)d[0], ci = (int)d[1];
+    if ((map && (int)map->size() != ci) || (!map && ci > K)) return refuse(why, name + ": input channels");
+    w->assign((size_t)K * co, 0.f);
+    for (int o = 0; o < co; o++)
+        for (int i = 0; i < ci; i++) (*w)[(size_t)(map ? (*map)[i] : i) * co + o] = v[(size_t)o * ci + i];
+    bias->clear();
+    if (n->in.size() > 2 && !n->in[2].empty() && (!rd.floats(n->in[2], bias) || (int)bias->size() != co)) return refuse(why, name + ": bias");
+    *cout = co;
+    return true;
 }
 
 }  // namespace onnxread

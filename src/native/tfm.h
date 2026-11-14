@@ -36,7 +36,7 @@ cudaError_t tmat_alloc(TMat &m, int K, int N, const float *bias_dev);
 // Pack w_dev ([K][N] floats, device) into m.frag on stream s (weights computed on the GPU).
 cudaError_t tmat_pack(TMat &m, const float *w_dev, cudaStream_t s);
 
-enum class TAct { None = 0, Gelu = 1 };
+enum class TAct { None = 0, Gelu = 1, LRelu = 2 };
 
 struct TGemm {
     const void *a = nullptr;   // [M][sa] fp16, the first Kpad channels read (padding must be zero)
@@ -47,6 +47,8 @@ struct TGemm {
     const float *colscale = nullptr;          // [Npad] device, or null
     const void *add1 = nullptr, *add2 = nullptr;  // [M][s] fp16, or null (added after the scale)
     int s1 = 0, s2 = 0;
+    float slope = 0.2f;     // LRelu
+    bool act_last = false;  // apply act after the adds instead of before the scale
 };
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
 
