@@ -386,6 +386,24 @@ add_executable(aji_frame_diff_test sanity/frame_diff.cu src/kernels.cu)
 target_include_directories(aji_frame_diff_test PRIVATE include src)
 target_link_libraries(aji_frame_diff_test PRIVATE CUDA::cudart)
 
+# Native tensor-core convolutions (src/native): the building blocks of the native executor.
+# Not linked into the backends yet; built for its tests.
+add_library(aji_native OBJECT src/native/conv.cu src/native/pack.cpp)
+target_include_directories(aji_native PRIVATE src)
+set_target_properties(aji_native PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    CUDA_VISIBILITY_PRESET hidden)
+add_executable(aji_native_pack_test sanity/native_pack_test.cpp src/native/pack.cpp)
+target_include_directories(aji_native_pack_test PRIVATE src)
+add_executable(aji_native_conv_test sanity/native_conv_test.cu $<TARGET_OBJECTS:aji_native>)
+target_include_directories(aji_native_conv_test PRIVATE src)
+target_link_libraries(aji_native_conv_test PRIVATE CUDA::cudart)
+# Whole-model timing on prepared data (experimental/native-span); built on request.
+add_executable(aji_native_bench EXCLUDE_FROM_ALL experimental/native-span/lib/native_bench.cu $<TARGET_OBJECTS:aji_native>)
+target_include_directories(aji_native_bench PRIVATE src)
+target_link_libraries(aji_native_bench PRIVATE CUDA::cudart)
+
 # Regression for concurrent first CUDA runtime loading in separate DLLs.
 if(WIN32)
     foreach(probe IN ITEMS aji_cuda_init_a aji_cuda_init_b)
@@ -404,11 +422,11 @@ enable_testing()
 add_executable(aji_rife_conf_test sanity/rife_conf_test.cpp src/aji_conf.cpp)
 target_include_directories(aji_rife_conf_test PRIVATE src)
 foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
-                     aji_held_test)
+                     aji_held_test aji_native_pack_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS cpu)
 endforeach()
-foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test)
+foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test aji_native_conv_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS gpu)
 endforeach()
