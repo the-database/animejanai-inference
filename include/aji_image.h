@@ -215,6 +215,43 @@ AJI_IMG_EXPORT void aji_img_destroy(aji_img_ctx **c);
  * symbol. */
 AJI_IMG_EXPORT int aji_img_release_device(int backend, uint64_t device_id);
 
+/* GPU memory, for a caller that sizes tiles to fit. Byte counts. */
+typedef struct aji_img_memory {
+    uint64_t device_free;   /* what this process can still allocate on the
+                               context's device now (CUDA: free memory;
+                               DirectML: the OS's budget for this process
+                               minus what it uses). On Windows neither
+                               counts other processes' memory, which WDDM
+                               pages out to make room, slowly: NVML's
+                               free memory does */
+    uint64_t device_total;
+    /* The context's memory that all its models share (CUDA backends; 0 on
+     * DirectML): one activation buffer as large as the largest loaded
+     * model's need, and the GPU tiling scratch, which grows to the largest
+     * image yet: about W*H*C + 5*C*(tile_h*scale)*(W*scale) for a W x H
+     * image of C channels. */
+    uint64_t ctx_activations;
+    uint64_t ctx_scratch;
+    /* With a READY model (else 0): */
+    uint64_t model_weights;     /* its weights (an estimate on DirectML) */
+    uint64_t model_activations; /* the activation memory its tile needs
+                                   (with EVEN_TILES, its largest tile); on
+                                   the CUDA backends held in the shared
+                                   buffer above, not by the model */
+    uint64_t model_buffers;     /* its tile input/output buffers */
+    int activations_shared;     /* 1 if model_activations is in
+                                   ctx_activations (CUDA), 0 if the model
+                                   holds them itself (DirectML) */
+} aji_img_memory;
+
+/* Fills `out` for the context's device and, if `m` is not NULL, that
+ * model; activations and buffers scale with the tile's area, so a caller
+ * can predict another tile size's from one loaded model. AJI_IMG_OK, or
+ * negative. Added in libaji 0.28.0 without an API version change: probe for
+ * the symbol. */
+AJI_IMG_EXPORT int aji_img_memory_get(aji_img_ctx *c, aji_img_model *m,
+                                      aji_img_memory *out);
+
 #ifdef __cplusplus
 }
 #endif

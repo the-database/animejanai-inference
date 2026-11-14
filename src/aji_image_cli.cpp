@@ -3,15 +3,16 @@
  *
  * Usage:
  *   aji_image --list-devices [--backend trt|trtrtx|dml]
- *   aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID] [--tile N]
- *             [--overlap N] [--cache DIR] [--trtexec PATH] [--gray]
+ *   aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID]
+ *             [--tile N|WxH] [--overlap N] [--cache DIR] [--trtexec PATH] [--gray]
  *             [--repeat N] [--async] [--even] IN.(pgm|ppm) OUT.(pgm|ppm)
  *
  * Images are binary PNM (P5 gray / P6 RGB, 8-bit). --gray feeds a P6
  * input as luma (1 channel), exercising the gray path. The model loads
  * blocking (a missing TensorRT engine is built first), or with --async
  * in the background while the CLI polls its state. Timing per run is
- * printed; --repeat N runs the same image N times (warm numbers).
+ * printed; --repeat N runs the same image N times (warm numbers), then the
+ * GPU memory the model and its context hold (aji_img_memory_get).
  */
 
 #include <chrono>
@@ -108,7 +109,7 @@ int usage()
     fprintf(stderr,
             "usage: aji_image --list-devices [--backend trt|trtrtx|dml]\n"
             "       aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID]\n"
-            "                 [--tile N] [--overlap N] [--cache DIR] [--trtexec PATH]\n"
+            "                 [--tile N|WxH] [--overlap N] [--cache DIR] [--trtexec PATH]\n"
             "                 [--gray] [--repeat N] [--async] [--even] IN.(pgm|ppm) OUT.(pgm|ppm)\n");
     return 2;
 }
@@ -121,7 +122,7 @@ int main(int argc, char **argv)
     const char *model = nullptr, *cache = nullptr, *trtexec = nullptr;
     const char *in_path = nullptr, *out_path = nullptr;
     uint64_t device = 0;
-    int tile = 0, overlap = 0, repeat = 1;
+    int tile = 0, tile_h = 0, overlap = 0, repeat = 1;
     bool list = false, gray = false, async = false, even = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -141,7 +142,7 @@ int main(int argc, char **argv)
         else if (a == "--cache") cache = next();
         else if (a == "--trtexec") trtexec = next();
         else if (a == "--device") { const char *v = next(); if (!v) return usage(); device = strtoull(v, nullptr, 0); }
-        else if (a == "--tile") { const char *v = next(); if (!v) return usage(); tile = atoi(v); }
+        else if (a == "--tile") { const char *v = next(); if (!v) return usage(); tile = atoi(v); const char *x = strchr(v, 'x'); tile_h = x ? atoi(x + 1) : 0; }
         else if (a == "--overlap") { const char *v = next(); if (!v) return usage(); overlap = atoi(v); }
         else if (a == "--repeat") { const char *v = next(); if (!v) return usage(); repeat = atoi(v); }
         else if (!in_path) in_path = argv[i];
@@ -196,7 +197,8 @@ int main(int argc, char **argv)
 
     aji_img_model_params mp = {};
     mp.onnx_path = model;
-    mp.tile_w = mp.tile_h = tile;
+    mp.tile_w = tile;
+    mp.tile_h = tile_h > 0 ? tile_h : tile;
     mp.overlap = overlap;
     mp.flags = (async ? AJI_IMG_LOAD_ASYNC_BUILD : 0) |
                (even ? AJI_IMG_LOAD_EVEN_TILES : 0);
@@ -235,6 +237,17 @@ int main(int argc, char **argv)
         rc = aji_img_upscale(m, &ib, &ob, repeat == 1 ? progress_cb : nullptr, nullptr);
         fprintf(stderr, "upscale %dx%d -> %dx%d: %.1f ms\n", src.w, src.h, dst.w,
                 dst.h, now_ms() - t0);
+    }
+    aji_img_memory mem;
+    if (aji_img_memory_get(c, m, &mem) == AJI_IMG_OK) {
+        const auto MB = [](uint64_t b) { return (double)b / (1 << 20); };
+        fprintf(stderr,
+                "memory: device %.0f of %.0f MB free; context activations %.0f MB, "
+                "scratch %.0f MB; model weights %.0f MB, activations %.0f MB%s, "
+                "buffers %.0f MB\n",
+                MB(mem.device_free), MB(mem.device_total), MB(mem.ctx_activations),
+                MB(mem.ctx_scratch), MB(mem.model_weights), MB(mem.model_activations),
+                mem.activations_shared ? " (shared)" : "", MB(mem.model_buffers));
     }
     if (rc != AJI_IMG_OK) {
         fprintf(stderr, "upscale failed (%d): %s\n", rc, aji_img_last_error(c));
