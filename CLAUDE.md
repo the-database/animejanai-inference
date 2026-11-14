@@ -380,6 +380,9 @@ divided by `num`, so a constant-rate source gets exact, evenly spaced timestamps
 ends at the last grid point at or before the last source frame: n frames give
 `floor((n-1)*num/den) + 1`, which for an integer factor is the old `(n-1)*F + 1`. The comment
 above `rife_step` in `src/encode.c` has the details. Unlike mpv, `aji_encode` has no 8x cap.
+Held-frame reuse leaves the grid alone: a pair that ends on a held frame repeats its first
+frame at each of its grid points instead of interpolating ("RIFE chains" under held-frame
+reuse).
 A factor below 1 fails before any engine is built: `aji_rife_factor_for_config` (dispatcher
 only) reads the chain's factor from the conf without configuring.
 
@@ -424,8 +427,9 @@ two frames after it exist (the last two frames are always upscaled) and are unda
 two-frame look-ahead sees no motion starting: D from the anchor crossing 2.5 while N is already
 close to the later frame, or growing past 1.5x (floor 0.5). The thresholds can be overridden
 (`--reuse-held-threshold`, `--reuse-held-fade-threshold`; tuning/debug only). Plain upscale
-chains use it, on CUDA and DirectML alike; RIFE, temporal chains, passthrough and
-`--preview-session` encode every frame, with a log line saying why.
+chains and RIFE chains without a temporal model use it (see "RIFE chains" below), on CUDA and
+DirectML alike; temporal chains (TemporalFix or a temporal upscale model, with or without RIFE),
+passthrough and `--preview-session` encode every frame, with a log line saying why.
 
 Evidence (RTX 5090): full episodes reuse 16-57% (a 1999 DVD 16%, 1080p web 30-57%); frame
 counts and timestamps match an encode without reuse; with a lossless NVENC every upscaled frame
@@ -473,6 +477,8 @@ frames are decided `ring_depth + 2` frames late and compared on a non-blocking s
 for each frame's arrival event (queued for N, N+1 and N+2 before each decision), because libav's
 decoder copies run on the legacy default stream behind the queued inference. Only three steps
 differ per backend (`reuse_arrived`, the event waits in `reuse_decide`, `reuse_anchor_copy`).
+`reuse_decide` only decides; what a decision does is the active path's (`reuse_consume`: the
+ring for a plain chain, the RIFE paths below), so every path shares the queue and the rule.
 Moving the rule into the engine changed nothing: the four traces of the evidence clips below
 (CUDA and DirectML) are byte-identical to `aji_encode`'s own from before, with the same counts,
 frame counts and timestamps, and CUDA at `-preset p1` is as fast as before (median wall time of
@@ -530,6 +536,48 @@ faster (11% and 24% without marks), same decisions as on the 5090; a compare tak
 (frame, pair, D, the 16 region means) and decision (frame, `reuse` or `upscale`) as CSV. At the
 end `aji_encode` logs `held frames: reused N of M (P%)` and `held frames: K comparisons, X ms each
 on average` (from `aji_held_get_stats`).
+
+**RIFE chains.** RIFE only, upscale then RIFE, and RIFE first (VideoJaNai's default; with or
+without a pre-resize), at any factor. The decisions are made on the source frames by the same
+queue and rule, before any pre-resize, so the trace is byte-identical to the plain chain's on
+the same clip. If N is held, N-1 shows the same anchor's picture (the anchor changes only on an
+upscale, and a damaged frame drops it), so the pair (N-1, N) has nothing to interpolate: every
+grid point in [N-1, N) puts out N-1's frame under its own timestamp, and the pair gets no RIFE
+call, no scene detection, no pre-resize and no upscale. The grid is untouched, so the frame
+count and timestamps are those of `--no-reuse-held-frames`. Per path (`rife_up_consume`,
+`rife_first_consume`, `rife_only_consume` in `src/encode.c`): upscale then RIFE takes the
+anchor's output for N; RIFE first interpolates the pair after a held frame from the anchor's
+work-size frame (`anchor_work`, or the anchor's source copy without a pre-resize) and upscales
+the anchor once, on first need (with a fractional factor the anchor may sit off the grid); RIFE
+only puts the frames out as they are, so only the in-betweens of a held pair change (they repeat
+N-1). The log adds `rife: H held pairs not interpolated (I in-betweens repeat their first
+frame)` after the scene duplicates. RIFE only compares frames in the output format (they are
+converted on upload): an 8-bit source at 10-bit output converts exactly (x4), so its trace is
+still the plain chain's; a 10-bit source at 8-bit output compares the rounded frames, so its
+decisions can differ slightly. Temporal chains stay off (`held frames: not reused (the chain is
+temporal)`): reuse ahead of a temporal stage isn't bit-neutral, and deciding on a temporal
+stage's output needs new libaji exports; the simulation put their saving at 1-9%.
+`tools/test-encode-reuse-chains.py` is the regression test (every RIFE chain and factor against
+`--no-reuse-held-frames`: packets and pts, the trace against the plain chain's, with
+`--lossless` every frame no held frame touches bit-identical and the rest above a PSNR floor;
+`--damage`: damaged frames and the frames after them are upscaled).
+
+Evidence (RTX 5090; tongari11 and testclip, 2x Balanced to 4K, RIFE 4.22): on 2878 frames at 2x
+and 5/2, CUDA and DirectML, every RIFE chain's packets and timestamps match
+`--no-reuse-held-frames` and its trace is the plain chain's (238 and 904 held), and CUDA's traces
+equal DirectML's. Lossless, at 2, 5/2, 3 and 3/2: every frame no held frame touches is
+bit-identical; held frames are the plain chain's reused frames (48.7 dB and up from a fresh
+upscale); a held pair's in-betweens are 45-49 dB from RIFE's (CUDA 46 and up, DirectML 45; on
+testclip RIFE's own in-between of two near-identical frames is about as far, 48.6 dB and up,
+from the frame before it, which is what reuse repeats); in-betweens after a held frame, interpolated from the anchor, 51.6 dB and up
+(RIFE first). Every touched frame on CUDA is 46.08 dB or more.
+Known defect, not reuse's: DirectML RIFE at 3840x2160 (upscale then RIFE) puts out a warped
+in-between even for two identical frames (21 dB from CUDA's), so there the no-reuse encode is the
+wrong one. Wall time (median of seven alternating runs, reuse against `--no-reuse-held-frames`,
+2878 frames at 2x, 8% and 31% held): RTX 5090 CUDA at NVENC p1, RIFE first 7.3% and 28.0% faster,
+upscale then RIFE 7.7% and 29.2%; at p7 (NVENC the limit) 0.6% and 1.9%, and 0.9% and 3.0%;
+DirectML at p1, RIFE first, 7.2% and 28.2%. Intel UHD 770 (DirectML, the Performance model, QSV,
+480 frames, 15% and 32% held), RIFE first: 13.7% and 30.2%.
 
 ## Damaged input in `aji_encode`
 
