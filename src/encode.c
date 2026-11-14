@@ -142,6 +142,7 @@ typedef struct {
     int session;            /* --preview-session: serve a player, no encode */
     enum damage_mode on_damage;
     int reuse_held;         /* held-frame reuse: on unless --no-reuse-held-frames */
+    int reuse_rife;         /* ... in RIFE chains too: --reuse-held-frames-rife */
     float reuse_t;          /* --reuse-held-threshold: largest 8x8 tile mean |diff| */
     float reuse_fade;       /* --reuse-held-fade-threshold: largest region signed mean */
 
@@ -519,13 +520,21 @@ typedef struct {
     int              hdr_seen;
 
     /* held-frame reuse (see push_reuse) */
-    int              reuse;          /* on: requested, and a plain upscale chain */
+    int              reuse;          /* on: requested, and a plain upscale chain
+                                        or a RIFE chain without a temporal model */
     aji_held        *held;           /* libaji's decision engine (the rule) */
     cudaStream_t     diff_stream;    /* CUDA: aji_frame_diff and anchor copies only */
     AVBufferRef     *anchor_pool;    /* source-format frames (CUDA: one; DirectML:
                                         each queued frame's copy) for: */
     AVFrame         *anchor_src;     /* a copy of the last upscaled source frame */
-    AVFrame         *anchor_out;     /* a ref of its upscaled output */
+    AVFrame         *anchor_out;     /* a ref of its upscaled output (RIFE-first:
+                                        made on first need; RIFE-only: unused) */
+    AVFrame         *anchor_work;    /* RIFE-first with a pre-resize: a ref of the
+                                        anchor's work-size frame */
+    int              prev_anchor;    /* RIFE-first: src_prev shows the anchor's
+                                        picture (it is the anchor, or held) */
+    int64_t          held_pairs;     /* RIFE pairs not interpolated (N held) */
+    int64_t          held_interps;   /* ... and the in-betweens they repeated */
     held_frame       hq[REUSE_QMAX]; /* frames not yet decided, oldest first */
     int              hq_head, hq_n;
     int              reuse_lag;      /* frames decided this many frames late */
@@ -3343,7 +3352,28 @@ static AVFrame *infer_enqueue(enc_ctx *c, AVFrame *dec)
  * the preview write frames of their own; the software path downloads it),
  * so sharing the buffer is safe, and NVENC maps a buffer sent twice once,
  * as for RIFE's scene duplicates. Damaged frames are always upscaled and
- * never become the anchor. */
+ * never become the anchor.
+ *
+ * RIFE chains without a temporal model share this front end: the same
+ * queue and decisions, on the source frames (so the trace is the plain
+ * chain's), and only what a decision does differs per path
+ * (reuse_consume). If N is held, N-1 shows the same anchor's picture (the
+ * anchor changes only on an upscale, and a damaged frame drops it), so the
+ * pair (N-1, N) has nothing to interpolate: every grid point in [N-1, N)
+ * puts out N-1's frame under its own timestamp, with no RIFE call and no
+ * scene detection, and the grid, the frame count and the timestamps stay
+ * as they are. Upscale then RIFE (rife_up_consume): N's output is the
+ * anchor's. RIFE first (rife_first_consume): N gets no pre-resize, RIFE or
+ * upscale; the pair after it interpolates from the anchor's work-size
+ * frame, and the anchor's upscale is made once, on first need (with a
+ * fractional factor the anchor itself may sit off the grid). RIFE only
+ * (rife_only_consume): frames are put out as they are, so only the
+ * in-betweens of a held pair change (they repeat N-1). */
+
+static int rife_only_consume(enc_ctx *c, held_frame p, int skip);
+static int rife_up_consume(enc_ctx *c, held_frame p, int skip);
+static int rife_first_consume(enc_ctx *c, held_frame p, int skip);
+static int rife_flush(enc_ctx *c);
 
 static int frame_damaged(const AVFrame *f)
 {
@@ -3442,13 +3472,13 @@ static void held_desc(enc_ctx *c, aji_held_frame *d, const held_frame *h)
     d->flags = frame_damaged(h->f) ? AJI_HELD_FRAME_DAMAGED : 0;
 }
 
-/* out, the upscale of h's frame just copied, is the anchor's output, and
- * the copy the engine's anchor (DirectML: with the mark taken after the
- * copy on arrival; CUDA: diff_stream wrote it, no mark) */
+/* out, the upscale of h's frame just copied, is the anchor's output (NULL:
+ * none yet), and the copy the engine's anchor (DirectML: with the mark
+ * taken after the copy on arrival; CUDA: diff_stream wrote it, no mark) */
 static int reuse_anchor_set(enc_ctx *c, AVFrame *out, const held_frame *h)
 {
     av_frame_unref(c->anchor_out);
-    if (av_frame_ref(c->anchor_out, out) < 0) return -1;
+    if (out && av_frame_ref(c->anchor_out, out) < 0) return -1;
     aji_held_frame a;
     memset(&a, 0, sizeof(a));
     fill_aji_frame(c, &a.frame, c->anchor_src, 0);
@@ -3470,65 +3500,101 @@ static int reuse_wait(enc_ctx *c, const held_frame *p, const held_frame *n,
     return 0;
 }
 
-/* upscale p (its frame owned) or reuse the anchor's output for it; n and
- * n2 are the two frames after it (NULL past the end, or with reuse off) */
-static int reuse_decide(enc_ctx *c, held_frame p, const held_frame *n,
+/* the engine's decision for p: 1 = held (reuse the anchor's output), 0 =
+ * upscale; n and n2 are the two frames after it (NULL past the end, or with
+ * reuse off) */
+static int reuse_decide(enc_ctx *c, const held_frame *p, const held_frame *n,
                         const held_frame *n2)
 {
-    int skip = 0;
-    if (c->held) {
-        if (c->reuse && n && n2 && !c->dml && reuse_wait(c, &p, n, n2) < 0) {
-            loge("held frames: cudaStreamWaitEvent failed; reusing no more frames");
-            c->reuse = 0;
-        }
-        const int ahead = c->reuse && n && n2;
-        aji_held_frame dp, dn, dn2;
-        held_desc(c, &dp, &p);
-        if (ahead) {
-            held_desc(c, &dn, n);
-            held_desc(c, &dn2, n2);
-        }
-        aji_held_decision d;
-        memset(&d, 0, sizeof(d));   /* UPSCALE, should the call refuse */
-        aji_held_decide(c->held, &dp, ahead ? &dn : NULL, ahead ? &dn2 : NULL,
-                        c->diff_stream, &d);
-        if (d.error && c->reuse) {
-            loge("held frames: aji_frame_diff: %d (%s); reusing no more frames",
-                 d.error, aji_last_error(c->aji));
-            c->reuse = 0;
-        }
-        skip = d.action == AJI_HELD_REUSE;
+    if (!c->held) return 0;
+    if (c->reuse && n && n2 && !c->dml && reuse_wait(c, p, n, n2) < 0) {
+        loge("held frames: cudaStreamWaitEvent failed; reusing no more frames");
+        c->reuse = 0;
     }
+    const int ahead = c->reuse && n && n2;
+    aji_held_frame dp, dn, dn2;
+    held_desc(c, &dp, p);
+    if (ahead) {
+        held_desc(c, &dn, n);
+        held_desc(c, &dn2, n2);
+    }
+    aji_held_decision d;
+    memset(&d, 0, sizeof(d));   /* UPSCALE, should the call refuse */
+    aji_held_decide(c->held, &dp, ahead ? &dn : NULL, ahead ? &dn2 : NULL,
+                    c->diff_stream, &d);
+    if (d.error && c->reuse) {
+        loge("held frames: aji_frame_diff: %d (%s); reusing no more frames",
+             d.error, aji_last_error(c->aji));
+        c->reuse = 0;
+    }
+    return d.action == AJI_HELD_REUSE;
+}
+
+/* a decided frame's own frames, once its path is done with them */
+static void held_drop(held_frame *p)
+{
+    av_frame_free(&p->f);
+    av_frame_free(&p->copy);
+}
+
+/* p, not held, becomes the anchor if it can (reuse on, undamaged): a copy of
+ * its source for the engine, and out (NULL: made later) as its output.
+ * 1 if it did. DirectML: p->copy is the anchor's now (NULL). */
+static int reuse_new_anchor(enc_ctx *c, held_frame *p, AVFrame *out)
+{
+    if (!c->reuse || frame_damaged(p->f)) return 0;
+    if (reuse_anchor_copy(c, p) < 0 || reuse_anchor_set(c, out, p) < 0) {
+        loge("held frames: keeping the anchor frame failed; reusing no more "
+             "frames");
+        c->reuse = 0;
+        return 0;
+    }
+    return 1;
+}
+
+/* plain chain: p's upscale, or the anchor's output if held, into the ring */
+static int plain_consume(enc_ctx *c, held_frame p, int skip)
+{
     if (ring_make_room(c) < 0) {
-        av_frame_free(&p.f);
-        av_frame_free(&p.copy);
+        held_drop(&p);
         return -1;
     }
     if (skip) {
         AVFrame *out = av_frame_clone(c->anchor_out);
-        if (!out) { loge("av_frame_clone failed"); av_frame_free(&p.f); av_frame_free(&p.copy); return -1; }
+        if (!out) { loge("av_frame_clone failed"); held_drop(&p); return -1; }
         out->pts = p.f->pts;
-        av_frame_free(&p.f);
-        av_frame_free(&p.copy);
+        held_drop(&p);
         ring_commit(c, NULL, out, 0);
         return 0;
     }
     AVFrame *out = infer_enqueue(c, p.f);
-    if (!out) { av_frame_free(&p.f); av_frame_free(&p.copy); return -1; }
-    if (c->reuse && !frame_damaged(p.f) &&
-        (reuse_anchor_copy(c, &p) < 0 || reuse_anchor_set(c, out, &p) < 0)) {
-        loge("held frames: keeping the anchor frame failed; reusing no more "
-             "frames");
-        c->reuse = 0;
-    }
+    if (!out) { held_drop(&p); return -1; }
+    reuse_new_anchor(c, &p, out);
     av_frame_free(&p.copy);       /* DirectML: not the anchor after all */
     ring_commit(c, p.f, out, aji_flush(c->aji, c->stream));
     return 0;
 }
 
-/* a plain upscale chain with held-frame reuse: frames wait in a queue and
- * are decided reuse_lag frames late, each with the two after it as its
- * look-ahead; dec==NULL flushes */
+/* what the active path does with a decided frame (its frames owned) */
+static int reuse_consume(enc_ctx *c, held_frame p, int skip)
+{
+    /* held implies a live anchor and a frame before it (the engine drops
+     * the anchor on every upscale); should that ever not hold, the frame
+     * is upscaled and its pair interpolated instead of repeating stale
+     * output */
+    if (skip && !(c->rife_only ? c->have_prev
+                  : c->rife_first ? c->src_prev && c->prev_anchor
+                                  : c->anchor_out->buf[0] != NULL))
+        skip = 0;
+    if (!c->rife) return plain_consume(c, p, skip);
+    if (c->rife_only) return rife_only_consume(c, p, skip);
+    return c->rife_first ? rife_first_consume(c, p, skip)
+                         : rife_up_consume(c, p, skip);
+}
+
+/* held-frame reuse, every path: frames wait in a queue and are decided
+ * reuse_lag frames late, each with the two after it as its look-ahead;
+ * dec==NULL flushes */
 static int push_reuse(enc_ctx *c, AVFrame *dec)
 {
     int queued = 0;
@@ -3555,16 +3621,19 @@ static int push_reuse(enc_ctx *c, AVFrame *dec)
         p->copy = NULL;
         c->hq_head = (c->hq_head + 1) % REUSE_QMAX;
         c->hq_n--;
-        if (reuse_decide(c, pf, n, n2) < 0) {
+        const int skip = reuse_decide(c, &pf, n, n2);
+        if (reuse_consume(c, pf, skip) < 0) {
             av_frame_free(&dec);
             return -1;
         }
     }
     if (dec) {    /* reuse is off */
         const held_frame h = {dec, NULL, 0, NULL, c->held_id++};
-        return reuse_decide(c, h, NULL, NULL);
+        const int skip = reuse_decide(c, &h, NULL, NULL);
+        return reuse_consume(c, h, skip);
     }
-    return queued ? 0 : ring_drain(c);
+    if (queued) return 0;
+    return c->rife ? rife_flush(c) : ring_drain(c);
 }
 
 /* push one decoded frame (dec==NULL flushes the ring) */
@@ -3638,8 +3707,10 @@ static int64_t interp_pts(const AVFrame *a, const AVFrame *b, int k, int n)
  */
 
 /* take one upscaled frame (up==NULL flushes): emit the grid points from the
- * held frame up to (not including) this one */
-static int rife_step(enc_ctx *c, AVFrame *up)
+ * held frame up to (not including) this one. held: the source frame of up
+ * is a held frame (push_reuse), so the pair has nothing to interpolate and
+ * every grid point repeats up_prev */
+static int rife_step(enc_ctx *c, AVFrame *up, int held)
 {
     if (!up) {
         /* the final upscaled frame, if on the grid: no successor to
@@ -3663,6 +3734,13 @@ static int rife_step(enc_ctx *c, AVFrame *up)
         if (acc == 0) {
             /* on source frame N (= up_prev) */
             if (emit_output(c, c->up_prev, c->up_prev->pts) < 0) return -1;
+            continue;
+        }
+        if (held) {
+            if (emit_output(c, c->up_prev,
+                            interp_pts(c->up_prev, c->up_cur, acc, c->rnum)) < 0)
+                return -1;
+            c->held_interps++;
             continue;
         }
         /* between N and N+1 */
@@ -3691,6 +3769,7 @@ static int rife_step(enc_ctx *c, AVFrame *up)
         if (er < 0) return -1;
     }
     c->rife_acc -= c->rnum;
+    c->held_pairs += held;
 
     av_frame_free(&c->up_prev);
     c->up_prev = c->up_cur;
@@ -3706,33 +3785,49 @@ static int rife_temporal_one(enc_ctx *c)
     AVFrame *up = infer_next_seq(c);
     if (!up) return -1;
     if (sync_aji(c) < 0) { av_frame_free(&up); return -1; }
-    return rife_step(c, up);
+    return rife_step(c, up, 0);
 }
 
-static int push_rife(enc_ctx *c, AVFrame *dec)
+static int push_rife_temporal(enc_ctx *c, AVFrame *dec)
 {
-    if (c->temporal_r) {
-        if (!dec) {
-            while (c->out_seq < c->in_seq)
-                if (rife_temporal_one(c) < 0) return -1;
-            return rife_step(c, NULL);
-        }
-        int r = ingest(c, dec);
-        if (r == 0 && c->in_seq <= (uint64_t)c->temporal_r)
-            r = sync_aji(c);           /* warm-up: nothing is due yet */
-        if (r < 0 || c->in_seq <= (uint64_t)c->temporal_r) {
-            av_frame_free(&dec);
-            return r;
-        }
-        r = rife_temporal_one(c);      /* waits on the ingest too */
+    if (!dec) {
+        while (c->out_seq < c->in_seq)
+            if (rife_temporal_one(c) < 0) return -1;
+        return rife_step(c, NULL, 0);
+    }
+    int r = ingest(c, dec);
+    if (r == 0 && c->in_seq <= (uint64_t)c->temporal_r)
+        r = sync_aji(c);           /* warm-up: nothing is due yet */
+    if (r < 0 || c->in_seq <= (uint64_t)c->temporal_r) {
         av_frame_free(&dec);
         return r;
     }
-    if (!dec) return rife_step(c, NULL);
-    AVFrame *up = upscale_one(c, dec);
+    r = rife_temporal_one(c);      /* waits on the ingest too */
     av_frame_free(&dec);
-    if (!up) return -1;
-    return rife_step(c, up);
+    return r;
+}
+
+/* RIFE only (reuse_consume): the frames are interpolated as they are */
+static int rife_only_consume(enc_ctx *c, held_frame p, int skip)
+{
+    if (!skip) reuse_new_anchor(c, &p, NULL);
+    av_frame_free(&p.copy);
+    return rife_step(c, p.f, skip);
+}
+
+/* upscale, then RIFE (reuse_consume): upscale p, or take the anchor's
+ * output for it if held */
+static int rife_up_consume(enc_ctx *c, held_frame p, int skip)
+{
+    AVFrame *up;
+    if (skip) {
+        if ((up = av_frame_clone(c->anchor_out))) up->pts = p.f->pts;
+        else loge("av_frame_clone failed");
+    } else if ((up = upscale_one(c, p.f))) {
+        reuse_new_anchor(c, &p, up);
+    }
+    held_drop(&p);
+    return up ? rife_step(c, up, skip) : -1;
 }
 
 /* ---- RIFE-first: interpolate source frames, then upscale each ----------- */
@@ -3752,24 +3847,48 @@ static AVFrame *alloc_work(enc_ctx *c)
     return f;
 }
 
-/* RIFE-first (dec==NULL flushes): when source frame N+1 arrives, emit the
- * grid points from N up to N+1 (rife_step's schedule): upscaled N if the
- * grid lands on it, and each interpolation between the two, upscaled. A
- * scene change repeats upscaled N, like the default order. */
-static int push_rife_first(enc_ctx *c, AVFrame *dec)
+/* RIFE-first: upscaled src_prev, for the pair that starts on it. When
+ * src_prev shows the anchor's picture that is the anchor's output, made on
+ * first need and kept until the next anchor (the same upscale of the same
+ * picture: src_prev is the anchor's own frame, or its work-size frame) */
+static AVFrame *rife_first_prev_up(enc_ctx *c)
 {
-    if (!dec) {
-        if (!c->src_prev || c->rife_acc != 0) return 0;  /* off the grid */
-        AVFrame *up = upscale_one(c, c->src_prev);
-        int r = up ? emit_output(c, up, up->pts) : -1;
-        av_frame_free(&up);
-        return r;
+    if (c->prev_anchor && c->anchor_out->buf[0]) {
+        AVFrame *f = av_frame_clone(c->anchor_out);
+        if (!f) { loge("av_frame_clone failed"); return NULL; }
+        f->pts = c->src_prev->pts;
+        return f;
     }
+    AVFrame *up = upscale_one(c, c->src_prev);
+    if (up && c->prev_anchor && av_frame_ref(c->anchor_out, up) < 0)
+        av_frame_free(&up);
+    return up;
+}
 
-    AVFrame *cur = dec;
-    if (c->pre_resize) {
+static int rife_first_flush(enc_ctx *c)
+{
+    if (!c->src_prev || c->rife_acc != 0) return 0;  /* off the grid */
+    AVFrame *up = rife_first_prev_up(c);
+    int r = up ? emit_output(c, up, up->pts) : -1;
+    av_frame_free(&up);
+    return r;
+}
+
+/* RIFE-first (reuse_consume): when source frame N+1 arrives, emit the grid
+ * points from N up to N+1 (rife_step's schedule): upscaled N if the grid
+ * lands on it, and each interpolation between the two, upscaled. A scene
+ * change repeats upscaled N, like the default order. If N+1 is held, every
+ * grid point repeats upscaled N, and N+1 gets no pre-resize: the pair after
+ * it starts from the anchor's work-size frame (anchor_work, or with no
+ * pre-resize the anchor's source copy). */
+static int rife_first_consume(enc_ctx *c, held_frame p, int skip)
+{
+    AVFrame *dec = p.f, *cur = dec;
+    if (skip) {
+        cur = NULL;
+    } else if (c->pre_resize) {
         cur = alloc_work(c);
-        if (!cur) { av_frame_free(&dec); return -1; }
+        if (!cur) { held_drop(&p); return -1; }
         aji_frame in_f, out_f;
         fill_aji_frame(c, &in_f, dec, 0);
         fill_aji_frame(c, &out_f, cur, 0);
@@ -3778,53 +3897,82 @@ static int push_rife_first(enc_ctx *c, AVFrame *dec)
             loge("aji_resize: %d: %s", ret, aji_last_error(c->aji));
         int r = ret == AJI_OK ? sync_aji(c) : -1;
         cur->pts = dec->pts;
-        av_frame_free(&dec);
-        if (r < 0) { av_frame_free(&cur); return -1; }
-    }
-    if (!c->src_prev) {
-        c->src_prev = cur;
-        c->rife_acc = 0;               /* the grid starts on the first frame */
-        return 0;
+        if (r < 0) { av_frame_free(&cur); held_drop(&p); return -1; }
     }
 
-    AVFrame *base = NULL;              /* upscaled N, once needed */
     int rc = 0;
-    for (; rc == 0 && c->rife_acc < c->rnum; c->rife_acc += c->rden) {
-        const int acc = c->rife_acc;
-        if (acc == 0) {
-            base = upscale_one(c, c->src_prev);
-            rc = base ? emit_output(c, base, base->pts) : -1;
-            continue;
+    if (!c->src_prev) {
+        c->rife_acc = 0;               /* the grid starts on the first frame */
+    } else {
+        AVFrame *base = NULL;          /* upscaled N, once needed */
+        for (; rc == 0 && c->rife_acc < c->rnum; c->rife_acc += c->rden) {
+            const int acc = c->rife_acc;
+            const int64_t pts = interp_pts(c->src_prev, dec, acc, c->rnum);
+            if (acc == 0 || skip) {
+                if (!base) base = rife_first_prev_up(c);
+                rc = base ? emit_output(c, base, pts) : -1;
+                c->held_interps += acc && skip;
+                continue;
+            }
+            AVFrame *interp = alloc_work(c);
+            if (!interp) { rc = -1; break; }
+            interp->pts = pts;
+            aji_frame a, b, o;
+            fill_aji_frame(c, &a, c->src_prev, 0);
+            fill_aji_frame(c, &b, cur, 0);
+            fill_aji_frame(c, &o, interp, 0);
+            int ret = aji_infer_rife(c->aji, &a, &b, (double)acc / c->rnum, &o,
+                                     c->stream);
+            if (ret == AJI_SCENE) {
+                c->scene_dupes++;
+                /* off the grid, N itself wasn't put out (or upscaled) */
+                if (!base) base = rife_first_prev_up(c);
+                rc = base ? emit_output(c, base, interp->pts) : -1;
+            } else if (ret != AJI_OK) {
+                loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
+                rc = -1;
+            } else {
+                AVFrame *up = upscale_one(c, interp);
+                rc = up ? emit_output(c, up, up->pts) : -1;
+                av_frame_free(&up);
+            }
+            av_frame_free(&interp);
         }
-        AVFrame *interp = alloc_work(c);
-        if (!interp) { rc = -1; break; }
-        interp->pts = interp_pts(c->src_prev, cur, acc, c->rnum);
-        aji_frame a, b, o;
-        fill_aji_frame(c, &a, c->src_prev, 0);
-        fill_aji_frame(c, &b, cur, 0);
-        fill_aji_frame(c, &o, interp, 0);
-        int ret = aji_infer_rife(c->aji, &a, &b, (double)acc / c->rnum, &o,
-                                 c->stream);
-        if (ret == AJI_SCENE) {
-            c->scene_dupes++;
-            /* off the grid, N itself wasn't put out (or upscaled) */
-            if (!base) base = upscale_one(c, c->src_prev);
-            rc = base ? emit_output(c, base, interp->pts) : -1;
-        } else if (ret != AJI_OK) {
-            loge("aji_infer_rife: %d: %s", ret, aji_last_error(c->aji));
-            rc = -1;
-        } else {
-            AVFrame *up = upscale_one(c, interp);
-            rc = up ? emit_output(c, up, up->pts) : -1;
-            av_frame_free(&up);
-        }
-        av_frame_free(&interp);
+        c->rife_acc -= c->rnum;
+        c->held_pairs += skip;
+        av_frame_free(&base);
+        av_frame_free(&c->src_prev);
     }
-    c->rife_acc -= c->rnum;
-    av_frame_free(&base);
-    av_frame_free(&c->src_prev);
-    c->src_prev = cur;
+
+    if (skip) {
+        /* N+1 shows the anchor's picture (prev_anchor stays set) */
+        c->src_prev = av_frame_clone(c->pre_resize ? c->anchor_work
+                                                   : c->anchor_src);
+        if (c->src_prev) c->src_prev->pts = dec->pts;
+        else if (!rc) { loge("av_frame_clone failed"); rc = -1; }
+    } else {
+        /* after the pair: on CUDA the new anchor's copy overwrites the old
+         * one, which src_prev may have been */
+        c->src_prev = cur;
+        c->prev_anchor = reuse_new_anchor(c, &p, NULL);
+        if (c->prev_anchor && c->pre_resize) {
+            av_frame_unref(c->anchor_work);
+            if (av_frame_ref(c->anchor_work, cur) < 0) {
+                loge("held frames: keeping the anchor frame failed; reusing no "
+                     "more frames");
+                c->reuse = 0;
+                c->prev_anchor = 0;
+            }
+        }
+    }
+    av_frame_free(&p.copy);
+    if (cur != dec) av_frame_free(&dec);
     return rc;
+}
+
+static int rife_flush(enc_ctx *c)
+{
+    return c->rife_first ? rife_first_flush(c) : rife_step(c, NULL, 0);
 }
 
 /* A decoded frame's timestamp in out_tb, from the input's start: the
@@ -3882,19 +4030,26 @@ static int push_frame(enc_ctx *c, AVFrame *fr)
         !(fr = to_device(c, fr)))
         return -1;
     if (!c->rife) return push_upscale(c, fr);
-    if (c->rife_only) return rife_step(c, fr);   /* interpolate the frames as-is */
-    return c->rife_first ? push_rife_first(c, fr) : push_rife(c, fr);
+    if (c->temporal_r) return push_rife_temporal(c, fr);
+    if (c->reuse || c->hq_n) return push_reuse(c, fr);
+    if (!fr) return rife_flush(c);
+    const held_frame h = {fr, NULL, 0, NULL, 0};
+    return reuse_consume(c, h, 0);       /* every frame, as it comes */
 }
 
-/* held-frame reuse: on by default for a plain upscale chain, CUDA or
- * DirectML (see push_reuse); otherwise off, with a line saying why */
+/* held-frame reuse: on by default for a plain upscale chain; for RIFE
+ * chains without a temporal model (RIFE only, upscale then RIFE, RIFE
+ * first) with --reuse-held-frames-rife (off by default until A/B-tested);
+ * CUDA or DirectML (see push_reuse); otherwise off, with a line saying
+ * why */
 static int reuse_setup(enc_ctx *c)
 {
     if (!c->o.reuse_held) return 0;
     const char *why = c->o.session ? "--preview-session"
-                    : c->rife      ? "RIFE interpolates the frames"
-                    : c->passthrough ? "no upscale chain is active"
+                    : c->passthrough && !c->rife_only ? "no upscale chain is active"
                     : c->temporal_r ? "the chain is temporal"
+                    : c->rife && !c->o.reuse_rife
+                        ? "RIFE chain; --reuse-held-frames-rife turns it on"
                     : NULL;
     if (why) {
         loge("held frames: not reused (%s)", why);
@@ -3912,7 +4067,8 @@ static int reuse_setup(enc_ctx *c)
         loge("held frames: not reused (the backend can't compare frames)");
         return 0;
     }
-    if (!(c->anchor_out = av_frame_alloc())) {
+    if (!(c->anchor_out = av_frame_alloc()) ||
+        !(c->anchor_work = av_frame_alloc())) {
         loge("held frames: setup failed");
         return -1;
     }
@@ -3936,10 +4092,14 @@ static int reuse_setup(enc_ctx *c)
     if (trace && *trace && aji_held_set_trace(c->held, trace) != AJI_OK)
         loge("held frames: can't write %s", trace);
     c->reuse = 1;
-    loge("held frames: reusing the last upscale for unchanged frames "
+    loge("held frames: %s for unchanged frames "
          "(tile threshold %.2f, fade threshold %.3f, at most %d in a row; "
          "--no-reuse-held-frames turns it off)",
+         c->rife_only ? "repeating the last frame" : "reusing the last upscale",
          c->o.reuse_t, c->o.reuse_fade, hp.max_run);
+    if (c->rife)
+        loge("held frames: decided on the source frames; RIFE skips the pair "
+             "before each unchanged frame and repeats its first frame");
     return 0;
 }
 
@@ -4066,6 +4226,10 @@ static int run(enc_ctx *c)
         loge("rife: produced %lld frames (~expected %lld), %lld scene dupes",
              (long long)c->out_frames, (long long)out_frames_est(c),
              (long long)c->scene_dupes);
+    if (c->rife && c->held)
+        loge("rife: %lld held pairs not interpolated (%lld in-betweens repeat "
+             "their first frame)", (long long)c->held_pairs,
+             (long long)c->held_interps);
     if (c->held) {
         aji_held_stats st;
         memset(&st, 0, sizeof(st));
@@ -4123,6 +4287,7 @@ static int sess_reset(enc_ctx *c)
     av_frame_free(&c->up_cur);
     av_frame_free(&c->src_prev);
     c->have_prev = 0;
+    c->prev_anchor = 0;             /* (a session reuses nothing) */
     if (c->temporal_r) {
         aji_temporal_reset(c->aji);
         c->in_seq = c->out_seq = 0;
@@ -4286,6 +4451,7 @@ static void cleanup(enc_ctx *c)
     }
     av_frame_free(&c->anchor_src);
     av_frame_free(&c->anchor_out);
+    av_frame_free(&c->anchor_work);
     av_buffer_unref(&c->anchor_pool);
     if (c->diff_stream) cudaStreamDestroy(c->diff_stream);
     aji_held_destroy(&c->held);     /* before aji_destroy; closes the trace */
@@ -4352,7 +4518,10 @@ static void usage(void)
 "                           past it; each spot prints DAMAGE t=<s> frame=<n|-1>)\n"
 "           [--no-reuse-held-frames] (upscale every frame: by default a frame that\n"
 "                           is the same picture as the last upscaled one reuses its\n"
-"                           upscale; plain upscale chains only)\n"
+"                           upscale; not with RIFE or a temporal model)\n"
+"           [--reuse-held-frames-rife] (reuse in RIFE chains too: RIFE repeats a\n"
+"                           held frame instead of interpolating towards it; not\n"
+"                           with a temporal model)\n"
 "           tuning/debug: [--reuse-held-threshold D] (largest 8x8 tile mean difference,\n"
 "                           8-bit levels; default 2.5) [--reuse-held-fade-threshold F]\n"
 "                           (largest region brightness change; default %.2f)\n"
@@ -4408,6 +4577,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-zerocopy")) c.o.no_zerocopy = 1;
         else if (!strcmp(a, "--reuse-held-frames")) c.o.reuse_held = 1;   /* the default */
         else if (!strcmp(a, "--no-reuse-held-frames")) c.o.reuse_held = 0;
+        else if (!strcmp(a, "--reuse-held-frames-rife")) c.o.reuse_rife = 1;
         else if (!strcmp(a, "--probe-encoders")) { probe_encoders(); return 0; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (i >= argc - 1) { usage(); return 2; }
