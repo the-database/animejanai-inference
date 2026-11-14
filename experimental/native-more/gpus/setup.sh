@@ -33,7 +33,7 @@ ls | wc -l
 # TFDAT v2 random exports (1x, 4x)
 cd $R/tfv2
 if [ -f export.py ] && python3 -c "import torch" 2>/dev/null; then
-  python3 -c "import onnx" 2>/dev/null || pip -q install onnx >/dev/null 2>&1
-  for sc in 1 4; do [ -f ${sc}x_tfdat2_rand_c5_fp16.onnx ] || python3 export.py $sc 5 . 2>&1 | grep -E "wrote|Error"; done
+  python3 -c "import onnx" 2>/dev/null || pip -q install onnx 2>/dev/null || pip -q install --break-system-packages onnx || echo "no onnx; skipping the TFDAT v2 exports"
+  for sc in 1 4; do [ -f ${sc}x_tfdat2_rand_c5_fp16.onnx ] || python3 export.py $sc 5 . 2>&1 | grep -E "wrote|Error" || true; done
 fi
 echo "setup done"
