@@ -380,9 +380,9 @@ divided by `num`, so a constant-rate source gets exact, evenly spaced timestamps
 ends at the last grid point at or before the last source frame: n frames give
 `floor((n-1)*num/den) + 1`, which for an integer factor is the old `(n-1)*F + 1`. The comment
 above `rife_step` in `src/encode.c` has the details. Unlike mpv, `aji_encode` has no 8x cap.
-Held-frame reuse leaves the grid alone: a pair that ends on a held frame repeats its first
-frame at each of its grid points instead of interpolating ("RIFE chains" under held-frame
-reuse).
+Held-frame reuse (with `--reuse-held-frames-rife`) leaves the grid alone: a pair that ends on a
+held frame repeats its first frame at each of its grid points instead of interpolating ("RIFE
+chains" under held-frame reuse).
 A factor below 1 fails before any engine is built: `aji_rife_factor_for_config` (dispatcher
 only) reads the chain's factor from the conf without configuring.
 
@@ -415,8 +415,9 @@ upscaling, and checks the output format, frame count and PSNR against the source
 
 ## Held-frame reuse (`aji_held_*`, used by `aji_encode`)
 
-On by default (`--no-reuse-held-frames` turns it off, for debugging and A/B tests;
-`--reuse-held-frames` is still accepted). A frame that is the same picture as the last frame
+On by default for the plain upscale chain (`--no-reuse-held-frames` turns it off, for debugging
+and A/B tests; `--reuse-held-frames` is still accepted); RIFE chains need
+`--reuse-held-frames-rife` (see "RIFE chains" below). A frame that is the same picture as the last frame
 that was upscaled (the anchor) skips inference: the anchor's output is encoded again under the
 frame's timestamp. Anime holds drawings for 2-3 frames; slides, screen recordings and still
 shots repeat frames exactly. The comparison is `aji_frame_diff` (every backend; additive
@@ -537,8 +538,10 @@ faster (11% and 24% without marks), same decisions as on the 5090; a compare tak
 end `aji_encode` logs `held frames: reused N of M (P%)` and `held frames: K comparisons, X ms each
 on average` (from `aji_held_get_stats`).
 
-**RIFE chains.** RIFE only, upscale then RIFE, and RIFE first (VideoJaNai's default; with or
-without a pre-resize), at any factor. The decisions are made on the source frames by the same
+**RIFE chains.** Opt-in for now: `--reuse-held-frames-rife` (off by default until the user has
+watched an A/B of it; without it a RIFE chain logs `held frames: not reused (RIFE chain;
+--reuse-held-frames-rife turns it on)`). RIFE only, upscale then RIFE, and RIFE first
+(VideoJaNai's default; with or without a pre-resize), at any factor. The decisions are made on the source frames by the same
 queue and rule, before any pre-resize, so the trace is byte-identical to the plain chain's on
 the same clip. If N is held, N-1 shows the same anchor's picture (the anchor changes only on an
 upscale, and a damaged frame drops it), so the pair (N-1, N) has nothing to interpolate: every
