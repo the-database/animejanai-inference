@@ -298,12 +298,16 @@ cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, in
 
 }  // namespace
 
+std::unique_ptr<ImgNet> build_fdat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
+
 std::unique_ptr<ImgNet> ImgNet::create(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
 {
     if (g.inputs.size() != 1) return refuse(why, "one input expected"), nullptr;
     std::string w;
     if (auto n = Esrgan::build(g, max_w, max_h, s, &w)) return n;
-    if (why) *why = w;
+    std::string w2;
+    if (auto n = build_fdat(g, max_w, max_h, s, &w2)) return n;
+    if (why) *why = w2 == "not an FDAT graph" ? w : w2;
     return nullptr;
 }
 

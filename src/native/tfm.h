@@ -31,6 +31,10 @@ struct TMat {
 // w: [K][N] floats (row k, column n). bias: N floats or null.
 cudaError_t tmat_upload(TMat &m, const float *w, const float *bias, int K, int N);
 void tmat_release(TMat &m);
+// Allocate a TMat for K x N with no weights yet (frag zeroed; bias copied from device if given).
+cudaError_t tmat_alloc(TMat &m, int K, int N, const float *bias_dev);
+// Pack w_dev ([K][N] floats, device) into m.frag on stream s (weights computed on the GPU).
+cudaError_t tmat_pack(TMat &m, const float *w_dev, cudaStream_t s);
 
 enum class TAct { None = 0, Gelu = 1 };
 
@@ -65,6 +69,9 @@ cudaError_t twinattn(const TWinAttn &a, cudaStream_t s);
 
 // Depthwise 3x3 (zero padding, no bias) over the first C channels; w: [C][9] floats (device).
 cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu, cudaStream_t s);
+// The same, also adding the channel sums of the output to sums[C] (float device, zeroed by the caller).
+cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu, float *sums,
+                    cudaStream_t s);
 // sums[c] += sum over tokens of in[t][c] for c < C (sums: float device, zeroed by the caller).
 cudaError_t tcolsum(const void *in, int sin, int M, int C, float *sums, cudaStream_t s);
 

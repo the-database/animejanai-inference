@@ -1,8 +1,8 @@
 /*
  * native/imgnet.h — image models on native kernels, for the tiled image path (aji_img_trt).
  *
- * create() recognises a model from its ONNX graph (today: ESRGAN / RRDBNet, 1x3xHxW, with or
- * without the 2x pixel-unshuffle) and builds it for tiles up to max_w x max_h; anything else is
+ * create() recognises a model from its ONNX graph (today: ESRGAN / RRDBNet and FDAT, 1x3xHxW, with
+ * or without the 2x pixel-unshuffle) and builds it for tiles up to max_w x max_h; anything else is
  * refused with a reason and the caller builds a TensorRT engine as before. run() takes one tile,
  * NCHW RGB (fp16 or fp32) in [0, 1], and writes NCHW RGB at scale() times its size.
  */

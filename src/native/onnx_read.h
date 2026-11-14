@@ -127,6 +127,37 @@ inline std::vector<uint16_t> conv_taps(const Conv &c, const std::vector<float> *
     return w;
 }
 
+// ConvTranspose 4x4/2/1 output phase p (0/1) from a 3x3 window tap d (-1/0/1): the kernel index,
+// or -1 when that tap does not contribute.
+inline int tk(int p, int d) { return p == 0 ? (d == 0 ? 1 : d == -1 ? 3 : -1) : (d == 0 ? 2 : d == 1 ? 0 : -1); }
+
+// A transposed conv as R phase convs: launch for row phase sy writes channels sx*CHP + ch of
+// pixel (R*y + sy, R*x + sx). R = 2: the plain transposed conv (ch = output channel). R = 4: the
+// transposed conv followed by DepthToSpace(2, CRD): output channel ch*4 + dy2*2 + dx2 of the
+// transposed conv lands at sub-position (dy2, dx2) of its 2x2 block.
+inline void phase_weights(const Conv &c, int R, int sy, int CHP, std::vector<uint16_t> *w, std::vector<float> *b)
+{
+    const int CH = R == 2 ? c.cout : c.cout / 4, cout = R * CHP;
+    w->assign((size_t)9 * c.cin * cout, 0);
+    b->assign(cout, 0.f);
+    const int py = R == 2 ? sy : sy / 2, dy2 = R == 2 ? 0 : sy % 2;
+    for (int sx = 0; sx < R; sx++) {
+        const int px = R == 2 ? sx : sx / 2, dx2 = R == 2 ? 0 : sx % 2;
+        for (int ch = 0; ch < CH; ch++) {
+            const int o = R == 2 ? ch : ch * 4 + dy2 * 2 + dx2;  // transposed-conv output channel
+            (*b)[sx * CHP + ch] = c.b[o];
+            for (int ty = -1; ty <= 1; ty++)
+                for (int tx = -1; tx <= 1; tx++) {
+                    const int ky = tk(py, ty), kx = tk(px, tx);
+                    if (ky < 0 || kx < 0) continue;
+                    const int t = (ty + 1) * 3 + (tx + 1);
+                    for (int i = 0; i < c.cin; i++)
+                        (*w)[((size_t)t * c.cin + i) * cout + sx * CHP + ch] = hb(c.w[(((size_t)i * c.cout + o) * 4 + ky) * 4 + kx]);
+                }
+        }
+    }
+}
+
 }  // namespace onnxread
 }  // namespace ajinative
 
