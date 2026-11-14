@@ -7,6 +7,21 @@ existing native kernel template on the network's shapes. Nothing here ships. RTX
 limit, TensorRT 11.4.0.106 with libaji's image-path build settings (`--builderOptimizationLevel=3`;
 level 5 measured the same), cached engines, a 512x512 input tile (the image path's default tile).
 
+## Summary (RTX 5090, TensorRT 11.4)
+
+| Model | Path | TensorRT | Where TensorRT loses | Native estimate | Effort |
+|---|---|---|---|---|---|
+| RIFE v4.26 | video, every RIFE chain | 19.3 ms @4K, 4.06 @1080p | 76% full-res warp/resize kernels; thin convs at ~9 TFLOPS | 4–6x @4K, ~3x @1080p | medium |
+| TemporalFix | video (temporal) | 11.7 ms @1080p, 4.76 @720p | tiny model run as ~126 kernels; convs at ~8 TFLOPS | 5–8x @1080p | medium, one model |
+| FDAT_M 2x/4x | image | 14.75 / 73.8 ms per 512 tile | ~550 small kernels, ~8% of peak | 2–3x / 3–4x | high |
+| TFDAT (bndl) | video (temporal) | 87 ms @720p | 71% is the FDAT body | ~2x (body) to ~3x | high, shares FDAT |
+| DAT-2 4x (bf16) | image | 331 ms per 512 tile | >25% pure data layout; ~19 TFLOPS | ~4x | highest, follows FDAT |
+| HAT-L 4x (bf16) | image | 572 ms per 512 tile | >30% data layout; ~44 TFLOPS | ~3x | highest, follows FDAT |
+| ESRGAN 2x/4x | image | 19.1 / 82.5 ms per 512 tile | generic sm80 convs; 276 concat copies | 1.5–1.9x (kernels measured) | medium |
+
+Only ESRGAN's estimate rests on measured native kernels; the rest come from profiles and FLOP
+counts. All image-path models also need native support in `aji_img_trt`, which has none today.
+
 ## ESRGAN (MangaJaNai V1, `esrgan/`)
 
 RRDBNet: 23 RRDB x 3 dense blocks, 64 features, growth 32, LeakyReLU 0.2, residual scale 0.2.
@@ -184,12 +199,12 @@ fp16-accumulate rate, and it would be a second kernel family (bf16 fragments, fp
 
 - DAT-2: 180 channels, 6 groups x 6 blocks alternating rectangle-window spatial attention (8x32 /
   32x8, dynamic position bias) and channel attention, each mixed with a depthwise-conv branch, and
-  an SGFN feed-forward; ~25 MFLOP per token, ~6.4 TFLOP per 4x 512 tile.
+  an SGFN feed-forward; ~24 MFLOP per token, ~6.2 TFLOP per 4x 512 tile.
 - HAT-L: 180 channels, 12 groups x 6 Swin blocks (16x16 shifted windows) each with a channel-
   attention conv branch (3x3 180→60→180), plus an overlapping cross-attention block per group;
-  ~93 MFLOP per token, ~24 TFLOP per tile.
+  ~95 MFLOP per token, ~25 TFLOP per tile.
 
-TensorRT (level 3), 4x, 512x512 tile: **DAT-2 331 ms (~20 TFLOPS), HAT-L 572 ms (~43 TFLOPS)**,
+TensorRT (level 3), 4x, 512x512 tile: **DAT-2 331 ms (~19 TFLOPS), HAT-L 572 ms (~44 TFLOPS)**,
 against a bf16/fp32-accumulate peak of ~210 TFLOPS. Profiles (2,200–2,400 layers each):
 
 | | DAT-2 | HAT-L |
