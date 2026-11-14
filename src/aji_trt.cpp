@@ -55,6 +55,7 @@
 #include "native/executor.h"
 #include "native/lower.h"
 #include "native/onnx_graph.h"
+#include "native/rife.h"
 
 namespace fs = std::filesystem;
 
@@ -211,6 +212,7 @@ struct aji_ctx {
         void *in_tensor = nullptr;   // 11 * pw*ph fp16
         void *out_tensor = nullptr;  // 3 * pw*ph fp16
         float *scd = nullptr;        // device diff accumulator
+        std::shared_ptr<ajinative::Rife> native;  // native kernels in place of the engine
     } rife;
 
     // CUDA graph replay of the whole chain (pre -> steps -> post). The
@@ -717,6 +719,7 @@ void rife_teardown(aji_ctx *c)
     cudaFree(R.scd);
     R.engine.exec.reset();
     R.engine.engine.reset();
+    R.native.reset();
     R = {};
 }
 
@@ -751,15 +754,42 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         "--stronglyTyped --optShapes=input:") + dims +
         " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
-    const std::string epath =
-        engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev);
-    int er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
-                           11, &c->rife_model_dir);
-    if (er < 0)
-        return false;
-    if (er == 0)
-        return true;  // building in the background; chain runs without
-                      // rife until aji_poll() triggers a reconfigure
+    // Native kernels first (native=on, the default): no engine to build.
+    std::string native_line;
+    if (c->conf.native) {
+        std::string why;
+        const std::string path =
+            (fs::u8path(c->rife_model_dir) / fs::u8path(model + ".onnx")).u8string();
+        std::vector<char> bytes;
+        ajinative::OnnxGraph g;
+        if (!ajinative::device_supported(c->cuda_dev, &why)) {
+        } else if (!read_file_bytes(path, &bytes)) {
+            why = "cannot read the model";
+        } else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) {
+            cudaStream_t s = nullptr;
+            if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess) {
+                R.native = std::shared_ptr<ajinative::Rife>(
+                    ajinative::Rife::create(g, R.pw, R.ph, s, &why).release());
+                cudaStreamDestroy(s);
+            } else {
+                why = "cannot create a CUDA stream";
+            }
+        }
+        native_line = R.native ? "Native kernels: " + model + " (" + R.native->describe() + ")"
+                               : "Native kernels not used for " + model + ": " + why +
+                                     "; using " AJI_TRT_PRODUCT;
+    }
+    if (!R.native) {
+        const std::string epath =
+            engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev);
+        int er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
+                               11, &c->rife_model_dir);
+        if (er < 0)
+            return false;
+        if (er == 0)
+            return true;  // building in the background; chain runs without
+                          // rife until aji_poll() triggers a reconfigure
+    }
 
     const size_t plane = (size_t)R.pw * R.ph;
     if (cudaMalloc(&R.in_tensor, plane * 11 * 2) != cudaSuccess ||
@@ -792,11 +822,14 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     // RIFE-first runs after any hoisted pre-RIFE resize but before the upscale
     // models, so its step goes right after the pre-resize line (if one was
     // pushed at index 0); the default (rife-after) appends it last.
-    if (before_upscale)
-        c->log_steps.insert(c->log_steps.begin() + (c->has_pre_resize ? 1 : 0),
-                            buf);
-    else
+    if (before_upscale) {
+        auto at = c->log_steps.begin() + (c->has_pre_resize ? 1 : 0);
+        at = c->log_steps.insert(at, buf);
+        if (!native_line.empty()) c->log_steps.insert(at, native_line);
+    } else {
+        if (!native_line.empty()) c->log_steps.push_back(native_line);
         c->log_steps.push_back(buf);
+    }
     R.enabled = true;
     return true;
 }
@@ -2848,15 +2881,23 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
         return AJI_ERR_CUDA;
     }
 
-    ModelEngine &me = R.engine;
-    if (!me.exec->setTensorAddress(me.in_name, R.in_tensor) ||
-        !me.exec->setTensorAddress(me.out_name, R.out_tensor)) {
-        c->set_error("rife setTensorAddress failed");
-        return AJI_ERR_ENGINE;
-    }
-    if (!me.exec->enqueueV3(stream)) {
-        c->set_error("rife enqueueV3 failed");
-        return AJI_ERR_ENGINE;
+    if (R.native) {
+        const cudaError_t ne = R.native->run(R.in_tensor, (float)t, R.out_tensor, stream);
+        if (ne != cudaSuccess) {
+            c->set_error("native rife failed: %s", cudaGetErrorString(ne));
+            return AJI_ERR_CUDA;
+        }
+    } else {
+        ModelEngine &me = R.engine;
+        if (!me.exec->setTensorAddress(me.in_name, R.in_tensor) ||
+            !me.exec->setTensorAddress(me.out_name, R.out_tensor)) {
+            c->set_error("rife setTensorAddress failed");
+            return AJI_ERR_ENGINE;
+        }
+        if (!me.exec->enqueueV3(stream)) {
+            c->set_error("rife enqueueV3 failed");
+            return AJI_ERR_ENGINE;
+        }
     }
 
     // RGB -> padded YUV, then crop the window out

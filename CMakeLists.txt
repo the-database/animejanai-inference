@@ -102,7 +102,7 @@ set_target_properties(aji_trt_common PROPERTIES
 
 # Native tensor-core kernels and their ONNX lowering/executor (src/native), linked into both
 # TensorRT backends (used with [global] native=on) and the native tests.
-add_library(aji_native OBJECT src/native/conv.cu src/native/pack.cpp src/native/onnx_graph.cpp
+add_library(aji_native OBJECT src/native/conv.cu src/native/gconv.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/pack.cpp src/native/onnx_graph.cpp
     src/native/lower.cpp src/native/executor.cpp)
 target_include_directories(aji_native PRIVATE src)
 target_link_libraries(aji_native PRIVATE CUDA::cudart)
@@ -414,6 +414,13 @@ target_include_directories(aji_native_lower_test PRIVATE src)
 add_executable(aji_native_conv_test sanity/native_conv_test.cu $<TARGET_OBJECTS:aji_native>)
 target_include_directories(aji_native_conv_test PRIVATE src)
 target_link_libraries(aji_native_conv_test PRIVATE CUDA::cudart)
+add_executable(aji_native_gconv_test sanity/native_gconv_test.cu $<TARGET_OBJECTS:aji_native>)
+target_include_directories(aji_native_gconv_test PRIVATE src)
+target_link_libraries(aji_native_gconv_test PRIVATE CUDA::cudart)
+# Native RIFE on a raw input tensor (parity against an fp32 reference, timing); built on request.
+add_executable(aji_native_rife_run EXCLUDE_FROM_ALL sanity/native_rife_run.cu $<TARGET_OBJECTS:aji_native>)
+target_include_directories(aji_native_rife_run PRIVATE src)
+target_link_libraries(aji_native_rife_run PRIVATE CUDA::cudart)
 # Whole-model timing on prepared data (experimental/native-span); built on request.
 add_executable(aji_native_bench EXCLUDE_FROM_ALL experimental/native-span/lib/native_bench.cu $<TARGET_OBJECTS:aji_native>)
 target_include_directories(aji_native_bench PRIVATE src)
@@ -441,7 +448,7 @@ foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_r
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS cpu)
 endforeach()
-foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test aji_native_conv_test)
+foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test aji_native_conv_test aji_native_gconv_test)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS gpu)
 endforeach()
