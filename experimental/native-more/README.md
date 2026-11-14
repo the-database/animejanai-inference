@@ -158,3 +158,19 @@ Cost: medium. Small graphs (~250 nodes) that are regular across versions; new pi
 stride-2 conv input mode, the transposed conv + depth-to-space tail, the per-channel β residual
 epilogue, a fused warp/resample kernel and the final blend, plus wiring a native RIFE step next
 to the TensorRT RIFE engine in the video path.
+
+## TemporalFix (`temporalfix_s1_v1.1_op18_fp16`)
+
+A 7-frame (21-channel) 1x model that runs before the upscale: a per-frame `encode`, an `aligner`
+(5 `GridSample` warps, resizes, cumulative sums) and a `conf_head`, 44 convs of 1–32 channels.
+TensorRT (level 5), per frame: **1280x736 4.76 ms, 1920x1088 11.7 ms**. At 1080p that is only
+~0.033 TFLOP of convs, run at ~8 TFLOPS (16→16 at 960x544: 1.12 ms for two convs; 1→3 and 1→1
+convs at full resolution at 0–2 TFLOPS), plus 7.5 ms of Myelin aligner/confidence/warp kernels:
+by module, aligner 3.8 ms, conf_head 2.5 ms, encode 1.7 ms, unlabelled 3.7 ms.
+
+So it is bound by memory traffic and kernel count, not maths. The 7 input frames are 88 MB at
+1080p and the features 16–32 channels at half resolution (~33 MB each); a native version that
+reads the frames once and fuses the thin convs with the elementwise work around them should be
+in the ~1.5–2.5 ms range at 1080p (**~5–8x**) and ~1 ms at 720p (~4–5x). Estimate only. It is one
+model rather than a family, so the lowering would be specific to it (or written by hand, as
+NeoRTX does per model), and it needs the temporal (multi-frame) input path.
