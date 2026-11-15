@@ -636,6 +636,65 @@ bool load_native(aji_img_model *m, const std::vector<char> &blob, std::string *w
 
 }  // namespace
 
+namespace {
+
+// The model's file, graph input and tile settings, as aji_img_load reads them, before any engine
+// or native build. False with the context's error set.
+bool begin_load(aji_img_ctx *c, const aji_img_model_params *p, aji_img_model *m, std::vector<char> *blob, AjiOnnxInput *oin)
+{
+    m->c = c;
+    m->onnx_path = p->onnx_path;
+    m->name = stem_of(m->onnx_path);
+    m->overlap = p->overlap > 0 ? p->overlap : DEFAULT_OVERLAP;
+
+    if (!read_file_bytes(m->onnx_path, blob)) {
+        c->set_error("cannot read model: " + m->onnx_path);
+        return false;
+    }
+    if (!aji_onnx_input(blob->data(), blob->size(), oin) || oin->dims.size() != 4) {
+        c->set_error(m->name + ": expected one NCHW graph input");
+        return false;
+    }
+    m->in_ch = oin->dims[1] > 0 ? (int)oin->dims[1] : 3;
+    if (m->in_ch != 1 && m->in_ch != 3) {
+        c->set_error(m->name + ": input must have 1 or 3 channels");
+        return false;
+    }
+    m->settings = IMG_ENGINE_SETTINGS;
+    if (oin->dims[2] > 0 && oin->dims[3] > 0) {
+        m->tile_h = (int)oin->dims[2];  // fixed-shape model: its shape is the tile
+        m->tile_w = (int)oin->dims[3];
+    } else {
+        m->tile_w = p->tile_w > 0 ? p->tile_w : DEFAULT_TILE;
+        m->tile_h = p->tile_h > 0 ? p->tile_h : DEFAULT_TILE;
+        const std::string shape = oin->name + ":1x" + std::to_string(m->in_ch) +
+                                  "x" + std::to_string(m->tile_h) + "x" +
+                                  std::to_string(m->tile_w);
+        // AJI_IMG_LOAD_EVEN_TILES: one engine for any tile shape from
+        // MIN_TILE up to the tile size, so each image is split into even
+        // tiles instead of fixed ones pushed flush against its edges.
+        m->even = (p->flags & AJI_IMG_LOAD_EVEN_TILES) != 0;
+        const std::string min_shape =
+            oin->name + ":1x" + std::to_string(m->in_ch) + "x" +
+            std::to_string(std::min(m->tile_h, MIN_TILE)) + "x" +
+            std::to_string(std::min(m->tile_w, MIN_TILE));
+        m->settings += " --minShapes=" + (m->even ? min_shape : shape) +
+                       " --optShapes=" + shape + " --maxShapes=" + shape;
+    }
+    m->overlap = std::min(m->overlap, std::min(m->tile_w, m->tile_h) / 2);
+
+    return true;
+}
+
+// Whether aji_img_load tries native kernels for the model (AJI_NATIVE=off disables them; they
+// take 3-channel models whose input size is dynamic).
+bool native_candidate(const aji_img_model &m, const AjiOnnxInput &oin)
+{
+    return native_enabled() && m.in_ch == 3 && oin.dims[2] <= 0;
+}
+
+}  // namespace
+
 extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
                                                       const aji_img_model_params *p)
 {
@@ -647,51 +706,13 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
         return nullptr;
     }
     auto m = std::make_unique<aji_img_model>();
-    m->c = c;
-    m->onnx_path = p->onnx_path;
-    m->name = stem_of(m->onnx_path);
-    m->overlap = p->overlap > 0 ? p->overlap : DEFAULT_OVERLAP;
-
     std::vector<char> blob;
     AjiOnnxInput oin;
-    if (!read_file_bytes(m->onnx_path, &blob)) {
-        c->set_error("cannot read model: " + m->onnx_path);
+    if (!begin_load(c, p, m.get(), &blob, &oin))
         return nullptr;
-    }
-    if (!aji_onnx_input(blob.data(), blob.size(), &oin) || oin.dims.size() != 4) {
-        c->set_error(m->name + ": expected one NCHW graph input");
-        return nullptr;
-    }
-    m->in_ch = oin.dims[1] > 0 ? (int)oin.dims[1] : 3;
-    if (m->in_ch != 1 && m->in_ch != 3) {
-        c->set_error(m->name + ": input must have 1 or 3 channels");
-        return nullptr;
-    }
-    m->settings = IMG_ENGINE_SETTINGS;
-    if (oin.dims[2] > 0 && oin.dims[3] > 0) {
-        m->tile_h = (int)oin.dims[2];  // fixed-shape model: its shape is the tile
-        m->tile_w = (int)oin.dims[3];
-    } else {
-        m->tile_w = p->tile_w > 0 ? p->tile_w : DEFAULT_TILE;
-        m->tile_h = p->tile_h > 0 ? p->tile_h : DEFAULT_TILE;
-        const std::string shape = oin.name + ":1x" + std::to_string(m->in_ch) +
-                                  "x" + std::to_string(m->tile_h) + "x" +
-                                  std::to_string(m->tile_w);
-        // AJI_IMG_LOAD_EVEN_TILES: one engine for any tile shape from
-        // MIN_TILE up to the tile size, so each image is split into even
-        // tiles instead of fixed ones pushed flush against its edges.
-        m->even = (p->flags & AJI_IMG_LOAD_EVEN_TILES) != 0;
-        const std::string min_shape =
-            oin.name + ":1x" + std::to_string(m->in_ch) + "x" +
-            std::to_string(std::min(m->tile_h, MIN_TILE)) + "x" +
-            std::to_string(std::min(m->tile_w, MIN_TILE));
-        m->settings += " --minShapes=" + (m->even ? min_shape : shape) +
-                       " --optShapes=" + shape + " --maxShapes=" + shape;
-    }
-    m->overlap = std::min(m->overlap, std::min(m->tile_w, m->tile_h) / 2);
 
     // Native kernels first (AJI_NATIVE=off to disable): no engine to build.
-    if (native_enabled() && m->in_ch == 3 && oin.dims[2] <= 0) {
+    if (native_candidate(*m, oin)) {
         std::string why;
         CtxGuard guard(c->cu_ctx);
         if (load_native(m.get(), blob, &why)) {
@@ -1191,5 +1212,54 @@ extern "C" AJI_IMG_EXPORT int aji_img_memory_get(aji_img_ctx *c, aji_img_model *
             out->activations_shared = 0;
         }
     }
+    return AJI_IMG_OK;
+}
+
+extern "C" AJI_IMG_EXPORT int aji_img_native_probe(aji_img_ctx *c, const aji_img_model_params *p,
+                                                   aji_img_memory *out)
+{
+    if (!c || !out)
+        return AJI_IMG_ERR_ARGS;
+    *out = {};
+    std::lock_guard<std::mutex> lock(c->mu);
+    if (!p || !p->onnx_path) {
+        c->set_error("aji_img_native_probe: no model path");
+        return AJI_IMG_ERR_ARGS;
+    }
+    auto m = std::make_unique<aji_img_model>();
+    std::vector<char> blob;
+    AjiOnnxInput oin;
+    if (!begin_load(c, p, m.get(), &blob, &oin))
+        return AJI_IMG_ERR;
+    if (!native_candidate(*m, oin)) {
+        c->set_error(m->name + ": not for native kernels (" +
+                     std::string(!native_enabled() ? "AJI_NATIVE is off" : m->in_ch != 3 ? "not 3-channel" : "fixed input size") + ")");
+        return AJI_IMG_ERR;
+    }
+    CtxGuard guard(c->cu_ctx);
+    std::string why;
+    const bool ok = load_native(m.get(), blob, &why);
+    if (ok) {
+        out->model_weights = (uint64_t)m->weights;
+        out->model_activations = (uint64_t)m->native_act;
+        out->model_buffers = m->buf_bytes;
+    }
+    m->free_buffers();  // before measuring the device, so the probe's own model is not counted
+    if (!ok) {
+        c->set_error(m->name + ": native kernels not used: " + why);
+        return AJI_IMG_ERR;
+    }
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        cudaGetLastError();
+        return AJI_IMG_ERR;
+    }
+    out->device_free = free_b;
+    out->device_total = total_b;
+    std::lock_guard<std::mutex> run(c->run_mu);
+    out->ctx_activations = (uint64_t)c->act_cap;
+    const GpuTileScratch &g = c->gpu;
+    out->ctx_scratch = g.img_cap + g.band_cap + g.rows_cap + g.wx_cap + g.wy_cap;
+    out->activations_shared = 0;
     return AJI_IMG_OK;
 }

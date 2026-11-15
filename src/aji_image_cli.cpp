@@ -5,7 +5,7 @@
  *   aji_image --list-devices [--backend trt|trtrtx|dml]
  *   aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID]
  *             [--tile N|WxH] [--overlap N] [--cache DIR] [--trtexec PATH] [--gray]
- *             [--repeat N] [--async] [--even] IN.(pgm|ppm) OUT.(pgm|ppm)
+ *             [--repeat N] [--async] [--even] [--probe] IN.(pgm|ppm) OUT.(pgm|ppm)
  *
  * Images are binary PNM (P5 gray / P6 RGB, 8-bit). --gray feeds a P6
  * input as luma (1 channel), exercising the gray path. The model loads
@@ -110,7 +110,7 @@ int usage()
             "usage: aji_image --list-devices [--backend trt|trtrtx|dml]\n"
             "       aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID]\n"
             "                 [--tile N|WxH] [--overlap N] [--cache DIR] [--trtexec PATH]\n"
-            "                 [--gray] [--repeat N] [--async] [--even] IN.(pgm|ppm) OUT.(pgm|ppm)\n");
+            "                 [--gray] [--repeat N] [--async] [--even] [--probe] IN.(pgm|ppm) OUT.(pgm|ppm)\n");
     return 2;
 }
 
@@ -123,7 +123,7 @@ int main(int argc, char **argv)
     const char *in_path = nullptr, *out_path = nullptr;
     uint64_t device = 0;
     int tile = 0, tile_h = 0, overlap = 0, repeat = 1;
-    bool list = false, gray = false, async = false, even = false;
+    bool list = false, gray = false, async = false, even = false, probe = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -144,6 +144,7 @@ int main(int argc, char **argv)
         else if (a == "--device") { const char *v = next(); if (!v) return usage(); device = strtoull(v, nullptr, 0); }
         else if (a == "--tile") { const char *v = next(); if (!v) return usage(); tile = atoi(v); const char *x = strchr(v, 'x'); tile_h = x ? atoi(x + 1) : 0; }
         else if (a == "--overlap") { const char *v = next(); if (!v) return usage(); overlap = atoi(v); }
+        else if (a == "--probe") probe = true;
         else if (a == "--repeat") { const char *v = next(); if (!v) return usage(); repeat = atoi(v); }
         else if (!in_path) in_path = argv[i];
         else if (!out_path) out_path = argv[i];
@@ -203,6 +204,17 @@ int main(int argc, char **argv)
     mp.flags = (async ? AJI_IMG_LOAD_ASYNC_BUILD : 0) |
                (even ? AJI_IMG_LOAD_EVEN_TILES : 0);
     double t0 = now_ms();
+    if (probe) {  // aji_img_native_probe first: would the load be native, and its memory
+        aji_img_memory pm;
+        const int pr = aji_img_native_probe(c, &mp, &pm);
+        const auto MB = [](uint64_t b) { return (double)b / (1 << 20); };
+        if (pr == AJI_IMG_OK)
+            fprintf(stderr, "probe: native; weights %.0f MB, activations %.0f MB, buffers %.0f MB; device %.0f MB free (%.0f ms)\n",
+                    MB(pm.model_weights), MB(pm.model_activations), MB(pm.model_buffers), MB(pm.device_free), now_ms() - t0);
+        else
+            fprintf(stderr, "probe: not native (%d): %s (%.0f ms)\n", pr, aji_img_last_error(c), now_ms() - t0);
+        t0 = now_ms();
+    }
     aji_img_model *m = aji_img_load(c, &mp);
     if (!m) {
         fprintf(stderr, "load failed: %s\n", aji_img_last_error(c));
