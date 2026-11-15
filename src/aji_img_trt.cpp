@@ -23,6 +23,7 @@
 #include <algorithm>
 #include "native/conv.h"
 #include "native/imgnet.h"
+#include "native/guard.h"
 #include "native/onnx_graph.h"
 #include <chrono>
 #include <cstdarg>
@@ -597,14 +598,16 @@ bool load_native(aji_img_model *m, const std::vector<char> &blob, std::string *w
     if (!ajinative::device_supported(c->device, why))
         return false;
     ajinative::OnnxGraph g;
-    if (!ajinative::parse_onnx(blob.data(), blob.size(), &g, why))
+    if (!ajinative::guarded(why, [&] { return ajinative::parse_onnx(blob.data(), blob.size(), &g, why); }))
         return false;
     if (cudaStreamCreateWithFlags(&m->stream, cudaStreamNonBlocking) != cudaSuccess) {
         *why = "cannot create a CUDA stream";
         return false;
     }
-    m->native = ajinative::ImgNet::create(g, m->tile_w, m->tile_h, m->stream, why);
-    if (!m->native)
+    if (!ajinative::guarded(why, [&] {
+            m->native = ajinative::ImgNet::create(g, m->tile_w, m->tile_h, m->stream, why);
+            return m->native != nullptr;
+        }))
         return false;
     if (!m->native->accepts(m->tile_w, m->tile_h)) {
         *why = "tile size not accepted";

@@ -22,6 +22,9 @@ struct OnnxTensor {
     std::vector<int64_t> dims;
     std::vector<uint8_t> raw;  // little-endian element bytes, whatever field they came from
 
+    // Elements per dims; kBadCount when a dim is negative or the product exceeds kMaxElems (the
+    // file is untrusted: callers index the data by dims, so the two must agree before any use).
+    static constexpr size_t kMaxElems = size_t(1) << 28, kBadCount = ~size_t(0);
     size_t count() const;
     // Element values as floats (FLOAT, FLOAT16, DOUBLE) or integers (INT32, INT64);
     // false for other types or a size mismatch.

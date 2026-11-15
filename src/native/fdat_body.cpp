@@ -42,12 +42,12 @@ bool FdatBody::parse(const Reader &rd, const std::string &prefix, int C_, std::s
             std::vector<int64_t> d;
             const OnnxNode *ln1 = rd.node(B + "n1/LayerNormalization"), *ln2 = rd.node(B + "n2/LayerNormalization");
             if (!tensor_floats(rd, ln1, 1, &v) || !tensor_floats(rd, ln1, 2, &v2) || (int)v.size() != C) return refuse(why, B + "n1");
-            b.ln1g = res.dfl(v);
-            b.ln1b = res.dfl(v2);
+            b.ln1g = res.dfl(v, C);
+            b.ln1b = res.dfl(v2, C);
             b.eps1 = ln1->attr("epsilon") ? ln1->attr("epsilon")->f : 1e-5f;
             if (!tensor_floats(rd, ln2, 1, &v) || !tensor_floats(rd, ln2, 2, &v2)) return refuse(why, B + "n2");
-            b.ln2g = res.dfl(v);
-            b.ln2b = res.dfl(v2);
+            b.ln2g = res.dfl(v, C);
+            b.ln2b = res.dfl(v2, C);
             b.eps2 = ln2->attr("epsilon") ? ln2->attr("epsilon")->f : 1e-5f;
             // no qkv / fc biases in these exports (qkv_bias=False); refuse rather than drop one
             if (rd.node(B + "attn/qkv/Add") || rd.node(B + "ffn/fc1/Add") || rd.node(B + "ffn/fc2/Add"))
@@ -61,7 +61,7 @@ bool FdatBody::parse(const Reader &rd, const std::string &prefix, int C_, std::s
                 return refuse(why, B + "proj");
             if (!tensor_floats(rd, rd.node(B + "conv/conv.0/Conv"), 1, &v, &d) || d != std::vector<int64_t>{C, 1, 3, 3})
                 return refuse(why, B + "conv");
-            b.dw = res.dfl(v);
+            b.dw = res.dfl(v, (size_t)9 * C);
             // The attention type from the graph: Softmax <- Add(bias [heads,T,T]) <- MatMul <- Mul(scale) (spatial),
             // or Softmax <- Mul(temperature [heads,1,1]) (channel).
             const OnnxNode *sm = rd.node(B + "attn/Softmax");
@@ -71,11 +71,11 @@ bool FdatBody::parse(const Reader &rd, const std::string &prefix, int C_, std::s
                 b.spatial = true;
                 if (!init_input(rd, pre, &v, &d) || d.size() != 3 || d[1] != d[2]) return refuse(why, B + "bias");
                 const int nh = (int)d[0], T = (int)d[1], wsz = (int)std::lround(std::sqrt((double)T));
-                if (wsz * wsz != T || C % nh) return refuse(why, B + "window");
+                if (nh < 1 || T < 1 || wsz * wsz != T || C % nh) return refuse(why, B + "window");
                 if ((heads && heads != nh) || (ws != wsz && bi + gi > 0)) return refuse(why, "FDAT mixed heads/windows");
                 heads = nh;
                 ws = wsz;
-                b.bias = res.dfl(v);
+                b.bias = res.dfl(v, (size_t)nh * T * T);
                 std::vector<float> sc;
                 const OnnxNode *mm = nullptr, *ml = nullptr;
                 for (const std::string &i : pre->in)
@@ -92,19 +92,19 @@ bool FdatBody::parse(const Reader &rd, const std::string &prefix, int C_, std::s
                     if (!t || !t->ints(&st) || st.size() != 1 || st[0] <= 0 || st[0] >= ws) return refuse(why, B + "window shift");
                     b.shift = (int)st[0];
                 }
-                if (!tensor_floats(rd, rd.node(B + "inter/cg/cg.1/Conv"), 1, &v, &d) || d.size() != 4 || d[1] != C)
+                if (!tensor_floats(rd, rd.node(B + "inter/cg/cg.1/Conv"), 1, &v, &d) || d.size() != 4 || d[1] != C || d[0] < 1 || d[2] != 1 || d[3] != 1)
                     return refuse(why, B + "cg");
                 cgr = (int)d[0];
-                b.cg1 = res.dfl(v);
-                if (!tensor_floats(rd, rd.node(B + "inter/cg/cg.3/Conv"), 1, &v, &d) || d[0] != C || d[1] != cgr) return refuse(why, B + "cg");
-                b.cg2 = res.dfl(v);
+                b.cg1 = res.dfl(v, (size_t)cgr * C);
+                if (!tensor_floats(rd, rd.node(B + "inter/cg/cg.3/Conv"), 1, &v, &d) || d.size() != 4 || d[0] != C || d[1] != cgr || d[2] != 1 || d[3] != 1) return refuse(why, B + "cg");
+                b.cg2 = res.dfl(v, (size_t)C * cgr);
                 b.proj = res.mat(wp, &bp, C, C);
             } else if (pre->op == "Mul" && rd.node(B + "attn/ReduceL2")) {
                 b.spatial = false;
-                if (!init_input(rd, pre, &v, &d) || d.size() != 3 || d[1] != 1 || d[2] != 1) return refuse(why, B + "temperature");
+                if (!init_input(rd, pre, &v, &d) || d.size() != 3 || d[0] < 1 || d[1] != 1 || d[2] != 1) return refuse(why, B + "temperature");
                 if (heads && heads != (int)d[0]) return refuse(why, "FDAT mixed heads");
                 heads = (int)d[0];
-                b.temp = res.dfl(v);
+                b.temp = res.dfl(v, heads);
                 std::vector<float> cl, pw;
                 const OnnxNode *clip = rd.node(B + "attn/Clip");
                 if (!clip || clip->in.size() < 2 || !rd.floats(clip->in[1], &cl) || cl.size() != 1) return refuse(why, B + "norm clip");
@@ -113,10 +113,10 @@ bool FdatBody::parse(const Reader &rd, const std::string &prefix, int C_, std::s
                     if (pn->in.size() < 2 || !rd.floats(pn->in[1], &pw) || pw.size() != 1) return refuse(why, B + "norm pre-scale");
                     b.pre = pw[0];
                 }
-                if (!tensor_floats(rd, rd.node(B + "inter/sg/sg.0/Conv"), 1, &v, &d) || d[0] != 1 || d[1] != C) return refuse(why, B + "sg");
-                b.sg = res.dfl(v);
-                b.wp = res.dfl(wp);
-                b.bias = res.dfl(bp);  // copied into the shared fold matrix's bias per block
+                if (!tensor_floats(rd, rd.node(B + "inter/sg/sg.0/Conv"), 1, &v, &d) || d.size() != 4 || d[0] != 1 || d[1] != C || d[2] != 1 || d[3] != 1) return refuse(why, B + "sg");
+                b.sg = res.dfl(v, C);
+                b.wp = res.dfl(wp, (size_t)C * C);
+                b.bias = res.dfl(bp, C);  // copied into the shared fold matrix's bias per block
             } else {
                 return refuse(why, B + "attention type");
             }
@@ -125,7 +125,7 @@ bool FdatBody::parse(const Reader &rd, const std::string &prefix, int C_, std::s
             if (!tensor_floats(rd, rd.node(B + "ffn/fc2/MatMul"), 1, &v, &d) || d != std::vector<int64_t>{2 * C, C}) return refuse(why, B + "fc2");
             b.fc2 = res.mat(v, nullptr, 2 * C, C);
             if (!tensor_floats(rd, rd.node(B + "ffn/smix/Conv"), 1, &v, &d) || d != std::vector<int64_t>{2 * C, 1, 3, 3}) return refuse(why, B + "smix");
-            b.smix = res.dfl(v);
+            b.smix = res.dfl(v, (size_t)18 * C);
             blocks.push_back(b);
         }
     }

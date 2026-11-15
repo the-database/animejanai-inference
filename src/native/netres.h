@@ -72,14 +72,24 @@ public:
         bytes += n;
         return p;
     }
-    float *dfl(const std::vector<float> &v)
+    // Weights from the model file are untrusted: every upload states how many values the kernels
+    // read (need), and a shorter tensor fails the build (failed) instead of being read past.
+    float *dfl(const std::vector<float> &v, size_t need)
     {
+        if (v.size() < need || need == 0) {
+            failed = true;
+            return nullptr;
+        }
         float *p = (float *)alloc(v.size() * 4);
         if (p) cudaMemcpy(p, v.data(), v.size() * 4, cudaMemcpyHostToDevice);
         return p;
     }
     GWeights *gup(const std::vector<uint16_t> &w, const std::vector<float> &b, int cin, int cin_pad, int cout, int cout_pad)
     {
+        if (cin <= 0 || cout <= 0 || w.size() < (size_t)9 * cin * cout || (!b.empty() && b.size() < (size_t)cout)) {
+            failed = true;
+            return nullptr;
+        }
         GWeights *g = new GWeights;
         if (gupload(*g, w.data(), b.empty() ? nullptr : b.data(), cin, cin_pad, cout, cout_pad) != cudaSuccess) {
             delete g;
@@ -93,6 +103,10 @@ public:
     // A GEMM weight matrix, w [K][N] (row k, column n), bias N floats or null.
     TMat *mat(const std::vector<float> &w, const std::vector<float> *bias, int K, int N)
     {
+        if (K <= 0 || N <= 0 || w.size() < (size_t)K * N || (bias && bias->size() < (size_t)N)) {
+            failed = true;
+            return nullptr;
+        }
         TMat *m = new TMat;
         if (tmat_upload(*m, w.data(), bias ? bias->data() : nullptr, K, N) != cudaSuccess) {
             delete m;

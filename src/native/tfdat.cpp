@@ -211,13 +211,13 @@ std::unique_ptr<VidNet> Tfdat::build(const OnnxGraph &g, int w, int h, cudaStrea
     {
         std::vector<float> v;
         std::vector<int64_t> d;
-        if (!tensor_floats(rd, rd.node(P + "temporal_fusion/se/se.1/Conv"), 1, &v, &d) || d.size() != 4 || d[1] != C)
+        if (!tensor_floats(rd, rd.node(P + "temporal_fusion/se/se.1/Conv"), 1, &v, &d) || d.size() != 4 || d[0] < 1 || d[1] != C || d[2] != 1 || d[3] != 1)
             return refuse(why, "TFDAT se"), nullptr;
         f->ser = (int)d[0];
-        f->se1 = f->res.dfl(v);
-        if (!tensor_floats(rd, rd.node(P + "temporal_fusion/se/se.3/Conv"), 1, &v, &d) || d[0] != C || d[1] != f->ser)
+        f->se1 = f->res.dfl(v, (size_t)f->ser * C);
+        if (!tensor_floats(rd, rd.node(P + "temporal_fusion/se/se.3/Conv"), 1, &v, &d) || d != std::vector<int64_t>{C, f->ser, 1, 1})
             return refuse(why, "TFDAT se"), nullptr;
-        f->se2 = f->res.dfl(v);
+        f->se2 = f->res.dfl(v, (size_t)C * f->ser);
         const OnnxNode *s1 = rd.node(P + "temporal_fusion/se/se.1/Conv"), *s3 = rd.node(P + "temporal_fusion/se/se.3/Conv");
         if ((s1->in.size() > 2 && !s1->in[2].empty()) || (s3->in.size() > 2 && !s3->in[2].empty())) return refuse(why, "TFDAT se bias"), nullptr;
     }

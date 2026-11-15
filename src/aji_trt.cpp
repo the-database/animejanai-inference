@@ -53,6 +53,7 @@
 #include "core/fileio.h"
 #include "core/trt_engine.h"
 #include "native/executor.h"
+#include "native/guard.h"
 #include "native/lower.h"
 #include "native/onnx_graph.h"
 #include "native/rife.h"
@@ -774,11 +775,14 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         if (!ajinative::device_supported(c->cuda_dev, &why)) {
         } else if (!read_file_bytes(path, &bytes)) {
             why = "cannot read the model";
-        } else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) {
+        } else if (ajinative::guarded(&why, [&] { return ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why); })) {
             cudaStream_t s = nullptr;
             if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess) {
-                R.native = std::shared_ptr<ajinative::Rife>(
-                    ajinative::Rife::create(g, R.pw, R.ph, s, &why).release());
+                ajinative::guarded(&why, [&] {
+                    R.native = std::shared_ptr<ajinative::Rife>(
+                        ajinative::Rife::create(g, R.pw, R.ph, s, &why).release());
+                    return R.native != nullptr;
+                });
                 cudaStreamDestroy(s);
             } else {
                 why = "cannot create a CUDA stream";
@@ -873,8 +877,10 @@ std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &n
         ajinative::OnnxGraph g;
         if (!read_file_bytes(path, &bytes))
             np.why = "cannot read the model";
-        else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &np.why))
-            np.ok = ajinative::lower(g, &np.plan, &np.why);
+        else
+            np.ok = ajinative::guarded(&np.why, [&] {
+                return ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &np.why) && ajinative::lower(g, &np.plan, &np.why);
+            });
         it = c->native_plans.emplace(path, std::move(np)).first;
     }
     if (!it->second.ok) {
@@ -886,7 +892,11 @@ std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &n
         *why = "cannot create a CUDA stream";
         return nullptr;
     }
-    auto ex = ajinative::Executor::create(it->second.plan, w, h, s, why);
+    std::unique_ptr<ajinative::Executor> ex;
+    ajinative::guarded(why, [&] {
+        ex = ajinative::Executor::create(it->second.plan, w, h, s, why);
+        return ex != nullptr;
+    });
     cudaStreamDestroy(s);
     if (ex) *what = ajinative::describe(it->second.plan);
     return ex;
@@ -904,13 +914,17 @@ std::shared_ptr<ajinative::VidNet> try_native_temporal(aji_ctx *c, const std::st
         *why = "cannot read the model";
         return nullptr;
     }
-    if (!ajinative::parse_onnx(bytes.data(), bytes.size(), &g, why)) return nullptr;
+    if (!ajinative::guarded(why, [&] { return ajinative::parse_onnx(bytes.data(), bytes.size(), &g, why); })) return nullptr;
     cudaStream_t s = nullptr;
     if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
         *why = "cannot create a CUDA stream";
         return nullptr;
     }
-    std::shared_ptr<ajinative::VidNet> n(ajinative::VidNet::create(g, w, h, s, why).release());
+    std::shared_ptr<ajinative::VidNet> n;
+    ajinative::guarded(why, [&] {
+        n.reset(ajinative::VidNet::create(g, w, h, s, why).release());
+        return n != nullptr;
+    });
     cudaStreamDestroy(s);
     if (n && n->frames() != frames) {
         *why = "frame count differs from the model input";
