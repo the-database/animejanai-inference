@@ -70,31 +70,35 @@ frame; aji_image on one 1200x1000 page with 512 tiles), TensorRT 11.4 then nativ
 TensorRT -> native ms. Raw output with parity per case: `gpus/<gpu>.txt`. The 5090 run predates acf2e0a (the GEMM
 fix), which leaves its outputs and times unchanged.
 
-| Model | RTX 5090 (Linux) | RTX 4090 |
-|---|---|---|
-| SPANF3 Performance, 1080p | 1.68x (3.395 -> 2.017) | 1.72x (4.966 -> 2.88) |
-| SPANF3 Balanced, 1080p | 1.58x (6.783 -> 4.28) | 1.43x (8.327 -> 5.82) |
-| Compact, 854x480 | 1.40x (2.651 -> 1.892) | 1.14x (3.207 -> 2.805) |
-| RIFE 4.26, 1080p | 1.88x (3.627 -> 1.928) | 2.99x (7.328 -> 2.453) |
-| RIFE 4.22 lite, 1080p | 1.73x (3.37 -> 1.947) | 2.50x (6.339 -> 2.536) |
-| RIFE 4.14, 1080p | 1.62x (4.035 -> 2.492) | 2.40x (7.817 -> 3.254) |
-| TemporalFix, 768x576 | 1.11x (2.022 -> 1.822) | 1.71x (4.499 -> 2.625) |
-| TemporalFix, 720p | 1.40x (4.633 -> 3.31) | 1.92x (10.03 -> 5.211) |
-| TemporalFix, 1080p | 1.39x (10.99 -> 7.927) | 2.06x (23.16 -> 11.26) |
-| TFDAT bndl 2x, 720p | 1.39x (83.76 -> 60.09) | 1.57x (123.8 -> 78.91) |
-| TFDAT bndl 2x, 1080p | 1.49x (206.2 -> 138.2) | 1.67x (285.3 -> 170.4) |
-| TFDAT v2 1x (random), 720p | 1.23x (16.81 -> 13.68) | 1.27x (23.69 -> 18.61) |
-| TFDAT v2 4x (random), 768x576 | 1.53x (152.6 -> 99.75) | 1.76x (218 -> 124.1) |
-| MangaJaNai ESRGAN 2x, page | 1.19x (165.5 -> 139.6) | 1.50x (228.3 -> 152.1) |
-| MangaJaNai ESRGAN 4x, page | 1.54x (758.9 -> 493.2) | 1.64x (982.3 -> 598.5) |
-| IllustrationJaNai FDAT_M 2x, page | 1.26x (131.2 -> 104.5) | 1.41x (188.2 -> 133.2) |
-| IllustrationJaNai FDAT_M 4x, page | 1.51x (671.1 -> 444.2) | 1.84x (1063 -> 578) |
-| IllustrationJaNai HAT-L 4x, page | 1.43x (5192 -> 3626) | 1.34x (7825 -> 5826) |
-| IllustrationJaNai DAT-2 4x, page | 1.92x (3033 -> 1579) | 2.11x (4697 -> 2225) |
+| Model | RTX 5090 (Blackwell, Linux) | RTX 4090 (Ada) | RTX A5000 (Ampere) |
+|---|---|---|---|
+| SPANF3 Performance, 1080p | 1.68x (3.395 -> 2.017) | 1.72x (4.966 -> 2.88) | 1.79x (10.8 -> 6.023) |
+| SPANF3 Balanced, 1080p | 1.58x (6.783 -> 4.28) | 1.43x (8.327 -> 5.82) | 1.15x (17.3 -> 15.08) |
+| Compact, 854x480 | 1.40x (2.651 -> 1.892) | 1.14x (3.207 -> 2.805) | 1.03x (7.958 -> 7.689) |
+| RIFE 4.26, 1080p | 1.88x (3.627 -> 1.928) | 2.99x (7.328 -> 2.453) | 2.49x (13.68 -> 5.503) |
+| RIFE 4.22 lite, 1080p | 1.73x (3.37 -> 1.947) | 2.50x (6.339 -> 2.536) | 2.24x (12.01 -> 5.361) |
+| RIFE 4.14, 1080p | 1.62x (4.035 -> 2.492) | 2.40x (7.817 -> 3.254) | 1.99x (14.92 -> 7.513) |
+| TemporalFix, 768x576 | 1.11x (2.022 -> 1.822) | 1.71x (4.499 -> 2.625) | 2.20x (9.56 -> 4.354) |
+| TemporalFix, 720p | 1.40x (4.633 -> 3.31) | 1.92x (10.03 -> 5.211) | 2.10x (19.82 -> 9.451) |
+| TemporalFix, 1080p | 1.39x (10.99 -> 7.927) | 2.06x (23.16 -> 11.26) | 2.18x (44.3 -> 20.3) |
+| TFDAT bndl 2x, 720p | 1.39x (83.76 -> 60.09) | 1.57x (123.8 -> 78.91) | 1.30x (233.7 -> 180.3) |
+| TFDAT bndl 2x, 1080p | 1.49x (206.2 -> 138.2) | 1.67x (285.3 -> 170.4) | 1.32x (528.2 -> 399.5) |
+| TFDAT v2 1x (random), 720p | 1.23x (16.81 -> 13.68) | 1.27x (23.69 -> 18.61) | 1.29x (62.27 -> 48.37) |
+| TFDAT v2 4x (random), 768x576 | 1.53x (152.6 -> 99.75) | 1.76x (218 -> 124.1) | 1.31x (373.6 -> 284.5) |
+| MangaJaNai ESRGAN 2x, page | 1.19x (165.5 -> 139.6) | 1.50x (228.3 -> 152.1) | 1.43x (615.7 -> 431.6) |
+| MangaJaNai ESRGAN 4x, page | 1.54x (758.9 -> 493.2) | 1.64x (982.3 -> 598.5) | 1.27x (2123 -> 1675) |
+| IllustrationJaNai FDAT_M 2x, page | 1.26x (131.2 -> 104.5) | 1.41x (188.2 -> 133.2) | 1.40x (477.3 -> 341.1) |
+| IllustrationJaNai FDAT_M 4x, page | 1.51x (671.1 -> 444.2) | 1.84x (1063 -> 578) | 1.41x (1796 -> 1270) |
+| IllustrationJaNai HAT-L 4x, page | 1.43x (5192 -> 3626) | 1.34x (7825 -> 5826) | 1.06x (1.571e+04 -> 1.482e+04) |
+| IllustrationJaNai DAT-2 4x, page | 1.92x (3033 -> 1579) | 2.11x (4697 -> 2225) | 1.61x (8349 -> 5193) |
 
 Parity: native against TensorRT is within 1–2 levels for SPAN and Compact and within about 7 for RIFE; the transformer
 and temporal models differ more because TensorRT's fp16 engines are further from fp32 (native is 57–91 dB from fp32
 on those). ESRGAN differs most (22–35 dB): its shipped fp16 model is far from fp32 on both backends.
+
+Nothing is slower than TensorRT on any of the three. The gains follow TensorRT's weak spots per generation: on Ada and
+Ampere its warp/resample kernels (RIFE, TemporalFix: 2–3x), on Blackwell its convs (SPAN, Compact). On Ampere its
+convs and large GEMMs are already near what the native kernels reach (Balanced 1.15x, Compact 1.03x, HAT-L 1.06x).
 
 ## Spikes
 
