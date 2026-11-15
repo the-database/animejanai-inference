@@ -147,6 +147,14 @@ its load and warm-up runs, less the ONNX file's size. On Windows the free memory
 processes' (WDDM pages them out instead of failing, at a heavy cost in speed), so apps take NVML's
 device-wide figure where lower.
 
+**`aji_img_native_probe`** (0.29.0, probed the same way) answers, before a load, whether
+`aji_img_load` with those params would run the model on native kernels, and fills the memory it
+would use there (weights; its own tile buffers as `model_activations`, `activations_shared` 0). It
+builds the native model and frees it, building no engine; `AJI_IMG_ERR` means a load would build
+a TensorRT engine (or the backend has none: DirectML). Apps size a native model's tiles from it on
+a first run instead of guessing, and keep their TensorRT guess for the rest. `aji_image --probe`
+prints it.
+
 ### Native kernels (`src/native`, on by default; `[global] native=off` disables)
 
 `aji_trt` and `aji_trtrtx` run each chain model the native path supports on hand-written CUDA

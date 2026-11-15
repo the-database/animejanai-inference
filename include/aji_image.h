@@ -255,6 +255,21 @@ typedef struct aji_img_memory {
 AJI_IMG_EXPORT int aji_img_memory_get(aji_img_ctx *c, aji_img_model *m,
                                       aji_img_memory *out);
 
+/* Whether aji_img_load with `p` would run the model on native kernels (no
+ * TensorRT engine to build; CUDA backends from sm_80, src/native), and its
+ * memory there, without loading it: builds the native model at p's tile,
+ * fills `out` as aji_img_memory_get would with it loaded (model_activations
+ * its own buffers for the tile, activations_shared 0), and frees it again;
+ * device_free leaves it out. AJI_IMG_OK if it would; AJI_IMG_ERR if
+ * aji_img_load would build an engine instead (aji_img_last_error says why)
+ * or the backend has no native kernels (DirectML, with no message). Takes about as long as a
+ * native load (seconds) and builds nothing. For a caller that sizes tiles
+ * before a model's memory is known: a native model measured this way needs
+ * no guess. Added in libaji 0.29.0 without an API version change: probe for
+ * the symbol. */
+AJI_IMG_EXPORT int aji_img_native_probe(aji_img_ctx *c, const aji_img_model_params *p,
+                                        aji_img_memory *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -43,6 +43,8 @@ struct ImgBackend {
     int (*release_device)(int, uint64_t) = nullptr;
     // optional (libaji 0.28.0)
     int (*memory)(aji_img_ctx *, aji_img_model *, aji_img_memory *) = nullptr;
+    // optional (libaji 0.29.0)
+    int (*native_probe)(aji_img_ctx *, const aji_img_model_params *, aji_img_memory *) = nullptr;
 };
 
 std::mutex g_mu;
@@ -116,6 +118,8 @@ ImgBackend *backend_for(int backend, std::string *err)
             *(void **)&b.release_device = sym(b.lib, "aji_img_release_device");
         if (ok)
             *(void **)&b.memory = sym(b.lib, "aji_img_memory_get");
+        if (ok)
+            *(void **)&b.native_probe = sym(b.lib, "aji_img_native_probe");
         if (!ok)
             b.lib = nullptr;  // leaked handle is harmless; never retried
     }
@@ -236,4 +240,14 @@ extern "C" AJI_IMG_EXPORT int aji_img_memory_get(aji_img_ctx *c, aji_img_model *
     if (!c->be->memory)
         return AJI_IMG_ERR;
     return c->be->memory(c->inner, m ? m->inner : nullptr, out);
+}
+
+extern "C" AJI_IMG_EXPORT int aji_img_native_probe(aji_img_ctx *c, const aji_img_model_params *p,
+                                                   aji_img_memory *out)
+{
+    if (!c || !out)
+        return AJI_IMG_ERR_ARGS;
+    if (!c->be->native_probe)  // DirectML, or a backend from before 0.29.0: no native kernels
+        return AJI_IMG_ERR;
+    return c->be->native_probe(c->inner, p, out);
 }
