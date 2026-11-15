@@ -47,6 +47,7 @@ public:
     int scale() const override { return scale_; }
     std::string describe() const override { return what; }
     size_t device_bytes() const override { return bytes; }
+    size_t weight_bytes() const override { return wbytes; }
     bool accepts(int w, int h) const override
     {
         return w > 0 && h > 0 && w <= maxw && h <= maxh && (!unshuffle || (w % 2 == 0 && h % 2 == 0));
@@ -61,7 +62,7 @@ private:
     std::vector<GOp> dense;  // nb * 3 RDBs * 5 convs
     std::vector<GWeights *> weights;
     std::vector<void *> bufs;
-    size_t bytes = 0;
+    size_t bytes = 0, wbytes = 0;  // all device memory; of which the weights
     void *in16 = nullptr, *F0 = nullptr, *D[3] = {}, *T = nullptr, *U1 = nullptr, *P = nullptr, *Q = nullptr, *O16 = nullptr;
     float *ws = nullptr;
     size_t ws_floats = 0;
@@ -86,6 +87,7 @@ private:
         }
         weights.push_back(g);
         bytes += (size_t)9 * cin_pad * pad16(c.cout) * 2;
+        wbytes += (size_t)9 * cin_pad * pad16(c.cout) * 2;
         return g;
     }
     // The ops of one run at body size bw x bh, in order, as (op, args) pairs.

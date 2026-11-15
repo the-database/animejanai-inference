@@ -23,6 +23,7 @@ public:
     int scale() const override { return unshuffle ? 2 : 4; }
     std::string describe() const override { return what; }
     size_t device_bytes() const override { return res.bytes + body.device_bytes(); }
+    size_t weight_bytes() const override { return res.weight_bytes + body.weight_bytes(); }
     bool accepts(int w, int h) const override
     {
         return w > 0 && h > 0 && w <= maxw && h <= maxh && (!unshuffle || (w % 2 == 0 && h % 2 == 0));
