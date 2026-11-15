@@ -173,8 +173,8 @@ Video, single-frame models: in `aji_configure` (`try_native` in `aji_trt.cpp`) t
 is parsed (`native/onnx_graph`, no onnx dependency) and lowered (`native/lower`); a lowered model
 is instantiated for the chain's size (`native/executor`, `FrameNet::lowered`). A model the
 lowering refuses goes to the image builders on the whole frame (`FrameNet::image`,
-`native/framenet.h`). They size their buffers for their largest input (HAT-L / DAT-2 ~10 KB per
-input pixel, ESRGAN 2x ~1.6 KB, FDAT_M 2x ~1.4 KB), so the model is first built at a 128x128
+`native/framenet.h`). They size their buffers for their largest input (per input pixel: HAT-L /
+DAT-2 ~10 KB, ESRGAN 4x ~6.5 KB, ESRGAN 2x ~1.6 KB, FDAT_M 2x ~1.4 KB), so the model is first built at a 128x128
 probe for its size rule and per-pixel buffers, and the frame is refused (TensorRT) when weights
 plus buffers scaled to it exceed the free memory less 1 GiB + 10% of the device; otherwise it is
 built at the frame size, reflect-padded at the right and bottom to the model's size rule (HAT: 16,
@@ -182,11 +182,13 @@ as its own graph pads) and cropped back. Whole frames rather than tiles: no seam
 work, the same computation as TensorRT's whole-frame engine; the cost is memory, hence the
 budget. Either way it becomes a `Step::NATIVE`, run by `run_steps` like a TensorRT `MODEL` step
 (same fp16 NCHW RGB in and out), so graph capture, RIFE, temporal steps and mixed chains are
-unchanged. Nothing is built: configure takes tens of milliseconds for a lowered model and up to a
-few hundred for the image builders (probe included), timing the kernel variants. The log gets
+unchanged. Nothing is built: configure takes tens of milliseconds for a lowered model, 0.1–0.5 s
+for FDAT / ESRGAN and ~1 s for HAT-L / DAT-2 (reading and parsing the file, the probe, timing the
+kernel variants). The log gets
 `Native kernels: <model> (<what>)` before the usual `Applied Model` line (`..., whole frame
 [padded to WxH], <n> MB` for the image builders), or `Native kernels not used for <model>: <why>;
-using TensorRT` (e.g. `a whole 1920x1080 frame needs ~N GB, M GB free (keeping K GB)`), and the
+using TensorRT` (e.g. HAT-L: `a whole 2560x1440 frame needs ~34.6 GB, 30.3 GB free (keeping 4.2
+GB)`), and the
 model goes through `ensure_engine` as before. The lowering, and an image-builder refusal that is
 not about the frame size or memory, are cached per ONNX path for the context's life. Temporal
 models: `try_native_temporal` (`native/vidnet`).
