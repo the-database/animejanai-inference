@@ -89,7 +89,7 @@ fix), which leaves its outputs and times unchanged.
 | MangaJaNai ESRGAN 4x, page | 1.54x (758.9 -> 493.2) | 1.64x (982.3 -> 598.5) | 1.27x (2123 -> 1675) |
 | IllustrationJaNai FDAT_M 2x, page | 1.26x (131.2 -> 104.5) | 1.41x (188.2 -> 133.2) | 1.40x (477.3 -> 341.1) |
 | IllustrationJaNai FDAT_M 4x, page | 1.51x (671.1 -> 444.2) | 1.84x (1063 -> 578) | 1.41x (1796 -> 1270) |
-| IllustrationJaNai HAT-L 4x, page | 1.43x (5192 -> 3626) | 1.34x (7825 -> 5826) | 1.06x (1.571e+04 -> 1.482e+04) |
+| IllustrationJaNai HAT-L 4x, page | 1.43x (5192 -> 3626) | 1.34x (7825 -> 5826) | 1.06x (15711 -> 14817) |
 | IllustrationJaNai DAT-2 4x, page | 1.92x (3033 -> 1579) | 2.11x (4697 -> 2225) | 1.61x (8349 -> 5193) |
 
 Parity: native against TensorRT is within 1–2 levels for SPAN and Compact and within about 7 for RIFE; the transformer
