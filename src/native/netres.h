@@ -81,6 +81,7 @@ public:
             return nullptr;
         }
         float *p = (float *)alloc(v.size() * 4);
+        if (p) weight_bytes += v.size() * 4;
         if (p) cudaMemcpy(p, v.data(), v.size() * 4, cudaMemcpyHostToDevice);
         return p;
     }
@@ -98,6 +99,7 @@ public:
         }
         gw.push_back(g);
         bytes += (size_t)9 * cin_pad * cout_pad * 2;
+        weight_bytes += (size_t)9 * cin_pad * cout_pad * 2;
         return g;
     }
     // A GEMM weight matrix, w [K][N] (row k, column n), bias N floats or null.
@@ -115,9 +117,11 @@ public:
         }
         mats.push_back(m);
         bytes += (size_t)m->Kpad * m->Npad * 2;
+        weight_bytes += (size_t)m->Kpad * m->Npad * 2;
         return m;
     }
-    size_t bytes = 0;
+    size_t bytes = 0;         // everything allocated
+    size_t weight_bytes = 0;  // of which the uploaded weights (dfl, gup, mat)
     bool failed = false;
 
 private:

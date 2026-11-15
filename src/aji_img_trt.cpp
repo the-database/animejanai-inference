@@ -168,6 +168,7 @@ struct aji_img_model : TileModel {
     int64_t act_need = 0;   // the engine's activation memory (c->run_mu)
     int64_t weights = 0;    // the engine file's size, for aji_img_memory_get
     size_t buf_bytes = 0;   // d_in + d_out
+    int64_t native_act = 0; // native kernels: the model's own buffers for its tile (not in the shared activations)
     uint64_t act_gen = 0;   // c->act_gen when me.exec was pointed at c->act
     nvinfer1::DataType in_dt = nvinfer1::DataType::kFLOAT;
     nvinfer1::DataType out_dt = nvinfer1::DataType::kFLOAT;
@@ -621,7 +622,8 @@ bool load_native(aji_img_model *m, const std::vector<char> &blob, std::string *w
     m->in_elems = (size_t)3 * m->tile_w * m->tile_h;
     m->out_elems = m->in_elems * m->scale * m->scale;
     const size_t ib = m->in_elems * 2, ob = m->out_elems * 2;
-    m->weights = (int64_t)m->native->device_bytes();
+    m->weights = (int64_t)m->native->weight_bytes();
+    m->native_act = (int64_t)(m->native->device_bytes() - m->native->weight_bytes());
     m->buf_bytes = ib + ob;
     if (cudaMalloc(&m->d_in, ib) != cudaSuccess || cudaMalloc(&m->d_out, ob) != cudaSuccess ||
         cudaMallocHost(&m->h_in, ib) != cudaSuccess || cudaMallocHost(&m->h_out, ob) != cudaSuccess) {
@@ -1184,6 +1186,10 @@ extern "C" AJI_IMG_EXPORT int aji_img_memory_get(aji_img_ctx *c, aji_img_model *
         out->model_weights = (uint64_t)m->weights;
         out->model_activations = (uint64_t)m->act_need;
         out->model_buffers = m->buf_bytes;
+        if (m->native) {  // its buffers are its own, sized for its tile
+            out->model_activations = (uint64_t)m->native_act;
+            out->activations_shared = 0;
+        }
     }
     return AJI_IMG_OK;
 }

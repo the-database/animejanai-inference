@@ -26,6 +26,8 @@ public:
     virtual int scale() const = 0;
     virtual std::string describe() const = 0;
     virtual size_t device_bytes() const = 0;
+    // Of device_bytes: the weights; the rest is the buffers sized for the tile (they scale with its area).
+    virtual size_t weight_bytes() const = 0;
     // Whether a w x h tile is accepted (size constraints of the model).
     virtual bool accepts(int w, int h) const = 0;
 

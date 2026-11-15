@@ -32,6 +32,7 @@ public:
     void *out() const { return G; }
     std::string describe() const;
     size_t device_bytes() const { return res.bytes; }
+    size_t weight_bytes() const { return res.weight_bytes; }
     int C = 0, CP = 0;
 
 private:
