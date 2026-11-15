@@ -53,8 +53,11 @@
 #include "core/fileio.h"
 #include "core/trt_engine.h"
 #include "native/executor.h"
+#include "native/guard.h"
 #include "native/lower.h"
 #include "native/onnx_graph.h"
+#include "native/rife.h"
+#include "native/vidnet.h"
 
 namespace fs = std::filesystem;
 
@@ -87,7 +90,7 @@ using Logger = ajicore::TrtLogger;
 struct Step {
     enum Kind { RESIZE, MODEL, TEMPORAL, NATIVE } kind;
     int out_w, out_h;
-    int engine_idx;             // MODEL, TEMPORAL: engines[]; NATIVE: natives[]
+    int engine_idx;             // MODEL, TEMPORAL: engines[] (TEMPORAL on native kernels: -1); NATIVE: natives[]
     aji_plan *plan = nullptr;   // RESIZE
 };
 
@@ -211,6 +214,7 @@ struct aji_ctx {
         void *in_tensor = nullptr;   // 11 * pw*ph fp16
         void *out_tensor = nullptr;  // 3 * pw*ph fp16
         float *scd = nullptr;        // device diff accumulator
+        std::shared_ptr<ajinative::Rife> native;  // native kernels in place of the engine
     } rife;
 
     // CUDA graph replay of the whole chain (pre -> steps -> post). The
@@ -257,15 +261,23 @@ struct aji_ctx {
         void *ring = nullptr;        // nslots * 3*w*h fp16
         float *diff = nullptr;       // per slot: rgb diff vs seq-1
         std::vector<int64_t> seq;    // per slot, -1 = empty
+        std::vector<uint64_t> gen;   // per slot: which store put the frame there (never reused)
         std::vector<int> matrix, range;
         void *in_tensor = nullptr;   // 3t * pw*ph fp16
         void *out_tensor = nullptr;  // 3 * pow*poh fp16
+        std::shared_ptr<ajinative::VidNet> native;  // native kernels in place of the engine
+        // native models that keep per-frame work (TemporalFix's encoder): the gen of the frame
+        // in each of its cache entries (0 = none), and the window's entries on the device
+        std::vector<uint64_t> cgen;
+        int *sel = nullptr;
         uint64_t runs = 0;           // model runs (AJI_TEMPORAL_STATS)
     };
     struct {
         bool enabled = false;
         int r = 0;                   // total radius: the sum over stages
         uint64_t ingests = 0;        // AJI_TEMPORAL_STATS
+        uint64_t encodes = 0;        // AJI_TEMPORAL_STATS: frames a native cache encoded
+        uint64_t gen_next = 1;       // the next ring store's gen
         std::vector<TemporalStage> st;
     } temporal;
 
@@ -717,6 +729,7 @@ void rife_teardown(aji_ctx *c)
     cudaFree(R.scd);
     R.engine.exec.reset();
     R.engine.engine.reset();
+    R.native.reset();
     R = {};
 }
 
@@ -751,15 +764,45 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         "--stronglyTyped --optShapes=input:") + dims +
         " --inputIOFormats=fp16:chw --outputIOFormats=fp16:chw"
         " --tacticSources=-CUDNN,-CUBLAS,-CUBLAS_LT --skipInference";
-    const std::string epath =
-        engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev);
-    int er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
-                           11, &c->rife_model_dir);
-    if (er < 0)
-        return false;
-    if (er == 0)
-        return true;  // building in the background; chain runs without
-                      // rife until aji_poll() triggers a reconfigure
+    // Native kernels first (native=on, the default): no engine to build.
+    std::string native_line;
+    if (c->conf.native) {
+        std::string why;
+        const std::string path =
+            (fs::u8path(c->rife_model_dir) / fs::u8path(model + ".onnx")).u8string();
+        std::vector<char> bytes;
+        ajinative::OnnxGraph g;
+        if (!ajinative::device_supported(c->cuda_dev, &why)) {
+        } else if (!read_file_bytes(path, &bytes)) {
+            why = "cannot read the model";
+        } else if (ajinative::guarded(&why, [&] { return ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why); })) {
+            cudaStream_t s = nullptr;
+            if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess) {
+                ajinative::guarded(&why, [&] {
+                    R.native = std::shared_ptr<ajinative::Rife>(
+                        ajinative::Rife::create(g, R.pw, R.ph, s, &why).release());
+                    return R.native != nullptr;
+                });
+                cudaStreamDestroy(s);
+            } else {
+                why = "cannot create a CUDA stream";
+            }
+        }
+        native_line = R.native ? "Native kernels: " + model + " (" + R.native->describe() + ")"
+                               : "Native kernels not used for " + model + ": " + why +
+                                     "; using " AJI_TRT_PRODUCT;
+    }
+    if (!R.native) {
+        const std::string epath =
+            engine_path_for(c->rife_model_dir, model, settings, c->cuda_dev);
+        int er = ensure_engine(c, model, settings, epath, &R.engine, R.pw, R.ph,
+                               11, &c->rife_model_dir);
+        if (er < 0)
+            return false;
+        if (er == 0)
+            return true;  // building in the background; chain runs without
+                          // rife until aji_poll() triggers a reconfigure
+    }
 
     const size_t plane = (size_t)R.pw * R.ph;
     if (cudaMalloc(&R.in_tensor, plane * 11 * 2) != cudaSuccess ||
@@ -792,11 +835,14 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     // RIFE-first runs after any hoisted pre-RIFE resize but before the upscale
     // models, so its step goes right after the pre-resize line (if one was
     // pushed at index 0); the default (rife-after) appends it last.
-    if (before_upscale)
-        c->log_steps.insert(c->log_steps.begin() + (c->has_pre_resize ? 1 : 0),
-                            buf);
-    else
+    if (before_upscale) {
+        auto at = c->log_steps.begin() + (c->has_pre_resize ? 1 : 0);
+        at = c->log_steps.insert(at, buf);
+        if (!native_line.empty()) c->log_steps.insert(at, native_line);
+    } else {
+        if (!native_line.empty()) c->log_steps.push_back(native_line);
         c->log_steps.push_back(buf);
+    }
     R.enabled = true;
     return true;
 }
@@ -831,8 +877,10 @@ std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &n
         ajinative::OnnxGraph g;
         if (!read_file_bytes(path, &bytes))
             np.why = "cannot read the model";
-        else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &np.why))
-            np.ok = ajinative::lower(g, &np.plan, &np.why);
+        else
+            np.ok = ajinative::guarded(&np.why, [&] {
+                return ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &np.why) && ajinative::lower(g, &np.plan, &np.why);
+            });
         it = c->native_plans.emplace(path, std::move(np)).first;
     }
     if (!it->second.ok) {
@@ -844,10 +892,45 @@ std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &n
         *why = "cannot create a CUDA stream";
         return nullptr;
     }
-    auto ex = ajinative::Executor::create(it->second.plan, w, h, s, why);
+    std::unique_ptr<ajinative::Executor> ex;
+    ajinative::guarded(why, [&] {
+        ex = ajinative::Executor::create(it->second.plan, w, h, s, why);
+        return ex != nullptr;
+    });
     cudaStreamDestroy(s);
     if (ex) *what = ajinative::describe(it->second.plan);
     return ex;
+}
+
+// The temporal model `name` on the native kernels at its padded input size, or null with *why.
+std::shared_ptr<ajinative::VidNet> try_native_temporal(aji_ctx *c, const std::string &name, int w, int h, int frames,
+                                                      std::string *why)
+{
+    const std::string path = (fs::u8path(c->model_dir) / fs::u8path(name + ".onnx")).u8string();
+    std::vector<char> bytes;
+    ajinative::OnnxGraph g;
+    if (!ajinative::device_supported(c->cuda_dev, why)) return nullptr;
+    if (!read_file_bytes(path, &bytes)) {
+        *why = "cannot read the model";
+        return nullptr;
+    }
+    if (!ajinative::guarded(why, [&] { return ajinative::parse_onnx(bytes.data(), bytes.size(), &g, why); })) return nullptr;
+    cudaStream_t s = nullptr;
+    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+        *why = "cannot create a CUDA stream";
+        return nullptr;
+    }
+    std::shared_ptr<ajinative::VidNet> n;
+    ajinative::guarded(why, [&] {
+        n.reset(ajinative::VidNet::create(g, w, h, s, why).release());
+        return n != nullptr;
+    });
+    cudaStreamDestroy(s);
+    if (n && n->frames() != frames) {
+        *why = "frame count differs from the model input";
+        n.reset();
+    }
+    return n;
 }
 
 void finalize_log(aji_ctx *c)
@@ -900,6 +983,9 @@ void temporal_teardown(aji_ctx *c)
         for (size_t i = 0; i < TT.st.size(); i++)
             fprintf(stderr, "; stage %zu (%d frames): %llu runs", i,
                     TT.st[i].t, (unsigned long long)TT.st[i].runs);
+        if (TT.encodes)
+            fprintf(stderr, "; %llu native frame encodes",
+                    (unsigned long long)TT.encodes);
         fprintf(stderr, "\n");
     }
     for (auto &T : TT.st) {
@@ -907,6 +993,7 @@ void temporal_teardown(aji_ctx *c)
         cudaFree(T.diff);
         cudaFree(T.in_tensor);
         cudaFree(T.out_tensor);
+        cudaFree(T.sel);
     }
     TT = {};
 }
@@ -938,6 +1025,16 @@ bool setup_temporal(aji_ctx *c)
         }
         cudaMemset(T.diff, 0, sizeof(float) * T.nslots);
         T.seq.assign(T.nslots, -1);
+        T.gen.assign(T.nslots, 0);
+        // AJI_NATIVE_FRAME_CACHE=off: every window encodes all its frames (for comparisons)
+        static const bool fcache = !getenv("AJI_NATIVE_FRAME_CACHE") || strcmp(getenv("AJI_NATIVE_FRAME_CACHE"), "off") != 0;
+        if (fcache && T.native && T.native->cache_entries() >= T.t) {
+            if (cudaMalloc((void **)&T.sel, sizeof(int) * T.t) != cudaSuccess) {
+                c->set_error("temporal buffer allocation failed");
+                return false;
+            }
+            T.cgen.assign(T.native->cache_entries(), 0);
+        }
         T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
         T.range.assign(T.nslots, AJI_RANGE_LIMITED);
     }
@@ -1367,6 +1464,44 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         const bool rank5 = t > 1 && model_frames[mi].rank5;
         const int bw = t > 1 ? (cw + 31) / 32 * 32 : cw;
         const int bh = t > 1 ? (ch + 31) / 32 * 32 : ch;
+        // Temporal models on the native kernels when they can (unless native=off), else TensorRT below
+        std::shared_ptr<ajinative::VidNet> tnative;
+        if (c->conf.native && t > 1) {
+            std::string why;
+            tnative = try_native_temporal(c, m.name, bw, bh, t, &why);
+            c->log_steps.push_back(tnative ? "Native kernels: " + m.name + " (" + tnative->describe() + ")"
+                                           : "Native kernels not used for " + m.name + ": " + why + "; using " AJI_TRT_PRODUCT);
+        }
+        if (tnative) {
+            const int sc = tnative->scale();
+            c->temporal.st.emplace_back();
+            auto &T = c->temporal.st.back();
+            T.t = t;
+            T.r = (t - 1) / 2;
+            T.w = cw; T.h = ch;
+            T.pw = bw; T.ph = bh;
+            T.pow = bw * sc; T.poh = bh * sc;
+            T.ow = cw * sc; T.oh = ch * sc;
+            T.threshold = (float)m.temporal_scene_threshold;
+            T.step_idx = c->steps.size();
+            T.native = tnative;
+            c->steps.push_back({Step::TEMPORAL, T.ow, T.oh, -1});
+            max_bytes = std::max(max_bytes, (size_t)3 * T.ow * T.oh * 2);
+            cw = T.ow; ch = T.oh;
+            if (T.threshold > 0)
+                snprintf(buf, sizeof(buf),
+                         "Applied Temporal Model: %s (%d frames, scene "
+                         "threshold %g);    New Video Resolution: %dx%d",
+                         m.name.c_str(), t, T.threshold, cw, ch);
+            else
+                snprintf(buf, sizeof(buf),
+                         "Applied Temporal Model: %s (%d frames);    "
+                         "New Video Resolution: %dx%d",
+                         m.name.c_str(), t, cw, ch);
+            any_model = true;
+            c->log_steps.push_back(buf);
+            continue;
+        }
         char dims[64];
         if (rank5)
             snprintf(dims, sizeof(dims), "1x%dx3x%dx%d", t, bh, bw);
@@ -2076,6 +2211,7 @@ static int temporal_store(aji_ctx *c, size_t lv, const void *src,
         }
     }
     T.seq[slot] = seq;
+    T.gen[slot] = c->temporal.gen_next++;
     T.matrix[slot] = matrix;
     T.range[slot] = range;
     return AJI_OK;
@@ -2147,6 +2283,63 @@ static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
         if (j + 1 < T.t && held[j] && held[j + 1])
             args.cut[j] = &T.diff[slots[j + 1]];
     }
+    const Step &st = c->steps[T.step_idx];
+    if (T.sel) {
+        // Per-frame work kept across windows: each window frame not in the
+        // model's cache is padded (into in_tensor's first frame) and encoded
+        // into an entry no frame of this window holds; the device then picks
+        // each position's entry under the gather's scene-cut rule.
+        aji_select_args sa = {};
+        for (int j = 0; j < T.t; j++) {
+            const uint64_t g = T.gen[slots[j]];
+            int e = -1;
+            for (int k = 0; k < (int)T.cgen.size() && e < 0; k++)
+                if (T.cgen[k] == g)
+                    e = k;
+            if (e < 0) {
+                uint64_t oldest = UINT64_MAX;
+                for (int k = 0; k < (int)T.cgen.size(); k++) {
+                    bool used = false;
+                    for (int i = 0; i < T.t; i++)
+                        used = used || T.cgen[k] == T.gen[slots[i]];
+                    if (!used && T.cgen[k] < oldest) {
+                        oldest = T.cgen[k];
+                        e = k;
+                    }
+                }
+                aji_gather_args one = {};
+                one.src[0] = args.src[j];
+                int err = aji_temporal_gather(&one, 1, 0.0f, T.w, T.h, T.pw,
+                                              T.ph, T.in_tensor, stream);
+                if (err) {
+                    c->set_error("temporal gather kernel failed: %s",
+                                 cudaGetErrorString((cudaError_t)err));
+                    return AJI_ERR_CUDA;
+                }
+                const cudaError_t ce = T.native->encode(e, T.in_tensor, stream);
+                if (ce != cudaSuccess) {
+                    c->set_error("native kernels failed: %s", cudaGetErrorString(ce));
+                    return AJI_ERR_CUDA;
+                }
+                T.cgen[e] = g;
+                c->temporal.encodes++;
+            }
+            sa.ent[j] = e;
+            sa.cut[j] = args.cut[j];
+        }
+        int err = aji_temporal_select(&sa, T.t, T.threshold, T.w, T.h, T.sel,
+                                      stream);
+        if (err) {
+            c->set_error("temporal select kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err));
+            return AJI_ERR_CUDA;
+        }
+        const cudaError_t e = T.native->run_cached(T.sel, T.out_tensor, stream);
+        if (e != cudaSuccess) {
+            c->set_error("native kernels failed: %s", cudaGetErrorString(e));
+            return AJI_ERR_CUDA;
+        }
+    } else {
     int err = aji_temporal_gather(&args, T.t, T.threshold, T.w, T.h, T.pw,
                                   T.ph, T.in_tensor, stream);
     if (err) {
@@ -2155,16 +2348,24 @@ static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
         return AJI_ERR_CUDA;
     }
 
-    const Step &st = c->steps[T.step_idx];
-    ModelEngine &me = c->engines[st.engine_idx];
-    if (!me.exec->setTensorAddress(me.in_name, T.in_tensor) ||
-        !me.exec->setTensorAddress(me.out_name, T.out_tensor)) {
-        c->set_error("setTensorAddress failed");
-        return AJI_ERR_ENGINE;
+    if (T.native) {
+        const cudaError_t e = T.native->run(T.in_tensor, T.out_tensor, stream);
+        if (e != cudaSuccess) {
+            c->set_error("native kernels failed: %s", cudaGetErrorString(e));
+            return AJI_ERR_CUDA;
+        }
+    } else {
+        ModelEngine &me = c->engines[st.engine_idx];
+        if (!me.exec->setTensorAddress(me.in_name, T.in_tensor) ||
+            !me.exec->setTensorAddress(me.out_name, T.out_tensor)) {
+            c->set_error("setTensorAddress failed");
+            return AJI_ERR_ENGINE;
+        }
+        if (!me.exec->enqueueV3(stream)) {
+            c->set_error("enqueueV3 failed");
+            return AJI_ERR_ENGINE;
+        }
     }
-    if (!me.exec->enqueueV3(stream)) {
-        c->set_error("enqueueV3 failed");
-        return AJI_ERR_ENGINE;
     }
     T.runs++;
 
@@ -2848,15 +3049,23 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
         return AJI_ERR_CUDA;
     }
 
-    ModelEngine &me = R.engine;
-    if (!me.exec->setTensorAddress(me.in_name, R.in_tensor) ||
-        !me.exec->setTensorAddress(me.out_name, R.out_tensor)) {
-        c->set_error("rife setTensorAddress failed");
-        return AJI_ERR_ENGINE;
-    }
-    if (!me.exec->enqueueV3(stream)) {
-        c->set_error("rife enqueueV3 failed");
-        return AJI_ERR_ENGINE;
+    if (R.native) {
+        const cudaError_t ne = R.native->run(R.in_tensor, (float)t, R.out_tensor, stream);
+        if (ne != cudaSuccess) {
+            c->set_error("native rife failed: %s", cudaGetErrorString(ne));
+            return AJI_ERR_CUDA;
+        }
+    } else {
+        ModelEngine &me = R.engine;
+        if (!me.exec->setTensorAddress(me.in_name, R.in_tensor) ||
+            !me.exec->setTensorAddress(me.out_name, R.out_tensor)) {
+            c->set_error("rife setTensorAddress failed");
+            return AJI_ERR_ENGINE;
+        }
+        if (!me.exec->enqueueV3(stream)) {
+            c->set_error("rife enqueueV3 failed");
+            return AJI_ERR_ENGINE;
+        }
     }
 
     // RGB -> padded YUV, then crop the window out

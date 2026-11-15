@@ -1,0 +1,29 @@
+# NVIDIA GeForce RTX 5090, 12.0, 400.00 W, 3105 MHz, 32607 MiB, 615.71.09
+# 2026-11-14T22:09:50Z, branch 2a1ebbe Per-GPU benchmark scripts for the native models
+== native tests
+aji_native_pack_test: native pack: OK
+aji_native_lower_test: native lower: OK (span_s: 23 kernels, 48 ch, depth-to-space 4)
+aji_native_conv_test: native conv: OK (198 op/variant/size checks; worst max 0.0056, rms 0.00056; limits 0.02, 0.003)
+aji_native_gconv_test: native gconv: OK (396 checks; worst max 0.0219)
+aji_native_tfm_test: native tfm: OK (29 checks)
+== video (aji_harness, device chain time per output frame; RIFE: per interpolated frame)
+span-perf-1080 | 1920x1080 -> 3840x2160 | native steps 1 | TensorRT 3.395 ms | native 2.017 ms | 1.68x | 12 frames; Y min PSNR 58.9 dB max 1; UV min PSNR 64.0 dB max 1 
+span-bal-1080 | 1920x1080 -> 3840x2160 | native steps 1 | TensorRT 6.783 ms | native 4.280 ms | 1.58x | 12 frames; Y min PSNR 58.8 dB max 1; UV min PSNR 63.8 dB max 1 
+span-compact-854 | 854x480 -> 1708x960 | native steps 1 | TensorRT 2.651 ms | native 1.892 ms | 1.40x | 12 frames; Y min PSNR 64.2 dB max 1; UV min PSNR 67.3 dB max 1 
+rife-4.26-1080 | 1920x1080 -> 1920x1080 | native steps 1 | TensorRT 3.627 ms | native 1.928 ms | 1.88x | 23 frames; Y min PSNR 64.9 dB max 3; UV min PSNR 68.1 dB max 1 
+rife-4.22lite-1080 | 1920x1080 -> 1920x1080 | native steps 1 | TensorRT 3.370 ms | native 1.947 ms | 1.73x | 23 frames; Y min PSNR 68.9 dB max 2; UV min PSNR 69.6 dB max 1 
+rife-4.14-1080 | 1920x1080 -> 1920x1080 | native steps 1 | TensorRT 4.035 ms | native 2.492 ms | 1.62x | 23 frames; Y min PSNR 67.4 dB max 7; UV min PSNR 68.0 dB max 1 
+tfix-dvd | 768x576 -> 768x576 | native steps 1 | TensorRT 2.022 ms | native 1.822 ms | 1.11x | 12 frames; Y min PSNR 49.4 dB max 25; UV min PSNR 60.6 dB max 3 
+tfix-720 | 1280x720 -> 1280x720 | native steps 1 | TensorRT 4.633 ms | native 3.310 ms | 1.40x | 12 frames; Y min PSNR 65.3 dB max 6; UV min PSNR 80.9 dB max 1 
+tfix-1080 | 1920x1080 -> 1920x1080 | native steps 1 | TensorRT 10.988 ms | native 7.927 ms | 1.39x | 12 frames; Y min PSNR 51.4 dB max 32; UV min PSNR 69.9 dB max 1 
+tfdat-bndl-720 | 1280x720 -> 2560x1440 | native steps 1 | TensorRT 83.756 ms | native 60.088 ms | 1.39x | 12 frames; Y min PSNR 48.7 dB max 57; UV min PSNR 59.6 dB max 5 
+tfdat-bndl-1080 | 1920x1080 -> 3840x2160 | native steps 1 | TensorRT 206.228 ms | native 138.194 ms | 1.49x | 12 frames; Y min PSNR 48.2 dB max 23; UV min PSNR 55.3 dB max 8 
+tfdat-v2-1x-720 | 1280x720 -> 1280x720 | native steps 1 | TensorRT 16.807 ms | native 13.683 ms | 1.23x | 12 frames; Y min PSNR 57.4 dB max 1; UV min PSNR 62.2 dB max 1 
+tfdat-v2-4x-dvd | 768x576 -> 3072x2304 | native steps 1 | TensorRT 152.618 ms | native 99.750 ms | 1.53x | 8 frames; Y min PSNR 49.2 dB max 5; UV min PSNR 54.6 dB max 2 
+== images (aji_image, one 1200x1000 page, warm)
+esrgan-2x | page 1200x1000, tile 512 | native 1 | TensorRT 165.5 ms | native 139.6 ms | 1.19x | parity 2400x2000: PSNR 35.1 dB, max 177 
+esrgan-4x | page 1200x1000, tile 512 | native 1 | TensorRT 758.9 ms | native 493.2 ms | 1.54x | parity 4800x4000: PSNR 23.8 dB, max 255 
+fdat-2x | page 1200x1000, tile 512 | native 1 | TensorRT 131.2 ms | native 104.5 ms | 1.26x | parity 2400x2000: PSNR 55.0 dB, max 8 
+fdat-4x | page 1200x1000, tile 512 | native 1 | TensorRT 671.1 ms | native 444.2 ms | 1.51x | parity 4800x4000: PSNR 43.2 dB, max 63 
+hat-l-4x | page 1200x1000, tile 512 | native 1 | TensorRT 5191.5 ms | native 3626.0 ms | 1.43x | parity 4800x4000: PSNR 55.5 dB, max 7 
+dat2-4x | page 1200x1000, tile 512 | native 1 | TensorRT 3032.8 ms | native 1578.8 ms | 1.92x | parity 4800x4000: PSNR 54.5 dB, max 3 
