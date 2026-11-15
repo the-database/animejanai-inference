@@ -11,6 +11,11 @@ namespace ajinative {
 cudaError_t img_to_nhwc(const void *in, bool in_f32, int w, int h, bool unshuffle, void *dst, int dstride, cudaStream_t s);
 // NHWC fp16 (sstride channels, the first 3 used), w x h -> NCHW RGB (fp16 or fp32).
 cudaError_t img_from_nhwc(const void *src, int sstride, int w, int h, void *out, bool out_f32, cudaStream_t s);
+// NCHW fp16 RGB, w x h -> pw x ph (pw >= w, ph >= h), the added right / bottom edge reflected
+// (numpy / torch "reflect": the edge pixel is not repeated).
+cudaError_t img_pad_reflect(const void *in, int w, int h, void *out, int pw, int ph, cudaStream_t s);
+// n values fp16 <-> fp32 (or a copy when both sides are the same type).
+cudaError_t img_cast(const void *in, bool in_f32, void *out, bool out_f32, size_t n, cudaStream_t s);
 
 }  // namespace ajinative
 

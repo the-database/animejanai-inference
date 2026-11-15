@@ -157,18 +157,47 @@ prints it.
 
 ### Native kernels (`src/native`, on by default; `[global] native=off` disables)
 
-`aji_trt` and `aji_trtrtx` run each chain model the native path supports on hand-written CUDA
-kernels instead of TensorRT (sm_80+; older GPUs and other models use TensorRT, with the reason
-logged). `native=off` (or `no`) in `[global]` turns it off; any other value, or no key, is on. In
-`aji_configure` (`try_native` in `aji_trt.cpp`) the model's ONNX is parsed (`native/onnx_graph`,
-no onnx dependency), lowered (`native/lower`) and instantiated for the chain's size
-(`native/executor`): it becomes a `Step::NATIVE`, run by `run_steps` like a TensorRT `MODEL`
-step (same fp16 NCHW RGB in and out), so graph capture, RIFE, temporal steps and mixed chains are
-unchanged. Nothing is built: configure takes tens of milliseconds, including timing the tile
-variants. The log gets `Native kernels: <model> (<n> kernels, ...)` before the usual `Applied
-Model` line, or `Native kernels not used for <model>: <why>; using TensorRT`, and the model goes
-through `ensure_engine` as before. Temporal (multi-frame) models are not attempted. The lowering
-works op by op on the graph's data path and folds into each Conv what follows it (activation,
+`aji_trt` and `aji_trtrtx` run every model the native path recognises on hand-written CUDA
+kernels instead of TensorRT, on both the video and the image path (sm_80+; older GPUs and other
+models use TensorRT, with the reason logged). Video: `native=off` (or `no`) in `[global]` turns it
+off; any other value, or no key, is on. Image path: `AJI_NATIVE=off` (or `0`, `no`, `false`).
+
+| Models | Video path (`aji_trt.cpp`) | Image path (`aji_img_trt.cpp`) |
+|---|---|---|
+| SPAN, SPANF3, span_s, Compact (SRVGG) | `native/lower` + `native/executor` at the chain's size | the same plan and executor behind `ImgNet` (`build_lowered`, `native/framenet.cpp`), per tile |
+| ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory | the `native/imgnet` builders, per tile |
+| TFDAT, TemporalFix | `native/vidnet` in the temporal stage | — |
+| RIFE | `native/rife` | — |
+
+Video, single-frame models: in `aji_configure` (`try_native` in `aji_trt.cpp`) the model's ONNX
+is parsed (`native/onnx_graph`, no onnx dependency) and lowered (`native/lower`); a lowered model
+is instantiated for the chain's size (`native/executor`, `FrameNet::lowered`). A model the
+lowering refuses goes to the image builders on the whole frame (`FrameNet::image`,
+`native/framenet.h`). They size their buffers for their largest input (HAT-L / DAT-2 ~10 KB per
+input pixel, ESRGAN 2x ~1.6 KB, FDAT_M 2x ~1.4 KB), so the model is first built at a 128x128
+probe for its size rule and per-pixel buffers, and the frame is refused (TensorRT) when weights
+plus buffers scaled to it exceed the free memory less 1 GiB + 10% of the device; otherwise it is
+built at the frame size, reflect-padded at the right and bottom to the model's size rule (HAT: 16,
+as its own graph pads) and cropped back. Whole frames rather than tiles: no seams and no overlap
+work, the same computation as TensorRT's whole-frame engine; the cost is memory, hence the
+budget. Either way it becomes a `Step::NATIVE`, run by `run_steps` like a TensorRT `MODEL` step
+(same fp16 NCHW RGB in and out), so graph capture, RIFE, temporal steps and mixed chains are
+unchanged. Nothing is built: configure takes tens of milliseconds for a lowered model and up to a
+few hundred for the image builders (probe included), timing the kernel variants. The log gets
+`Native kernels: <model> (<what>)` before the usual `Applied Model` line (`..., whole frame
+[padded to WxH], <n> MB` for the image builders), or `Native kernels not used for <model>: <why>;
+using TensorRT` (e.g. `a whole 1920x1080 frame needs ~N GB, M GB free (keeping K GB)`), and the
+model goes through `ensure_engine` as before. The lowering, and an image-builder refusal that is
+not about the frame size or memory, are cached per ONNX path for the context's life. Temporal
+models: `try_native_temporal` (`native/vidnet`).
+
+Image path: `load_native` builds `ImgNet::create` at the tile size, which tries ESRGAN, FDAT,
+HAT, DAT, then the lowered conv nets (`LoweredImg`: the executor at the tile; even tiles smaller
+than it run from the same buffers, `Executor::run(in, out, w, h, s)`; sides must be multiples of
+the pixel-unshuffle factor). `aji_img_memory_get` and `aji_img_native_probe` see every family
+through the same `ImgNet` interface (`weight_bytes`, `device_bytes`).
+
+The lowering works op by op on the graph's data path and folds into each Conv what follows it (activation,
 SPAN gate with the residual, depth-to-space and SRVGG's upsampled-input add); `Concat` + 1x1 `Conv`
 is the concat kernel; pixel-unshuffle (reshape/transpose or `SpaceToDepth`) and `DepthToSpace`
 (CRD or DCR, by reordering weights) fold into the first and last convs. Shape-only plumbing,
