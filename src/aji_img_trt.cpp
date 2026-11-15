@@ -21,6 +21,10 @@
  */
 
 #include <algorithm>
+#include "native/conv.h"
+#include "native/imgnet.h"
+#include "native/guard.h"
+#include "native/onnx_graph.h"
 #include <chrono>
 #include <cstdarg>
 #include <cstdlib>
@@ -176,6 +180,7 @@ struct aji_img_model : TileModel {
     bool even = false;  // AJI_IMG_LOAD_EVEN_TILES: engine for any tile shape
     int cur_w = 0, cur_h = 0;     // the input shape last set on the context
     std::vector<cudaEvent_t> tile_ev;  // AJI_IMG_PROFILE on the GPU path
+    std::unique_ptr<ajinative::ImgNet> native;  // native kernels in place of the engine
 
     int run_tile(const float *in, float *out, std::string *err) override
     {
@@ -201,7 +206,10 @@ struct aji_img_model : TileModel {
                                         cudaMemcpyHostToDevice, stream);
         if (P)
             cudaEventRecord(prof_ev[1], stream);
-        if (e == cudaSuccess && !me.exec->enqueueV3(stream)) {
+        if (e == cudaSuccess && native) {
+            e = native->run(d_in, in_dt == nvinfer1::DataType::kFLOAT, d_out,
+                            out_dt == nvinfer1::DataType::kFLOAT, tile_w, tile_h, stream);
+        } else if (e == cudaSuccess && !me.exec->enqueueV3(stream)) {
             *err = AJI_TRT_PRODUCT " enqueue failed for " + name;
             return AJI_IMG_ERR;
         }
@@ -257,6 +265,7 @@ struct aji_img_model : TileModel {
         stream = nullptr;
         me.exec.reset();
         me.engine.reset();
+        native.reset();
         act_gen = 0;
 #ifdef AJI_TRTRTX
         me.rt.save();  // needs the context, which the callers hold
@@ -299,6 +308,8 @@ bool reserve_activations(aji_img_ctx *c, int64_t need, const std::string &who,
 bool bind_activations(aji_img_model *m, std::string *err)
 {
     aji_img_ctx *c = m->c;
+    if (m->native)
+        return true;
     if (!reserve_activations(c, m->act_need, m->name, err))
         return false;
     if (m->act_gen != c->act_gen) {
@@ -568,6 +579,61 @@ extern "C" AJI_IMG_EXPORT aji_img_ctx *aji_img_create(const aji_img_create_param
     return c.release();
 }
 
+namespace {
+
+bool native_enabled()
+{
+    const char *v = std::getenv("AJI_NATIVE");
+    if (!v)
+        return true;
+    const std::string s(v);
+    return !(s == "0" || s == "off" || s == "no" || s == "false");
+}
+
+// The model on native kernels (src/native/imgnet.h) for its tile size: fp16 tile buffers, no
+// engine. Context pushed.
+bool load_native(aji_img_model *m, const std::vector<char> &blob, std::string *why)
+{
+    aji_img_ctx *c = m->c;
+    if (!ajinative::device_supported(c->device, why))
+        return false;
+    ajinative::OnnxGraph g;
+    if (!ajinative::guarded(why, [&] { return ajinative::parse_onnx(blob.data(), blob.size(), &g, why); }))
+        return false;
+    if (cudaStreamCreateWithFlags(&m->stream, cudaStreamNonBlocking) != cudaSuccess) {
+        *why = "cannot create a CUDA stream";
+        return false;
+    }
+    if (!ajinative::guarded(why, [&] {
+            m->native = ajinative::ImgNet::create(g, m->tile_w, m->tile_h, m->stream, why);
+            return m->native != nullptr;
+        }))
+        return false;
+    if (!m->native->accepts(m->tile_w, m->tile_h)) {
+        *why = "tile size not accepted";
+        return false;
+    }
+    m->scale = m->native->scale();
+    m->out_ch = 3;
+    m->cur_w = m->tile_w;
+    m->cur_h = m->tile_h;
+    m->in_dt = m->out_dt = nvinfer1::DataType::kHALF;
+    m->in_elems = (size_t)3 * m->tile_w * m->tile_h;
+    m->out_elems = m->in_elems * m->scale * m->scale;
+    const size_t ib = m->in_elems * 2, ob = m->out_elems * 2;
+    m->weights = (int64_t)m->native->device_bytes();
+    m->buf_bytes = ib + ob;
+    if (cudaMalloc(&m->d_in, ib) != cudaSuccess || cudaMalloc(&m->d_out, ob) != cudaSuccess ||
+        cudaMallocHost(&m->h_in, ib) != cudaSuccess || cudaMallocHost(&m->h_out, ob) != cudaSuccess) {
+        cudaGetLastError();
+        *why = "out of memory for the tile buffers";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
                                                       const aji_img_model_params *p)
 {
@@ -594,8 +660,6 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
         c->set_error(m->name + ": expected one NCHW graph input");
         return nullptr;
     }
-    blob.clear();
-    blob.shrink_to_fit();
     m->in_ch = oin.dims[1] > 0 ? (int)oin.dims[1] : 3;
     if (m->in_ch != 1 && m->in_ch != 3) {
         c->set_error(m->name + ": input must have 1 or 3 channels");
@@ -623,6 +687,22 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c,
                        " --optShapes=" + shape + " --maxShapes=" + shape;
     }
     m->overlap = std::min(m->overlap, std::min(m->tile_w, m->tile_h) / 2);
+
+    // Native kernels first (AJI_NATIVE=off to disable): no engine to build.
+    if (native_enabled() && m->in_ch == 3 && oin.dims[2] <= 0) {
+        std::string why;
+        CtxGuard guard(c->cu_ctx);
+        if (load_native(m.get(), blob, &why)) {
+            c->info("native kernels: " + m->name + " (" + m->native->describe() + ")");
+            m->state = AJI_IMG_STATE_READY;
+            c->models.insert(m.get());
+            return m.release();
+        }
+        m->free_buffers();
+        c->info("native kernels not used for " + m->name + ": " + why + "; using " AJI_TRT_PRODUCT);
+    }
+    blob.clear();
+    blob.shrink_to_fit();
 
     const std::string dir = c->cache_dir.empty()
                                 ? fs::u8path(m->onnx_path).parent_path().u8string()
@@ -798,7 +878,7 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
     if (m.even) {
         ox = even_origins(W, m.tile_w, m.overlap, &Tw);
         oy = even_origins(H, m.tile_h, m.overlap, &Th);
-        if (Tw != m.cur_w || Th != m.cur_h) {
+        if (!m.native && (Tw != m.cur_w || Th != m.cur_h)) {
             if (!m.me.exec->setInputShape(m.me.in_name,
                                           nvinfer1::Dims4{1, m.in_ch, Th, Tw})) {
                 *err = m.name + ": setInputShape " + std::to_string(Tw) + "x" +
@@ -882,7 +962,11 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
                 return cuda_fail(e, "tile extract");
             if (prof)
                 cudaEventRecord(m.tile_ev[2 * done], st);
-            if (!m.me.exec->enqueueV3(st)) {
+            if (m.native) {
+                e = m.native->run(m.d_in, in_t == GpuDtype::F32, m.d_out, out_t == GpuDtype::F32, Tw, Th, st);
+                if (e != cudaSuccess)
+                    return cuda_fail(e, "native kernels");
+            } else if (!m.me.exec->enqueueV3(st)) {
                 cudaStreamSynchronize(st);
                 *err = AJI_TRT_PRODUCT " enqueue failed for " + m.name;
                 return AJI_IMG_ERR;
@@ -961,7 +1045,7 @@ extern "C" AJI_IMG_EXPORT int aji_img_upscale(aji_img_model *m,
             rc = AJI_IMG_ERR_NO_MEM;
         } else if (std::getenv("AJI_IMG_CPU_TILING")) {
             // the host tiling path, for comparison; fixed full-size tiles
-            if ((m->cur_w != m->tile_w || m->cur_h != m->tile_h) &&
+            if (!m->native && (m->cur_w != m->tile_w || m->cur_h != m->tile_h) &&
                 m->me.exec->setInputShape(
                     m->me.in_name,
                     nvinfer1::Dims4{1, m->in_ch, m->tile_h, m->tile_w})) {

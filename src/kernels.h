@@ -151,6 +151,17 @@ int aji_temporal_gather(const aji_gather_args *args, int t, float thresh,
                         int w, int h, int pw, int ph, void *dst_f16,
                         void *stream);
 
+/* For models that keep per-frame work (native TemporalFix): ent[j] is the
+ * cache slot of window position j's own frame, cut[] as for the gather;
+ * writes sel[z] (device, t ints) = the slot position z reads under the
+ * gather's scene-cut rule. */
+typedef struct aji_select_args {
+    int ent[AJI_TEMPORAL_MAX];
+    const float *cut[AJI_TEMPORAL_MAX];
+} aji_select_args;
+int aji_temporal_select(const aji_select_args *args, int t, float thresh,
+                        int w, int h, int *sel_dev, void *stream);
+
 #ifdef __cplusplus
 }
 #endif

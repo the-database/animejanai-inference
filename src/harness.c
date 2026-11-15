@@ -378,15 +378,22 @@ int main(int argc, char **argv)
         cudaStream_t stream;
         CK(cudaStreamCreate(&stream));
 
-        int prev = -1, cur = 0, n = 0, interp = 0, scenes = 0;
+        int prev = -1, cur = 0, n = 0, interp = 0, scenes = 0, timed = 0;
+        double rife_ms = 0;
+        cudaEvent_t re0, re1;
+        CK(cudaEventCreate(&re0));
+        CK(cudaEventCreate(&re1));
         while (n < max_frames && fread(h_in, 1, frame_sz, fin) == frame_sz) {
             CK(cudaMemcpyAsync(fr[cur].plane[0], h_in, y_sz,
                                cudaMemcpyHostToDevice, stream));
             CK(cudaMemcpyAsync(fr[cur].plane[1], (char *)h_in + y_sz, uv_sz,
                                cudaMemcpyHostToDevice, stream));
             if (prev >= 0 && fout) {
+                CK(cudaStreamSynchronize(stream));
+                CK(cudaEventRecord(re0, stream));
                 int ret = aji_infer_rife(aji, &fr[prev], &fr[cur], 0.5,
                                          &fr[2], stream);
+                CK(cudaEventRecord(re1, stream));
                 const aji_frame *emit;
                 if (ret == AJI_OK) {
                     emit = &fr[2];
@@ -404,6 +411,12 @@ int main(int argc, char **argv)
                 CK(cudaMemcpyAsync((char *)h_out + y_sz, emit->plane[1],
                                    uv_sz, cudaMemcpyDeviceToHost, stream));
                 CK(cudaStreamSynchronize(stream));
+                if (ret == AJI_OK && interp > 2) {  // skip the first two (warm-up)
+                    float ms = 0;
+                    CK(cudaEventElapsedTime(&ms, re0, re1));
+                    rife_ms += ms;
+                    timed++;
+                }
                 if (fwrite(h_out, 1, frame_sz, fout) != frame_sz) {
                     perror("fwrite");
                     return 1;
@@ -427,6 +440,9 @@ int main(int argc, char **argv)
         }
         printf("rife: %d source frames, %d interpolated, %d scene skips\n",
                n, interp, scenes);
+        if (timed)
+            printf("rife time: %.3f ms per interpolated frame avg (%d timed, incl. scene detection)\n",
+                   rife_ms / timed, timed);
         if (fout) fclose(fout);
         fclose(fin);
         aji_destroy(&aji);

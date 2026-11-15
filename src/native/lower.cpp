@@ -223,7 +223,13 @@ struct Lowerer {
         std::vector<float> f, b;
         if (!wt || wt->dims.size() != 4 || wt->dims[2] != k || wt->dims[3] != k || !wt->floats(&f))
             return fail("Conv weights are not a constant " + std::to_string(k) + "x" + std::to_string(k) + " kernel");
-        const int co = (int)wt->dims[0], ci = (int)wt->dims[1];
+        const int co = (int)wt->dims[0], ci = (int)wt->dims[1];  // bounded: floats() checked dims against the data
+        if (co < 1 || ci < 1) return fail("Conv weights are empty");
+        // the channel maps (from a pixel-unshuffle or a depth-to-space) must cover the tensor's channels
+        if (cin_from && ((int)cin_from->size() != ci || std::any_of(cin_from->begin(), cin_from->end(), [&](int c) { return c < 0 || c >= ci; })))
+            return fail("Conv input channels do not match the unshuffle");
+        if (cout_from && ((int)cout_from->size() != co || std::any_of(cout_from->begin(), cout_from->end(), [&](int c) { return c < 0 || c >= co; })))
+            return fail("Conv output channels do not match the depth-to-space");
         if (wt->dtype != ONNX_FLOAT16) plan.fp32_weights = true;
         if (n.in.size() > 2 && !n.in[2].empty()) {
             const OnnxTensor *bt = constant(n.in[2]);
@@ -341,6 +347,7 @@ struct Lowerer {
         if (depth_to_space_after(o, &d2s, &r, &dcr, &d2s_out)) {
             // last conv -> depth-to-space -> output (+ the nearest-upsampled input)
             const OnnxTensor *wt = constant(n.in[1]);
+            if (!wt || wt->dims.size() != 4 || wt->count() == OnnxTensor::kBadCount) return fail("Conv weights are not a constant");
             const int co = (int)wt->dims[0];
             if (r == 0) r = co == 12 ? 2 : co == 48 ? 4 : 0;
             if ((r != 2 && r != 4) || co != 3 * r * r) return fail("depth-to-space other than 2x/4x to RGB");
