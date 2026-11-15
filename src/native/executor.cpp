@@ -33,6 +33,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
     if (plan.aligned_only && (in_w % u || in_h % u)) return fail("this model needs aligned video dimensions");
 
     std::unique_ptr<Executor> e(new Executor());
+    e->u_ = u;
     e->W_ = in_w / u;
     e->H_ = in_h / u;
     e->out_w_ = e->W_ * r;
@@ -46,7 +47,9 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
         const cudaError_t ce = upload(w, pw.w.data(), pw.bias.data(), pw.slope.empty() ? nullptr : pw.slope.data(), pw.taps,
                                       pw.cin, cin_pad, pw.cout, cout_pad);
         if (ce != cudaSuccess) { reason = std::string("weight upload failed: ") + cudaGetErrorString(ce); return false; }
-        e->bytes_ += (size_t)pw.taps * cin_pad * cout_pad * 2 + (size_t)cout_pad * 4;
+        const size_t wb = (size_t)pw.taps * cin_pad * cout_pad * 2 + (size_t)cout_pad * 4;
+        e->bytes_ += wb;
+        e->weight_bytes_ += wb;
         *out = &w;
         return true;
     };
@@ -143,20 +146,22 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
     return e;
 }
 
-cudaError_t Executor::run(const void *in, void *out, cudaStream_t s) const
+cudaError_t Executor::run(const void *in, void *out, int w, int h, cudaStream_t s) const
 {
+    if (w < 1 || h < 1 || w % u_ || h % u_ || w / u_ > W_ || h / u_ > H_) return cudaErrorInvalidValue;
+    const int W = w / u_, H = h / u_;
     for (const Step &st : steps_) {
         cudaError_t ce;
         if (st.concat) {
             const void *srcs[4];
             for (int k = 0; k < 4; k++) srcs[k] = ptr(st.srcs[k], in, out);
-            ce = launch(st.cop, srcs, const_cast<void *>(ptr(st.dst, in, out)), W_ * H_, 0, s);
+            ce = launch(st.cop, srcs, const_cast<void *>(ptr(st.dst, in, out)), W * H, 0, s);
         } else {
             Tensors t;
             t.src = ptr(st.src, in, out);
             t.resid = ptr(st.resid, in, out);
             t.dst = const_cast<void *>(ptr(st.dst, in, out));
-            ce = launch(st.op, t, H_, W_, st.variant, s);
+            ce = launch(st.op, t, H, W, st.variant, s);
         }
         if (ce != cudaSuccess) return ce;
     }

@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include "native/executor.h"
+#include "native/framenet.h"
 #include "native/guard.h"
 #include "native/imgnet.h"
 #include "native/lower.h"
@@ -128,6 +129,8 @@ bool build_all(const OnnxGraph &g, cudaStream_t s)
     bool any = false;
     std::string why;
     guarded(&why, [&] { auto n = ImgNet::create(g, 64, 64, s, &why); any |= n != nullptr; return true; });
+    // the video path's whole-frame image models, at a size most models must pad
+    guarded(&why, [&] { auto n = FrameNet::image(g, 70, 42, s, &why); any |= n != nullptr; return true; });
     guarded(&why, [&] { auto n = VidNet::create(g, 64, 64, s, &why); any |= n != nullptr; return true; });
     guarded(&why, [&] { auto n = Rife::create(g, 64, 64, s, &why); any |= n != nullptr; return true; });
     guarded(&why, [&] {

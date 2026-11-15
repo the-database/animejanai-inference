@@ -53,6 +53,7 @@
 #include "core/fileio.h"
 #include "core/trt_engine.h"
 #include "native/executor.h"
+#include "native/framenet.h"
 #include "native/guard.h"
 #include "native/lower.h"
 #include "native/onnx_graph.h"
@@ -94,11 +95,14 @@ struct Step {
     aji_plan *plan = nullptr;   // RESIZE
 };
 
-// A model lowered for the native kernels, or why it can't be.
+// A model lowered for the native kernels, or why it can't be; for models the lowering refuses,
+// whether the image models (native/imgnet.h) refused it whatever the frame size.
 struct NativePlan {
     bool ok = false;
     std::string why;
     ajinative::Plan plan;
+    bool img_refused = false;
+    std::string img_why;
 };
 
 } // namespace
@@ -123,7 +127,7 @@ struct aji_ctx {
     int slot = 1;
     bool engines_cleaned = false;
     std::vector<ModelEngine> engines;
-    std::vector<std::unique_ptr<ajinative::Executor>> natives;  // NATIVE steps
+    std::vector<std::unique_ptr<ajinative::FrameNet>> natives;  // NATIVE steps
     std::map<std::string, NativePlan> native_plans;              // by ONNX path
     std::vector<Step> steps;
     bool active = false;
@@ -865,8 +869,10 @@ bool push_resize_step(aji_ctx *c, int *cw, int *ch, int nw, int nh)
 }
 
 // The model `name` on the native kernels at w x h, or null with *why (the caller
-// then uses TensorRT). Lowering is cached per ONNX path for the context's lifetime.
-std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &name, int w, int h,
+// then uses TensorRT): the lowered conv nets (SPAN, SPANF3, Compact) on the executor, else the
+// image models (ESRGAN, FDAT, HAT, DAT) on whole frames when they fit in memory. Lowering, and an
+// image-model refusal that is not about the size, are cached per ONNX path for the context's lifetime.
+std::unique_ptr<ajinative::FrameNet> try_native(aji_ctx *c, const std::string &name, int w, int h,
                                                 std::string *why, std::string *what)
 {
     const std::string path = (fs::u8path(c->model_dir) / fs::u8path(name + ".onnx")).u8string();
@@ -883,8 +889,9 @@ std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &n
             });
         it = c->native_plans.emplace(path, std::move(np)).first;
     }
-    if (!it->second.ok) {
-        *why = it->second.why;
+    NativePlan &np = it->second;
+    if (!np.ok && np.img_refused) {
+        *why = np.img_why;
         return nullptr;
     }
     cudaStream_t s = nullptr;
@@ -892,14 +899,39 @@ std::unique_ptr<ajinative::Executor> try_native(aji_ctx *c, const std::string &n
         *why = "cannot create a CUDA stream";
         return nullptr;
     }
-    std::unique_ptr<ajinative::Executor> ex;
-    ajinative::guarded(why, [&] {
-        ex = ajinative::Executor::create(it->second.plan, w, h, s, why);
-        return ex != nullptr;
-    });
+    std::unique_ptr<ajinative::FrameNet> n;
+    if (np.ok) {
+        ajinative::guarded(why, [&] {
+            n = ajinative::FrameNet::lowered(np.plan, w, h, s, why);
+            return n != nullptr;
+        });
+    } else {
+        // not a conv net the lowering takes: an image model on the whole frame
+        std::vector<char> bytes;
+        ajinative::OnnxGraph g;
+        bool size_only = false;
+        if (!read_file_bytes(path, &bytes))
+            *why = "cannot read the model";
+        else
+            ajinative::guarded(why, [&] {
+                if (!ajinative::parse_onnx(bytes.data(), bytes.size(), &g, why))
+                    return false;
+                bytes.clear();
+                bytes.shrink_to_fit();
+                n = ajinative::FrameNet::image(g, w, h, s, why, &size_only);
+                return n != nullptr;
+            });
+        if (!n && !size_only) {
+            np.img_refused = true;
+            np.img_why = *why;
+        }
+    }
     cudaStreamDestroy(s);
-    if (ex) *what = ajinative::describe(it->second.plan);
-    return ex;
+    if (n)
+        *what = n->describe();
+    else
+        cudaGetLastError();  // a failed allocation is not sticky; don't leave it for the next check
+    return n;
 }
 
 // The temporal model `name` on the native kernels at its padded input size, or null with *why.
