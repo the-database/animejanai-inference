@@ -409,6 +409,11 @@ bool aji_conf_load(const char *path, AjiConf *out, std::string *err)
             const std::string v = lower(strip(nit->second));
             out->native = !(v == "off" || v == "no");  // on, yes, auto, empty: native
         }
+        auto hit = g.find("reuse_held_frames");
+        if (hit != g.end()) {
+            const std::string v = lower(strip(hit->second));
+            out->reuse_held_frames = !(v == "off" || v == "no" || v == "false" || v == "0");
+        }
         auto tit = g.find("trt_engine_settings");
         if (tit != g.end()) {
             std::string v = strip(tit->second);

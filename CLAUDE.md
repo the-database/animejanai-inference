@@ -479,6 +479,10 @@ upscaling, and checks the output format, frame count and PSNR against the source
 
 ## Held-frame reuse (`aji_held_*`, used by `aji_encode`)
 
+Players read `[global] reuse_held_frames` (on by default; `no`/`off`/`false`/`0` turns it off)
+through `aji_reuse_held_frames_for_config(conf_path)` (0.30.0, additive); aji_encode ignores the
+key and keeps its own switch.
+
 On by default for the plain upscale chain (`--no-reuse-held-frames` turns it off, for debugging
 and A/B tests; `--reuse-held-frames` is still accepted); RIFE chains need
 `--reuse-held-frames-rife` (see "RIFE chains" below). A frame that is the same picture as the last frame
