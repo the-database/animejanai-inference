@@ -303,6 +303,7 @@ cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, in
 std::unique_ptr<ImgNet> build_fdat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
 std::unique_ptr<ImgNet> build_hat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
 std::unique_ptr<ImgNet> build_dat(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
+std::unique_ptr<ImgNet> build_lowered(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
 
 std::unique_ptr<ImgNet> ImgNet::create(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
 {
@@ -313,8 +314,13 @@ std::unique_ptr<ImgNet> ImgNet::create(const OnnxGraph &g, int max_w, int max_h,
     if (auto n = build_fdat(g, max_w, max_h, s, &w2)) return n;
     if (auto n = build_hat(g, max_w, max_h, s, &w3)) return n;
     if (auto n = build_dat(g, max_w, max_h, s, &w4)) return n;
-    // the reason of the family the graph belongs to (the others say "not a ... graph")
-    if (why) *why = w4.rfind("not a", 0) ? w4 : w3.rfind("not a", 0) ? w3 : w2.rfind("not a", 0) ? w2 : w;
+    // the conv nets the video path lowers (SPAN, SPANF3, Compact), on the executor
+    std::string w5;
+    if (auto n = build_lowered(g, max_w, max_h, s, &w5)) return n;
+    // the reason of the family the graph belongs to (the others say "not a ... graph"); the
+    // lowering's when it is none of them
+    if (why)
+        *why = w4.rfind("not a", 0) ? w4 : w3.rfind("not a", 0) ? w3 : w2.rfind("not a", 0) ? w2 : w.rfind("not a", 0) ? w : w5;
     return nullptr;
 }
 

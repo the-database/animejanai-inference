@@ -1,6 +1,8 @@
 // native/img_kernels.cu — see img_kernels.h.
 #include "native/img_kernels.h"
 
+#include <algorithm>
+
 #include <cuda_fp16.h>
 
 namespace ajinative {
@@ -50,7 +52,50 @@ __global__ void k_from_nhwc(const half *src, int ss, int w, int h, void *out, bo
     }
 }
 
+__device__ __forceinline__ int reflect_idx(int i, int n)
+{
+    if (n == 1) return 0;
+    const int period = 2 * (n - 1);
+    i %= period;
+    return i < n ? i : period - i;
+}
+
+__global__ void k_pad_reflect(const half *in, int w, int h, half *out, int pw, int ph)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= pw || y >= ph) return;
+    const int sx = reflect_idx(x, w), sy = reflect_idx(y, h);
+#pragma unroll
+    for (int c = 0; c < 3; c++) out[(size_t)c * pw * ph + (size_t)y * pw + x] = in[(size_t)c * w * h + (size_t)sy * w + sx];
+}
+
+__global__ void k_cast(const void *in, bool in_f32, void *out, bool out_f32, size_t n)
+{
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const float v = ld(in, in_f32, i);
+        if (out_f32) ((float *)out)[i] = v;
+        else ((half *)out)[i] = __float2half(v);
+    }
+}
+
 }  // namespace
+
+cudaError_t img_pad_reflect(const void *in, int w, int h, void *out, int pw, int ph, cudaStream_t s)
+{
+    if (w < 1 || h < 1 || pw < w || ph < h) return cudaErrorInvalidValue;
+    const dim3 b(32, 8), g((pw + 31) / 32, (ph + 7) / 8);
+    k_pad_reflect<<<g, b, 0, s>>>((const half *)in, w, h, (half *)out, pw, ph);
+    return cudaGetLastError();
+}
+
+cudaError_t img_cast(const void *in, bool in_f32, void *out, bool out_f32, size_t n, cudaStream_t s)
+{
+    if (in_f32 == out_f32) return cudaMemcpyAsync(out, in, n * (in_f32 ? 4 : 2), cudaMemcpyDeviceToDevice, s);
+    if (!n) return cudaSuccess;
+    const unsigned blocks = (unsigned)std::min<size_t>((n + 255) / 256, 65535);
+    k_cast<<<blocks, 256, 0, s>>>(in, in_f32, out, out_f32, n);
+    return cudaGetLastError();
+}
 
 cudaError_t img_to_nhwc(const void *in, bool in_f32, int w, int h, bool unshuffle, void *dst, int dstride, cudaStream_t s)
 {

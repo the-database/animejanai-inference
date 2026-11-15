@@ -27,10 +27,17 @@ public:
     Executor(const Executor &) = delete;
     Executor &operator=(const Executor &) = delete;
 
+    int in_w() const { return W_ * u_; }
+    int in_h() const { return H_ * u_; }
     int out_w() const { return out_w_; }
     int out_h() const { return out_h_; }
     size_t device_bytes() const { return bytes_; }
-    cudaError_t run(const void *in, void *out, cudaStream_t s) const;
+    // Of device_bytes: the packed weights (the rest is the feature buffers, sized for the input).
+    size_t weight_bytes() const { return weight_bytes_; }
+    cudaError_t run(const void *in, void *out, cudaStream_t s) const { return run(in, out, in_w(), in_h(), s); }
+    // An input up to the size created for (w <= in_w(), h <= in_h(), multiples of the model's
+    // pixel-unshuffle factor): the buffers and tile variants of the created size serve it.
+    cudaError_t run(const void *in, void *out, int w, int h, cudaStream_t s) const;
 
 private:
     Executor() = default;
@@ -46,8 +53,8 @@ private:
     std::vector<Step> steps_;
     std::vector<void *> buffers_;  // owned
     std::vector<void *> tensor_;   // feature id -> buffer
-    int H_ = 0, W_ = 0, out_w_ = 0, out_h_ = 0;
-    size_t bytes_ = 0;
+    int H_ = 0, W_ = 0, out_w_ = 0, out_h_ = 0, u_ = 1;
+    size_t bytes_ = 0, weight_bytes_ = 0;
 };
 
 }  // namespace ajinative
