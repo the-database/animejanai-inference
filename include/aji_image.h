@@ -237,11 +237,14 @@ typedef struct aji_img_memory {
     uint64_t model_activations; /* the activation memory its tile needs
                                    (with EVEN_TILES, its largest tile); on
                                    the CUDA backends held in the shared
-                                   buffer above, not by the model */
+                                   buffer above, not by the model, except
+                                   for a model on native kernels */
     uint64_t model_buffers;     /* its tile input/output buffers */
     int activations_shared;     /* 1 if model_activations is in
                                    ctx_activations (CUDA), 0 if the model
-                                   holds them itself (DirectML) */
+                                   holds them itself (DirectML, and a model
+                                   on native kernels, which allocates them
+                                   for its tile size) */
 } aji_img_memory;
 
 /* Fills `out` for the context's device and, if `m` is not NULL, that
