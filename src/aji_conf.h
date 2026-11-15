@@ -52,6 +52,8 @@ struct AjiConf {
     bool native = true;                        // run supported models on the native kernels
                                                // (src/native) instead of TensorRT, falling
                                                // back per model; [global] native=off disables
+    bool reuse_held_frames = true;             // players: reuse a held frame's upscale
+                                               // (aji_held_*); [global] reuse_held_frames=no
     std::map<int, AjiSlotConf> slots;
 };
 

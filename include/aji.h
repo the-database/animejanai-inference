@@ -384,6 +384,13 @@ typedef struct aji_held_stats {
     int64_t  comparisons, compare_ns;
 } aji_held_stats;
 
+/* Dispatcher query, no context: whether a player should reuse held frames,
+ * from conf_path's [global] reuse_held_frames (yes by default; no/off/false/0
+ * turns it off). 1 for NULL, a missing file or an unreadable conf. Players
+ * read it when they (re)configure; aji_encode has its own switch
+ * (--no-reuse-held-frames) and ignores the key. Additive export (0.30.0):
+ * resolve it optionally. */
+AJI_EXPORT int aji_reuse_held_frames_for_config(const char *conf_path);
 /* The rule version this library implements (AJI_HELD_RULE_VERSION). */
 AJI_EXPORT int aji_held_version(void);
 /* NULL on bad params, or when c's backend has no aji_frame_diff. Destroy

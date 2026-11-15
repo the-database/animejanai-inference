@@ -418,6 +418,17 @@ extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
     return c->be.rife_factor(c->inner, num, den);
 }
 
+extern "C" AJI_EXPORT int aji_reuse_held_frames_for_config(const char *conf_path)
+{
+    if (!conf_path || !conf_path[0])
+        return 1;
+    AjiConf conf;
+    std::string err;
+    if (!aji_conf_load(conf_path, &conf, &err))
+        return 1;
+    return conf.reuse_held_frames ? 1 : 0;
+}
+
 extern "C" AJI_EXPORT int aji_rife_factor_for_config(
     const aji_create_params *params, int w, int h, double fps, int *num,
     int *den)
