@@ -12,6 +12,7 @@
 #include "native/pack.h"
 
 #include <cstring>
+#include <utility>
 
 namespace ajinative {
 namespace {
@@ -236,14 +237,23 @@ bool parse_graph(Reader r, OnnxGraph *g)
 
 size_t OnnxTensor::count() const
 {
+    if (dims.size() > 8) return kBadCount;
     size_t n = 1;
-    for (int64_t d : dims) n *= (size_t)(d > 0 ? d : 0);
+    for (int64_t d : dims) {
+        if (d < 0 || (uint64_t)d > kMaxElems) return kBadCount;
+        n *= (size_t)d;  // both factors <= 2^28 and n <= 2^28 before: no overflow
+        if (n > kMaxElems) return kBadCount;
+    }
     return n;
 }
 
 bool OnnxTensor::floats(std::vector<float> *out) const
 {
     const size_t n = count();
+    out->clear();
+    if (n == kBadCount) return false;
+    const size_t es = dtype == ONNX_FLOAT ? 4 : dtype == ONNX_DOUBLE ? 8 : (dtype == ONNX_FLOAT16 || dtype == ONNX_BFLOAT16) ? 2 : 0;
+    if (!es || raw.size() != n * es) return false;
     out->resize(n);
     if (dtype == ONNX_FLOAT && raw.size() == n * 4) {
         std::memcpy(out->data(), raw.data(), n * 4);
@@ -275,6 +285,10 @@ bool OnnxTensor::floats(std::vector<float> *out) const
 bool OnnxTensor::ints(std::vector<int64_t> *out) const
 {
     const size_t n = count();
+    out->clear();
+    if (n == kBadCount) return false;
+    const size_t es = dtype == ONNX_INT64 ? 8 : dtype == ONNX_INT32 ? 4 : 0;
+    if (!es || raw.size() != n * es) return false;
     out->resize(n);
     if (dtype == ONNX_INT64 && raw.size() == n * 8) {
         std::memcpy(out->data(), raw.data(), n * 8);
@@ -330,6 +344,24 @@ bool parse_onnx(const void *data, size_t size, OnnxGraph *g, std::string *err)
     if (!r.ok || !have_graph) {
         if (err) *err = "not an ONNX model";
         return false;
+    }
+    // The native parsers index nodes' inputs and outputs: every node has an output, and the ops they
+    // read have at least the inputs their ONNX schema requires (exporters always write them).
+    static const std::pair<const char *, size_t> kMinIn[] = {
+        {"Conv", 2}, {"ConvTranspose", 2}, {"Add", 2}, {"Sub", 2}, {"Mul", 2}, {"Div", 2}, {"MatMul", 2}, {"Gemm", 2},
+        {"PRelu", 2}, {"Reshape", 2}, {"LayerNormalization", 2}, {"GatherND", 2}, {"Pad", 1}, {"Slice", 1}, {"Concat", 1},
+        {"Split", 1}, {"Resize", 1}, {"LeakyRelu", 1}, {"Relu", 1}, {"Sigmoid", 1}, {"Identity", 1}, {"Cast", 1},
+        {"Transpose", 1}, {"Softmax", 1}, {"Dropout", 1}, {"Shape", 1}, {"Size", 1}, {"SpaceToDepth", 1},
+        {"DepthToSpace", 1}, {"Clip", 1}, {"Unsqueeze", 1}, {"Gelu", 1}, {"Erf", 1}, {"ReduceL2", 1},
+        {"ReduceMean", 1}, {"Pow", 2}, {"Sqrt", 1}, {"Tanh", 1}, {"GridSample", 2}};
+    for (const OnnxNode &n : g->nodes) {
+        bool bad = n.out.empty();
+        for (const auto &m : kMinIn)
+            if (n.op == m.first && n.in.size() < m.second) bad = true;
+        if (bad) {
+            if (err) *err = "malformed ONNX node " + n.name + " (" + n.op + ")";
+            return false;
+        }
     }
     return true;
 }

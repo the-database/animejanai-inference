@@ -227,8 +227,8 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
                 const OnnxNode *dn = rd.node(R + "dw/Conv"), *pn = rd.node(R + "pw/Conv");
                 if (!tensor_floats(rd, dn, 1, &v, &d) || d != std::vector<int64_t>{S.c, 1, 3, 3} || dn->in.size() < 3 || !rd.floats(dn->in[2], &bb))
                     return refuse(why, R + "dw"), nullptr;
-                S.dw[j] = r.dfl(v);
-                S.dwb[j] = r.dfl(bb);
+                S.dw[j] = r.dfl(v, (size_t)9 * S.c);
+                S.dwb[j] = r.dfl(bb, S.c);
                 std::vector<float> wm, bm;
                 int co = 0;
                 if (!conv1x1_matrix(rd, R + "pw/Conv", S.c, nullptr, &wm, &bm, &co, why) || co != S.c || (int)bm.size() != S.c)

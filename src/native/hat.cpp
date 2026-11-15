@@ -88,8 +88,8 @@ bool ln(const Reader &rd, DevRes &r, const std::string &name, int C, Ln *l, std:
     if (!n || n->op != "LayerNormalization" || !tensor_floats(rd, n, 1, &g) || !tensor_floats(rd, n, 2, &b) || (int)g.size() != C ||
         (int)b.size() != C)
         return refuse(why, "missing " + name);
-    l->g = r.dfl(g);
-    l->b = r.dfl(b);
+    l->g = r.dfl(g, C);
+    l->b = r.dfl(b, C);
     l->eps = n->attr("epsilon") ? n->attr("epsilon")->f : 1e-5f;
     return true;
 }
@@ -126,7 +126,7 @@ bool attn(const Reader &rd, DevRes &r, const std::string &pre, const char *scale
     std::vector<float> tab;
     if (!tbias_table(bias, heads, ws, ws, kws, kws, kpad, &tab, &a->rt_w, &a->rt_offy, &a->rt_offx))
         return refuse(why, pre + ": bias is not a relative-position table");
-    a->rtab = r.dfl(tab);
+    a->rtab = r.dfl(tab, tab.size());
     return true;
 }
 
@@ -161,8 +161,10 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
         if (!init_input(rd, rd.node("/layers.0/residual_group/blocks.0/attn/Add"), &b, &d) || d.size() != 4) return refuse(why, "HAT bias"), nullptr;
         f->heads = (int)d[1];
         f->ws = (int)std::lround(std::sqrt((double)d[2]));
+        if (f->heads < 1 || f->ws < 1 || (int64_t)f->ws * f->ws != d[2] || f->ws * f->ws > 256) return refuse(why, "HAT bias"), nullptr;
         if (!init_input(rd, rd.node("/layers.0/residual_group/overlap_attn/Add"), &b, &d) || d.size() != 4) return refuse(why, "HAT OCAB bias"), nullptr;
         f->kws = (int)std::lround(std::sqrt((double)d[3]));
+        if (f->kws < f->ws || (int64_t)f->kws * f->kws != d[3] || (f->kws - f->ws) % 2) return refuse(why, "HAT OCAB bias"), nullptr;
         f->kpad = (f->kws - f->ws) / 2;
         std::vector<int64_t> pads;
         const OnnxNode *pn = rd.node("/layers.0/residual_group/overlap_attn/unfold/Pad");
@@ -181,6 +183,7 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
     {
         if (!tensor_floats(rd, rd.node("/layers.0/residual_group/blocks.0/mlp/fc1/MatMul"), 1, &v, &d) || d.size() != 2) return refuse(why, "HAT mlp"), nullptr;
         hid = (int)d[1];
+        if (hid < 1 || d[0] != C) return refuse(why, "HAT mlp"), nullptr;
         f->HS = pad16(hid);
     }
     for (int l = 0; l < nl; l++) {
@@ -208,6 +211,7 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
             if (!rd.conv(CB + "cab.0/Conv", &c0, why) || !rd.conv(CB + "cab.2/Conv", &c2, why)) return nullptr;
             if (c0.cin != C || c2.cout != C || c2.cin != c0.cout || !rd.node(CB + "cab.1/Gelu") || c0.lrelu || c2.lrelu)
                 return refuse(why, B + "CAB"), nullptr;
+            if (f->cr && f->cr != c0.cout) return refuse(why, B + "CAB width"), nullptr;  // the buffers are sized once
             f->cr = c0.cout;
             f->crp = pad16(f->cr);
             hb.cab0.w = r.gup(conv_taps(c0, nullptr), c0.b, C, CP, f->cr, f->crp);
@@ -216,15 +220,18 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
             hb.cab2.w = r.gup(conv_taps(c2, &sc), b2, f->cr, f->crp, C, CP);
             std::vector<float> w1, bb1, w2, bb2;
             const OnnxNode *a1 = rd.node(CB + "cab.3/attention/attention.1/Conv"), *a3 = rd.node(CB + "cab.3/attention/attention.3/Conv");
-            if (!tensor_floats(rd, a1, 1, &w1, &d) || d.size() != 4 || d[1] != C || !tensor_floats(rd, a3, 1, &w2, &d) || d[0] != C ||
-                a1->in.size() < 3 || !rd.floats(a1->in[2], &bb1) || a3->in.size() < 3 || !rd.floats(a3->in[2], &bb2) ||
-                !rd.node(CB + "cab.3/attention/attention.2/Relu"))
+            std::vector<int64_t> d3;
+            if (!tensor_floats(rd, a1, 1, &w1, &d) || d.size() != 4 || d[0] < 1 || d[1] != C || d[2] != 1 || d[3] != 1 ||
+                !tensor_floats(rd, a3, 1, &w2, &d3) || d3 != std::vector<int64_t>{C, d[0], 1, 1} || a1->in.size() < 3 ||
+                !rd.floats(a1->in[2], &bb1) || (int64_t)bb1.size() != d[0] || a3->in.size() < 3 || !rd.floats(a3->in[2], &bb2) ||
+                (int)bb2.size() != C || !rd.node(CB + "cab.3/attention/attention.2/Relu"))
                 return refuse(why, B + "CAB channel attention"), nullptr;
+            if (f->cs && f->cs != (int)bb1.size()) return refuse(why, B + "CAB channel attention width"), nullptr;
             f->cs = (int)bb1.size();
-            hb.ca1 = r.dfl(w1);
-            hb.cab1 = r.dfl(bb1);
-            hb.ca2 = r.dfl(w2);
-            hb.cab2b = r.dfl(bb2);
+            hb.ca1 = r.dfl(w1, (size_t)f->cs * C);
+            hb.cab1 = r.dfl(bb1, f->cs);
+            hb.ca2 = r.dfl(w2, (size_t)C * f->cs);
+            hb.cab2b = r.dfl(bb2, C);
             gr.habs.push_back(hb);
         }
         const std::string O = L + "residual_group/overlap_attn/";

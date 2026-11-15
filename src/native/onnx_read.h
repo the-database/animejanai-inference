@@ -73,11 +73,16 @@ struct Reader {
         c->transposed = n->op == "ConvTranspose";
         const OnnxTensor *w = n->in.size() > 1 ? tensor(n->in[1]) : nullptr;
         if (!w || w->dims.size() != 4 || !w->floats(&c->w)) return refuse(why, name + ": weights");
+        // dims are bounded by the element count floats() checked against the data (<= 2^28 each)
         c->k = (int)w->dims[2];
         if (w->dims[3] != c->k) return refuse(why, name + ": non-square kernel");
         c->cout = (int)(c->transposed ? w->dims[1] : w->dims[0]);
         c->cin = (int)(c->transposed ? w->dims[0] : w->dims[1]);
-        const int ng = (int)n->attr_i("group", 1);
+        if (c->cout < 1 || c->cin < 1 || c->k < 1) return refuse(why, name + ": empty weights");
+        const int64_t ng64 = n->attr_i("group", 1);
+        if (ng64 < 1 || ng64 > c->cout) return refuse(why, name + ": groups");
+        const int ng = (int)ng64;
+        if (ng > 1 && (size_t)c->cout * c->cin * ng * c->k * c->k > OnnxTensor::kMaxElems) return refuse(why, name + ": grouped conv too large");
         if (ng > 1 && !c->transposed && c->cout % ng == 0) {
             // grouped conv: expand to block-diagonal dense weights [co][cin*groups][k][k]
             const int cig = c->cin, cog = c->cout / ng, kk = c->k * c->k;
@@ -93,9 +98,10 @@ struct Reader {
         if (n->in.size() > 2 && !n->in[2].empty() && (!floats(n->in[2], &c->b) || (int)c->b.size() != c->cout))
             return refuse(why, name + ": bias");
         const OnnxAttr *st = n->attr("strides"), *pd = n->attr("pads"), *dl = n->attr("dilations");
+        if (st && !st->ints.empty() && (st->ints[0] < 1 || st->ints[0] > 2)) return refuse(why, name + ": strides");
         c->stride = st && !st->ints.empty() ? (int)st->ints[0] : 1;
         if (st && st->ints.size() == 2 && st->ints[1] != st->ints[0]) return refuse(why, name + ": strides");
-        const int groups = (int)n->attr_i("group", 1);
+        const int groups = ng;
         if (groups < 1 || (groups > 1 && (c->transposed || c->cout % groups))) return refuse(why, name + ": groups");
         if (dl)
             for (int64_t d : dl->ints)
@@ -209,7 +215,10 @@ inline bool conv1x1_matrix(const Reader &rd, const std::string &name, int K, con
         n->attr_i("group", 1) != 1)
         return refuse(why, "missing 1x1 conv " + name);
     const int co = (int)d[0], ci = (int)d[1];
-    if ((map && (int)map->size() != ci) || (!map && ci > K)) return refuse(why, name + ": input channels");
+    if (co < 1 || ci < 1 || (map && (int)map->size() != ci) || (!map && ci > K)) return refuse(why, name + ": input channels");
+    if (map)
+        for (int r : *map)
+            if (r < 0 || r >= K) return refuse(why, name + ": input channel map");
     w->assign((size_t)K * co, 0.f);
     for (int o = 0; o < co; o++)
         for (int i = 0; i < ci; i++) (*w)[(size_t)(map ? (*map)[i] : i) * co + o] = v[(size_t)o * ci + i];

@@ -29,16 +29,25 @@ namespace {
 using namespace onnxread;
 
 // ---- a host evaluator for the constant subgraphs (the dynamic position bias)
+// The graph is untrusted: every value's dims must match its data (shape_ok), each op checks its
+// inputs' shapes and indices, and a value or a Gemm's work is capped.
 struct HT {
     std::vector<int64_t> dims;
     std::vector<double> v;
 };
-size_t numel(const std::vector<int64_t> &d)
+constexpr size_t kMaxEval = OnnxTensor::kMaxElems;
+size_t numel(const std::vector<int64_t> &d)  // kMaxEval + 1 when negative or too large
 {
+    if (d.size() > 8) return kMaxEval + 1;
     size_t n = 1;
-    for (int64_t x : d) n *= (size_t)x;
+    for (int64_t x : d) {
+        if (x < 0 || (uint64_t)x > kMaxEval) return kMaxEval + 1;
+        n *= (size_t)x;
+        if (n > kMaxEval) return kMaxEval + 1;
+    }
     return n;
 }
+bool shape_ok(const HT &t) { return numel(t.dims) <= kMaxEval && numel(t.dims) == t.v.size(); }
 
 class StaticEval {
 public:
@@ -65,6 +74,7 @@ public:
             auto p = rd.prod.find(name);
             if (p == rd.prod.end() || depth > 64 || !op(*p->second, &t, depth)) return false;
         }
+        if (!shape_ok(t)) return false;
         memo[name] = t;
         *out = t;
         return true;
@@ -74,19 +84,46 @@ private:
     const Reader &rd;
     std::map<std::string, HT> memo;
 
+    static bool to_ints(const HT &t, std::vector<int64_t> *o)
+    {
+        o->clear();
+        for (double x : t.v) {
+            if (!(std::fabs(x) < 9.0e15) || x != std::floor(x)) return false;
+            o->push_back((int64_t)x);
+        }
+        return true;
+    }
+
     bool op(const OnnxNode &n, HT *o, int depth)
     {
         std::vector<HT> in(n.in.size());
-        for (size_t i = 0; i < n.in.size(); i++)
-            if (!n.in[i].empty() && !eval(n.in[i], &in[i], depth + 1)) return false;
+        std::vector<bool> have(n.in.size(), false);
+        for (size_t i = 0; i < n.in.size(); i++) {
+            if (n.in[i].empty()) continue;
+            if (!eval(n.in[i], &in[i], depth + 1)) return false;
+            have[i] = true;
+        }
+        auto need = [&](size_t k) {
+            for (size_t i = 0; i < k; i++)
+                if (i >= have.size() || !have[i]) return false;
+            return true;
+        };
+        const bool third = in.size() > 2 && have[2];
         if (n.op == "Relu") {
+            if (!need(1)) return false;
             *o = in[0];
             for (double &x : o->v) x = std::max(x, 0.0);
         } else if (n.op == "Cast" || n.op == "Identity") {
+            if (!need(1)) return false;
             *o = in[0];
         } else if (n.op == "LayerNormalization") {  // over the last axis
+            if (!need(2) || in[0].dims.empty()) return false;
+            const int64_t axis = n.attr_i("axis", -1);
+            if (axis != -1 && axis != (int64_t)in[0].dims.size() - 1) return false;
+            const size_t C = (size_t)in[0].dims.back();
+            if (!C || in[1].v.size() != C || (third && in[2].v.size() != C)) return false;
+            const size_t rows = in[0].v.size() / C;
             *o = in[0];
-            const size_t C = (size_t)in[0].dims.back(), rows = in[0].v.size() / C;
             const double eps = n.attr("epsilon") ? n.attr("epsilon")->f : 1e-5;
             for (size_t r = 0; r < rows; r++) {
                 double m = 0, q = 0;
@@ -94,13 +131,17 @@ private:
                 m /= C;
                 for (size_t c = 0; c < C; c++) q += (in[0].v[r * C + c] - m) * (in[0].v[r * C + c] - m);
                 const double rs = 1.0 / std::sqrt(q / C + eps);
-                for (size_t c = 0; c < C; c++) o->v[r * C + c] = (in[0].v[r * C + c] - m) * rs * in[1].v[c] + (in.size() > 2 ? in[2].v[c] : 0.0);
+                for (size_t c = 0; c < C; c++) o->v[r * C + c] = (in[0].v[r * C + c] - m) * rs * in[1].v[c] + (third ? in[2].v[c] : 0.0);
             }
         } else if (n.op == "Gemm") {
+            if (!need(2)) return false;
             const bool ta = n.attr_i("transA", 0), tb = n.attr_i("transB", 0);
             const double al = n.attr("alpha") ? n.attr("alpha")->f : 1.0, be = n.attr("beta") ? n.attr("beta")->f : 1.0;
             if (ta || in[0].dims.size() != 2 || in[1].dims.size() != 2) return false;
             const size_t M = in[0].dims[0], K = in[0].dims[1], N = tb ? in[1].dims[0] : in[1].dims[1];
+            if ((size_t)(tb ? in[1].dims[1] : in[1].dims[0]) != K) return false;
+            if (M * N > kMaxEval || (double)M * N * K > 1e9) return false;
+            if (third && in[2].v.size() != N && in[2].v.size() != M * N && in[2].v.size() != 1) return false;
             o->dims = {(int64_t)M, (int64_t)N};
             o->v.assign(M * N, 0.0);
             for (size_t i = 0; i < M; i++)
@@ -108,35 +149,69 @@ private:
                     double s = 0;
                     for (size_t k = 0; k < K; k++) s += in[0].v[i * K + k] * (tb ? in[1].v[j * K + k] : in[1].v[k * N + j]);
                     double c = 0;
-                    if (in.size() > 2 && !in[2].v.empty()) c = in[2].v.size() == N ? in[2].v[j] : in[2].v[i * N + j];
+                    if (third) c = in[2].v.size() == 1 ? in[2].v[0] : in[2].v.size() == N ? in[2].v[j] : in[2].v[i * N + j];
                     o->v[i * N + j] = al * s + be * c;
                 }
         } else if (n.op == "Reshape") {
             std::vector<int64_t> sh;
-            for (double x : in[1].v) sh.push_back((int64_t)x);
+            if (!need(2) || !to_ints(in[1], &sh) || sh.size() > 8) return false;
             const size_t total = in[0].v.size();
             int neg = -1;
             size_t known = 1;
             for (size_t i = 0; i < sh.size(); i++) {
-                if (sh[i] == 0 && !n.attr_i("allowzero", 0)) sh[i] = in[0].dims[i];
-                if (sh[i] == -1) neg = (int)i;
-                else known *= (size_t)sh[i];
+                if (sh[i] == 0 && !n.attr_i("allowzero", 0)) {
+                    if (i >= in[0].dims.size()) return false;
+                    sh[i] = in[0].dims[i];
+                }
+                if (sh[i] == -1) {
+                    if (neg >= 0) return false;
+                    neg = (int)i;
+                } else if (sh[i] < 0 || (uint64_t)sh[i] > kMaxEval) {
+                    return false;
+                } else {
+                    known *= (size_t)sh[i];
+                    if (known > kMaxEval) return false;
+                }
             }
-            if (neg >= 0) sh[neg] = (int64_t)(total / known);
+            if (neg >= 0) {
+                if (!known || total % known) return false;
+                sh[neg] = (int64_t)(total / known);
+            }
             if (numel(sh) != total) return false;
             *o = in[0];
             o->dims = sh;
         } else if (n.op == "Unsqueeze") {
-            *o = in[0];
+            if (!need(1)) return false;
             std::vector<int64_t> ax;
-            for (double x : in[1].v) ax.push_back((int64_t)x);
+            if (in.size() > 1 && have[1]) {
+                if (!to_ints(in[1], &ax)) return false;
+            } else if (const OnnxAttr *a = n.attr("axes")) {
+                ax = a->ints;
+            } else {
+                return false;
+            }
+            *o = in[0];
+            const int64_t rank = (int64_t)o->dims.size() + (int64_t)ax.size();
+            if (rank > 8) return false;
+            for (int64_t &a : ax) {
+                if (a < 0) a += rank;
+                if (a < 0 || a >= rank) return false;
+            }
             std::sort(ax.begin(), ax.end());
-            for (int64_t a : ax) o->dims.insert(o->dims.begin() + (a < 0 ? a + (int64_t)o->dims.size() + 1 : a), 1);
+            if (std::adjacent_find(ax.begin(), ax.end()) != ax.end()) return false;
+            for (int64_t a : ax) o->dims.insert(o->dims.begin() + a, 1);
         } else if (n.op == "Transpose") {
+            if (!need(1)) return false;
             const OnnxAttr *pa = n.attr("perm");
             const size_t r = in[0].dims.size();
+            if (pa && pa->ints.size() != r) return false;
             std::vector<int64_t> perm(r);
-            for (size_t i = 0; i < r; i++) perm[i] = pa ? pa->ints[i] : (int64_t)(r - 1 - i);
+            std::vector<bool> seen(r, false);
+            for (size_t i = 0; i < r; i++) {
+                perm[i] = pa ? pa->ints[i] : (int64_t)(r - 1 - i);
+                if (perm[i] < 0 || perm[i] >= (int64_t)r || seen[perm[i]]) return false;
+                seen[perm[i]] = true;
+            }
             o->dims.resize(r);
             for (size_t i = 0; i < r; i++) o->dims[i] = in[0].dims[perm[i]];
             o->v.assign(in[0].v.size(), 0.0);
@@ -152,22 +227,33 @@ private:
                 o->v[k] = in[0].v[src];
             }
         } else if (n.op == "GatherND") {  // batch_dims 0
-            if (n.attr_i("batch_dims", 0)) return false;
-            const size_t kk = (size_t)in[1].dims.back(), nidx = in[1].v.size() / kk;
+            if (!need(2) || n.attr_i("batch_dims", 0) || in[1].dims.empty()) return false;
+            const int64_t kk64 = in[1].dims.back();
+            if (kk64 < 1 || kk64 > (int64_t)in[0].dims.size()) return false;
+            const size_t kk = (size_t)kk64, nidx = in[1].v.size() / kk;
+            std::vector<int64_t> ix;
+            if (!to_ints(in[1], &ix)) return false;
             size_t inner = 1;
             for (size_t i = kk; i < in[0].dims.size(); i++) inner *= (size_t)in[0].dims[i];
             o->dims.assign(in[1].dims.begin(), in[1].dims.end() - 1);
             for (size_t i = kk; i < in[0].dims.size(); i++) o->dims.push_back(in[0].dims[i]);
+            if (numel(o->dims) > kMaxEval) return false;
             o->v.assign(nidx * inner, 0.0);
             for (size_t q = 0; q < nidx; q++) {
                 size_t off = 0;
-                for (size_t a = 0; a < kk; a++) off = off * (size_t)in[0].dims[a] + (size_t)(int64_t)in[1].v[q * kk + a];
+                for (size_t a = 0; a < kk; a++) {
+                    int64_t x = ix[q * kk + a];
+                    const int64_t dim = in[0].dims[a];
+                    if (x < 0) x += dim;
+                    if (x < 0 || x >= dim) return false;
+                    off = off * (size_t)dim + (size_t)x;
+                }
                 for (size_t e = 0; e < inner; e++) o->v[q * inner + e] = in[0].v[off * inner + e];
             }
         } else {
             return false;
         }
-        return true;
+        return shape_ok(*o);
     }
 };
 
@@ -287,9 +373,11 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     };
     auto lnw = [&](const OnnxNode *n, DevRes &r, Ln *l, int C_) -> bool {
         std::vector<float> gg, bb;
-        if (!n || !tensor_floats(rd, n, 1, &gg) || !tensor_floats(rd, n, 2, &bb) || (int)gg.size() != C_) return false;
-        l->g = r.dfl(gg);
-        l->b = r.dfl(bb);
+        if (!n || n->in.size() < 3 || !tensor_floats(rd, n, 1, &gg) || !tensor_floats(rd, n, 2, &bb) || (int)gg.size() != C_ ||
+            (int)bb.size() != C_)
+            return false;
+        l->g = r.dfl(gg, C_);
+        l->b = r.dfl(bb, C_);
         l->eps = n->attr("epsilon") ? n->attr("epsilon")->f : 1e-5f;
         return true;
     };
@@ -323,11 +411,11 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
                 take(Ev::REDUCEL2);
                 const OnnxNode *rl = take(Ev::REDUCEL2);
                 const OnnxNode *tm = take(Ev::MULC);
-                if (!rl || !tm || !take(Ev::SOFTMAX) || !consts_of(rd, tm, &v, &d) || d.size() != 3 || d[1] != 1 || d[2] != 1)
+                if (!rl || !tm || !take(Ev::SOFTMAX) || !consts_of(rd, tm, &v, &d) || d.size() != 3 || d[0] < 1 || d[1] != 1 || d[2] != 1)
                     return refuse(why, where + ": channel attention"), nullptr;
                 if (f->heads && f->heads != (int)d[0]) return refuse(why, "DAT mixed heads"), nullptr;
                 f->heads = (int)d[0];
-                bk.temp = r.dfl(v);
+                bk.temp = r.dfl(v, f->heads);
                 // the norm's clamp: Clip after the ReduceL2
                 for (const OnnxNode &n : g.nodes)
                     if (n.op == "Clip" && !n.in.empty() && n.in[0] == rl->out[0] && n.in.size() > 1 && rd.floats(n.in[1], &v) && v.size() == 1)
@@ -351,6 +439,9 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
                     if (bias.dims.size() != 3 || bias.dims[1] != bias.dims[2]) return refuse(why, where + ": position bias shape"), nullptr;
                     B.heads = (int)bias.dims[0];
                     const int T = (int)bias.dims[1];
+                    // the attention kernel's windows hold at most 256 tokens
+                    if (B.heads < 1 || T < 1 || T > 256 || bias.v.size() != (size_t)B.heads * T * T)
+                        return refuse(why, where + ": position bias shape"), nullptr;
                     std::vector<float> bf, tab;
                     for (double x : bias.v) bf.push_back((float)x);
                     // the window: the factor pair of T whose table is consistent (DAT: branch 0 short and wide)
@@ -368,7 +459,7 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
                         }
                     }
                     if (!found) return refuse(why, where + ": position bias is not a window table"), nullptr;
-                    B.rtab = r.dfl(tab);
+                    B.rtab = r.dfl(tab, tab.size());
                     if (B.mask) {
                         B.shift_y = B.wh / 2;
                         B.shift_x = B.ww / 2;
@@ -385,21 +476,26 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
             if (!conv_w(dwn, &w0, &b0, &d) || d != std::vector<int64_t>{C, 1, 3, 3} || (int)b0.size() != C) return refuse(why, where + ": v dwconv"), nullptr;
             w0.resize((size_t)C8 * 9, 0.f);
             b0.resize(C8, 0.f);
-            bk.dw = r.dfl(w0);
-            bk.dwb = r.dfl(b0);
-            if (!conv_w(c1, &v, &b, &d) || d.size() != 4 || d[1] != C || d[2] != 1) return refuse(why, where + ": channel gate"), nullptr;
+            bk.dw = r.dfl(w0, (size_t)C8 * 9);
+            bk.dwb = r.dfl(b0, C8);
+            if (!conv_w(c1, &v, &b, &d) || d.size() != 4 || d[0] < 1 || d[1] != C || d[2] != 1 || d[3] != 1 || (int64_t)b.size() != d[0])
+                return refuse(why, where + ": channel gate"), nullptr;
             bk.cr = (int)d[0];
-            bk.cw1 = r.dfl(v);
-            bk.cb1 = r.dfl(b);
-            if (!conv_w(c2, &v, &b, &d) || d[0] != C || d[1] != bk.cr) return refuse(why, where + ": channel gate"), nullptr;
-            bk.cw2 = r.dfl(v);
-            bk.cb2 = r.dfl(b);
-            if (!conv_w(s1, &v, &b, &d) || d.size() != 4 || d[1] != C || d[2] != 1 || d[0] > 16) return refuse(why, where + ": token gate"), nullptr;
+            bk.cw1 = r.dfl(v, (size_t)bk.cr * C);
+            bk.cb1 = r.dfl(b, bk.cr);
+            if (!conv_w(c2, &v, &b, &d) || d.size() != 4 || d[0] != C || d[1] != bk.cr || d[2] != 1 || d[3] != 1 || (int)b.size() != C)
+                return refuse(why, where + ": channel gate"), nullptr;
+            bk.cw2 = r.dfl(v, (size_t)C * bk.cr);
+            bk.cb2 = r.dfl(b, C);
+            if (!conv_w(s1, &v, &b, &d) || d.size() != 4 || d[0] < 1 || d[1] != C || d[2] != 1 || d[3] != 1 || d[0] > 16 ||
+                (int64_t)b.size() != d[0])
+                return refuse(why, where + ": token gate"), nullptr;
             bk.sr = (int)d[0];
-            bk.sw1 = r.dfl(v);
-            bk.sb1 = r.dfl(b);
-            if (!conv_w(s2, &v, &b, &d) || d[0] != 1 || d[1] != bk.sr || b.size() != 1) return refuse(why, where + ": token gate"), nullptr;
-            bk.sw2 = r.dfl(v);
+            bk.sw1 = r.dfl(v, (size_t)bk.sr * C);
+            bk.sb1 = r.dfl(b, bk.sr);
+            if (!conv_w(s2, &v, &b, &d) || d.size() != 4 || d[0] != 1 || d[1] != bk.sr || d[2] != 1 || d[3] != 1 || b.size() != 1)
+                return refuse(why, where + ": token gate"), nullptr;
+            bk.sw2 = r.dfl(v, bk.sr);
             bk.sb2 = b[0];
             if (!linear(take(Ev::MM), C, C, &v, &b)) return refuse(why, where + ": proj"), nullptr;
             bk.proj = r.mat(v, &b, C, C);
@@ -413,13 +509,14 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
                 bk.fc1 = r.mat(w2, &b2, C, f->FS);
             }
             const OnnxNode *sp = take(Ev::SPLIT), *n3 = take(Ev::LN);
-            if (!sp || sp->out.size() != 2 || !n3 || n3->in[0] != sp->out[1] || !lnw(n3, r, &bk.n3, C)) return refuse(why, where + ": SGFN"), nullptr;
+            if (!sp || sp->out.size() != 2 || !n3 || n3->in.empty() || n3->in[0] != sp->out[1] || !lnw(n3, r, &bk.n3, C)) return refuse(why, where + ": SGFN"), nullptr;
             const OnnxNode *fdw = take(Ev::CV);
-            if (!conv_w(fdw, &w0, &b0, &d) || d != std::vector<int64_t>{C, 1, 3, 3}) return refuse(why, where + ": SGFN dwconv"), nullptr;
+            if (!conv_w(fdw, &w0, &b0, &d) || d != std::vector<int64_t>{C, 1, 3, 3} || (int)b0.size() != C)
+                return refuse(why, where + ": SGFN dwconv"), nullptr;
             w0.resize((size_t)C8 * 9, 0.f);
             b0.resize(C8, 0.f);
-            bk.fdw = r.dfl(w0);
-            bk.fdwb = r.dfl(b0);
+            bk.fdw = r.dfl(w0, (size_t)C8 * 9);
+            bk.fdwb = r.dfl(b0, C8);
             if (!linear(take(Ev::MM), C, C, &v, &b)) return refuse(why, where + ": fc2"), nullptr;
             bk.fc2 = r.mat(v, &b, C, C);
             blocks.push_back(bk);
@@ -463,7 +560,7 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     {
         std::vector<float> id((size_t)C * C, 0.f);
         for (int i = 0; i < C; i++) id[(size_t)i * C + i] = 1.f;
-        f->identf = r.dfl(id);
+        f->identf = r.dfl(id, (size_t)C * C);
         float *zb = (float *)r.alloc((size_t)C * 4);
         if (!zb || tmat_alloc(f->foldm, C, C, zb) != cudaSuccess) return refuse(why, "weight upload failed"), nullptr;
     }
