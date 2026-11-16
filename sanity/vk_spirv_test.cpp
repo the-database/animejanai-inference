@@ -57,7 +57,6 @@ int check_module(const SpirvModule &m)
 int main()
 {
     CHECK(kSpirvModuleCount > 0);
-    std::set<const char *> seen;
     for (size_t k = 0; k < kSpirvModuleCount; k++) {
         const SpirvModule &m = kSpirvModules[k];
         if (check_module(m)) {

@@ -316,7 +316,8 @@ The self-contained tests are registered with CTest under two labels: `ctest --te
 cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`, `aji_rife_conf_test`,
 `aji_held_test`, `aji_native_pack_test`, `aji_native_lower_test`, `aji_native_layout_test`, and
 with `AJI_CUDA` `aji_native_onnx_test`, with `AJI_VULKAN` `aji_vk_spirv_test`; what CI runs) and `-L gpu` (`aji_pre_fusion_test`, `aji_msb444_test`,
-`aji_frame_diff_test`, `aji_native_conv_test`; needs an
+`aji_frame_diff_test`, `aji_native_conv_test`, `aji_native_gconv_test`, `aji_native_tfm_test`;
+`AJI_CUDA` only; needs an
 NVIDIA GPU; on Windows also `aji_frame_diff_dml_test`, which runs on any DirectML GPU from
 `dml-test/`, beside copies of `aji.dll`, `aji_dml.dll`, ONNX Runtime and DirectML). A new test
 that needs no GPU, models or fixtures goes in the `cpu` list at the end of `CMakeLists.txt`, and
