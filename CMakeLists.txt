@@ -524,7 +524,8 @@ if(AJI_VULKAN)
         message(FATAL_ERROR "AJI_VULKAN=ON needs the Vulkan headers: install the Vulkan SDK or pass "
                             "-DAJI_VK_INCLUDE=<dir containing vulkan/vulkan_core.h>")
     endif()
-    add_library(aji_vk_core OBJECT src/vk/vk.cpp src/vk/device.cpp src/vk/kernels.cpp src/vk/executor.cpp)
+    add_library(aji_vk_core OBJECT src/vk/vk.cpp src/vk/device.cpp src/vk/kernels.cpp src/vk/executor.cpp
+                src/core/fileio.cpp)
     target_include_directories(aji_vk_core PRIVATE src)
     target_include_directories(aji_vk_core SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
     set_target_properties(aji_vk_core PROPERTIES

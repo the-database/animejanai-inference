@@ -94,6 +94,17 @@ public:
     // A buffer of kBindings * 16 zero bytes for descriptor slots a kernel does not read.
     VkBuffer dummy() const { return dummy_.buf; }
 
+    // Caches that make a later configure fast, kept in dir (e.g. the model directory) as
+    // aji-vk-<vendor>-<device>-<driver>.vkcache (the driver's VkPipelineCache, which it
+    // validates itself) and .variants (the tile variant timed fastest per kernel and size, one
+    // "<key> <variant>" line each). set_cache_dir loads them; save_caches writes what changed.
+    // AJI_VK_RETUNE=1 ignores the stored variants (and times again).
+    void set_cache_dir(const std::string &dir);
+    void save_caches();
+    // The stored variant for key, or -1.
+    int cached_variant(const std::string &key);
+    void store_variant(const std::string &key, int variant);
+
 private:
     Device() = default;
     VkCommandBuffer begin_locked();
@@ -114,6 +125,11 @@ private:
     VkPipelineLayout pipe_layout_ = VK_NULL_HANDLE;
     VkPipelineCache cache_ = VK_NULL_HANDLE;
     std::map<std::string, VkPipeline> pipelines_;
+    std::mutex cache_mu_;  // the variant table and the cache directory
+    std::string cache_dir_;
+    std::map<std::string, int> variants_;
+    bool variants_dirty_ = false, pipelines_dirty_ = false;
+    std::string cache_base() const;
     Buffer dummy_;
     Buffer stage_;  // upload/download staging, grown on demand
 };

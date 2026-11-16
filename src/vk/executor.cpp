@@ -1,8 +1,10 @@
 // vk/executor.cpp — see executor.h.
 #include "vk/executor.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 
 #include "native/layout.h"
 
@@ -50,6 +52,13 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
         return nullptr;
     };
     std::string reason;
+    const bool trace = std::getenv("AJI_VK_TRACE") != nullptr;
+    auto t_mark = std::chrono::steady_clock::now();
+    auto mark = [&](const char *what) {
+        const auto now = std::chrono::steady_clock::now();
+        if (trace) std::fprintf(stderr, "aji_vk: create: %s %.1f ms\n", what, std::chrono::duration<double, std::milli>(now - t_mark).count());
+        t_mark = now;
+    };
     ajinative::Layout L;
     if (!ajinative::layout(plan, in_w, in_h, &L, &reason)) return fail(reason);
     const Family fam = dev.family();
@@ -65,6 +74,7 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
         return fail(reason);
     e->bytes_ += e->in_.size + e->out_.size;
 
+    mark("input/output buffers");
     // feature buffers, as the layout assigned them
     std::vector<int> fbuf;
     // Slack after each feature map: the cm16 kernels load a gate's block input 16 pixels at a
@@ -103,6 +113,7 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
         return true;
     };
 
+    mark("feature buffers");
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint32_t)(plan.steps.size() * Device::kBindings)};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = (uint32_t)plan.steps.size();
@@ -147,10 +158,6 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
                 !upload_conv(p.att, p.att.cin, p.att.cout, &b[6], &b[7], nullptr))
                 return fail("attention weights: " + reason);
         }
-        for (int v = 0; v < st.nvar; v++) {
-            st.pipe[v] = dev.pipeline(st.disp[v].module.c_str(), st.disp[v].local_size, st.disp[v].subgroup, &reason);
-            if (!st.pipe[v]) return fail(reason);
-        }
         VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dsa.descriptorPool = e->pool_;
         dsa.descriptorSetCount = 1;
@@ -173,6 +180,7 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
         e->steps_.push_back(st);
     }
 
+    mark("weights and descriptor sets");
     // zeroed buffers, so variant timing never runs on stale bits
     {
         VkCommandBuffer cb = dev.begin();
@@ -181,51 +189,83 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
         if (!dev.submit_wait(cb, &reason)) return fail(reason);
     }
 
-    // tile variants: fixed by AJI_VK_VARIANT, else timed per step when the queue has timestamps
+    mark("zero fill");
+    // Tile variants: AJI_VK_VARIANT=<n> fixes them; else the device's stored pick for the kernel
+    // at this size (vk/device.h, set_cache_dir); else timed when the queue has timestamps (once
+    // per kernel and size: identical steps share it) and stored. Only the pipelines a step can
+    // run are compiled.
     const char *fixed = std::getenv("AJI_VK_VARIANT");
     const double tick_ns = dev.info().timestamp_ns;
     VkQueryPool qp = VK_NULL_HANDLE;
-    if (!fixed && tick_ns > 0) {
-        VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-        qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qpi.queryCount = 2;
-        if (vkCreateQueryPool(dev.device(), &qpi, nullptr, &qp) != VK_SUCCESS) qp = VK_NULL_HANDLE;
-    }
+    auto compile = [&](Step &st, int v) -> bool {
+        if (!st.pipe[v]) st.pipe[v] = dev.pipeline(st.disp[v].module.c_str(), st.disp[v].local_size, st.disp[v].subgroup, &reason);
+        return st.pipe[v] != VK_NULL_HANDLE;
+    };
+    auto bail = [&](const std::string &m) -> std::unique_ptr<Executor> {
+        if (qp) vkDestroyQueryPool(dev.device(), qp, nullptr);
+        return fail(m);
+    };
+    const std::string size = "@" + std::to_string(e->W_) + "x" + std::to_string(e->H_);
+    std::map<std::string, std::pair<int, double>> timed;  // this create's timings
     char line[256];
     for (size_t i = 0; i < e->steps_.size(); i++) {
         Step &st = e->steps_[i];
-        double best_ms = -1.0;
+        const std::string &m0 = st.disp[0].module;
+        const std::string key = m0.substr(0, m0.rfind('_')) + size;  // the kernel without its tile shape
+        double ms = -1.0;
+        const char *how = "";
+        int v = -1;
         if (fixed) {
-            st.variant = std::atoi(fixed);
-            if (st.variant < 0 || st.variant >= st.nvar) st.variant = 0;
-        } else if (qp && st.nvar > 1) {
-            constexpr int kWarm = 2, kRuns = 8;
-            for (int v = 0; v < st.nvar; v++) {
-                VkCommandBuffer cb = dev.begin();
-                vkCmdResetQueryPool(cb, qp, 0, 2);
-                for (int k = 0; k < kWarm; k++) e->record_step(cb, st, v, e->W_, e->H_);
-                vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
-                for (int k = 0; k < kRuns; k++) e->record_step(cb, st, v, e->W_, e->H_);
-                vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
-                if (!dev.submit_wait(cb, &reason)) {
-                    vkDestroyQueryPool(dev.device(), qp, nullptr);
-                    return fail("timing the tile variants: " + reason);
+            v = std::atoi(fixed);
+            how = " (AJI_VK_VARIANT)";
+        } else if (st.nvar > 1) {
+            const auto it = timed.find(key);
+            if (it != timed.end()) {
+                v = it->second.first;
+                ms = it->second.second;
+            } else if ((v = dev.cached_variant(key)) >= 0 && v < st.nvar) {
+                how = " (stored)";
+            } else if (tick_ns > 0) {
+                if (!qp) {
+                    VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                    qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                    qpi.queryCount = 2;
+                    if (vkCreateQueryPool(dev.device(), &qpi, nullptr, &qp) != VK_SUCCESS) qp = VK_NULL_HANDLE;
                 }
-                uint64_t t[2] = {0, 0};
-                vkGetQueryPoolResults(dev.device(), qp, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-                const double ms = (double)(t[1] - t[0]) * tick_ns * 1e-6 / kRuns;
-                if (best_ms < 0 || ms < best_ms) {
-                    best_ms = ms;
-                    st.variant = v;
+                v = -1;
+                for (int c = 0; qp && c < st.nvar; c++) {
+                    if (!compile(st, c)) return bail(reason);
+                    constexpr int kWarm = 2, kRuns = 8;
+                    VkCommandBuffer cb = dev.begin();
+                    vkCmdResetQueryPool(cb, qp, 0, 2);
+                    for (int k = 0; k < kWarm; k++) e->record_step(cb, st, c, e->W_, e->H_);
+                    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+                    for (int k = 0; k < kRuns; k++) e->record_step(cb, st, c, e->W_, e->H_);
+                    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+                    if (!dev.submit_wait(cb, &reason)) return bail("timing the tile variants: " + reason);
+                    uint64_t t[2] = {0, 0};
+                    vkGetQueryPoolResults(dev.device(), qp, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                    const double cms = (double)(t[1] - t[0]) * tick_ns * 1e-6 / kRuns;
+                    if (v < 0 || cms < ms) {
+                        ms = cms;
+                        v = c;
+                    }
+                }
+                if (v >= 0) {
+                    timed[key] = {v, ms};
+                    dev.store_variant(key, v);
                 }
             }
         }
-        if (best_ms >= 0)
-            std::snprintf(line, sizeof line, "%2zu %s %.3f ms\n", i, st.disp[st.variant].module.c_str(), best_ms);
+        st.variant = v >= 0 && v < st.nvar ? v : 0;
+        if (!compile(st, st.variant)) return bail(reason);
+        if (ms >= 0)
+            std::snprintf(line, sizeof line, "%2zu %s %.3f ms\n", i, st.disp[st.variant].module.c_str(), ms);
         else
-            std::snprintf(line, sizeof line, "%2zu %s\n", i, st.disp[st.variant].module.c_str());
+            std::snprintf(line, sizeof line, "%2zu %s%s\n", i, st.disp[st.variant].module.c_str(), how);
         e->desc_ += line;
     }
+    mark("variants and pipelines");
     if (qp) vkDestroyQueryPool(dev.device(), qp, nullptr);
     return e;
 }

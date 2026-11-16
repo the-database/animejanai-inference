@@ -1,8 +1,9 @@
 // aji_vk_model_test: one lowered model on aji_vk's executor (vk/executor.h), by hand.
 //   aji_vk_model_test list
-//   aji_vk_model_test <model.onnx> <w> <h> [--device N] [--iters N] [--ref WxH ...]
+//   aji_vk_model_test <model.onnx> <w> <h> [--device N] [--iters N] [--ref WxH ...] [--cache DIR]
 // Runs the model at w x h on a synthetic frame and times it (GPU timestamps, model only, and the
-// executor's create time). Then, per --ref size (default 256x144 and a ragged 202x118), compares
+// executor's create time; --cache keeps the variant and pipeline caches in DIR, as aji_vk keeps
+// them in the model directory, so a second run shows a warm configure). Then, per --ref size (default 256x144 and a ragged 202x118), compares
 // the Vulkan output with the fp32 CPU reference of the same plan (sanity/native_ref.h): PSNR and
 // max error. With AJI_CUDA, also compares the w x h output with the CUDA native executor's.
 // Exit 1 when a comparison is under its limit (--min-db, default 50).
@@ -82,9 +83,11 @@ Cmp compare(const std::vector<uint16_t> &a, const std::vector<float> &ref)
 }
 
 bool run_vk(ajivk::Device &dev, const Plan &plan, int w, int h, const std::vector<float> &in, std::vector<uint16_t> *out,
-            std::unique_ptr<ajivk::Executor> *keep, std::string *why)
+            std::unique_ptr<ajivk::Executor> *keep, std::string *why, double *create_s = nullptr)
 {
+    const auto t0 = std::chrono::steady_clock::now();
     auto ex = ajivk::Executor::create(dev, plan, w, h, why);
+    if (create_s) *create_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (!ex) return false;
     const auto hin = to_half(in);
     if (!dev.upload(ex->input(), hin.data(), hin.size() * 2, why)) return false;
@@ -117,11 +120,13 @@ int main(int argc, char **argv)
     const int w = std::atoi(argv[2]), h = std::atoi(argv[3]);
     int device = -1, iters = 20;
     double min_db = 50.0;
+    std::string cache;
     std::vector<std::pair<int, int>> refs;
     for (int i = 4; i < argc; i++) {
         if (!std::strcmp(argv[i], "--device") && i + 1 < argc) device = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--min-db") && i + 1 < argc) min_db = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--cache") && i + 1 < argc) cache = argv[++i];
         else if (!std::strcmp(argv[i], "--ref") && i + 1 < argc) {
             int rw = 0, rh = 0;
             if (std::sscanf(argv[++i], "%dx%d", &rw, &rh) == 2) refs.push_back({rw, rh});
@@ -145,19 +150,19 @@ int main(int argc, char **argv)
         return 1;
     }
     std::printf("device %u: %s, family %s\n", dev->info().index, dev->info().name.c_str(), ajivk::family_name(dev->family()));
+    if (!cache.empty()) dev->set_cache_dir(cache);
 
     // full size: create (twice: the second is warm, its pipelines cached), run, time
     const auto in = synth(w, h);
     std::vector<uint16_t> out;
     std::unique_ptr<ajivk::Executor> ex;
-    auto t0 = std::chrono::steady_clock::now();
-    if (!run_vk(*dev, plan, w, h, in, &out, &ex, &why)) {
+    double cold = 0;
+    if (!run_vk(*dev, plan, w, h, in, &out, &ex, &why, &cold)) {
         std::fprintf(stderr, "vulkan %dx%d: %s\n", w, h, why.c_str());
         return 1;
     }
-    const double cold = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     ex.reset();
-    t0 = std::chrono::steady_clock::now();
+    const auto t0 = std::chrono::steady_clock::now();
     ex = ajivk::Executor::create(*dev, plan, w, h, &why);
     const double warm = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (!ex) {
@@ -165,6 +170,7 @@ int main(int argc, char **argv)
         return 1;
     }
     std::printf("%s", ex->describe().c_str());
+    dev->save_caches();
     double best = -1;
     if (dev->info().timestamp_ns > 0) {
         VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -190,7 +196,7 @@ int main(int argc, char **argv)
         }
         vkDestroyQueryPool(dev->device(), qp, nullptr);
     }
-    std::printf("vulkan %dx%d -> %dx%d: %.3f ms per frame (model only), create %.2f s cold, %.3f s warm, %.1f MB on the device\n", w, h,
+    std::printf("vulkan %dx%d -> %dx%d: %.3f ms per frame (model only), create %.3f s (first in this process), %.3f s (again), %.1f MB on the device\n", w, h,
                 ex->out_w(), ex->out_h(), best, cold, warm, ex->device_bytes() / 1048576.0);
 
     int bad = 0;

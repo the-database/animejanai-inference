@@ -1,9 +1,13 @@
 // vk/device.cpp — see device.h.
 #include "vk/device.h"
 
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 
+#include "core/fileio.h"
 #include "vk/spirv.h"
 
 namespace ajivk {
@@ -274,6 +278,7 @@ Device::~Device()
 {
     if (!dev_) return;
     vkDeviceWaitIdle(dev_);
+    save_caches();
     for (auto &p : pipelines_) vkDestroyPipeline(dev_, p.second, nullptr);
     destroy(dummy_);
     destroy(stage_);
@@ -432,14 +437,98 @@ VkPipeline Device::pipeline(const char *module, uint32_t local_size, uint32_t su
     }
     cpi.layout = pipe_layout_;
     VkPipeline p = VK_NULL_HANDLE;
+    const auto t0 = std::chrono::steady_clock::now();
     r = vkCreateComputePipelines(dev_, cache_, 1, &cpi, nullptr, &p);
+    if (std::getenv("AJI_VK_TRACE"))
+        std::fprintf(stderr, "aji_vk: pipeline %s: %.1f ms\n", module,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     vkDestroyShaderModule(dev_, sm, nullptr);
     if (r != VK_SUCCESS) {
         if (why) *why = err((std::string("pipeline ") + module).c_str(), r);
         return VK_NULL_HANDLE;
     }
     pipelines_[key] = p;
+    pipelines_dirty_ = true;
     return p;
+}
+
+std::string Device::cache_base() const
+{
+    char name[96];
+    std::snprintf(name, sizeof name, "aji-vk-%04x-%04x-%08x", info_.vendor, info_.device_id, info_.driver_version);
+    std::string dir = cache_dir_;
+    if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+    return dir + name;
+}
+
+void Device::set_cache_dir(const std::string &dir)
+{
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    if (dir.empty() || dir == cache_dir_) return;
+    cache_dir_ = dir;
+    const std::string base = cache_base();
+    std::vector<char> data;
+    const char *retune = std::getenv("AJI_VK_RETUNE");
+    if (!(retune && std::strcmp(retune, "0")) && ajicore::read_file_bytes(base + ".variants", &data)) {
+        std::istringstream in(std::string(data.begin(), data.end()));
+        std::string key;
+        int v = -1;
+        while (in >> key >> v)
+            if (v >= 0) variants_.emplace(key, v);
+    }
+    data.clear();
+    if (ajicore::read_file_bytes(base + ".vkcache", &data) && !data.empty()) {
+        // the driver checks the header and ignores data it can't use
+        VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        pci.initialDataSize = data.size();
+        pci.pInitialData = data.data();
+        VkPipelineCache c = VK_NULL_HANDLE;
+        std::lock_guard<std::mutex> plock(pipe_mu_);
+        if (pipelines_.empty() && vkCreatePipelineCache(dev_, &pci, nullptr, &c) == VK_SUCCESS) {
+            vkDestroyPipelineCache(dev_, cache_, nullptr);
+            cache_ = c;
+        }
+    }
+}
+
+void Device::save_caches()
+{
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    if (cache_dir_.empty()) return;
+    const std::string base = cache_base();
+    auto replace = [](const std::string &path, const void *p, size_t n) {
+        return ajicore::write_file_bytes(path + ".tmp", p, n) && ajicore::move_file(path + ".tmp", path);
+    };
+    if (variants_dirty_) {
+        std::string text;
+        for (const auto &kv : variants_) text += kv.first + " " + std::to_string(kv.second) + "\n";
+        if (replace(base + ".variants", text.data(), text.size())) variants_dirty_ = false;
+    }
+    std::lock_guard<std::mutex> plock(pipe_mu_);
+    if (pipelines_dirty_) {
+        size_t n = 0;
+        if (vkGetPipelineCacheData(dev_, cache_, &n, nullptr) == VK_SUCCESS && n) {
+            std::vector<char> data(n);
+            if (vkGetPipelineCacheData(dev_, cache_, &n, data.data()) == VK_SUCCESS && replace(base + ".vkcache", data.data(), n))
+                pipelines_dirty_ = false;
+        }
+    }
+}
+
+int Device::cached_variant(const std::string &key)
+{
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    auto it = variants_.find(key);
+    return it == variants_.end() ? -1 : it->second;
+}
+
+void Device::store_variant(const std::string &key, int variant)
+{
+    std::lock_guard<std::mutex> lock(cache_mu_);
+    auto it = variants_.find(key);
+    if (it != variants_.end() && it->second == variant) return;
+    variants_[key] = variant;
+    variants_dirty_ = true;
 }
 
 }  // namespace ajivk
