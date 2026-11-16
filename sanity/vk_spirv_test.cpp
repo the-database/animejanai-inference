@@ -65,7 +65,7 @@ int main()
         }
         CHECK(spirv_find(m.name) == &m);
     }
-    CHECK(spirv_find("conv3x3_cm16_c48_w4_r4") && spirv_find("conv3x3_sg16_c64_t8_r1"));
+    CHECK(spirv_find("c3_cm16_i48_o48_n0a1g0o0_w4r4") && spirv_find("c3_sg16_i64_o64_n0a2g0o0_t8r1"));
     CHECK(!spirv_find("no_such_module"));
     std::printf("vk spirv: %zu modules, all checks passed\n", kSpirvModuleCount);
     return 0;
