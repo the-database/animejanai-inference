@@ -19,6 +19,7 @@
 
 #include "native/gconv.h"
 #include "native/img_kernels.h"
+#include "native/netres.h"
 #include "native/onnx_read.h"
 
 namespace ajinative {
@@ -234,16 +235,18 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
     const int bw = e->unshuffle ? max_w / 2 : max_w, bh = e->unshuffle ? max_h / 2 : max_h;
     if (bw < 1 || bh < 1) return refuse(why, "tile too small"), nullptr;
     const size_t px = (size_t)bw * bh;
-    e->in16 = e->alloc(px * 16);
-    e->F0 = e->alloc(px * e->nf);
-    for (auto &d : e->D) d = e->alloc(px * e->DS);
-    e->T = e->alloc(px * e->nf);
-    e->U1 = e->alloc(px * 4 * e->nf);
-    e->P = e->alloc(px * 16 * e->nf);
-    e->Q = e->alloc(px * 16 * e->nf);
-    e->O16 = e->alloc(px * 16 * 16);
-    for (void *b : e->bufs)
-        if (!b) return refuse(why, "out of GPU memory"), nullptr;
+    // One arena shared by lifetime (steps of run(): 1 in16, 2 F0 and its copy into D[0], 3 the
+    // dense blocks, 4 T, 5 U1, 6 P, 7 Q, 8 O16, 9 out): the upsampler's buffers reuse the trunk's.
+    Lifetimes lt;
+    lt.add(&e->in16, px * 16 * 2, {{1, 2}});
+    lt.add(&e->F0, px * e->nf * 2, {{2, 4}});
+    for (auto &d : e->D) lt.add(&d, px * e->DS * 2, {{2, 4}});
+    lt.add(&e->T, px * e->nf * 2, {{4, 5}});
+    lt.add(&e->U1, px * 4 * e->nf * 2, {{5, 6}});
+    lt.add(&e->P, px * 16 * e->nf * 2, {{6, 7}});
+    lt.add(&e->Q, px * 16 * e->nf * 2, {{7, 8}});
+    lt.add(&e->O16, px * 16 * 16 * 2, {{8, 9}});
+    if (!lt.assign([&](size_t n) { return e->alloc((n + 1) / 2); })) return refuse(why, "out of GPU memory"), nullptr;
     // split-K workspace: the most any op needs at the largest and at a small tile
     std::vector<std::pair<GOp *, GConvArgs>> ops;
     for (int sz : {0, 1}) {

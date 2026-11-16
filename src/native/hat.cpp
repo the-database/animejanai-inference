@@ -271,22 +271,26 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
     f->maxw = max_w;
     f->maxh = max_h;
     const size_t M = (size_t)max_w * max_h;
-    f->IN16 = r.alloc(M * 32);
-    f->XF = r.alloc(M * CP * 2);
-    f->N1 = r.alloc(M * CP * 2);
-    f->QKV = r.alloc(M * f->QS * 2);
-    f->AT = r.alloc(M * CP * 2);
-    f->T60 = r.alloc(M * f->crp * 2);
-    f->Y = r.alloc(M * CP * 2);
-    f->H1 = r.alloc(M * f->HS * 2);
-    f->S16 = r.alloc(M * CP * 2);
-    f->TT = r.alloc(M * CP * 2);
-    f->U0 = r.alloc(M * 64 * 2);
-    f->V1 = r.alloc(4 * M * 64 * 2);
-    f->V2 = r.alloc(16 * M * 64 * 2);
-    f->O16 = r.alloc(16 * M * 16 * 2);
-    f->S = (float *)r.alloc(M * CP * 4);
-    f->GIN = (float *)r.alloc(M * CP * 4);
+    // The per-pixel buffers share one arena by lifetime: the steps of exec() each is live in (1-3 the
+    // input conv, 9-28 a group (10-19 a HAB, 20-26 the OCAB), 30-36 the tail). Kept in step with exec().
+    Lifetimes lt;
+    lt.add(&f->IN16, M * 32, {{1, 2}});
+    lt.add(&f->XF, M * CP * 2, {{2, 31}});
+    lt.add((void **)&f->S, M * CP * 4, {{3, 30}});
+    lt.add((void **)&f->GIN, M * CP * 4, {{9, 28}});
+    lt.add(&f->N1, M * CP * 2, {{10, 14}, {17, 18}, {20, 21}, {24, 25}, {30, 31}});
+    lt.add(&f->T60, M * f->crp * 2, {{11, 12}});
+    lt.add(&f->Y, M * CP * 2, {{12, 16}});
+    lt.add(&f->QKV, M * f->QS * 2, {{14, 15}, {21, 22}});
+    lt.add(&f->AT, M * CP * 2, {{15, 16}, {22, 23}});
+    lt.add(&f->H1, M * f->HS * 2, {{18, 19}, {25, 26}});
+    lt.add(&f->S16, M * CP * 2, {{27, 28}});
+    lt.add(&f->TT, M * CP * 2, {{31, 32}});
+    lt.add(&f->U0, M * 64 * 2, {{32, 33}});
+    lt.add(&f->V1, 4 * M * 64 * 2, {{33, 34}});
+    lt.add(&f->V2, 16 * M * 64 * 2, {{34, 35}});
+    lt.add(&f->O16, 16 * M * 16 * 2, {{35, 36}});
+    if (!lt.assign(r)) return refuse(why, "out of GPU memory"), nullptr;
     f->sums = (float *)r.alloc(CP * 4);
     f->cm = (float *)r.alloc(CP * 4);
     if (r.failed) return refuse(why, "out of GPU memory"), nullptr;
@@ -369,6 +373,9 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         return cudaSuccess;
     };
 
+    // Steps (the buffers' lifetimes in build()): 1 IN16, 2 XF, 3 S; per group 9 GIN; per HAB 10 N1,
+    // 11 T60, 12 Y, 13 the gate, 14 QKV, 15 AT, 16 S, 17 N1, 18 H1, 19 S; the OCAB 20 N1, 21 QKV,
+    // 22 AT, 23 S, 24 N1, 25 H1, 26 S; 27 S16, 28 S; then 30 N1, 31 TT, 32 U0, 33 V1, 34 V2, 35 O16, 36 out.
     K(img_to_nhwc(in, in_f32, w, h, false, IN16, 16, s));
     K(tok_sub3(IN16, 16, M, mean[0], mean[1], mean[2], s));
     pr.mark(P_IO);

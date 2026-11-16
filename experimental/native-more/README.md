@@ -61,7 +61,8 @@ What came out differently from the spikes:
   frames' means that keeps them alive in the graph. Native leaves it out.
 
 Memory: TFDAT uses one arena shared by alignment, body and tail (2.4 GB at 1080p). The image models
-allocate for their tile, e.g. HAT-L 2.7 GB and DAT-2 2.9 GB at 512.
+allocate for their tile, e.g. HAT-L 2.7 GB and DAT-2 2.9 GB at 512 (v0.31.0; since v0.31.1 their
+buffers share an arena by lifetime: 1.1 and 1.2 GB of buffers at 512).
 
 ## Per GPU
 
