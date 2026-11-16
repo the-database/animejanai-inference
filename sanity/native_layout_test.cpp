@@ -1,0 +1,134 @@
+// native/layout: the size checks, channel padding and feature-buffer reuse of a lowered model,
+// on plans written here (the shapes native/lower emits). CPU only.
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "native/layout.h"
+#include "native/ops.h"
+
+#define CHECK(x) do { if (!(x)) { \
+    std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; \
+} } while (0)
+
+using namespace ajinative;
+
+namespace {
+
+PlanStep conv(int src, int dst, int cin, int cout, Input in = Input::NHWC, Output out = Output::NHWC)
+{
+    PlanStep s;
+    s.kind = PlanStep::CONV;
+    s.in = (int)in;
+    s.out = (int)out;
+    s.cin = cin;
+    s.cout = cout;
+    s.w.taps = 9;
+    s.w.cin = cin;
+    s.w.cout = cout;
+    s.src = src;
+    s.dst = dst;
+    return s;
+}
+
+PlanStep concat(std::vector<int> srcs, int dst, int c)
+{
+    PlanStep s;
+    s.kind = PlanStep::CONCAT;
+    s.c = c;
+    s.nsrc = (int)srcs.size();
+    for (size_t k = 0; k < srcs.size(); k++) s.srcs[k] = srcs[k];
+    s.w.taps = 1;
+    s.w.cin = c * s.nsrc;
+    s.w.cout = c;
+    s.dst = dst;
+    return s;
+}
+
+int test_refusals()
+{
+    Plan p;
+    Layout L;
+    std::string why;
+    CHECK(!layout(p, 64, 64, &L, &why) && why == "empty plan");
+    p.steps.push_back(conv(kModelInput, kModelOutput, 12, 12, Input::NCHW3Unshuffle2, Output::DepthToSpace2));
+    p.unshuffle = 2;
+    p.depth_to_space = 2;
+    CHECK(!layout(p, 63, 64, &L, &why) && why == "this model needs even video dimensions");
+    CHECK(!layout(p, 64, 31, &L, &why));
+    CHECK(layout(p, 64, 32, &L, &why));
+    CHECK(L.u == 2 && L.W == 32 && L.H == 16 && L.out_w == 64 && L.out_h == 32);
+    // NCHW input pads cin to 16; a depth-to-space 2 output (12 channels) pads cout to 16
+    CHECK(L.cin_pad[0] == 16 && L.cout_pad[0] == 16);
+    CHECK(L.buffer_bytes.empty());
+    return 0;
+}
+
+// SPANF3-shaped: unshuffled head, a block with a residual gate, a concat of three feature maps,
+// a depth-to-space 4 tail.
+int test_span_chain()
+{
+    Plan p;
+    p.unshuffle = 2;
+    p.depth_to_space = 4;
+    p.channels = {48, 48, 48, 48, 48};
+    p.steps.push_back(conv(kModelInput, 0, 12, 48, Input::NCHW3Unshuffle2));  // t0, read by s2 and s4
+    p.steps.push_back(conv(0, 1, 48, 48));                                  // t1, read by s2
+    PlanStep g = conv(1, 2, 48, 48);
+    g.gate = (int)Gate::Residual;
+    g.resid = 0;
+    p.steps.push_back(g);                                                   // t2, read by s3, s4
+    p.steps.push_back(conv(2, 3, 48, 48));                                  // t3, read by s4
+    p.steps.push_back(concat({0, 2, 3}, 4, 48));                            // t4, read by s5
+    p.steps.push_back(conv(4, kModelOutput, 48, 48, Input::NHWC, Output::DepthToSpace4));
+    Layout L;
+    std::string why;
+    CHECK(layout(p, 1920, 1080, &L, &why));
+    CHECK(L.W == 960 && L.H == 540 && L.out_w == 3840 && L.out_h == 2160);
+    CHECK(L.cin_pad[0] == 16 && L.cout_pad[0] == 48);
+    CHECK(L.cin_pad[4] == 144 && L.cout_pad[4] == 48);  // concat: not padded
+    CHECK(L.cin_pad[5] == 48 && L.cout_pad[5] == 48);   // depth-to-space 4: 48 channels as they are
+    // t1's buffer is free after s2 (its last reader), so t3 takes it; t4 needs a fourth, since
+    // t0, t2 and t3 are still read by s4 itself
+    CHECK(L.buffer.size() == 5);
+    CHECK(L.buffer[0] == 0 && L.buffer[1] == 1 && L.buffer[2] == 2 && L.buffer[3] == 1 && L.buffer[4] == 3);
+    CHECK(L.buffer_bytes.size() == 4);
+    for (size_t b : L.buffer_bytes) CHECK(b == (size_t)960 * 540 * 48 * 2);
+    return 0;
+}
+
+// Buffers are reused only at the same size; a tensor nobody reads is freed right after its step.
+int test_sizes_and_unread()
+{
+    Plan p;
+    p.channels = {64, 32, 64, 32};
+    p.steps.push_back(conv(kModelInput, 0, 3, 64, Input::NCHW3));  // t0 (64), read by s1
+    p.steps.push_back(conv(0, 1, 64, 32));                       // t1 (32), never read
+    p.steps.push_back(conv(0, 2, 64, 64));                       // t2 (64): t0 is still read here
+    p.steps.push_back(conv(2, 3, 64, 32));                       // t3 (32): takes t1's buffer
+    p.steps.push_back(conv(3, kModelOutput, 32, 3));
+    Layout L;
+    std::string why;
+    CHECK(layout(p, 100, 50, &L, &why));
+    CHECK(L.u == 1 && L.W == 100 && L.H == 50 && L.out_w == 100 && L.out_h == 50);
+    CHECK(L.cin_pad[0] == 16);  // NCHW3 input
+    CHECK(L.buffer[0] == 0 && L.buffer[1] == 1 && L.buffer[2] == 2 && L.buffer[3] == 1);
+    CHECK(L.buffer_bytes.size() == 3);
+    CHECK(L.buffer_bytes[0] == (size_t)100 * 50 * 64 * 2 && L.buffer_bytes[1] == (size_t)100 * 50 * 32 * 2);
+    // a feature id no step writes gets no buffer
+    p.channels.push_back(16);
+    CHECK(layout(p, 100, 50, &L, &why));
+    CHECK(L.buffer.size() == 5 && L.buffer[4] == -1);
+    return 0;
+}
+
+}  // namespace
+
+int main()
+{
+    if (test_refusals()) return 1;
+    if (test_span_chain()) return 1;
+    if (test_sizes_and_unread()) return 1;
+    std::printf("native layout: all checks passed\n");
+    return 0;
+}

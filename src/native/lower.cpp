@@ -1,5 +1,6 @@
 // native/lower.cpp — see lower.h.
 #include "native/lower.h"
+#include "native/ops.h"
 #include "native/pack.h"
 
 #include <algorithm>
@@ -322,10 +323,10 @@ struct Lowerer {
         std::vector<int> cin_from;
         const std::vector<int> *cin_map = nullptr;
         if (s == X) {
-            st.in = 1;  // NCHW3
+            st.in = (int)Input::NCHW3;
             st.src = kModelInput;
         } else if (unshuffled.count(s)) {
-            st.in = 2;  // NCHW3Unshuffle2
+            st.in = (int)Input::NCHW3Unshuffle2;
             st.src = kModelInput;
             plan.unshuffle = 2;
             if (unshuffled[s] == 1) {  // SpaceToDepth (DCR): ONNX channel (ry*2+rx)*3 + c
@@ -333,7 +334,7 @@ struct Lowerer {
                 cin_map = &cin_from;
             }
         } else if (feat.count(s)) {
-            st.in = 0;
+            st.in = (int)Input::NHWC;
             st.src = feat[s];
         } else {
             return fail("Conv input is not the model input or a supported tensor");
@@ -358,7 +359,7 @@ struct Lowerer {
             }
             if (!weights(n, 3, &st.w, cin_map, &cout_from)) return false;
             for (int d : d2s) used[d] = true;
-            st.out = r == 2 ? 1 : 2;
+            st.out = (int)(r == 2 ? Output::DepthToSpace2 : Output::DepthToSpace4);
             st.dst = kModelOutput;
             const std::string dout = canon(d2s_out);
             if (dout != Y) {
@@ -403,7 +404,7 @@ struct Lowerer {
                         if (!weights(node(k1), 1, &st.att, nullptr, nullptr)) return false;
                         if (st.att.cin != st.cout || st.att.cout != st.cout) return fail("attention conv is not cout -> cout");
                         used[a] = used[k1] = used[th] = used[m] = true;
-                        st.gate = 2;
+                        st.gate = (int)Gate::Tanh1x1;
                         st.resid = feat[x];
                         st.dst = new_feat(node(m).out[0], st.cout);
                         plan.steps.push_back(st);
@@ -417,7 +418,7 @@ struct Lowerer {
                     if (sub >= 0 && canon(node(sub).in[0]) == canon(node(sg).out[0]) && scalar(node(sub).in[1], &half) &&
                         half == 0.5f && other(m, ao) == canon(node(sub).out[0])) {
                         used[a] = used[sg] = used[sub] = used[m] = true;
-                        st.gate = 3;
+                        st.gate = (int)Gate::SigmoidHalf;
                         st.resid = feat[x];
                         st.dst = new_feat(node(m).out[0], st.cout);
                         plan.steps.push_back(st);
@@ -431,7 +432,7 @@ struct Lowerer {
             const std::string x = other(a, o);
             if (feat.count(x) && plan.channels[feat[x]] == st.cout) {
                 used[a] = true;
-                st.gate = 1;
+                st.gate = (int)Gate::Residual;
                 st.resid = feat[x];
                 st.dst = new_feat(node(a).out[0], st.cout);
                 plan.steps.push_back(st);
@@ -455,10 +456,10 @@ struct Lowerer {
         if (act_node >= 0) {
             const OnnxNode &an = node(act_node);
             std::string aout = an.out[0];
-            if (an.op == "Relu") st.act = 1;
-            if (an.op == "Sigmoid") { st.act = 3; aout = node(mul).out[0]; }
+            if (an.op == "Relu") st.act = (int)Act::Relu;
+            if (an.op == "Sigmoid") { st.act = (int)Act::SiLU; aout = node(mul).out[0]; }
             if (an.op == "PRelu" || an.op == "LeakyRelu") {
-                st.act = 2;
+                st.act = (int)Act::PRelu;
                 if (an.op == "LeakyRelu") {
                     const OnnxAttr *al = an.attr("alpha");
                     st.w.slope.assign(st.cout, al ? al->f : 0.01f);
@@ -473,7 +474,7 @@ struct Lowerer {
             const size_t others = oc.size() - (mul >= 0 ? 2 : 1);
             if (others > 0) {
                 PlanStep pre = st;
-                pre.act = 0;
+                pre.act = (int)Act::None;
                 pre.w.slope.clear();
                 pre.dst = new_feat(o, st.cout);
                 plan.steps.push_back(pre);

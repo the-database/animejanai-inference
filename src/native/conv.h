@@ -30,14 +30,10 @@
 
 #include <cuda_runtime.h>
 
+#include "native/ops.h"
 #include "native/pack.h"
 
 namespace ajinative {
-
-enum class Input { NHWC = 0, NCHW3 = 1, NCHW3Unshuffle2 = 2 };
-enum class Act { None = 0, Relu = 1, PRelu = 2, SiLU = 3 };
-enum class Gate { None = 0, Residual = 1, Tanh1x1 = 2, SigmoidHalf = 3 };
-enum class Output { NHWC = 0, DepthToSpace2 = 1, DepthToSpace4 = 2 };
 
 // Fragment-packed weights in device memory (owned; release() frees).
 struct Weights {

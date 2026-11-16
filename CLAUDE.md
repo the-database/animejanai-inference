@@ -207,6 +207,14 @@ casts, and pads/slices that align to the unshuffle factor are ignored; any other
 model with its reason. `aji_native_lower_test` (cpu) checks the plans for SPANF3-, Compact- and
 span_s-shaped graphs written in memory, and the refusals.
 
+**What's host-only** (no CUDA, shared by any backend that runs a `Plan`): `native/ops.h` (the
+`Input` / `Act` / `Gate` / `Output` values a lowered conv step stores), `onnx_graph`, `lower`,
+and `native/layout`. `layout()` instantiates a plan's sizes for one input: the even-size
+checks, each step's padded channel counts, and the feature buffers (one per live tensor,
+reused once its last reader has run). `Executor::create` allocates and uploads from it.
+`pack_fragments` is host code too, but its layout is the `mma.sync` B fragment, so it's CUDA's
+packing, not a shared one.
+
 The kernels: one family, `k_conv3x3` (`native/conv_kernels.cuh`), a 3x3 conv on fp16 NHWC activations with
 `mma.sync` m16n8k16 and **fp16 accumulation** (fp32 accumulation was slower than TensorRT), A
 tiles from padded shared memory via `ldmatrix`, and weights packed on the host into B-fragment
@@ -228,9 +236,31 @@ comparison). Tile variants are only tuned on the 5090.
 
 ## Build system
 
-CMake only (`cmake_minimum_required(VERSION 3.24)`, C11 / C++17, `LANGUAGES C CXX CUDA`).
-There is no Cargo, meson, vcpkg, or conan manifest anywhere. The single `find_package` is
-`CUDAToolkit REQUIRED`.
+CMake only (`cmake_minimum_required(VERSION 3.24)`, C11 / C++17, `LANGUAGES C CXX`, with CUDA
+enabled by `AJI_CUDA`). There is no Cargo, meson, vcpkg, or conan manifest anywhere. The single
+`find_package` is `CUDAToolkit REQUIRED`, under `AJI_CUDA`.
+
+**`AJI_CUDA` (default ON)** builds the CUDA backends (`aji_trt`, `aji_trtrtx`), the native CUDA
+kernels, `aji_harness`, `aji_encode` and the CUDA tests. **`AJI_CUDA=OFF`** builds what needs no
+CUDA toolkit: the dispatcher, `aji_dml` (Windows), `aji_image`, `aji_harness_dml`,
+`aji_native_host` (the native path's host half) and the CPU tests. It's for the Vulkan
+backend's development and for machines without CUDA (Linux on AMD/Intel, Android). Without CUDA
+the dispatcher's runtime-pack names (`AJI_PACK_CUDART`, `AJI_PACK_NVINFER`) are empty, which
+`core/runtime_packs` reads as nothing to preload.
+
+**`AJI_VULKAN` (default OFF)** compiles the Vulkan compute shaders in `src/vk/shaders` with
+`glslc` (`AJI_GLSLC`; found on `PATH` or under `$VULKAN_SDK/bin`; a missing glslc is a configure
+error, not a skip) and embeds them as SPIR-V (`cmake/aji_spirv.cmake`). The modules are listed
+in `src/vk/shaders/shaders.txt`, one per line: name, shader file, `-D` defines. One shader
+file makes many modules (its structural variants), and the generated table is `vk/spirv.h`'s
+`kSpirvModules`. On Windows, MSYS2's `mingw-w64-ucrt-x86_64-shaderc` glslc works; the
+Android NDK's shaderc (2022) predates `GL_KHR_cooperative_matrix`. CI doesn't build it yet. A
+build without CUDA and with the shaders:
+
+```
+cmake -S . -B build-nocuda -G Ninja -DAJI_CUDA=OFF -DAJI_VULKAN=ON -DAJI_GLSLC=<glslc> \
+  -DAJI_ORT_ROOT=... -DAJI_DML_ROOT=...   # Windows, for aji_dml
+```
 
 ### Cache options
 
@@ -273,14 +303,19 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_tiling_test` | EXE | — | CPU-only checks of `core/tiling` and the fp16/bf16 conversions |
 | `aji_held_test` | EXE | — | CPU-only checks of `core/held`, the held-frame reuse rule, and its C ABI (`aji_held_*`) over a stub context |
 | `aji_native` | OBJECT | `CUDA::cudart` | `src/native`: kernels, ONNX lowering, executor; linked into `aji_trt` and `aji_trtrtx` |
+| `aji_native_host` | OBJECT | — | the host-only sources of `src/native` (ONNX reader, lowering, `layout`, packing; `AJI_NATIVE_HOST_SOURCES`, also compiled into `aji_native`), built with or without CUDA |
 | `aji_native_pack_test` | EXE | — | CPU-only check of the native weight packing and fp16 conversion |
 | `aji_native_lower_test` | EXE | — | CPU-only check of the ONNX reader and lowering on in-memory graphs |
+| `aji_native_layout_test` | EXE | — | CPU-only check of `native/layout`: size checks, padding, feature-buffer reuse |
+| `aji_vk_shaders` | OBJECT | — | **`AJI_VULKAN` only**: the embedded SPIR-V table (`vk/spirv.h`) |
+| `aji_vk_spirv_test` | EXE | — | **`AJI_VULKAN` only**: CPU check that each embedded module is well-formed SPIR-V with its family's capabilities |
 | `aji_native_conv_test` | EXE | `aji_native`, `CUDA::cudart` | every native kernel against a CPU reference (sm_80+, skips below) |
 | `aji_native_bench` | EXE | `aji_native`, `CUDA::cudart` | **EXCLUDE_FROM_ALL**; whole-model native timing on `experimental/native-span` data |
 
 The self-contained tests are registered with CTest under two labels: `ctest --test-dir build -L
-cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`, `aji_held_test`,
-`aji_native_pack_test`, `aji_native_lower_test`; what CI runs) and `-L gpu` (`aji_pre_fusion_test`, `aji_msb444_test`,
+cpu` (`aji_half_test`, `aji_tiling_test`, `aji_runtime_packs_test`, `aji_rife_conf_test`,
+`aji_held_test`, `aji_native_pack_test`, `aji_native_lower_test`, `aji_native_layout_test`, and
+with `AJI_CUDA` `aji_native_onnx_test`, with `AJI_VULKAN` `aji_vk_spirv_test`; what CI runs) and `-L gpu` (`aji_pre_fusion_test`, `aji_msb444_test`,
 `aji_frame_diff_test`, `aji_native_conv_test`; needs an
 NVIDIA GPU; on Windows also `aji_frame_diff_dml_test`, which runs on any DirectML GPU from
 `dml-test/`, beside copies of `aji.dll`, `aji_dml.dll`, ONNX Runtime and DirectML). A new test

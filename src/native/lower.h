@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "native/onnx_graph.h"
+#include "native/ops.h"
 
 namespace ajinative {
 
@@ -42,7 +43,7 @@ constexpr int kModelInput = -2, kModelOutput = -3;
 
 struct PlanStep {
     enum Kind { CONV = 0, CONCAT = 1 } kind = CONV;
-    // CONV: values of Input / Act / Gate / Output (native/conv.h)
+    // CONV: values of Input / Act / Gate / Output (native/ops.h)
     int in = 0, act = 0, gate = 0, out = 0;
     int cin = 0, cout = 0;
     PlanWeights w, att;
