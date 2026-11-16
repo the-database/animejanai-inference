@@ -31,7 +31,8 @@ with tempfile.TemporaryDirectory(prefix="aji-release-") as temporary:
     assert subprocess.run(["cmd.exe", "/d", "/c", str(batch)], env=env).returncode == 1
     print("PASS missing TensorRT library rejects release configuration")
     cmake = (source / "CMakeLists.txt").read_text()
-    block = cmake[cmake.index('if(WIN32)'):cmake.index('find_package(CUDAToolkit')]
+    # The TensorRT location block: from if(WIN32) to the AJI_CUDA guard around find_package(CUDAToolkit).
+    block = cmake[cmake.index('if(WIN32)'):cmake.index('if(AJI_CUDA)\n    find_package(CUDAToolkit')]
     (root / "CMakeLists.txt").write_text('cmake_minimum_required(VERSION 3.24)\nproject(Check NONE)\nset(WIN32 TRUE)\n' +
         block + '\nfile(WRITE "${CMAKE_BINARY_DIR}/selected.txt" "${AJI_TRT_LIB}")\n')
     for sdk in ("old-sdk", "new-sdk"):
