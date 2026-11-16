@@ -145,12 +145,15 @@ bool FdatBody::parse(const Reader &rd, const std::string &prefix, int C_, std::s
 void FdatBody::carve(Bump &b, size_t M)
 {
     const size_t CPb = (size_t)CP * 2;
-    void **bufs[8] = {&G, &X, &N1, &CF, &AT, &QKV, &H1, &H2};  // G first: it stays valid while a caller reuses the rest
-    const size_t sizes[8] = {M * CPb, M * CPb, M * CPb, M * CPb, M * CPb, M * QS * 2, M * HS * 2, M * HS * 2};
-    for (int i = 0; i < 8; i++) {
+    void **bufs[7] = {&G, &X, &N1, &CF, &AT, &QKV, &H2};  // G first: it stays valid while a caller reuses the rest
+    const size_t sizes[7] = {M * CPb, M * CPb, M * CPb, M * CPb, M * CPb, M * QS * 2, M * HS * 2};
+    for (int i = 0; i < 7; i++) {
         void *p = b.take(sizes[i]);
         if (b.base) *bufs[i] = p;
     }
+    // H1 (the MLP's hidden layer) lives in QKV: a block's attention is done with QKV before fc1
+    // writes H1, both are written whole by their GEMMs each block, and QS >= HS (3C vs 2C channels).
+    if (b.base) H1 = QKV;
 }
 
 size_t FdatBody::scratch_bytes(int bw, int bh) const

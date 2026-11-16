@@ -180,15 +180,21 @@ plus buffers scaled to it exceed the free memory less 1 GiB + 10% of the device;
 built at the frame size, reflect-padded at the right and bottom to the model's size rule (HAT: 16,
 as its own graph pads) and cropped back. Whole frames rather than tiles: no seams and no overlap
 work, the same computation as TensorRT's whole-frame engine; the cost is memory, hence the
-budget. Either way it becomes a `Step::NATIVE`, run by `run_steps` like a TensorRT `MODEL` step
+budget. The image builders keep it down the way an engine's memory planner does: their per-pixel
+buffers share one arena by lifetime (`Lifetimes` in `native/netres.h`, each buffer listing the
+steps it holds data in; ESRGAN, HAT, DAT), and FDAT's upsampler reuses its body's scratch as
+TFDAT's does. On the 5090 that puts them under TensorRT's whole-frame engines (720p: DAT-2 5.2 vs
+6.0 GB, HAT-L 4.9 vs 7.9, FDAT 3.3 vs 3.7, ESRGAN 2x 1.5 vs 2.1); before v0.31.1 each buffer had
+its own allocation and they used up to 1.8x TensorRT's. `AJI_NATIVE_POISON` fills those arenas
+with 0xFF (NaN) instead of zeros, so a step reading another buffer's leftovers shows in the
+output; with it set the output must match a normal run. Either way it becomes a `Step::NATIVE`, run by `run_steps` like a TensorRT `MODEL` step
 (same fp16 NCHW RGB in and out), so graph capture, RIFE, temporal steps and mixed chains are
 unchanged. Nothing is built: configure takes tens of milliseconds for a lowered model, 0.1–0.5 s
 for FDAT / ESRGAN and ~1 s for HAT-L / DAT-2 (reading and parsing the file, the probe, timing the
 kernel variants). The log gets
 `Native kernels: <model> (<what>)` before the usual `Applied Model` line (`..., whole frame
 [padded to WxH], <n> MB` for the image builders), or `Native kernels not used for <model>: <why>;
-using TensorRT` (e.g. HAT-L: `a whole 2560x1440 frame needs ~34.6 GB, 30.3 GB free (keeping 4.2
-GB)`), and the
+using TensorRT` (e.g. `a whole 2560x1440 frame needs ~N GB, M GB free (keeping K GB)`), and the
 model goes through `ensure_engine` as before. The lowering, and an image-builder refusal that is
 not about the frame size or memory, are cached per ONNX path for the context's life. Temporal
 models: `try_native_temporal` (`native/vidnet`).

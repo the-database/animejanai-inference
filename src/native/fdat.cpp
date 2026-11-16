@@ -112,14 +112,27 @@ std::unique_ptr<ImgNet> Fdat::build(const OnnxGraph &g, int max_w, int max_h, cu
     f->maxh = max_h;
     const int bw = f->unshuffle ? max_w / 2 : max_w, bh = f->unshuffle ? max_h / 2 : max_h;
     const size_t M = (size_t)bw * bh, CPb = (size_t)CP * 2;
-    if (!f->body.setup(bw, bh, s, why)) return nullptr;
-    f->IN16 = f->res.alloc(M * 32);
+    // XS (the body input, also conv_after's residual) on its own; the rest in one arena shared, as
+    // TFDAT's is, by phases that never overlap in time: the input (IN16, before the body), the body
+    // (its scratch, its output G first) and the tail (T, U1, U2, O16, after G).
     f->XS = f->res.alloc(M * CPb);
-    f->T = f->res.alloc(M * CPb);
-    f->U1 = f->res.alloc(M * 4 * CPb);
-    f->U2 = f->res.alloc(M * 16 * 32);
-    f->O16 = f->res.alloc(M * 16 * 32);
     if (f->res.failed) return refuse(why, "out of GPU memory"), nullptr;
+    auto carve = [&](Bump &bp) {
+        f->IN16 = bp.take(M * 32);
+        bp.off = 0;
+        bp.take(M * CPb);  // G
+        f->T = bp.take(M * CPb);
+        f->U1 = bp.take(M * 4 * CPb);
+        f->U2 = bp.take(M * 16 * 32);
+        f->O16 = bp.take(M * 16 * 32);
+    };
+    Bump cnt;
+    carve(cnt);
+    Bump bp;
+    bp.base = (char *)f->res.alloc(std::max(cnt.off, f->body.scratch_bytes(bw, bh)));
+    if (!bp.base) return refuse(why, "out of GPU memory"), nullptr;
+    carve(bp);
+    if (!f->body.setup(bw, bh, s, why, bp.base)) return nullptr;
     std::vector<std::pair<GOp *, GConvArgs>> ops;
     for (int sz : {0, 1}) {
         f->gplan(sz ? std::min(bw, 32) : bw, sz ? std::min(bh, 32) : bh, &ops);

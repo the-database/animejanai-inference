@@ -572,24 +572,28 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     f->maxh = max_h;
     const size_t M = (size_t)max_w * max_h;
     f->maxm = (int)M;
-    f->IN16 = r.alloc(M * 32);
-    f->XF = r.alloc(M * CP * 2);
-    f->N1 = r.alloc(M * CP * 2);
-    f->QKV = r.alloc(M * f->QS * 2);
-    f->AT = r.alloc(M * CP * 2);
-    f->CX = r.alloc(M * CP * 2);
-    f->Z = r.alloc(M * CP * 2);
-    f->H1 = r.alloc(M * f->FS * 2);
-    f->N2 = r.alloc(M * CP * 2);
-    f->PR = r.alloc(M * CP * 2);
-    f->S16 = r.alloc(M * CP * 2);
-    f->TT = r.alloc(M * CP * 2);
-    f->U0 = r.alloc(M * 64 * 2);
-    f->V1 = r.alloc(4 * M * 64 * 2);
-    f->V2 = r.alloc(16 * M * 64 * 2);
-    f->O16 = r.alloc(16 * M * 16 * 2);
-    f->S = (float *)r.alloc(M * CP * 4);
-    f->GIN = (float *)r.alloc(M * CP * 4);
+    // The per-pixel buffers share one arena by lifetime: the steps of exec() each is live in (1-3 the
+    // input conv, 9-22 a group (10-20 a block), 30-36 the tail). Kept in step with exec().
+    Lifetimes lt;
+    lt.add(&f->IN16, M * 32, {{1, 2}});
+    lt.add(&f->XF, M * CP * 2, {{2, 31}});
+    lt.add((void **)&f->S, M * CP * 4, {{3, 30}});
+    lt.add((void **)&f->GIN, M * CP * 4, {{9, 22}});
+    lt.add(&f->N1, M * CP * 2, {{10, 11}, {16, 17}, {30, 31}});
+    lt.add(&f->QKV, M * f->QS * 2, {{11, 14}});
+    lt.add(&f->CX, M * CP * 2, {{12, 14}});
+    lt.add(&f->AT, M * CP * 2, {{13, 14}});
+    lt.add(&f->Z, M * CP * 2, {{14, 15}});
+    lt.add(&f->H1, M * f->FS * 2, {{17, 19}});
+    lt.add(&f->N2, M * CP * 2, {{18, 19}});
+    lt.add(&f->PR, M * CP * 2, {{19, 20}});
+    lt.add(&f->S16, M * CP * 2, {{21, 22}});
+    lt.add(&f->TT, M * CP * 2, {{31, 32}});
+    lt.add(&f->U0, M * 64 * 2, {{32, 33}});
+    lt.add(&f->V1, 4 * M * 64 * 2, {{33, 34}});
+    lt.add(&f->V2, 16 * M * 64 * 2, {{34, 35}});
+    lt.add(&f->O16, 16 * M * 16 * 2, {{35, 36}});
+    if (!lt.assign(r)) return refuse(why, "out of GPU memory"), nullptr;
     f->sums = (float *)r.alloc(CP * 4);
     f->cg = (float *)r.alloc(CP * 4);
     f->tg = (float *)r.alloc(M * 4);
@@ -657,6 +661,9 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
     };
     const uint16_t *q16 = (const uint16_t *)QKV;
 
+    // Steps (the buffers' lifetimes in build()): 1 IN16, 2 XF, 3 S; per group 9 GIN; per block 10 N1,
+    // 11 QKV, 12 CX, 13 AT, 14 Z, 15 S, 16 N1, 17 H1, 18 N2, 19 PR, 20 S; 21 S16, 22 S; then 30 N1,
+    // 31 TT, 32 U0, 33 V1, 34 V2, 35 O16, 36 out.
     K(img_to_nhwc(in, in_f32, w, h, false, IN16, 16, s));
     K(tok_sub3(IN16, 16, M, mean[0], mean[1], mean[2], s));
     pr.mark(P_IO);
