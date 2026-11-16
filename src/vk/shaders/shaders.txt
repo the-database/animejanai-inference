@@ -1,0 +1,15 @@
+# Vulkan compute modules embedded with AJI_VULKAN=ON (cmake/aji_spirv.cmake):
+#   <module name> <shader file> [define=value ...]
+# Names spell out the variant: kernel family, channels, tile shape.
+
+# 3x3 conv, VK_KHR_cooperative_matrix 16x16x16 with fp16 accumulate (RDNA3/4; NVIDIA as the
+# development reference). Workgroup = WARPS subgroups (local_size_x is specialization
+# constant 0), tile WARPS*WR rows x 16 pixels.
+conv3x3_cm16_c48_w4_r4  conv3x3_cm16.comp  C=48 WARPS=4 WR=4
+conv3x3_cm16_c64_w4_r4  conv3x3_cm16.comp  C=64 WARPS=4 WR=4
+
+# 3x3 conv without a matrix extension, for subgroup-16 GPUs (Intel Xe, Mali): one output channel
+# per lane, fp16 partial sums per tap then fp32 (ACC=3). Tile TH rows x 16 pixels, RPS rows per
+# subgroup.
+conv3x3_sg16_c48_t8_r1  conv3x3_sg16.comp  C=48 TH=8 RPS=1 ACC=3
+conv3x3_sg16_c64_t8_r1  conv3x3_sg16.comp  C=64 TH=8 RPS=1 ACC=3

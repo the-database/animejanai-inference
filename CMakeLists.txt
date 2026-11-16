@@ -1,7 +1,13 @@
 cmake_minimum_required(VERSION 3.24)
-# Select the default before project() initializes it from nvcc's default GPU.
+# AJI_CUDA=OFF builds what needs no CUDA toolkit: the dispatcher, aji_dml (Windows), the
+# host-only half of the native path (ONNX reader, lowering, layout) and the CPU tests. For
+# machines without CUDA (Linux on AMD/Intel, Android) and the Vulkan backend's development.
+option(AJI_CUDA "Build the CUDA backends (aji_trt, aji_trtrtx), the native CUDA kernels and their tests" ON)
+# AJI_VULKAN=ON compiles the Vulkan compute shaders (src/vk/shaders) with glslc and embeds them.
+option(AJI_VULKAN "Compile and embed the Vulkan compute shaders (needs glslc)" OFF)
+# Select the default before CUDA is enabled, which initializes it from nvcc's default GPU.
 # Preserve explicit -D overrides and CMake's CUDAARCHS environment override.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
+if(AJI_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
     # Ship kernels for every supported GPU generation (Turing..Blackwell), NOT
     # "native": native builds only for the build machine's GPU, so the shipped
     # binary dies with "no kernel image is available for execution on the device"
@@ -12,7 +18,10 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
     set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual
         CACHE STRING "CUDA architectures for AJN kernels")
 endif()
-project(animejanai-inference LANGUAGES C CXX CUDA)
+project(animejanai-inference LANGUAGES C CXX)
+if(AJI_CUDA)
+    enable_language(CUDA)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -38,12 +47,18 @@ else()
     set(AJI_NVINFER nvinfer)
 endif()
 
-find_package(CUDAToolkit REQUIRED)
+if(AJI_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
 
 # Library names the TensorRT backends import, for preloading them from the
 # shared runtime packs that aji-runtime.json names (core/runtime_packs).
-# They follow the SDKs this build uses.
-if(WIN32)
+# They follow the SDKs this build uses. Without CUDA there are no TensorRT
+# backends to preload for: both names are empty.
+if(NOT AJI_CUDA)
+    set(_pack_cudart "")
+    set(_pack_nvinfer "")
+elseif(WIN32)
     set(_pack_cudart "cudart64_${CUDAToolkit_VERSION_MAJOR}.dll")
     set(_pack_nvinfer "${AJI_NVINFER}.dll")
 else()
@@ -91,6 +106,20 @@ if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
     set_source_files_properties(src/core/half_f16c.cpp PROPERTIES
         COMPILE_OPTIONS /arch:AVX)
 endif()
+
+# The host-only half of the native path (no CUDA): the ONNX reader, the lowering to a Plan,
+# its layout for one size (native/layout) and the weight packing. Compiled into aji_native for
+# the CUDA backends, and on its own (aji_native_host) for the CPU tests and the builds without
+# CUDA.
+set(AJI_NATIVE_HOST_SOURCES src/native/onnx_graph.cpp src/native/lower.cpp
+    src/native/layout.cpp src/native/pack.cpp)
+add_library(aji_native_host OBJECT ${AJI_NATIVE_HOST_SOURCES})
+target_include_directories(aji_native_host PRIVATE src)
+set_target_properties(aji_native_host PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden)
+
+if(AJI_CUDA)
 add_library(aji_trt_common OBJECT src/aji_conf.cpp src/onnx_shape.cpp
     src/core/fileio.cpp src/core/runtime_packs.cpp src/core/tiling.cpp src/core/tiling_gpu.cu src/kernels.cu
     ${AJI_HALF_SOURCES})
@@ -102,8 +131,8 @@ set_target_properties(aji_trt_common PROPERTIES
 
 # Native tensor-core kernels and their ONNX lowering/executor (src/native), linked into both
 # TensorRT backends (used with [global] native=on) and the native tests.
-add_library(aji_native OBJECT src/native/conv.cu src/native/gconv.cu src/native/tfm.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/esrgan.cpp src/native/fdat.cpp src/native/fdat_body.cpp src/native/fdat_kernels.cu src/native/tfdat.cpp src/native/tfdat_kernels.cu src/native/hat.cpp src/native/dat.cpp src/native/dat_kernels.cu src/native/tfix.cpp src/native/tfix_kernels.cu src/native/img_kernels.cu src/native/pack.cpp src/native/onnx_graph.cpp
-    src/native/lower.cpp src/native/executor.cpp src/native/framenet.cpp)
+add_library(aji_native OBJECT src/native/conv.cu src/native/gconv.cu src/native/tfm.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/esrgan.cpp src/native/fdat.cpp src/native/fdat_body.cpp src/native/fdat_kernels.cu src/native/tfdat.cpp src/native/tfdat_kernels.cu src/native/hat.cpp src/native/dat.cpp src/native/dat_kernels.cu src/native/tfix.cpp src/native/tfix_kernels.cu src/native/img_kernels.cu
+    ${AJI_NATIVE_HOST_SOURCES} src/native/executor.cpp src/native/framenet.cpp)
 target_include_directories(aji_native PRIVATE src)
 target_link_libraries(aji_native PRIVATE CUDA::cudart)
 # The kernels need sm_80+ (device_supported refuses older GPUs before any launch), so skip
@@ -232,11 +261,17 @@ if(AJI_TRTRTX_ROOT)
 else()
     message(STATUS "AJI_TRTRTX_ROOT not set; skipping aji_trtrtx target")
 endif()
+else()
+    message(STATUS "AJI_CUDA=OFF: skipping aji_trt, aji_trtrtx, the native CUDA kernels, "
+                   "aji_harness, aji_encode and the CUDA tests")
+endif()  # AJI_CUDA
 
 # aji_image: image-ABI CLI harness (PNM in/out); any backend via aji.dll.
 add_executable(aji_image src/aji_image_cli.cpp $<$<BOOL:${WIN32}>:src/utf8-argv.manifest>)
 target_link_libraries(aji_image PRIVATE aji)
-add_dependencies(aji_image aji_trt)
+if(TARGET aji_trt)
+    add_dependencies(aji_image aji_trt)
+endif()
 if(WIN32)
     add_dependencies(aji_image aji_dml)
 endif()
@@ -244,6 +279,7 @@ if(TARGET aji_trtrtx)
     add_dependencies(aji_image aji_trtrtx)
 endif()
 
+if(AJI_CUDA)
 # The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so argv/fopen
 # carry non-ASCII paths intact; benchmark.ps1 runs this from the installed
 # package, which may live under a non-ASCII path.
@@ -300,6 +336,7 @@ else()
         message(STATUS "ffmpeg/libav not found via pkg-config; skipping aji_encode target")
     endif()
 endif()
+endif()  # AJI_CUDA: aji_harness, aji_encode
 
 # aji_dml: DirectML backend (Windows only). Needs the ONNX Runtime
 # DirectML headers (Microsoft.ML.OnnxRuntime.DirectML nupkg) and the
@@ -332,6 +369,8 @@ if(WIN32)
     # kernels.cu where CUDA works (cudart is delay-loaded, so it runs on any
     # DirectML GPU). aji_dml loads ONNX Runtime and DirectML from its own
     # folder, so the test runs from dml-test/ beside copies of the three.
+    # It compiles kernels.cu, so it needs AJI_CUDA.
+  if(AJI_CUDA)
     add_executable(aji_frame_diff_dml_test sanity/frame_diff_dml.cpp src/kernels.cu)
     target_include_directories(aji_frame_diff_dml_test PRIVATE include src)
     target_link_libraries(aji_frame_diff_dml_test PRIVATE aji d3d11 dxgi
@@ -357,8 +396,10 @@ if(WIN32)
                 "${CMAKE_BINARY_DIR}/dml-test"
         DEPENDS aji aji_dml)
     add_dependencies(aji_frame_diff_dml_test aji_frame_diff_dml_runtime)
+  endif()
 endif()
 
+if(AJI_CUDA)
 # Parity test tool: compiles the kernels directly (the shared lib hides
 # the launcher symbols), no TensorRT dependency.
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
@@ -370,6 +411,7 @@ target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
 add_executable(aji_pre_fusion_test sanity/pre_fusion.cu)
 target_include_directories(aji_pre_fusion_test PRIVATE include src)
 target_link_libraries(aji_pre_fusion_test PRIVATE CUDA::cudart)
+endif()  # AJI_CUDA
 
 # Image-ABI conversion and tiling checks: CPU only, no GPU or models.
 add_executable(aji_half_test sanity/half_array_test.cpp ${AJI_HALF_SOURCES})
@@ -395,6 +437,15 @@ target_include_directories(aji_held_test PRIVATE include src)
 target_link_libraries(aji_held_test PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(aji_runtime_packs_test PRIVATE ${CMAKE_DL_LIBS})
 
+# Native path, host only: the packing, the ONNX lowering and the layout, on the CPU.
+add_executable(aji_native_pack_test sanity/native_pack_test.cpp src/native/pack.cpp)
+target_include_directories(aji_native_pack_test PRIVATE src)
+add_executable(aji_native_lower_test sanity/native_lower_test.cpp $<TARGET_OBJECTS:aji_native_host>)
+target_include_directories(aji_native_lower_test PRIVATE src)
+add_executable(aji_native_layout_test sanity/native_layout_test.cpp $<TARGET_OBJECTS:aji_native_host>)
+target_include_directories(aji_native_layout_test PRIVATE src)
+
+if(AJI_CUDA)
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
 target_include_directories(aji_msb444_test PRIVATE include src)
 target_link_libraries(aji_msb444_test PRIVATE CUDA::cudart)
@@ -404,13 +455,7 @@ add_executable(aji_frame_diff_test sanity/frame_diff.cu src/kernels.cu)
 target_include_directories(aji_frame_diff_test PRIVATE include src)
 target_link_libraries(aji_frame_diff_test PRIVATE CUDA::cudart)
 
-# Native kernels (aji_native, above): CPU checks of the packing and the ONNX lowering, and the
-# kernels against a CPU reference on the GPU.
-add_executable(aji_native_pack_test sanity/native_pack_test.cpp src/native/pack.cpp)
-target_include_directories(aji_native_pack_test PRIVATE src)
-add_executable(aji_native_lower_test sanity/native_lower_test.cpp src/native/onnx_graph.cpp
-    src/native/lower.cpp src/native/pack.cpp)
-target_include_directories(aji_native_lower_test PRIVATE src)
+# Native kernels (aji_native, above): the kernels against a CPU reference on the GPU.
 add_executable(aji_native_conv_test sanity/native_conv_test.cu $<TARGET_OBJECTS:aji_native>)
 target_include_directories(aji_native_conv_test PRIVATE src)
 target_link_libraries(aji_native_conv_test PRIVATE CUDA::cudart)
@@ -450,6 +495,28 @@ if(WIN32)
     add_executable(aji_cuda_init_test EXCLUDE_FROM_ALL sanity/cuda_init.cpp)
     add_dependencies(aji_cuda_init_test aji_cuda_init_a aji_cuda_init_b)
 endif()
+endif()  # AJI_CUDA: CUDA tests
+
+# Vulkan compute shaders (src/vk/shaders), compiled to SPIR-V by glslc and embedded in a
+# generated source (cmake/aji_spirv.cmake). Shipped libraries embed them, so glslc is a build
+# tool only; a missing glslc is an error, never a silent skip.
+if(AJI_VULKAN)
+    find_program(AJI_GLSLC glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+    if(NOT AJI_GLSLC)
+        message(FATAL_ERROR "AJI_VULKAN=ON needs glslc (the Vulkan SDK, shaderc, or MSYS2's "
+                            "mingw-w64-ucrt-x86_64-shaderc); pass -DAJI_GLSLC=<path>")
+    endif()
+    message(STATUS "glslc: ${AJI_GLSLC}")
+    include(cmake/aji_spirv.cmake)
+    aji_spirv_embed(aji_vk_shaders src/vk/shaders/shaders.txt)
+    add_library(aji_vk_shaders OBJECT ${AJI_VK_SHADERS_SOURCE})
+    target_include_directories(aji_vk_shaders PRIVATE src)
+    set_target_properties(aji_vk_shaders PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden)
+    add_executable(aji_vk_spirv_test sanity/vk_spirv_test.cpp $<TARGET_OBJECTS:aji_vk_shaders>)
+    target_include_directories(aji_vk_spirv_test PRIVATE src)
+endif()
 
 # Self-contained tests for ctest. CI runs `ctest -L cpu` (no GPU on hosted
 # runners); `ctest -L gpu` needs an NVIDIA GPU. aji_kernel_test, the harnesses
@@ -457,17 +524,27 @@ endif()
 enable_testing()
 add_executable(aji_rife_conf_test sanity/rife_conf_test.cpp src/aji_conf.cpp)
 target_include_directories(aji_rife_conf_test PRIVATE src)
-foreach(test IN ITEMS aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
-                     aji_held_test aji_native_pack_test aji_native_lower_test aji_native_onnx_test)
+set(_cpu_tests aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
+               aji_held_test aji_native_pack_test aji_native_lower_test aji_native_layout_test)
+if(AJI_CUDA)
+    # CPU-only, but compiled with nvcc
+    list(APPEND _cpu_tests aji_native_onnx_test)
+endif()
+if(AJI_VULKAN)
+    list(APPEND _cpu_tests aji_vk_spirv_test)
+endif()
+foreach(test IN LISTS _cpu_tests)
     add_test(NAME ${test} COMMAND ${test})
     set_tests_properties(${test} PROPERTIES LABELS cpu)
 endforeach()
-foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test aji_native_conv_test aji_native_gconv_test aji_native_tfm_test)
-    add_test(NAME ${test} COMMAND ${test})
-    set_tests_properties(${test} PROPERTIES LABELS gpu)
-endforeach()
-if(WIN32)
-    # any DirectML GPU; the CUDA cross-check is skipped without an NVIDIA one
-    add_test(NAME aji_frame_diff_dml_test COMMAND aji_frame_diff_dml_test)
-    set_tests_properties(aji_frame_diff_dml_test PROPERTIES LABELS gpu)
+if(AJI_CUDA)
+    foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test aji_native_conv_test aji_native_gconv_test aji_native_tfm_test)
+        add_test(NAME ${test} COMMAND ${test})
+        set_tests_properties(${test} PROPERTIES LABELS gpu)
+    endforeach()
+    if(WIN32)
+        # any DirectML GPU; the CUDA cross-check is skipped without an NVIDIA one
+        add_test(NAME aji_frame_diff_dml_test COMMAND aji_frame_diff_dml_test)
+        set_tests_properties(aji_frame_diff_dml_test PROPERTIES LABELS gpu)
+    endif()
 endif()

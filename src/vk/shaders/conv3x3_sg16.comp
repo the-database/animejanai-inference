@@ -1,0 +1,116 @@
+#version 450
+// 3x3 conv, NHWC fp16, bias + ReLU, without a matrix extension, laid out for subgroup-16 GPUs
+// (Intel): a register-blocked GEMM where each lane owns one output channel of a 16-channel group
+// and accumulates a row of 16 pixels. A lane loads its own pixel's 16 input channels (two
+// 16-byte reads from the shared halo tile) and its own 16 weights (two reads, pre-packed per
+// lane); the input values reach the other lanes through subgroupBroadcast with constant lane
+// ids, which Intel's compiler turns into register-region operands.
+// Defines: C, TH (tile rows), RPS (rows per subgroup), ACC (0 fp16, 1 fp32, 2 fp16 per 16-term
+// chunk then fp32, 3 fp16 per tap then fp32).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+const int TW = 16, NG = C / 16, KC = C / 16, CP = C + 8, VPP = C / 8, HP = (TH + 2) * (TW + 2);
+const int NSG = NG * (TH / RPS);
+layout(local_size_x = 16 * NSG) in;
+
+layout(push_constant) uniform PC { int H; int W; } pc;
+layout(std430, binding = 0) readonly buffer Src { uvec4 src[]; };
+layout(std430, binding = 1) readonly buffer Wt { uvec4 wp[]; };   // [9][KC][NG][16 lanes][16 k]
+layout(std430, binding = 2) readonly buffer Bias { float16_t bias[]; };
+layout(std430, binding = 3) writeonly buffer Dst { float16_t dst[]; };
+
+shared uvec4 sm[HP * CP / 8];
+
+#if ACC == 1
+#define AT float
+#else
+#define AT float16_t
+#endif
+
+void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
+{
+    f16vec2 p;
+    p = unpackFloat2x16(u0.x); v[0] = p.x; v[1] = p.y;
+    p = unpackFloat2x16(u0.y); v[2] = p.x; v[3] = p.y;
+    p = unpackFloat2x16(u0.z); v[4] = p.x; v[5] = p.y;
+    p = unpackFloat2x16(u0.w); v[6] = p.x; v[7] = p.y;
+    p = unpackFloat2x16(u1.x); v[8] = p.x; v[9] = p.y;
+    p = unpackFloat2x16(u1.y); v[10] = p.x; v[11] = p.y;
+    p = unpackFloat2x16(u1.z); v[12] = p.x; v[13] = p.y;
+    p = unpackFloat2x16(u1.w); v[14] = p.x; v[15] = p.y;
+}
+
+void main()
+{
+    const int tid = int(gl_LocalInvocationIndex), nth = 16 * NSG;
+    const int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
+    const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
+    const int H = pc.H, W = pc.W;
+
+    for (int i = tid; i < HP * VPP; i += nth) {
+        const int px = i / VPP, v = i % VPP;
+        const int yy = ty0 - 1 + px / (TW + 2), xx = tx0 - 1 + px % (TW + 2);
+        const bool ok = yy >= 0 && yy < H && xx >= 0 && xx < W;
+        sm[px * (CP / 8) + v] = ok ? src[(yy * W + xx) * VPP + v] : uvec4(0);
+    }
+    barrier();
+
+    const int g = sg % NG, row0 = (sg / NG) * RPS;
+#if ACC >= 2
+    float tot[RPS][16];
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) tot[r][m] = 0.0;
+#endif
+    AT acc[RPS][16];
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) acc[r][m] = AT(0.0);
+
+    [[dont_unroll]] for (int t = 0; t < 9; t++) {
+        const int dy = t / 3, dx = t % 3;
+        [[unroll]] for (int kc = 0; kc < KC; kc++) {
+            const int wi = (((t * KC + kc) * NG + g) * 16 + lane) * 2;
+            float16_t w[16];
+            unpack16(wp[wi], wp[wi + 1], w);
+            [[unroll]] for (int r = 0; r < RPS; r++) {
+                const int ai = ((row0 + r + dy) * (TW + 2) + lane + dx) * (CP / 8) + kc * 2;
+                float16_t a[16];
+                unpack16(sm[ai], sm[ai + 1], a);
+                [[unroll]] for (int k = 0; k < 16; k++) {
+                    [[unroll]] for (int m = 0; m < 16; m++)
+                        acc[r][m] = fma(AT(subgroupBroadcast(a[k], m)), AT(w[k]), acc[r][m]);
+                }
+            }
+#if ACC == 2
+            [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+                tot[r][m] += float(acc[r][m]);
+                acc[r][m] = float16_t(0.0);
+            }
+#endif
+        }
+#if ACC == 3
+        [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+            tot[r][m] += float(acc[r][m]);
+            acc[r][m] = float16_t(0.0);
+        }
+#endif
+    }
+
+    const float b = float(bias[g * 16 + lane]);
+    [[unroll]] for (int r = 0; r < RPS; r++) {
+        const int oy = ty0 + row0 + r;
+        if (oy >= H) continue;
+        [[unroll]] for (int m = 0; m < 16; m++) {
+            const int ox = tx0 + m;
+            if (ox >= W) continue;
+#if ACC >= 2
+            const float v = tot[r][m] + b;
+#else
+            const float v = float(acc[r][m]) + b;
+#endif
+            dst[(oy * W + ox) * C + g * 16 + lane] = float16_t(max(v, 0.0));
+        }
+    }
+}
