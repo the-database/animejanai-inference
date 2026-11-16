@@ -359,7 +359,7 @@ if(WIN32)
     set_target_properties(aji_dml PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
     add_executable(aji_harness_dml src/harness_dml.cpp src/utf8-argv.manifest)
-    target_link_libraries(aji_harness_dml PRIVATE aji d3d11)
+    target_link_libraries(aji_harness_dml PRIVATE aji d3d11 dxgi)
     add_dependencies(aji_harness_dml aji_dml)
     add_executable(aji_scene_dml_test sanity/scene_dml.cpp)
     target_link_libraries(aji_scene_dml_test PRIVATE aji d3d11)
@@ -544,6 +544,26 @@ if(AJI_VULKAN)
     endif()
     target_include_directories(aji_vk_model_test PRIVATE src)
     target_include_directories(aji_vk_model_test SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
+
+    if(WIN32)
+        # aji_vk (backend=Vulkan): aji_dml.cpp built with AJI_VULKAN. The D3D12
+        # frame pipeline is DirectML's; each model that lowers to the native
+        # kernels runs on the Vulkan executor on the same adapter, the others
+        # on DirectML. Ships beside aji_dml with the same ONNX Runtime and
+        # DirectML DLLs; Vulkan is loaded at run time.
+        add_library(aji_vk SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp
+            src/core/ort_dml.cpp src/aji_img_dml.cpp src/core/tiling.cpp ${AJI_HALF_SOURCES}
+            $<TARGET_OBJECTS:aji_vk_core> $<TARGET_OBJECTS:aji_vk_shaders>
+            $<TARGET_OBJECTS:aji_native_host>)
+        target_include_directories(aji_vk
+            PUBLIC include
+            PRIVATE src "${AJI_ORT_ROOT}/build/native/include" "${AJI_DML_ROOT}/include")
+        target_include_directories(aji_vk SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
+        target_compile_definitions(aji_vk PRIVATE AJI_VULKAN=1)
+        target_link_libraries(aji_vk PRIVATE d3d12 d3d11 dxgi d3dcompiler)
+        set_target_properties(aji_vk PROPERTIES CXX_VISIBILITY_PRESET hidden)
+        add_dependencies(aji_harness_dml aji_vk)
+    endif()
     if(UNIX)
         find_package(Threads REQUIRED)
         target_link_libraries(aji_vk_model_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)

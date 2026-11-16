@@ -41,8 +41,37 @@ Executor::~Executor()
     vkDeviceWaitIdle(d);
     if (pool_) vkDestroyDescriptorPool(d, pool_, nullptr);
     for (Buffer &b : owned_) dev_.destroy(b);
-    dev_.destroy(in_);
-    dev_.destroy(out_);
+    if (!io_external_) {
+        dev_.destroy(in_);
+        dev_.destroy(out_);
+    }
+}
+
+void Executor::bind_io(VkBuffer in, VkBuffer out)
+{
+    std::vector<VkDescriptorBufferInfo> bi(io_refs_.size());
+    std::vector<VkWriteDescriptorSet> wr(io_refs_.size());
+    for (size_t i = 0; i < io_refs_.size(); i++) {
+        bi[i] = {io_refs_[i].output ? out : in, 0, VK_WHOLE_SIZE};
+        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr[i].dstSet = io_refs_[i].set;
+        wr[i].dstBinding = io_refs_[i].binding;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[i].pBufferInfo = &bi[i];
+    }
+    vkUpdateDescriptorSets(dev_.device(), (uint32_t)wr.size(), wr.data(), 0, nullptr);
+    if (!io_external_) {
+        vkDeviceWaitIdle(dev_.device());
+        bytes_ -= in_.size + out_.size;
+        dev_.destroy(in_);
+        dev_.destroy(out_);
+    }
+    io_external_ = true;
+    in_ = Buffer{};
+    out_ = Buffer{};
+    in_.buf = in;
+    out_.buf = out;
 }
 
 std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in_w, int in_h, std::string *why)
@@ -168,6 +197,7 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
         VkDescriptorBufferInfo bi[Device::kBindings];
         VkWriteDescriptorSet wr[Device::kBindings];
         for (int j = 0; j < Device::kBindings; j++) {
+            if (b[j] == e->in_.buf || b[j] == e->out_.buf) e->io_refs_.push_back({st.set, (uint32_t)j, b[j] == e->out_.buf});
             bi[j] = {b[j], 0, VK_WHOLE_SIZE};
             wr[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             wr[j].dstSet = st.set;

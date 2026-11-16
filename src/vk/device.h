@@ -105,6 +105,23 @@ public:
     int cached_variant(const std::string &key);
     void store_variant(const std::string &key, int variant);
 
+    // Frame work on the queue without a CPU wait: frame_begin returns a recording command
+    // buffer from a small ring (waiting, on the CPU, only if that buffer's previous submit is
+    // still running), frame_submit submits it waiting for timeline value wait_value of sem
+    // and signaling signal_value (0: none).
+    VkCommandBuffer frame_begin(int *slot);
+    bool frame_submit(int slot, VkSemaphore sem, uint64_t wait_value, uint64_t signal_value, std::string *why);
+
+#ifdef _WIN32
+    // D3D12 interop (aji_vk on Windows runs inside aji_dml's D3D12 frame pipeline): import a
+    // shared D3D12 buffer (an NT handle from CreateSharedHandle; the caller closes it) as a
+    // storage buffer, and a shared D3D12 fence as a timeline semaphore. False and *why when
+    // the driver can't.
+    bool interop() const { return interop_; }
+    bool import_d3d12_buffer(HANDLE h, VkDeviceSize size, Buffer *out, std::string *why);
+    bool import_d3d12_fence(HANDLE h, VkSemaphore *out, std::string *why);
+#endif
+
 private:
     Device() = default;
     VkCommandBuffer begin_locked();
@@ -130,6 +147,19 @@ private:
     std::map<std::string, int> variants_;
     bool variants_dirty_ = false, pipelines_dirty_ = false;
     std::string cache_base() const;
+    static constexpr int kFrameSlots = 8;
+    struct FrameSlot {
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        VkSemaphore sem = VK_NULL_HANDLE;  // what its last submit signaled, and the value
+        uint64_t value = 0;
+        VkFence fence = VK_NULL_HANDLE;    // when it signaled nothing
+        bool fenced = false;
+    };
+    VkCommandPool frame_pool_ = VK_NULL_HANDLE;
+    FrameSlot frames_[kFrameSlots];
+    int next_frame_ = 0;
+    std::mutex frame_mu_;
+    bool interop_ = false;
     Buffer dummy_;
     Buffer stage_;  // upload/download staging, grown on demand
 };

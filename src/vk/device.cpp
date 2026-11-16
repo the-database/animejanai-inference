@@ -225,9 +225,19 @@ std::unique_ptr<Device> Device::create(int index, const uint8_t *luid, std::stri
     f.f13.subgroupSizeControl = VK_TRUE;
     f.f13.computeFullSubgroups = VK_TRUE;
     f.f13.synchronization2 = VK_TRUE;
+    f.f12.timelineSemaphore = VK_TRUE;  // required by Vulkan 1.3
     f.cm.cooperativeMatrix = cm ? VK_TRUE : VK_FALSE;
     std::vector<const char *> exts;
     if (cm) exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+#ifdef _WIN32
+    d->interop_ = has_ext(d->phys_, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME) &&
+                  has_ext(d->phys_, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME) && vkGetMemoryWin32HandlePropertiesKHR &&
+                  vkImportSemaphoreWin32HandleKHR;
+    if (d->interop_) {
+        exts.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+        exts.push_back(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+    }
+#endif
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f.f2};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
@@ -248,6 +258,15 @@ std::unique_ptr<Device> Device::create(int index, const uint8_t *luid, std::stri
     if ((r = vkAllocateCommandBuffers(d->dev_, &cai, &d->cb_)) != VK_SUCCESS) return fail(err("vkAllocateCommandBuffers", r));
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if ((r = vkCreateFence(d->dev_, &fci, nullptr, &d->fence_)) != VK_SUCCESS) return fail(err("vkCreateFence", r));
+    // frame command buffers: their own pool (frame_mu_), so frames and one-shot work can come
+    // from different threads
+    if ((r = vkCreateCommandPool(d->dev_, &cpi, nullptr, &d->frame_pool_)) != VK_SUCCESS)
+        return fail(err("vkCreateCommandPool", r));
+    cai.commandPool = d->frame_pool_;
+    for (FrameSlot &fs : d->frames_) {
+        if ((r = vkAllocateCommandBuffers(d->dev_, &cai, &fs.cb)) != VK_SUCCESS) return fail(err("vkAllocateCommandBuffers", r));
+        if ((r = vkCreateFence(d->dev_, &fci, nullptr, &fs.fence)) != VK_SUCCESS) return fail(err("vkCreateFence", r));
+    }
 
     VkDescriptorSetLayoutBinding lb[kBindings];
     for (int i = 0; i < kBindings; i++) lb[i] = {(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -286,9 +305,153 @@ Device::~Device()
     if (pipe_layout_) vkDestroyPipelineLayout(dev_, pipe_layout_, nullptr);
     if (set_layout_) vkDestroyDescriptorSetLayout(dev_, set_layout_, nullptr);
     if (fence_) vkDestroyFence(dev_, fence_, nullptr);
+    for (FrameSlot &fs : frames_)
+        if (fs.fence) vkDestroyFence(dev_, fs.fence, nullptr);
+    if (frame_pool_) vkDestroyCommandPool(dev_, frame_pool_, nullptr);
     if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
     vkDestroyDevice(dev_, nullptr);
 }
+
+VkCommandBuffer Device::frame_begin(int *slot)
+{
+    frame_mu_.lock();  // released by frame_submit
+    const int s = next_frame_;
+    next_frame_ = (next_frame_ + 1) % kFrameSlots;
+    FrameSlot &fs = frames_[s];
+    // the slot's previous submit must have finished before its buffer is re-recorded
+    if (fs.fenced) {
+        vkWaitForFences(dev_, 1, &fs.fence, VK_TRUE, UINT64_MAX);
+        vkResetFences(dev_, 1, &fs.fence);
+        fs.fenced = false;
+    } else if (fs.sem) {
+        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wi.semaphoreCount = 1;
+        wi.pSemaphores = &fs.sem;
+        wi.pValues = &fs.value;
+        vkWaitSemaphores(dev_, &wi, UINT64_MAX);
+    }
+    vkResetCommandBuffer(fs.cb, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(fs.cb, &bi);
+    *slot = s;
+    return fs.cb;
+}
+
+bool Device::frame_submit(int slot, VkSemaphore sem, uint64_t wait_value, uint64_t signal_value, std::string *why)
+{
+    FrameSlot &fs = frames_[slot];
+    VkResult r = vkEndCommandBuffer(fs.cb);
+    if (r == VK_SUCCESS) {
+        VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        ts.waitSemaphoreValueCount = wait_value ? 1 : 0;
+        ts.pWaitSemaphoreValues = &wait_value;
+        ts.signalSemaphoreValueCount = signal_value ? 1 : 0;
+        ts.pSignalSemaphoreValues = &signal_value;
+        const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts};
+        si.waitSemaphoreCount = sem && wait_value ? 1 : 0;
+        si.pWaitSemaphores = &sem;
+        si.pWaitDstStageMask = &stage;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &fs.cb;
+        si.signalSemaphoreCount = sem && signal_value ? 1 : 0;
+        si.pSignalSemaphores = &sem;
+        const bool fenced = !(sem && signal_value);
+        r = vkQueueSubmit(queue_, 1, &si, fenced ? fs.fence : VK_NULL_HANDLE);
+        if (r == VK_SUCCESS) {
+            fs.fenced = fenced;
+            fs.sem = fenced ? VK_NULL_HANDLE : sem;
+            fs.value = signal_value;
+        }
+    }
+    frame_mu_.unlock();
+    if (r != VK_SUCCESS && why) *why = err("frame submit", r);
+    return r == VK_SUCCESS;
+}
+
+#ifdef _WIN32
+bool Device::import_d3d12_buffer(HANDLE h, VkDeviceSize size, Buffer *out, std::string *why)
+{
+    *out = Buffer{};
+    if (!interop_) {
+        if (why) *why = "the Vulkan driver can't import D3D12 memory";
+        return false;
+    }
+    const VkExternalMemoryHandleTypeFlagBits ht = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+    VkExternalMemoryBufferCreateInfo emb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    emb.handleTypes = ht;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &emb};
+    bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult r = vkCreateBuffer(dev_, &bi, nullptr, &out->buf);
+    if (r != VK_SUCCESS) {
+        if (why) *why = err("vkCreateBuffer (D3D12 import)", r);
+        return false;
+    }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(dev_, out->buf, &mr);
+    VkMemoryWin32HandlePropertiesKHR hp{VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR};
+    if ((r = vkGetMemoryWin32HandlePropertiesKHR(dev_, ht, h, &hp)) != VK_SUCCESS) {
+        destroy(*out);
+        if (why) *why = err("vkGetMemoryWin32HandlePropertiesKHR", r);
+        return false;
+    }
+    const uint32_t bits = mr.memoryTypeBits & hp.memoryTypeBits;
+    uint32_t type = 0;
+    while (type < 32 && !(bits & (1u << type))) type++;
+    if (type == 32) {
+        destroy(*out);
+        if (why) *why = "no memory type for the imported D3D12 buffer";
+        return false;
+    }
+    VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    ded.buffer = out->buf;
+    VkImportMemoryWin32HandleInfoKHR imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR, &ded};
+    imp.handleType = ht;
+    imp.handle = h;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = type;
+    if ((r = vkAllocateMemory(dev_, &ai, nullptr, &out->mem)) != VK_SUCCESS ||
+        (r = vkBindBufferMemory(dev_, out->buf, out->mem, 0)) != VK_SUCCESS) {
+        destroy(*out);
+        if (why) *why = err("importing the D3D12 buffer", r);
+        return false;
+    }
+    out->size = size;
+    return true;
+}
+
+bool Device::import_d3d12_fence(HANDLE h, VkSemaphore *out, std::string *why)
+{
+    *out = VK_NULL_HANDLE;
+    if (!interop_) {
+        if (why) *why = "the Vulkan driver can't import D3D12 fences";
+        return false;
+    }
+    VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &st};
+    VkResult r = vkCreateSemaphore(dev_, &si, nullptr, out);
+    if (r != VK_SUCCESS) {
+        if (why) *why = err("vkCreateSemaphore", r);
+        return false;
+    }
+    VkImportSemaphoreWin32HandleInfoKHR ii{VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR};
+    ii.semaphore = *out;
+    ii.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+    ii.handle = h;
+    if ((r = vkImportSemaphoreWin32HandleKHR(dev_, &ii)) != VK_SUCCESS) {
+        vkDestroySemaphore(dev_, *out, nullptr);
+        *out = VK_NULL_HANDLE;
+        if (why) *why = err("importing the D3D12 fence", r);
+        return false;
+    }
+    return true;
+}
+#endif
 
 bool Device::make_buffer(Buffer *b, VkDeviceSize size, bool host, std::string *why)
 {

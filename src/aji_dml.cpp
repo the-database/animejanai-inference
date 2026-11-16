@@ -55,6 +55,20 @@
 #include "core/fileio.h"
 #include "core/ort_dml.h"
 
+#ifdef AJI_VULKAN
+/* aji_vk (backend=Vulkan) is this file built with AJI_VULKAN: the same D3D12
+ * frame pipeline (plane copies, pre/post, resizes, the ticket API), with each
+ * model step that lowers to the native kernels (native/lower.h) run by the
+ * Vulkan executor (vk/executor.h) on the same adapter instead of ONNX
+ * Runtime. The chain buffers are shared D3D12 buffers imported into Vulkan;
+ * the queues hand off through a shared D3D12 fence imported as a Vulkan
+ * timeline semaphore. Models that don't lower run on DirectML, per model. */
+#include "native/lower.h"
+#include "native/onnx_graph.h"
+#include "vk/device.h"
+#include "vk/executor.h"
+#endif
+
 using Microsoft::WRL::ComPtr;
 
 /* ---------------- module loading (DirectML before onnxruntime) -------- */
@@ -116,6 +130,9 @@ struct DmlModel {
     int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
     OrtIoBinding *binding = nullptr;
     OrtValue *in_val = nullptr, *out_val = nullptr;
+#ifdef AJI_VULKAN
+    std::shared_ptr<ajivk::Executor> vk;  // the native kernels run this model (no session)
+#endif
 };
 
 struct Step {
@@ -195,6 +212,16 @@ struct aji_ctx {
     size_t buf_bytes = 0;
     bool first_elem16 = true;   // element type cs_pre_combine writes
     bool last_elem16 = true;    // element type cs_post_matrix reads
+#ifdef AJI_VULKAN
+    // Vulkan on the same adapter; null when it can't run (everything then runs
+    // on DirectML). vk_buf: buf[] imported, while a chain has a Vulkan model.
+    std::unique_ptr<ajivk::Device> vk;
+    std::string vk_why;           // why vk is null
+    ComPtr<ID3D12Fence> vk_fence; // shared: D3D12 -> Vulkan -> D3D12 handoffs
+    VkSemaphore vk_sem = VK_NULL_HANDLE;
+    uint64_t vk_val = 0;
+    ajivk::Buffer vk_buf[2];
+#endif
 
     // lazy per-frame-format state
     std::unique_ptr<DmlPlan> pre_plan, post_plan;
@@ -413,7 +440,8 @@ void finalize_log(aji_ctx *c)
 }
 
 ComPtr<ID3D12Resource> make_buffer(ID3D12Device *dev, uint64_t bytes,
-                                   bool upload)
+                                   bool upload,
+                                   D3D12_HEAP_FLAGS heap = D3D12_HEAP_FLAG_NONE)
 {
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT;
@@ -429,7 +457,7 @@ ComPtr<ID3D12Resource> make_buffer(ID3D12Device *dev, uint64_t bytes,
                       : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ComPtr<ID3D12Resource> res;
     if (FAILED(dev->CreateCommittedResource(
-            &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            &hp, heap, &rd,
             upload ? D3D12_RESOURCE_STATE_GENERIC_READ
                    : D3D12_RESOURCE_STATE_COMMON,
             NULL, IID_PPV_ARGS(&res))))
@@ -1100,6 +1128,9 @@ void model_release(DmlModel *m)
     m->in_val = m->out_val = nullptr;
     m->binding = nullptr;
     m->session = nullptr;
+#ifdef AJI_VULKAN
+    m->vk.reset();
+#endif
 }
 
 void rife_teardown(aji_ctx *c);
@@ -1114,11 +1145,19 @@ void chain_teardown(aji_ctx *c)
     for (auto &b : c->cl_busy)
         c->cl_free.push_back(std::move(b.first));
     c->cl_busy.clear();
+#ifdef AJI_VULKAN
+    if (c->vk)
+        ajivk::vkDeviceWaitIdle(c->vk->device());
+#endif
     for (auto &m : c->models)
         model_release(&m);
     c->models.clear();
     c->steps.clear();
     for (int i = 0; i < 2; i++) {
+#ifdef AJI_VULKAN
+        if (c->vk)
+            c->vk->destroy(c->vk_buf[i]);
+#endif
         if (c->buf_alloc[i]) {
             g_dml_api->FreeGPUAllocation(c->buf_alloc[i]);
             c->buf_alloc[i] = nullptr;
@@ -1339,6 +1378,79 @@ bool model_open(aji_ctx *c, DmlModel *m, const std::string &onnx_path,
     drain_queue(c, 30000);
     return ok;
 }
+
+#ifdef AJI_VULKAN
+// The model on the Vulkan native kernels at w x h, when it lowers (unless
+// native=off) and the device runs every step; logs either way. False: open it
+// on DirectML.
+bool vk_model_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const std::string &name, int w, int h)
+{
+    if (!c->conf.native)
+        return false;
+    std::string why;
+    if (!c->vk) {
+        why = c->vk_why;
+    } else {
+        std::vector<char> bytes;
+        ajinative::OnnxGraph g;
+        ajinative::Plan plan;
+        if (!ajicore::read_file_bytes(onnx, &bytes)) {
+            why = "the model file can't be read";
+        } else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why) && ajinative::lower(g, &plan, &why)) {
+            std::unique_ptr<ajivk::Executor> ex = ajivk::Executor::create(*c->vk, plan, w, h, &why);
+            if (ex) {
+                m->fp16 = true;
+                m->in_w = w;
+                m->in_h = h;
+                m->out_w = ex->out_w();
+                m->out_h = ex->out_h();
+                m->vk = std::move(ex);
+                c->vk->save_caches();
+                c->log_steps.push_back("Native kernels: " + name + " (" + ajinative::describe(plan) + "; Vulkan " +
+                                       ajivk::family_name(c->vk->family()) + ")");
+                return true;
+            }
+        }
+    }
+    c->log_steps.push_back("Native kernels not used for " + name + ": " + why + "; using DirectML");
+    return false;
+}
+
+// One Vulkan model step, queued without a CPU wait: our queue signals the
+// handoff fence, Vulkan waits for it, runs the model straight from chain
+// buffer in_buf into the other one (bind_io at configure) and signals; our
+// queue waits for that before the next step.
+bool vk_run_model(aji_ctx *c, const DmlModel &m, int in_buf)
+{
+    using namespace ajivk;
+    (void)in_buf;
+    const uint64_t ready = ++c->vk_val, done = ++c->vk_val;
+    if (FAILED(c->queue->Signal(c->vk_fence.Get(), ready))) {
+        c->set_error("handoff fence signal failed");
+        return false;
+    }
+    int slot = 0;
+    VkCommandBuffer cb = c->vk->frame_begin(&slot);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    const bool ok = m.vk->record(cb, m.in_w, m.in_h);
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    std::string why;
+    if (!c->vk->frame_submit(slot, c->vk_sem, ready, done, &why) || !ok) {
+        c->set_error("Vulkan model step: %s", ok ? why.c_str() : "the executor refused the frame size");
+        return false;
+    }
+    if (FAILED(c->queue->Wait(c->vk_fence.Get(), done))) {
+        c->set_error("handoff fence wait failed");
+        return false;
+    }
+    return true;
+}
+#endif
 
 // Bind a model's IO to the chain buffers (called once buffers exist).
 bool model_bind(aji_ctx *c, DmlModel *m, int in_buf)
@@ -1758,6 +1870,38 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     }
     CloseHandle(fh);
 
+#ifdef AJI_VULKAN
+    // Vulkan on the adapter the player renders on, and the handoff fence. Any
+    // failure leaves vk null: every model then runs on DirectML, and the log
+    // says why.
+    {
+        std::string why;
+        c->vk = ajivk::Device::create(-1, reinterpret_cast<const uint8_t *>(&ad.AdapterLuid), &why);
+        HANDLE vh = NULL;
+        if (c->vk && !c->vk->interop()) {
+            why = "the Vulkan driver can't share memory with D3D12";
+            c->vk.reset();
+        }
+        if (c->vk && (FAILED(c->dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&c->vk_fence))) ||
+                      FAILED(c->dev->CreateSharedHandle(c->vk_fence.Get(), NULL, GENERIC_ALL, NULL, &vh)) ||
+                      !c->vk->import_d3d12_fence(vh, &c->vk_sem, &why))) {
+            if (why.empty())
+                why = "the D3D12 handoff fence could not be shared";
+            c->vk.reset();
+        }
+        if (vh)
+            CloseHandle(vh);
+        if (c->vk) {
+            c->vk->set_cache_dir(c->model_dir);
+            c->verbose("Vulkan on %s (%s kernels)", c->vk->info().name.c_str(),
+                       ajivk::family_name(c->vk->family()));
+        } else {
+            c->vk_why = why;
+            c->verbose("Vulkan unavailable (%s); models run on DirectML", why.c_str());
+        }
+    }
+#endif
+
     if (FAILED(g_dml_create_device(c->dev.Get(), DML_CREATE_DEVICE_FLAG_NONE,
                                    IID_PPV_ARGS(&c->dml_dev)))) {
         c->set_error("DMLCreateDevice failed");
@@ -1977,7 +2121,12 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         const int bh = t > 1 ? (ch + 31) / 32 * 32 : ch;
         DmlModel dm;
         const std::string onnx = c->model_dir + "\\" + m.name + ".onnx";
-        if (!model_open(c, &dm, onnx, bw, bh, 3 * t)) {
+#ifdef AJI_VULKAN
+        const bool on_vk = t == 1 && vk_model_open(c, &dm, onnx, m.name, cw, ch);
+#else
+        const bool on_vk = false;
+#endif
+        if (!on_vk && !model_open(c, &dm, onnx, bw, bh, 3 * t)) {
             model_release(&dm);
             finalize_log(c);
             return AJI_ERR_ENGINE;
@@ -2111,13 +2260,37 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         }
     }
 
+#ifdef AJI_VULKAN
+    // a Vulkan model reads and writes the chain buffers: share them
+    bool any_vk = false;
+    for (const DmlModel &m : c->models)
+        any_vk = any_vk || m.vk != nullptr;
+#else
+    const bool any_vk = false;
+#endif
     for (int i = 0; i < 2; i++) {
-        c->buf[i] = make_buffer(c->dev.Get(), max_bytes, false);
+        c->buf[i] = make_buffer(c->dev.Get(), max_bytes, false,
+                                any_vk ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE);
         if (!c->buf[i]) {
             c->set_error("chain buffer allocation (%zu bytes) failed",
                          max_bytes);
             return AJI_ERR;
         }
+#ifdef AJI_VULKAN
+        if (any_vk) {
+            HANDLE h = NULL;
+            std::string why;
+            const bool ok = SUCCEEDED(c->dev->CreateSharedHandle(c->buf[i].Get(), NULL, GENERIC_ALL, NULL, &h)) &&
+                            c->vk->import_d3d12_buffer(h, max_bytes, &c->vk_buf[i], &why);
+            if (h)
+                CloseHandle(h);
+            if (!ok) {
+                c->set_error("sharing the chain buffers with Vulkan failed: %s",
+                             why.empty() ? "CreateSharedHandle failed" : why.c_str());
+                return AJI_ERR;
+            }
+        }
+#endif
         if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
                            c->buf[i].Get(), &c->buf_alloc[i]),
                        "CreateGPUAllocationFromD3DResource"))
@@ -2128,6 +2301,13 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     for (Step &st : c->steps) {
         if (st.kind != Step::MODEL)
             continue;
+#ifdef AJI_VULKAN
+        if (c->models[st.model_idx].vk) {
+            // reads and writes the shared chain buffers directly
+            c->models[st.model_idx].vk->bind_io(c->vk_buf[st.in_buf].buf, c->vk_buf[st.in_buf ^ 1].buf);
+            continue;
+        }
+#endif
         if (!model_bind(c, &c->models[st.model_idx], st.in_buf))
             return AJI_ERR_ENGINE;
     }
@@ -2320,6 +2500,14 @@ static int run_steps(aji_ctx *c, size_t first, size_t last, int *cur)
         Step &st = c->steps[i];
         if (st.kind == Step::MODEL) {
             DmlModel &m = c->models[st.model_idx];
+#ifdef AJI_VULKAN
+            if (m.vk) {
+                if (!vk_run_model(c, m, *cur))
+                    return AJI_ERR_ENGINE;
+                *cur ^= 1;
+                continue;
+            }
+#endif
             if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
                            "RunWithBinding"))
                 return AJI_ERR_ENGINE;
@@ -3642,6 +3830,11 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         return;
     aji_ctx *c = *pc;
     chain_teardown(c);
+#ifdef AJI_VULKAN
+    if (c->vk && c->vk_sem)
+        ajivk::vkDestroySemaphore(c->vk->device(), c->vk_sem, nullptr);
+    c->vk.reset();
+#endif
     if (c->mi_dml)
         g_ort->ReleaseMemoryInfo(c->mi_dml);
     if (c->env)

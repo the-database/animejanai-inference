@@ -12,6 +12,7 @@
  *                   [--range limited|full] [--siting left|center|topleft]
  *                   [--fps F] [--frames N] [--output out.raw]
  *                   --conf animejanai.conf --model-dir DIR [--slot N]
+ *                   [--adapter N]   (DXGI adapter index; default: the default adapter)
  *
  * --rife: interpolation-only parity loop (scale-free 2/1 chain).
  * --rife-chain: times the full upscale+RIFE chain per source frame, honoring
@@ -28,6 +29,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,7 +77,7 @@ int main(int argc, char **argv)
     const char *input = NULL, *output = NULL, *conf = NULL, *mdir = NULL;
     const char *rife_mdir = NULL;
     int w = 0, h = 0, frames = 1, slot = 1, rife = 0, rife_chain = 0;
-    int ingest_ahead = -1, reset_at = -1;
+    int ingest_ahead = -1, reset_at = -1, adapter_index = -1;
     int format = AJI_FMT_NV12, matrix = AJI_MATRIX_BT709;
     int range = AJI_RANGE_LIMITED, siting = AJI_SITING_LEFT;
     double fps = 23.976;
@@ -95,6 +97,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--ingest-ahead")) { ingest_ahead = atoi(v); i++; }
         else if (!strcmp(a, "--reset-at")) { reset_at = atoi(v); i++; }
         else if (!strcmp(a, "--slot")) { slot = atoi(v); i++; }
+        else if (!strcmp(a, "--adapter")) { adapter_index = atoi(v); i++; }
         else if (!strcmp(a, "--fps")) { fps = atof(v); i++; }
         else if (!strcmp(a, "--format")) {
             format = strcmp(v, "p010") ? AJI_FMT_NV12 : AJI_FMT_P010; i++;
@@ -117,14 +120,28 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    // --adapter N: the DXGI adapter to render on (default: the system's
+    // default adapter), e.g. an iGPU beside a discrete card
+    IDXGIAdapter1 *adapter = NULL;
+    if (adapter_index >= 0) {
+        IDXGIFactory1 *fac = NULL;
+        if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&fac)) ||
+            FAILED(fac->EnumAdapters1((UINT)adapter_index, &adapter))) {
+            fprintf(stderr, "no DXGI adapter %d\n", adapter_index);
+            return 1;
+        }
+        fac->Release();
+    }
     ID3D11Device *dev = NULL;
     ID3D11DeviceContext *ctx = NULL;
-    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-                                 NULL, 0, D3D11_SDK_VERSION, &dev, NULL,
+    if (FAILED(D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+                                 NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, NULL,
                                  &ctx))) {
         fprintf(stderr, "D3D11CreateDevice failed\n");
         return 1;
     }
+    if (adapter)
+        adapter->Release();
 
     aji_create_params p = {};
     p.api_version = AJI_API_VERSION;

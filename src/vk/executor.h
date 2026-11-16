@@ -36,6 +36,11 @@ public:
     // NCHW fp16 [3][in_h][in_w] / [3][out_h][out_w]; a smaller frame packs its planes at its own size.
     const Buffer &input() const { return in_; }
     const Buffer &output() const { return out_; }
+    // Read the input from in and write the output to out instead (buffers the caller owns,
+    // e.g. chain buffers shared with D3D12; at least the sizes above), and free the executor's
+    // own. Not while a recorded command buffer is pending. input()/output() then refer to
+    // in/out (handle only).
+    void bind_io(VkBuffer in, VkBuffer out);
 
     // Appends the model for an input of w x h (<= the created size, multiples of the pixel-
     // unshuffle factor) to cb: the caller makes input() visible to compute shaders before, and
@@ -61,6 +66,13 @@ private:
     std::vector<Buffer> owned_;     // weights and feature buffers
     std::vector<Step> steps_;
     Buffer in_, out_;
+    bool io_external_ = false;
+    struct IoRef {
+        VkDescriptorSet set;
+        uint32_t binding;
+        bool output;
+    };
+    std::vector<IoRef> io_refs_;  // descriptors that point at the model input / output
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     int H_ = 0, W_ = 0, out_w_ = 0, out_h_ = 0, u_ = 1;
     size_t bytes_ = 0, weight_bytes_ = 0;

@@ -39,7 +39,14 @@
     X(vkGetDeviceProcAddr)
 
 // Optional (extensions): null when the driver lacks them.
+#ifdef _WIN32
+#define AJI_VK_INSTANCE_EXT_FUNCS(X)                     \
+    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) \
+    X(vkGetMemoryWin32HandlePropertiesKHR)               \
+    X(vkImportSemaphoreWin32HandleKHR)
+#else
 #define AJI_VK_INSTANCE_EXT_FUNCS(X) X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+#endif
 
 #define AJI_VK_DEVICE_FUNCS(X)          \
     X(vkDestroyDevice)                  \
@@ -98,7 +105,10 @@
     X(vkGetImageMemoryRequirements)     \
     X(vkBindImageMemory)                \
     X(vkCmdCopyImageToBuffer)           \
-    X(vkCmdCopyBufferToImage)
+    X(vkCmdCopyBufferToImage)           \
+    X(vkCreateSemaphore)                \
+    X(vkDestroySemaphore)               \
+    X(vkWaitSemaphores)
 
 namespace ajivk {
 
