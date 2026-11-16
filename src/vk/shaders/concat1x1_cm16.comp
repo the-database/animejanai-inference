@@ -39,7 +39,9 @@ uvec4 src_at(int s, int i)
 void main()
 {
     const int tid = int(gl_LocalInvocationIndex), nth = int(gl_WorkGroupSize.x), sg = int(gl_SubgroupID);
-    const int p0 = int(gl_WorkGroupID.x) * M, npx = pc.npx;
+    // a 2-D grid of pixel blocks (one dimension caps at 65535 groups); the last row may overshoot
+    const int p0 = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * M, npx = pc.npx;
+    if (p0 >= npx) return;  // the whole workgroup, before any barrier
     [[unroll]] for (int s = 0; s < NSRC; s++)
         for (int i = tid; i < M * VPP; i += nth) {
             const int px = i / VPP, v = i % VPP;

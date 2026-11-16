@@ -29,6 +29,8 @@ bool finish(const Device &dev, Dispatch *d, std::string *why)
     if (!spirv_find(d->module.c_str())) return fail(why, "no kernel " + d->module + " in this build");
     if (d->shared_bytes > dev.info().max_shared)
         return fail(why, d->module + " needs " + std::to_string(d->shared_bytes) + " bytes of shared memory");
+    if (d->threads > dev.info().max_invocations)
+        return fail(why, d->module + " needs workgroups of " + std::to_string(d->threads) + " invocations");
     return true;
 }
 
@@ -54,6 +56,7 @@ bool conv_dispatch(const Device &dev, const ConvKey &k, int v, Dispatch *d, std:
         d->module = "c3_cm16" + ops + "_w" + std::to_string(warps) + "r" + std::to_string(wr);
         d->subgroup = 32;
         d->local_size = (uint32_t)warps * d->subgroup;
+        d->threads = d->local_size;
         d->tile_h = warps * wr;
         d->shared_bytes = conv_shared(k, d->tile_h, 0);
         break;
@@ -62,6 +65,7 @@ bool conv_dispatch(const Device &dev, const ConvKey &k, int v, Dispatch *d, std:
         d->module = "c3_sg16" + ops + "_t" + std::to_string(kSgRows[v]) + "r1";
         d->subgroup = 16;
         d->tile_h = kSgRows[v];
+        d->threads = (uint32_t)(16 * (k.coutp / 16) * d->tile_h);  // a subgroup per row and 16-channel group
         d->shared_bytes = conv_shared(k, d->tile_h, 0);
         break;
     default:
@@ -81,10 +85,12 @@ bool concat_dispatch(const Device &dev, int c, int nsrc, Dispatch *d, std::strin
         d->module = "cat_cm16" + base + "_w4";
         d->subgroup = 32;
         d->local_size = 4 * d->subgroup;
+        d->threads = d->local_size;
         break;
     case Family::SG16:
         d->module = "cat_sg16" + base + "_b4";
         d->subgroup = 16;
+        d->threads = (uint32_t)(16 * (c / 16) * 4);
         break;
     default:
         return fail(why, "no kernel family");

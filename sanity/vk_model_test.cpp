@@ -6,7 +6,8 @@
 // them in the model directory, so a second run shows a warm configure). Then, per --ref size (default 256x144 and a ragged 202x118), compares
 // the Vulkan output with the fp32 CPU reference of the same plan (sanity/native_ref.h): PSNR and
 // max error. With AJI_CUDA, also compares the w x h output with the CUDA native executor's.
-// Exit 1 when a comparison is under its limit (--min-db, default 50).
+// Exit 1 when a comparison is under its limits: --min-db (default 50) and --max-levels, the
+// largest error in 8-bit levels (default 2), since PSNR alone can hide a few wrong pixels.
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -119,13 +120,14 @@ int main(int argc, char **argv)
     const char *model = argv[1];
     const int w = std::atoi(argv[2]), h = std::atoi(argv[3]);
     int device = -1, iters = 20;
-    double min_db = 50.0;
+    double min_db = 50.0, max_levels = 2.0;
     std::string cache;
     std::vector<std::pair<int, int>> refs;
     for (int i = 4; i < argc; i++) {
         if (!std::strcmp(argv[i], "--device") && i + 1 < argc) device = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--min-db") && i + 1 < argc) min_db = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--max-levels") && i + 1 < argc) max_levels = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--cache") && i + 1 < argc) cache = argv[++i];
         else if (!std::strcmp(argv[i], "--ref") && i + 1 < argc) {
             int rw = 0, rh = 0;
@@ -211,7 +213,7 @@ int main(int argc, char **argv)
         }
         const auto ref = ajiref::run_plan(plan, rin, rw, rh);
         const Cmp c = compare(rout, ref);
-        const bool ok = c.nan == 0 && c.db >= min_db;
+        const bool ok = c.nan == 0 && c.db >= min_db && c.maxd * 255 <= max_levels;
         std::printf("vs fp32 CPU reference at %dx%d: %.1f dB, max error %.4f (%.1f levels of 255), %zu non-finite: %s\n", rw, rh, c.db,
                     c.maxd, c.maxd * 255, c.nan, ok ? "ok" : "FAIL");
         bad += !ok;

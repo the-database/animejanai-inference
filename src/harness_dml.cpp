@@ -125,12 +125,14 @@ int main(int argc, char **argv)
     IDXGIAdapter1 *adapter = NULL;
     if (adapter_index >= 0) {
         IDXGIFactory1 *fac = NULL;
-        if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&fac)) ||
-            FAILED(fac->EnumAdapters1((UINT)adapter_index, &adapter))) {
+        const bool found = SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&fac)) &&
+                           SUCCEEDED(fac->EnumAdapters1((UINT)adapter_index, &adapter));
+        if (fac)
+            fac->Release();
+        if (!found) {
             fprintf(stderr, "no DXGI adapter %d\n", adapter_index);
             return 1;
         }
-        fac->Release();
     }
     ID3D11Device *dev = NULL;
     ID3D11DeviceContext *ctx = NULL;

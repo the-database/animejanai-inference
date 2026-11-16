@@ -33,6 +33,8 @@ struct DeviceInfo {
     bool luid_valid = false;
     uint32_t subgroup = 0, min_subgroup = 0, max_subgroup = 0;
     uint32_t max_shared = 0;             // maxComputeSharedMemorySize
+    uint32_t max_invocations = 0;        // maxComputeWorkGroupInvocations
+    uint32_t max_groups[2] = {0, 0};     // maxComputeWorkGroupCount x, y
     double timestamp_ns = 0.0;           // timestampPeriod; 0 if the queue can't time
     uint64_t device_local_bytes = 0;     // the largest device-local heap
     bool cm16 = false, sg16 = false;     // the device can run that family
@@ -107,8 +109,8 @@ public:
 
     // Frame work on the queue without a CPU wait: frame_begin returns a recording command
     // buffer from a small ring (waiting, on the CPU, only if that buffer's previous submit is
-    // still running), frame_submit submits it waiting for timeline value wait_value of sem
-    // and signaling signal_value (0: none).
+    // still running; null if it still is after 10 s), frame_submit submits it waiting for
+    // timeline value wait_value of sem and signaling signal_value (0: none).
     VkCommandBuffer frame_begin(int *slot);
     bool frame_submit(int slot, VkSemaphore sem, uint64_t wait_value, uint64_t signal_value, std::string *why);
 

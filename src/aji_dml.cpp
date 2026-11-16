@@ -132,6 +132,7 @@ struct DmlModel {
     OrtValue *in_val = nullptr, *out_val = nullptr;
 #ifdef AJI_VULKAN
     std::shared_ptr<ajivk::Executor> vk;  // the native kernels run this model (no session)
+    std::string vk_onnx, vk_name;         // to reopen it on DirectML
 #endif
 };
 
@@ -1405,6 +1406,8 @@ bool vk_model_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const std::
                 m->out_w = ex->out_w();
                 m->out_h = ex->out_h();
                 m->vk = std::move(ex);
+                m->vk_onnx = onnx;
+                m->vk_name = name;
                 c->vk->save_caches();
                 c->log_steps.push_back("Native kernels: " + name + " (" + ajinative::describe(plan) + "; Vulkan " +
                                        ajivk::family_name(c->vk->family()) + ")");
@@ -1431,6 +1434,10 @@ bool vk_run_model(aji_ctx *c, const DmlModel &m, int in_buf)
     }
     int slot = 0;
     VkCommandBuffer cb = c->vk->frame_begin(&slot);
+    if (!cb) {
+        c->set_error("Vulkan model step: an earlier Vulkan submit has not finished after 10 s");
+        return false;
+    }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1891,6 +1898,25 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         }
         if (vh)
             CloseHandle(vh);
+        // a driver can list the extensions and still refuse D3D12 buffers: try one
+        // now, so configure never fails on it later
+        if (c->vk) {
+            ComPtr<ID3D12Resource> probe = make_buffer(c->dev.Get(), 65536, false, D3D12_HEAP_FLAG_SHARED);
+            HANDLE ph = NULL;
+            ajivk::Buffer pb;
+            const bool ok = probe && SUCCEEDED(c->dev->CreateSharedHandle(probe.Get(), NULL, GENERIC_ALL, NULL, &ph)) &&
+                            c->vk->import_d3d12_buffer(ph, 65536, &pb, &why);
+            if (ph)
+                CloseHandle(ph);
+            c->vk->destroy(pb);
+            if (!ok) {
+                if (why.empty())
+                    why = "a shared D3D12 buffer could not be made";
+                ajivk::vkDestroySemaphore(c->vk->device(), c->vk_sem, nullptr);
+                c->vk_sem = VK_NULL_HANDLE;
+                c->vk.reset();
+            }
+        }
         if (c->vk) {
             c->vk->set_cache_dir(c->model_dir);
             c->verbose("Vulkan on %s (%s kernels)", c->vk->info().name.c_str(),
@@ -2183,6 +2209,32 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         any_model = true;
         c->log_steps.push_back(buf);
     }
+
+#ifdef AJI_VULKAN
+    // The Vulkan executor computes in fp16. A chain whose other models run in
+    // fp32 on DirectML can't mix element types in its chain buffers, so its
+    // Vulkan models run on DirectML too (as plain aji_dml runs that chain).
+    {
+        bool any32 = false;
+        for (const DmlModel &m : c->models)
+            any32 = any32 || (!m.vk && !m.fp16);
+        for (DmlModel &m : c->models) {
+            if (!any32 || !m.vk)
+                continue;
+            const std::string onnx = m.vk_onnx, name = m.vk_name;
+            const int mw = m.in_w, mh = m.in_h;
+            model_release(&m);
+            m = DmlModel{};
+            c->log_steps.push_back("Native kernels not used for " + name +
+                                   ": another model in the chain runs in fp32 on "
+                                   "DirectML; using DirectML");
+            if (!model_open(c, &m, onnx, mw, mh, 3)) {
+                finalize_log(c);
+                return AJI_ERR_ENGINE;
+            }
+        }
+    }
+#endif
 
     if (chain->rife) {
         if (!c->rife_model_dir.empty()) {

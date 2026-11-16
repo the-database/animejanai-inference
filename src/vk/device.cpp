@@ -63,6 +63,9 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
     d.min_subgroup = ssp.minSubgroupSize;
     d.max_subgroup = ssp.maxSubgroupSize;
     d.max_shared = pr.limits.maxComputeSharedMemorySize;
+    d.max_invocations = pr.limits.maxComputeWorkGroupInvocations;
+    d.max_groups[0] = pr.limits.maxComputeWorkGroupCount[0];
+    d.max_groups[1] = pr.limits.maxComputeWorkGroupCount[1];
     d.timestamp_ns = pr.limits.timestampComputeAndGraphics ? pr.limits.timestampPeriod : 0.0;
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(p, &mp);
@@ -102,6 +105,7 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
         // section 3: gate on the architecture). Until the device tables land, only NVIDIA and AMD.
         else if (d.vendor != kVendorNvidia && d.vendor != kVendorAmd) d.cm16_why = "cooperative matrix kernels are tuned for NVIDIA and AMD only";
         else if (d.subgroup != 32 && !(d.min_subgroup <= 32 && d.max_subgroup >= 32)) d.cm16_why = "no 32-lane subgroups";
+        else if (!(ssp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) d.cm16_why = "compute shaders can't require a subgroup size";
         else d.cm16 = true;
     }
     // sg16: subgroups of exactly 16 lanes with fp16 broadcasts and shuffles
@@ -113,7 +117,11 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
     else if (!(ssp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) d.sg16_why = "compute shaders can't require a subgroup size";
     else d.sg16 = true;
 
-    d.family = d.cm16 ? Family::CM16 : d.sg16 ? Family::SG16 : Family::None;
+    // cm16 on AMD hasn't run on an AMD GPU yet (stride-0 matrix loads, element indexing, wave32):
+    // only on request, AJI_VK_FAMILY=cm16, until it has
+    const bool cm16_default = d.cm16 && d.vendor == kVendorNvidia;
+    d.family = cm16_default ? Family::CM16 : d.sg16 ? Family::SG16 : Family::None;
+    if (d.cm16 && !cm16_default && d.family == Family::None) d.cm16_why = "untested on this vendor (AJI_VK_FAMILY=cm16 enables it)";
     if (const char *e = std::getenv("AJI_VK_FAMILY")) {
         if (!std::strcmp(e, "cm16")) d.family = d.cm16 ? Family::CM16 : Family::None;
         else if (!std::strcmp(e, "sg16")) d.family = d.sg16 ? Family::SG16 : Family::None;
@@ -172,9 +180,12 @@ std::unique_ptr<Device> Device::create(int index, const uint8_t *luid, std::stri
         if (index >= (int)pds.size()) return fail("no Vulkan device " + std::to_string(index));
         pick = index;
     } else if (luid) {
-        for (uint32_t i = 0; i < pds.size() && pick < 0; i++) {
+        // two drivers can expose one adapter: prefer the one with a kernel family
+        for (uint32_t i = 0; i < pds.size(); i++) {
             const DeviceInfo d = probe(pds[i], i);
-            if (d.luid_valid && !std::memcmp(d.luid, luid, 8)) pick = (int)i;
+            if (!d.luid_valid || std::memcmp(d.luid, luid, 8)) continue;
+            if (pick < 0 || d.family != Family::None) pick = (int)i;
+            if (d.family != Family::None) break;
         }
         if (pick < 0) return fail("no Vulkan device matches the D3D11 adapter");
     } else {
@@ -318,17 +329,27 @@ VkCommandBuffer Device::frame_begin(int *slot)
     const int s = next_frame_;
     next_frame_ = (next_frame_ + 1) % kFrameSlots;
     FrameSlot &fs = frames_[s];
-    // the slot's previous submit must have finished before its buffer is re-recorded
+    // the slot's previous submit must have finished before its buffer is re-recorded; a submit
+    // still pending after 10 s (a lost device, a hand-off that never came) fails the frame
+    constexpr uint64_t kTimeoutNs = 10ull * 1000 * 1000 * 1000;
+    VkResult r = VK_SUCCESS;
     if (fs.fenced) {
-        vkWaitForFences(dev_, 1, &fs.fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(dev_, 1, &fs.fence);
-        fs.fenced = false;
+        r = vkWaitForFences(dev_, 1, &fs.fence, VK_TRUE, kTimeoutNs);
+        if (r == VK_SUCCESS) {
+            vkResetFences(dev_, 1, &fs.fence);
+            fs.fenced = false;
+        }
     } else if (fs.sem) {
         VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         wi.semaphoreCount = 1;
         wi.pSemaphores = &fs.sem;
         wi.pValues = &fs.value;
-        vkWaitSemaphores(dev_, &wi, UINT64_MAX);
+        r = vkWaitSemaphores(dev_, &wi, kTimeoutNs);
+        if (r == VK_SUCCESS) fs.sem = VK_NULL_HANDLE;
+    }
+    if (r != VK_SUCCESS) {
+        frame_mu_.unlock();
+        return VK_NULL_HANDLE;
     }
     vkResetCommandBuffer(fs.cb, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -344,9 +365,9 @@ bool Device::frame_submit(int slot, VkSemaphore sem, uint64_t wait_value, uint64
     VkResult r = vkEndCommandBuffer(fs.cb);
     if (r == VK_SUCCESS) {
         VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-        ts.waitSemaphoreValueCount = wait_value ? 1 : 0;
+        ts.waitSemaphoreValueCount = sem && wait_value ? 1 : 0;
         ts.pWaitSemaphoreValues = &wait_value;
-        ts.signalSemaphoreValueCount = signal_value ? 1 : 0;
+        ts.signalSemaphoreValueCount = sem && signal_value ? 1 : 0;
         ts.pSignalSemaphoreValues = &signal_value;
         const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts};

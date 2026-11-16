@@ -32,6 +32,7 @@ struct Dispatch {
     uint32_t local_size = 0;  // specialization constant 0, or 0 when the shader fixes it
     uint32_t subgroup = 0;    // required subgroup size
     uint32_t shared_bytes = 0;
+    uint32_t threads = 0;     // invocations per workgroup
     int tile_h = 0;           // conv: output rows per workgroup (16 pixels wide)
     int tile_px = 0;          // concat: pixels per workgroup
 };

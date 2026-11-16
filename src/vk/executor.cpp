@@ -108,7 +108,11 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
     std::vector<int> fbuf;
     // Slack after each feature map: the cm16 kernels load a gate's block input 16 pixels at a
     // time, and the last tile's columns past W run off the end.
-    constexpr size_t kSlack = 16 * 64 * 2;
+    // The overrun is up to 15 pixels of the widest feature map.
+    int widest = 16;
+    for (int c : plan.channels) widest = c > widest ? c : widest;
+    for (int c : L.cout_pad) widest = c > widest ? c : widest;
+    const size_t kSlack = (size_t)16 * widest * 2;
     for (size_t need : L.buffer_bytes) {
         Buffer b;
         if (!dev.make_buffer(&b, need + kSlack, false, &reason)) return fail("feature buffer: " + reason);
@@ -309,8 +313,10 @@ void Executor::record_step(VkCommandBuffer cb, const Step &st, int v, int W, int
     uint32_t gx, gy;
     if (st.concat) {
         pc[0] = W * H;
-        gx = (uint32_t)((W * H + d.tile_px - 1) / d.tile_px);
-        gy = 1;
+        // a 2-D grid: the guaranteed maximum per dimension is 65535 groups
+        const uint32_t blocks = (uint32_t)((W * H + d.tile_px - 1) / d.tile_px);
+        gx = blocks < 32768u ? blocks : 32768u;
+        gy = (blocks + gx - 1) / gx;
     } else {
         pc[0] = H;
         pc[1] = W;
