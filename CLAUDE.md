@@ -34,14 +34,15 @@ DirectML backend.
 ```
 vf_animejanai (mpv)  ──dlopen──►  aji.dll / libaji.so        (aji_dispatch.cpp — thin dispatcher)
                                         │ forwards over aji.h
-                  ┌─────────────────────┼─────────────────────┐
-            aji_trt.dll          aji_trtrtx.dll          aji_dml.dll        (Windows only)
-          TensorRT + CUDA     TensorRT for RTX + CUDA   DirectML + D3D12
+                  ┌─────────────────────┼─────────────────────┬──────────────────────┐
+            aji_trt.dll          aji_trtrtx.dll          aji_dml.dll          aji_vk.dll   (Windows only)
+          TensorRT + CUDA     TensorRT for RTX + CUDA   DirectML + D3D12   aji_dml + Vulkan kernels
 ```
 
 `[global] backend=` picks the library: `DirectML` (or the retired `NCNN`) -> `aji_dml`,
 `TensorRT-RTX` (also `TensorRT_RTX`, `TRT-RTX`, `TRTRTX`; case-insensitive) -> `aji_trtrtx`,
-anything else -> `aji_trt`. The image ABI selects it with `AJI_IMG_TENSORRT_RTX`.
+`Vulkan` (also `VK`) -> `aji_vk` (built with `AJI_VULKAN` only; in development, see "The Vulkan
+backend"), anything else -> `aji_trt`. The image ABI selects it with `AJI_IMG_TENSORRT_RTX`.
 
 **`aji_trtrtx` is `aji_trt`'s sources compiled with `AJI_TRTRTX`** against the TensorRT for
 RTX SDK; every difference lives in `core/trt_engine` (plus a few `#ifdef`s for log wording and
@@ -234,6 +235,47 @@ on an RTX 5090 it runs SPANF3 Performance 1080p→4K in ~2.0 ms vs ~3.6 ms on Te
 58.6 dB vs ORT fp16 (`experimental/native-span/README.md` has the numbers and the NeoRTX
 comparison). Tile variants are only tuned on the 5090.
 
+### The Vulkan backend (`aji_vk`, in development)
+
+The native kernels on Vulkan, for GPUs without the CUDA native path (AMD, Intel, RTX 20, later
+Linux and Android). Plan, phases and measurements: animejan.ai-site
+`plans/vulkan-backend/plan.md`. Built with `AJI_VULKAN=ON`; not shipped yet.
+
+- **`src/vk/vk.h`:** the Vulkan entry points, loaded at run time from `vulkan-1.dll` /
+  `libvulkan.so.1` (nothing links a Vulkan SDK), on one process-wide instance.
+- **`vk/device`:** a device by index or by the D3D11 adapter's LUID; which kernel family it runs
+  (`AJI_VK_FAMILY=cm16|sg16` overrides); buffers; one-shot and frame submits; pipelines from the
+  embedded SPIR-V. Its variant and pipeline caches go in the model directory as
+  `aji-vk-<vendor>-<device>-<driver>.variants` / `.vkcache` (`AJI_VK_RETUNE=1` times again).
+- **`vk/kernels`, `src/vk/shaders`:** the fused conv and concat kernels of a `Plan`, with the CUDA
+  kernels' semantics, in two families:
+  - **cm16:** `VK_KHR_cooperative_matrix` 16x16x16 with fp16 accumulate (NVIDIA Ampere+, AMD
+    RDNA3/4). The epilogue runs on the accumulators: bias, slopes and the attention bias load as
+    matrices with every row the same vector, a gate's block input loads from its feature buffer,
+    and activations are element-wise. That needs the slack after each feature buffer.
+  - **sg16:** register-blocked with the subgroup pinned to 16 lanes (Intel Xe, Mali); fp16 per tap,
+    then fp32.
+
+  `shaders.txt` lists exactly the modules built (phase 1: what SPANF3 Performance and Compact lower
+  to); a step whose module isn't there refuses the model.
+- **`vk/executor`:** the `Plan` on the device, from the shared `native/layout`. Each kernel's tile
+  variant is timed once per size (identical steps share the timing) and stored. `bind_io` points
+  the model input and output at caller-owned buffers.
+- **`aji_vk` (Windows) is `aji_dml.cpp` built with `AJI_VULKAN`,** as `aji_trtrtx` is `aji_trt`'s
+  sources with a define. The D3D12 frame pipeline is DirectML's: plane copies, pre/post, resizes,
+  the ticket API. Each model step that lowers runs on the Vulkan executor; the others run on
+  DirectML, so the fallback is per model. The log line is `Native kernels: <model> (...; Vulkan
+  cm16)`, or `Native kernels not used for <model>: <why>; using DirectML`.
+  - The chain buffers are shared D3D12 buffers imported into Vulkan (`import_d3d12_buffer`).
+  - Hand-offs use a shared D3D12 fence imported as a timeline semaphore: D3D12 signals, Vulkan
+    waits, runs the model and signals, and D3D12 waits.
+  - Frames are never imported as textures: a shared D3D11 NV12 texture imported straight into
+    Vulkan reads wrong chroma on NVIDIA, and Intel allows no arrays.
+- **`aji_vk_model_test`** (by hand): one model on the executor, timed, against the fp32 CPU
+  reference of its plan (`sanity/native_ref.h`), and against the CUDA executor when built with CUDA.
+  `aji_vk_model_test list` prints the devices and families. `aji_harness_dml --adapter N` runs a
+  chain on another GPU, e.g. the iGPU.
+
 ## Build system
 
 CMake only (`cmake_minimum_required(VERSION 3.24)`, C11 / C++17, `LANGUAGES C CXX`, with CUDA
@@ -254,8 +296,11 @@ error, not a skip) and embeds them as SPIR-V (`cmake/aji_spirv.cmake`). The modu
 in `src/vk/shaders/shaders.txt`, one per line: name, shader file, `-D` defines. One shader
 file makes many modules (its structural variants), and the generated table is `vk/spirv.h`'s
 `kSpirvModules`. On Windows, MSYS2's `mingw-w64-ucrt-x86_64-shaderc` glslc works; the
-Android NDK's shaderc (2022) predates `GL_KHR_cooperative_matrix`. CI doesn't build it yet. A
-build without CUDA and with the shaders:
+Android NDK's shaderc (2022) predates `GL_KHR_cooperative_matrix`. It also builds `aji_vk_core`,
+`aji_vk_model_test` and, on Windows, `aji_vk`. Those need the Vulkan headers: from the Vulkan
+SDK, or `AJI_VK_INCLUDE` (a directory holding `vulkan/vulkan_core.h`). Don't point it at all of
+MSYS2's `include`, which would shadow MSVC's C headers; copy `vulkan/` and `vk_video/` out. CI
+doesn't build `AJI_VULKAN` yet. A build without CUDA and with the shaders:
 
 ```
 cmake -S . -B build-nocuda -G Ninja -DAJI_CUDA=OFF -DAJI_VULKAN=ON -DAJI_GLSLC=<glslc> \
@@ -309,6 +354,9 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_native_layout_test` | EXE | — | CPU-only check of `native/layout`: size checks, padding, feature-buffer reuse |
 | `aji_vk_shaders` | OBJECT | — | **`AJI_VULKAN` only**: the embedded SPIR-V table (`vk/spirv.h`) |
 | `aji_vk_spirv_test` | EXE | — | **`AJI_VULKAN` only**: CPU check that each embedded module is well-formed SPIR-V with its family's capabilities |
+| `aji_vk_core` | OBJECT | — (Vulkan loaded at run time) | **`AJI_VULKAN` only**: `src/vk` device, kernels, executor |
+| `aji_vk` | SHARED | `d3d12 d3d11 dxgi d3dcompiler` | **`AJI_VULKAN` + WIN32 only**: `aji_dml.cpp` with `AJI_VULKAN`, model steps on the Vulkan executor |
+| `aji_vk_model_test` | EXE | — | **`AJI_VULKAN` only**, by hand: one model on the Vulkan executor against the fp32 CPU reference (and the CUDA executor with `AJI_CUDA`) |
 | `aji_native_conv_test` | EXE | `aji_native`, `CUDA::cudart` | every native kernel against a CPU reference (sm_80+, skips below) |
 | `aji_native_bench` | EXE | `aji_native`, `CUDA::cudart` | **EXCLUDE_FROM_ALL**; whole-model native timing on `experimental/native-span` data |
 
