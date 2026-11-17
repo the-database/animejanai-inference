@@ -93,6 +93,19 @@ jobs:
         run: |
           ctest --test-dir build -L cpu --output-on-failure
           echo 'GPU tests (`ctest -L gpu`, aji_kernel_test, the harnesses) were built but not run: no GPU on hosted runners.' >> "$GITHUB_STEP_SUMMARY"
+      # aji_encode loads CUDA when first used (encode_cuda_dl.h): it must not need libcuda /
+      # libcudart to start, and the runner has no NVIDIA driver, so it can show that it doesn't
+      - name: aji_encode starts without the NVIDIA driver
+        run: |
+          if readelf -d build/aji_encode | grep -E 'NEEDED.*lib(cuda|cudart)[.]so'; then
+            echo "aji_encode links CUDA directly"; exit 1
+          fi
+          export LD_LIBRARY_PATH="$FFMPEG_ROOT/lib:$PWD/build"
+          set +e
+          ./build/aji_encode --help > /dev/null 2>&1; r=$?
+          [ "$r" -lt 128 ] || { echo "aji_encode --help died ($r)"; exit 1; }
+          ./build/aji_encode --probe-encoders; r=$?
+          [ "$r" -lt 128 ] || { echo "aji_encode --probe-encoders died ($r)"; exit 1; }
 
   # The Vulkan backend (AJI_VULKAN=ON, in development) without CUDA: every shader compiled and
   # checked (aji_vk_spirv_test in ctest -L cpu), libaji_vk.so and the Vulkan tools built, and

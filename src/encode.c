@@ -30,7 +30,8 @@
  *
  * --backend vulkan (the conf must say backend=Vulkan): the same, on Vulkan
  * frames from libav Vulkan pools on libav's Vulkan device, which libaji
- * takes with aji_create_vk (Linux AMD / Intel; Windows too).
+ * takes with aji_create_vk (Linux AMD / Intel; Windows too). On Linux CUDA
+ * is loaded when first used (encode_cuda_dl.h), so this runs without it.
  */
 
 #include <limits.h>
@@ -40,8 +41,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef AJI_ENCODE_CUDA_DL
+#include "encode_cuda_dl.h"   /* Linux: CUDA loaded when first used */
+#else
 #include <cuda.h>
 #include <cuda_runtime.h>
+#endif
 
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>

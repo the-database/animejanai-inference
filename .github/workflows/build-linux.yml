@@ -92,6 +92,11 @@ jobs:
         patchelf --set-rpath '$ORIGIN' stage-encode/aji_encode stage-encode/lib*.so.*
         chmod +x stage-encode/aji_encode
         ldd stage-encode/aji_encode | grep -E 'libav|libsw|not found' || true
+        # CUDA is loaded when first used: a NEEDED libcuda / libcudart would stop it starting
+        # without the NVIDIA driver (--backend vulkan)
+        if readelf -d stage-encode/aji_encode | grep -E 'NEEDED.*lib(cuda|cudart)\.so'; then
+          echo "aji_encode links CUDA directly"; exit 1
+        fi
         tar --zstd -C stage-encode -cf aji-encode-linux-x64.tar.zst .
 
     # allowUpdates: the Windows zips may already be on the release; check-tag has made sure

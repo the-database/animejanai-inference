@@ -327,8 +327,13 @@ else()
     if(FFMPEG_FOUND)
         find_package(Threads REQUIRED)    # --preview-session's stdin reader
         add_executable(aji_encode src/encode.c)
+        # CUDA is loaded when first used (encode_cuda_dl.h), as /DELAYLOAD does on Windows: the
+        # binary starts without the NVIDIA driver (--backend vulkan on AMD / Intel)
+        target_compile_definitions(aji_encode PRIVATE AJI_ENCODE_CUDA_DL=1
+            AJI_CUDART_SOVER="${CUDAToolkit_VERSION_MAJOR}")
+        target_include_directories(aji_encode SYSTEM PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(aji_encode PRIVATE
-            aji CUDA::cudart CUDA::cuda_driver PkgConfig::FFMPEG Threads::Threads)
+            aji ${CMAKE_DL_LIBS} PkgConfig::FFMPEG Threads::Threads)
         add_dependencies(aji_encode aji_trt)
         set_target_properties(aji_encode PROPERTIES
             BUILD_RPATH "${AJI_TRT_LIB};$<TARGET_FILE_DIR:aji>")
