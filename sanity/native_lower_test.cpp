@@ -263,9 +263,42 @@ int main()
         CHECK(!lower_bytes(g.bytes("input", "y"), &p, &why) && why.find("3x3") != std::string::npos);
     }
     {
-        G g;  // ends without depth-to-space
-        const std::string y = g.conv(g.op1("Relu", g.conv("input", 3, 48, 3)), 48, 3, 3);
+        G g;  // ends without depth-to-space, not in RGB
+        const std::string y = g.conv(g.op1("Relu", g.conv("input", 3, 48, 3)), 48, 6, 3);
         CHECK(!lower_bytes(g.bytes("input", y), &p, &why) && !why.empty());
+    }
+
+    // output forms: 1x (the last conv's 3 channels are the output), 3x, a final Clip(0, 1)
+    {
+        G g;
+        const std::string y = g.conv(g.op1("Relu", g.conv("input", 3, 48, 3)), 48, 3, 3);
+        CHECK(lower_bytes(g.bytes("input", y), &p, &why));
+        CHECK(p.depth_to_space == 1 && p.steps.back().out == 3 && p.steps.back().dst == kModelOutput && !p.out_clamp);
+    }
+    for (bool clip : {false, true}) {
+        G g;
+        const std::string t = g.conv(g.op1("Relu", g.conv("input", 3, 48, 3)), 48, 27, 3);
+        std::string y = g.fresh("d2s");
+        g.node("DepthToSpace", {t}, {y}, {attr_i("blocksize", 3)});
+        if (clip) {
+            g.init(tensor("lo", {}, 1, 0.f));
+            g.init(tensor("hi", {}, 1, 1.f));
+            const std::string c = g.fresh("clip");
+            g.node("Clip", {y, "lo", "hi"}, {c});
+            y = c;
+        }
+        CHECK(lower_bytes(g.bytes("input", y), &p, &why));
+        CHECK(p.depth_to_space == 3 && p.steps.back().out == 4 && p.steps.back().out_clamp == clip && p.out_clamp == clip);
+    }
+    {
+        G g;  // Clip to another range: refused
+        const std::string t = g.conv(g.conv("input", 3, 48, 3), 48, 12, 3);
+        const std::string d = g.fresh("d2s");
+        g.node("DepthToSpace", {t}, {d}, {attr_i("blocksize", 2)});
+        g.init(tensor("lo2", {}, 1, -1.f));
+        g.init(tensor("hi2", {}, 1, 1.f));
+        g.node("Clip", {d, "lo2", "hi2"}, {"y"});
+        CHECK(!lower_bytes(g.bytes("input", "y"), &p, &why) && !why.empty());
     }
     {
         std::string bad = "not a model";

@@ -49,7 +49,7 @@ cudaError_t upload(Weights &out, const uint16_t *w, const float *bias, const flo
 void release(Weights &w);
 
 // One fused 3x3 convolution. Channel counts are the logical ones: an NCHW3 input has cin 3,
-// an unshuffled one 12; a DepthToSpace2 output has cout 12, DepthToSpace4 48.
+// an unshuffled one 12; a DepthToSpace1 / 2 / 3 / 4 output has cout 3 / 12 / 27 / 48.
 struct Conv3x3 {
     Input in = Input::NHWC;
     Act act = Act::None;
@@ -61,6 +61,7 @@ struct Conv3x3 {
     // NCHW inputs: the model input normalized as it is loaded, (x - in_mean[c]) * in_scale[c]
     bool in_norm = false;
     float in_mean[3] = {0.f, 0.f, 0.f}, in_scale[3] = {1.f, 1.f, 1.f};
+    bool out_clamp = false;  // depth-to-space outputs: clamp to [0, 1]
 };
 
 // H, W: the conv's resolution (an unshuffled input is 2H x 2W). src: NHWC [H][W][cin] or NCHW

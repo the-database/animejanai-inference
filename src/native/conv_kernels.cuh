@@ -31,6 +31,7 @@ struct ConvParams {
     // the model input normalized as it is loaded: (x - in_mean[c]) * in_scale[c] (NCHW inputs)
     int in_norm;
     float in_mean[3], in_scale[3];
+    int out_clamp;  // depth-to-space outputs: clamp to [0, 1] (after the input is added)
 };
 
 struct ConcatParams {
@@ -268,7 +269,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
     } else {
         // depth-to-space by R (PyTorch PixelShuffle / ONNX DepthToSpace CRD): channel
         // c*R*R + ry*R + rx -> dst[c][R*y + ry][R*x + rx], plus the model input when given
-        constexpr int R = OUT == 1 ? 2 : 4, CPO = TW * R / 8;  // 8-column output chunks per row
+        constexpr int R = OUT == 1 ? 2 : OUT == 2 ? 4 : OUT == 3 ? 1 : 3, CPO = (TW * R + 7) / 8;  // 8-column chunks per row
         static_assert(COUTP >= 3 * R * R, "depth-to-space needs 3*R*R channels");
         const int OH = R * H, OW = R * W;
         const bool add = p.resid != nullptr;
@@ -280,18 +281,20 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
             __align__(16) half o[8];
 #pragma unroll
             for (int e = 0; e < 8; e++) {
-                const int lx = (8 * k + e) / R, rx = (8 * k + e) % R, ox = tx0 + lx;
+                const int lx = min((8 * k + e) / R, TW - 1), rx = (8 * k + e) % R, ox = tx0 + lx;
                 half v = sm[(r * TW + lx) * SP + c * R * R + ry * R + rx];
                 if (add && ox < W) v = __hadd(v, __ldg(p.resid + ((size_t)c * H + oy) * W + ox));
+                if (p.out_clamp) v = __hmin(__hmax(v, __float2half(0.f)), __float2half(1.f));
                 o[e] = v;
             }
             half *d = p.dst + ((size_t)c * OH + R * oy + ry) * OW + col0;
-            if (col0 + 8 <= OW && (OW % 8) == 0) {
+            const int tile_end = R * (tx0 + TW);  // columns of this tile only
+            if (col0 + 8 <= OW && col0 + 8 <= tile_end && (OW % 8) == 0) {
                 *reinterpret_cast<uint4 *>(d) = *reinterpret_cast<uint4 *>(o);
             } else {
 #pragma unroll
                 for (int e = 0; e < 8; e++)
-                    if (col0 + e < OW) d[e] = o[e];
+                    if (col0 + e < OW && col0 + e < tile_end) d[e] = o[e];
             }
         }
     }

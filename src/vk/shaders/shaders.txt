@@ -716,3 +716,39 @@ g3_plain_o64_n2a0r0u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2
 fr_tdiff       frame_temporal.comp  PASS=1
 fr_tgather     frame_temporal.comp  PASS=2
 fr_diff        frame_diff.comp
+c3_cm16_i32_o16_n0a0g0o3_w8r2  conv3x3_cm16.comp  CINP=32 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 WARPS=8 WR=2
+c3_cm16_i32_o32_n0a0g0o4_w8r2  conv3x3_cm16.comp  CINP=32 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 WARPS=8 WR=2
+c3_cm16_i32_o16_n0a0g0o3_w4r4  conv3x3_cm16.comp  CINP=32 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 WARPS=4 WR=4
+c3_cm16_i32_o32_n0a0g0o4_w4r4  conv3x3_cm16.comp  CINP=32 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 WARPS=4 WR=4
+c3_cm16_i48_o16_n0a0g0o3_w8r2  conv3x3_cm16.comp  CINP=48 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 WARPS=8 WR=2
+c3_cm16_i48_o32_n0a0g0o4_w8r2  conv3x3_cm16.comp  CINP=48 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 WARPS=8 WR=2
+c3_cm16_i48_o16_n0a0g0o3_w4r4  conv3x3_cm16.comp  CINP=48 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 WARPS=4 WR=4
+c3_cm16_i48_o32_n0a0g0o4_w4r4  conv3x3_cm16.comp  CINP=48 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 WARPS=4 WR=4
+c3_cm16_i64_o16_n0a0g0o3_w8r2  conv3x3_cm16.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 WARPS=8 WR=2
+c3_cm16_i64_o32_n0a0g0o4_w8r2  conv3x3_cm16.comp  CINP=64 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 WARPS=8 WR=2
+c3_cm16_i64_o16_n0a0g0o3_w4r4  conv3x3_cm16.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 WARPS=4 WR=4
+c3_cm16_i64_o32_n0a0g0o4_w4r4  conv3x3_cm16.comp  CINP=64 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 WARPS=4 WR=4
+c3_sg16_i32_o16_n0a0g0o3_t8r1  conv3x3_sg16.comp  CINP=32 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=8 RPS=1
+c3_sg16_i32_o32_n0a0g0o4_t8r1  conv3x3_sg16.comp  CINP=32 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=8 RPS=1
+c3_sg16_i32_o16_n0a0g0o3_t4r1  conv3x3_sg16.comp  CINP=32 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=4 RPS=1
+c3_sg16_i32_o32_n0a0g0o4_t4r1  conv3x3_sg16.comp  CINP=32 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=4 RPS=1
+c3_sg16_i48_o16_n0a0g0o3_t8r1  conv3x3_sg16.comp  CINP=48 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=8 RPS=1
+c3_sg16_i48_o32_n0a0g0o4_t8r1  conv3x3_sg16.comp  CINP=48 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=8 RPS=1
+c3_sg16_i48_o16_n0a0g0o3_t4r1  conv3x3_sg16.comp  CINP=48 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=4 RPS=1
+c3_sg16_i48_o32_n0a0g0o4_t4r1  conv3x3_sg16.comp  CINP=48 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=4 RPS=1
+c3_sg16_i64_o16_n0a0g0o3_t8r1  conv3x3_sg16.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=8 RPS=1
+c3_sg16_i64_o32_n0a0g0o4_t8r1  conv3x3_sg16.comp  CINP=64 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=8 RPS=1
+c3_sg16_i64_o16_n0a0g0o3_t4r1  conv3x3_sg16.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=4 RPS=1
+c3_sg16_i64_o32_n0a0g0o4_t4r1  conv3x3_sg16.comp  CINP=64 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=4 RPS=1
+c3_plain_i32_o16_n0a0g0o3_t8r1  conv3x3_plain.comp  CINP=32 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=8 RPS=1
+c3_plain_i32_o32_n0a0g0o4_t8r1  conv3x3_plain.comp  CINP=32 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=8 RPS=1
+c3_plain_i32_o16_n0a0g0o3_t4r1  conv3x3_plain.comp  CINP=32 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=4 RPS=1
+c3_plain_i32_o32_n0a0g0o4_t4r1  conv3x3_plain.comp  CINP=32 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=4 RPS=1
+c3_plain_i48_o16_n0a0g0o3_t8r1  conv3x3_plain.comp  CINP=48 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=8 RPS=1
+c3_plain_i48_o32_n0a0g0o4_t8r1  conv3x3_plain.comp  CINP=48 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=8 RPS=1
+c3_plain_i48_o16_n0a0g0o3_t4r1  conv3x3_plain.comp  CINP=48 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=4 RPS=1
+c3_plain_i48_o32_n0a0g0o4_t4r1  conv3x3_plain.comp  CINP=48 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=4 RPS=1
+c3_plain_i64_o16_n0a0g0o3_t8r1  conv3x3_plain.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=8 RPS=1
+c3_plain_i64_o32_n0a0g0o4_t8r1  conv3x3_plain.comp  CINP=64 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=8 RPS=1
+c3_plain_i64_o16_n0a0g0o3_t4r1  conv3x3_plain.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=3 TH=4 RPS=1
+c3_plain_i64_o32_n0a0g0o4_t4r1  conv3x3_plain.comp  CINP=64 COUTP=32 IN=0 ACT=0 GATE=0 OUT=4 TH=4 RPS=1
