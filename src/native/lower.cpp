@@ -2,9 +2,12 @@
 #include "native/lower.h"
 #include "native/ops.h"
 #include "native/pack.h"
+#include "native/static_eval.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <memory>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -96,8 +99,30 @@ struct Lowerer {
             const OnnxAttr *v = node(p->second).attr("value");
             if (v && v->type == 4) return &v->t;
         }
-        return nullptr;
+        // a constant the exporter left unfolded (an Unsqueeze / Reshape / Cast ... of initializers,
+        // e.g. a PReLU slope): evaluated on the host, once
+        if (p == prod.end() || data.count(canon(name))) return nullptr;
+        auto f = folded.find(name);
+        if (f != folded.end()) return f->second.dims.empty() && f->second.raw.empty() ? nullptr : &f->second;
+        OnnxTensor &t = folded[name];
+        if (!rd) rd.reset(new onnxread::Reader(g));
+        if (!se) se.reset(new static_eval::StaticEval(*rd));
+        static_eval::HT h;
+        if (!se->eval(name, &h)) return nullptr;
+        t.name = name;
+        t.dtype = 1;  // FLOAT
+        t.dims = h.dims;
+        t.raw.resize(h.v.size() * 4);
+        for (size_t i = 0; i < h.v.size(); i++) {
+            const float x = (float)h.v[i];
+            std::memcpy(&t.raw[i * 4], &x, 4);
+        }
+        if (t.dims.empty() && h.v.size() != 1) return nullptr;
+        return &t;
     }
+    std::map<std::string, OnnxTensor> folded;   // constant(): host-evaluated constants
+    std::unique_ptr<onnxread::Reader> rd;
+    std::unique_ptr<static_eval::StaticEval> se;
     bool scalar(const std::string &name, float *v)
     {
         auto p = prod.find(name);

@@ -320,6 +320,10 @@ std::unique_ptr<ImgNet> ImgNet::create(const OnnxGraph &g, int max_w, int max_h,
     // the conv nets the video path lowers (SPAN, SPANF3, Compact), on the executor
     std::string w5;
     if (auto n = build_lowered(g, max_w, max_h, s, &w5)) return n;
+    // AJI_NATIVE_WHY=1: every family's reason on stderr (which one a model nearly is)
+    if (const char *v = getenv("AJI_NATIVE_WHY"); v && *v == '1')
+        fprintf(stderr, "native: esrgan: %s\nnative: fdat: %s\nnative: hat: %s\nnative: dat: %s\nnative: lowered: %s\n", w.c_str(), w2.c_str(),
+                w3.c_str(), w4.c_str(), w5.c_str());
     // the reason of the family the graph belongs to (the others say "not a ... graph"); the
     // lowering's when it is none of them
     if (why)
