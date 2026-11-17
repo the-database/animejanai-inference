@@ -3,7 +3,10 @@
 #ifndef AJI_NATIVE_ONNX_READ_H
 #define AJI_NATIVE_ONNX_READ_H
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <iterator>
 #include <map>
 #include <string>
 #include <vector>
@@ -48,17 +51,128 @@ struct Reader {
         auto it = by_name.find(name);
         return it == by_name.end() ? nullptr : it->second;
     }
-    const OnnxTensor *tensor(const std::string &name) const
+    const OnnxTensor *tensor(const std::string &name) const { return tensor_at(name, 0); }
+
+private:
+    // Constants an exporter left unfolded: Identity / Cast / Unsqueeze / Squeeze / Reshape /
+    // Flatten / Transpose of a constant (weights passed through Identity, transposed MatMul
+    // weights), folded on the host once (fp32).
+    mutable std::map<std::string, OnnxTensor> folded_;
+    const OnnxTensor *tensor_at(const std::string &name, int depth) const
     {
         auto it = g.inits.find(name);
         if (it != g.inits.end()) return &it->second;
         auto p = prod.find(name);
-        if (p != prod.end() && p->second->op == "Constant") {
-            const OnnxAttr *v = p->second->attr("value");
-            if (v && v->type == 4) return &v->t;
+        if (p == prod.end()) return nullptr;
+        const OnnxNode &n = *p->second;
+        if (n.op == "Constant") {
+            const OnnxAttr *v = n.attr("value");
+            return v && v->type == 4 ? &v->t : nullptr;
         }
-        return nullptr;
+        static const char *const kFold[] = {"Identity", "Cast", "Unsqueeze", "Squeeze", "Reshape", "Flatten", "Transpose"};
+        if (depth > 16 || n.in.empty() || n.out.empty() || std::none_of(std::begin(kFold), std::end(kFold), [&](const char *o) { return n.op == o; }))
+            return nullptr;
+        auto f = folded_.find(name);
+        if (f != folded_.end()) return f->second.raw.empty() ? nullptr : &f->second;
+        OnnxTensor &t = folded_[name];
+        const OnnxTensor *src = tensor_at(n.in[0], depth + 1);
+        std::vector<float> v;
+        if (!src || src->count() == OnnxTensor::kBadCount || !src->floats(&v)) return nullptr;
+        std::vector<int64_t> dims = src->dims;
+        if (n.op == "Transpose") {
+            const OnnxAttr *pa = n.attr("perm");
+            const size_t r = dims.size();
+            std::vector<int64_t> perm(r);
+            for (size_t k = 0; k < r; k++) perm[k] = (int64_t)(r - 1 - k);
+            if (pa && !pa->ints.empty()) perm = pa->ints;
+            if (perm.size() != r || r > 6) return nullptr;
+            std::vector<int64_t> od(r), sstr(r, 1), ostr(r, 1);
+            for (size_t k = 0; k < r; k++) {
+                if (perm[k] < 0 || perm[k] >= (int64_t)r) return nullptr;
+                od[k] = dims[(size_t)perm[k]];
+            }
+            for (int k = (int)r - 2; k >= 0; k--) sstr[k] = sstr[k + 1] * dims[k + 1];
+            for (int k = (int)r - 2; k >= 0; k--) ostr[k] = ostr[k + 1] * od[k + 1];
+            std::vector<float> o(v.size());
+            for (size_t i = 0; i < v.size(); i++) {
+                size_t rem = i, si = 0;
+                for (size_t k = 0; k < r; k++) {
+                    const size_t c = rem / (size_t)ostr[k];
+                    rem %= (size_t)ostr[k];
+                    si += c * (size_t)sstr[(size_t)perm[k]];
+                }
+                o[i] = v[si];
+            }
+            v.swap(o);
+            dims = od;
+        } else if (n.op == "Unsqueeze" || n.op == "Squeeze" || n.op == "Reshape" || n.op == "Flatten") {
+            // the data stays; the dims follow the op (Reshape: its shape input, 0 = keep, -1 = rest)
+            std::vector<int64_t> axes;
+            const OnnxAttr *aa = n.attr("axes");
+            if (aa) axes = aa->ints;
+            else if (n.in.size() > 1 && !n.in[1].empty()) {
+                const OnnxTensor *at = tensor_at(n.in[1], depth + 1);
+                if (!at || !at->ints(&axes)) return nullptr;
+            }
+            if (n.op == "Reshape") {
+                std::vector<int64_t> sh = axes, out;
+                if (aa) return nullptr;  // Reshape takes its shape as an input
+                int64_t known = 1, neg = -1;
+                for (size_t k = 0; k < sh.size(); k++) {
+                    int64_t d = sh[k] == 0 && k < dims.size() ? dims[k] : sh[k];
+                    if (d == -1) {
+                        if (neg >= 0) return nullptr;
+                        neg = (int64_t)k;
+                    } else if (d < 0) {
+                        return nullptr;
+                    } else {
+                        known *= d;
+                    }
+                    out.push_back(d);
+                }
+                if (neg >= 0) {
+                    if (known == 0 || (int64_t)v.size() % known) return nullptr;
+                    out[(size_t)neg] = (int64_t)v.size() / known;
+                }
+                dims = out;
+            } else if (n.op == "Flatten") {
+                const int64_t ax = n.attr_i("axis", 1);
+                int64_t a = 1;
+                for (int64_t k = 0; k < ax && k < (int64_t)dims.size(); k++) a *= dims[(size_t)k];
+                dims = {a, a ? (int64_t)v.size() / a : 0};
+            } else if (n.op == "Squeeze") {
+                std::vector<int64_t> out;
+                for (size_t k = 0; k < dims.size(); k++) {
+                    const bool drop = axes.empty() ? dims[k] == 1
+                                                   : std::any_of(axes.begin(), axes.end(), [&](int64_t x) {
+                                                         return (x < 0 ? x + (int64_t)dims.size() : x) == (int64_t)k;
+                                                     });
+                    if (!drop) out.push_back(dims[k]);
+                }
+                dims = out;
+            } else {
+                const int64_t r = (int64_t)(dims.size() + axes.size());
+                std::vector<int64_t> out;
+                size_t src_k = 0;
+                for (int64_t k = 0; k < r; k++) {
+                    const bool ins = std::any_of(axes.begin(), axes.end(), [&](int64_t x) { return (x < 0 ? x + r : x) == k; });
+                    out.push_back(ins ? 1 : (src_k < dims.size() ? dims[src_k++] : 1));
+                }
+                dims = out;
+            }
+        }
+        size_t cnt = 1;
+        for (int64_t d : dims) cnt *= (size_t)(d < 0 ? 0 : d);
+        if (cnt != v.size()) return nullptr;
+        t.name = name;
+        t.dtype = 1;
+        t.dims = dims;
+        t.raw.resize(v.size() * 4);
+        if (!v.empty()) std::memcpy(t.raw.data(), v.data(), v.size() * 4);
+        return &t;
     }
+
+public:
     bool floats(const std::string &name, std::vector<float> *out) const
     {
         const OnnxTensor *t = tensor(name);

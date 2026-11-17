@@ -442,13 +442,15 @@ target_include_directories(aji_held_test PRIVATE include src)
 target_link_libraries(aji_held_test PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(aji_runtime_packs_test PRIVATE ${CMAKE_DL_LIBS})
 
-# Native path, host only: the packing, the ONNX lowering and the layout, on the CPU.
+# Native path, host only: the packing, the ONNX lowering, the layout and the export forms, on the CPU.
 add_executable(aji_native_pack_test sanity/native_pack_test.cpp src/native/pack.cpp)
 target_include_directories(aji_native_pack_test PRIVATE src)
 add_executable(aji_native_lower_test sanity/native_lower_test.cpp $<TARGET_OBJECTS:aji_native_host>)
 target_include_directories(aji_native_lower_test PRIVATE src)
 add_executable(aji_native_layout_test sanity/native_layout_test.cpp $<TARGET_OBJECTS:aji_native_host>)
 target_include_directories(aji_native_layout_test PRIVATE src)
+add_executable(aji_native_forms_test sanity/native_forms_test.cpp $<TARGET_OBJECTS:aji_native_host>)
+target_include_directories(aji_native_forms_test PRIVATE src)
 
 if(AJI_CUDA)
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
@@ -639,7 +641,7 @@ enable_testing()
 add_executable(aji_rife_conf_test sanity/rife_conf_test.cpp src/aji_conf.cpp)
 target_include_directories(aji_rife_conf_test PRIVATE src)
 set(_cpu_tests aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
-               aji_held_test aji_native_pack_test aji_native_lower_test aji_native_layout_test)
+               aji_held_test aji_native_pack_test aji_native_lower_test aji_native_layout_test aji_native_forms_test)
 if(AJI_CUDA)
     # CPU-only, but compiled with nvcc
     list(APPEND _cpu_tests aji_native_onnx_test)

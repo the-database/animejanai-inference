@@ -239,6 +239,160 @@ private:
                 }
                 for (size_t e = 0; e < inner; e++) o->v[q * inner + e] = in[0].v[off * inner + e];
             }
+        } else if (n.op == "Gather") {  // the table lookup of the legacy exports' position bias
+            if (!need(2) || in[0].dims.empty()) return false;
+            const int64_t r = (int64_t)in[0].dims.size();
+            int64_t axis = n.attr_i("axis", 0);
+            if (axis < 0) axis += r;
+            if (axis < 0 || axis >= r) return false;
+            std::vector<int64_t> ix;
+            if (!to_ints(in[1], &ix)) return false;
+            size_t outer = 1, inner = 1;
+            for (int64_t i = 0; i < axis; i++) outer *= (size_t)in[0].dims[i];
+            for (int64_t i = axis + 1; i < r; i++) inner *= (size_t)in[0].dims[i];
+            const int64_t dim = in[0].dims[axis];
+            o->dims.assign(in[0].dims.begin(), in[0].dims.begin() + axis);
+            o->dims.insert(o->dims.end(), in[1].dims.begin(), in[1].dims.end());
+            o->dims.insert(o->dims.end(), in[0].dims.begin() + axis + 1, in[0].dims.end());
+            if (numel(o->dims) > kMaxEval) return false;
+            o->v.assign(outer * ix.size() * inner, 0.0);
+            for (size_t a = 0; a < outer; a++)
+                for (size_t q = 0; q < ix.size(); q++) {
+                    int64_t x = ix[q];
+                    if (x < 0) x += dim;
+                    if (x < 0 || x >= dim) return false;
+                    for (size_t e = 0; e < inner; e++)
+                        o->v[(a * ix.size() + q) * inner + e] = in[0].v[(a * (size_t)dim + (size_t)x) * inner + e];
+                }
+        } else if (n.op == "Squeeze") {
+            if (!need(1)) return false;
+            std::vector<int64_t> ax;
+            if (in.size() > 1 && have[1]) {
+                if (!to_ints(in[1], &ax)) return false;
+            } else if (const OnnxAttr *a = n.attr("axes")) {
+                ax = a->ints;
+            }
+            const int64_t r = (int64_t)in[0].dims.size();
+            std::vector<bool> drop(r, false);
+            for (int64_t a : ax) {
+                if (a < 0) a += r;
+                if (a < 0 || a >= r || in[0].dims[a] != 1) return false;
+                drop[a] = true;
+            }
+            *o = in[0];
+            o->dims.clear();
+            for (int64_t i = 0; i < r; i++)
+                if (!(ax.empty() ? in[0].dims[i] == 1 : drop[i])) o->dims.push_back(in[0].dims[i]);
+        } else if (n.op == "Flatten") {
+            if (!need(1)) return false;
+            const int64_t r = (int64_t)in[0].dims.size();
+            int64_t axis = n.attr_i("axis", 1);
+            if (axis < 0) axis += r;
+            if (axis < 0 || axis > r) return false;
+            int64_t a = 1;
+            for (int64_t i = 0; i < axis; i++) a *= in[0].dims[i];
+            *o = in[0];
+            o->dims = {a, a ? (int64_t)(in[0].v.size() / (size_t)a) : 0};
+        } else if (n.op == "Add" || n.op == "Sub" || n.op == "Mul" || n.op == "Div") {  // numpy broadcasting
+            if (!need(2)) return false;
+            const size_t r = std::max(in[0].dims.size(), in[1].dims.size());
+            std::vector<int64_t> da(r, 1), db(r, 1);
+            std::copy(in[0].dims.begin(), in[0].dims.end(), da.begin() + (r - in[0].dims.size()));
+            std::copy(in[1].dims.begin(), in[1].dims.end(), db.begin() + (r - in[1].dims.size()));
+            o->dims.resize(r);
+            for (size_t i = 0; i < r; i++) {
+                if (da[i] != db[i] && da[i] != 1 && db[i] != 1) return false;
+                o->dims[i] = std::max(da[i], db[i]);
+            }
+            if (numel(o->dims) > kMaxEval) return false;
+            o->v.assign(numel(o->dims), 0.0);
+            const char k = n.op[0];
+            std::vector<size_t> idx(r);
+            for (size_t e = 0; e < o->v.size(); e++) {
+                size_t rem = e, ia = 0, ib = 0, sa = 1, sb = 1;
+                for (int i = (int)r - 1; i >= 0; i--) {
+                    const size_t x = rem % (size_t)o->dims[i];
+                    rem /= (size_t)o->dims[i];
+                    ia += (da[i] == 1 ? 0 : x) * sa;
+                    ib += (db[i] == 1 ? 0 : x) * sb;
+                    sa *= (size_t)da[i];
+                    sb *= (size_t)db[i];
+                }
+                const double a = in[0].v[ia], b = in[1].v[ib];
+                o->v[e] = k == 'A' ? a + b : k == 'S' ? a - b : k == 'M' ? a * b : a / b;
+            }
+        } else if (n.op == "Sqrt" || n.op == "Neg" || n.op == "Abs" || n.op == "Exp" || n.op == "Erf" || n.op == "Sigmoid" || n.op == "Tanh") {
+            if (!need(1)) return false;
+            *o = in[0];
+            for (double &x : o->v)
+                x = n.op == "Sqrt" ? std::sqrt(x) : n.op == "Neg" ? -x : n.op == "Abs" ? std::fabs(x) : n.op == "Exp" ? std::exp(x)
+                    : n.op == "Erf" ? std::erf(x) : n.op == "Sigmoid" ? 1.0 / (1.0 + std::exp(-x)) : std::tanh(x);
+        } else if (n.op == "Pow") {
+            if (!need(2) || in[1].v.size() != 1) return false;  // a scalar exponent
+            *o = in[0];
+            const double e = in[1].v[0];
+            for (double &x : o->v) x = e == 2.0 ? x * x : e == 0.5 ? std::sqrt(x) : std::pow(x, e);
+        } else if (n.op == "ReduceMean" || n.op == "ReduceSum") {  // the spelled-out LayerNorm's means
+            if (!need(1) || in[0].dims.empty()) return false;
+            std::vector<int64_t> ax;
+            if (in.size() > 1 && have[1]) {
+                if (!to_ints(in[1], &ax)) return false;
+            } else if (const OnnxAttr *a = n.attr("axes")) {
+                ax = a->ints;
+            }
+            const int64_t r = (int64_t)in[0].dims.size();
+            std::vector<bool> red(r, ax.empty() && !n.attr_i("noop_with_empty_axes", 0));
+            for (int64_t a : ax) {
+                if (a < 0) a += r;
+                if (a < 0 || a >= r) return false;
+                red[a] = true;
+            }
+            const bool keep = n.attr_i("keepdims", 1) != 0;
+            std::vector<int64_t> od;
+            for (int64_t i = 0; i < r; i++)
+                if (!red[i]) od.push_back(in[0].dims[i]);
+                else if (keep) od.push_back(1);
+            o->dims = od;
+            o->v.assign(numel(od), 0.0);
+            std::vector<int64_t> kd(r);  // the kept dims (1 where reduced), for the output index
+            for (int64_t i = 0; i < r; i++) kd[i] = red[i] ? 1 : in[0].dims[i];
+            size_t cnt = 1;
+            for (int64_t i = 0; i < r; i++)
+                if (red[i]) cnt *= (size_t)in[0].dims[i];
+            for (size_t e = 0; e < in[0].v.size(); e++) {
+                size_t rem = e, oi = 0, st = 1;
+                for (int64_t i = r - 1; i >= 0; i--) {
+                    const size_t x = rem % (size_t)in[0].dims[i];
+                    rem /= (size_t)in[0].dims[i];
+                    oi += (red[i] ? 0 : x) * st;
+                    st *= (size_t)kd[i];
+                }
+                o->v[oi] += in[0].v[e];
+            }
+            if (n.op == "ReduceMean" && cnt)
+                for (double &x : o->v) x /= (double)cnt;
+        } else if (n.op == "Concat") {
+            if (in.empty() || !need(in.size()) || in[0].dims.empty()) return false;
+            const int64_t r = (int64_t)in[0].dims.size();
+            int64_t axis = n.attr_i("axis", 0);
+            if (axis < 0) axis += r;
+            if (axis < 0 || axis >= r) return false;
+            o->dims = in[0].dims;
+            o->dims[axis] = 0;
+            for (const HT &t : in) {
+                if ((int64_t)t.dims.size() != r) return false;
+                for (int64_t i = 0; i < r; i++)
+                    if (i != axis && t.dims[i] != in[0].dims[i]) return false;
+                o->dims[axis] += t.dims[axis];
+            }
+            size_t outer = 1;
+            for (int64_t i = 0; i < axis; i++) outer *= (size_t)in[0].dims[i];
+            o->v.clear();
+            for (size_t a = 0; a < outer; a++)
+                for (const HT &t : in) {
+                    const size_t blk = t.v.size() / outer;
+                    o->v.insert(o->v.end(), t.v.begin() + a * blk, t.v.begin() + (a + 1) * blk);
+                }
         } else {
             return false;
         }

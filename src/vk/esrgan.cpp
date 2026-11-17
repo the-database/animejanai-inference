@@ -193,8 +193,10 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
     e->gc = eg.gc;
     e->nb = eg.nb;
     const int nb = e->nb;
-    // the modules built (shaders.txt): 64 features, growth 32
-    if (e->nf != 64 || e->gc != 32) return refuse_(why, "ESRGAN with " + std::to_string(e->nf) + " features, growth " + std::to_string(e->gc) + " (Vulkan has 64 / 32)"), nullptr;
+    // the modules built (shaders.txt): 64 or 32 features, growth 32 or 16 (a missing one refuses below)
+    if (e->nf % 16 || e->gc % 16 || e->nf > 64 || e->gc > 64)
+        return refuse_(why, "ESRGAN with " + std::to_string(e->nf) + " features, growth " + std::to_string(e->gc)), nullptr;
+    const int nf = e->nf, gc = e->gc;
     if (e->nup_ > 3) return refuse_(why, "ESRGAN upsample stages"), nullptr;
     e->DS = e->nf + 4 * e->gc;
     e->scale_ = eg.scale();
@@ -253,7 +255,7 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
         return s;
     };
     const int in_mode = U == 1 ? 1 : U == 2 ? 2 : 3;
-    const int i_first = add_conv(c0, 1.f, U == 4 ? 48 : 16, shape(64, in_mode, 0, 0, 0, 0));
+    const int i_first = add_conv(c0, 1.f, U == 4 ? 48 : 16, shape(nf, in_mode, 0, 0, 0, 0));
     std::vector<int> i_dense;
     for (int i = 0; i < nb; i++)
         for (int r = 0; r < 3; r++)
@@ -262,26 +264,26 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
                 if (!rd.conv(eg.dense[(i * 3 + r) * 5 + k], &c, why)) return nullptr;
                 if (k < 4) {
                     if (!c.lrelu || c.stride != 1) return refuse_(why, "ESRGAN dense conv"), nullptr;
-                    i_dense.push_back(add_conv(c, 1.f, c.cin, shape(32, 0, 2, 0, 0, 0)));
+                    i_dense.push_back(add_conv(c, 1.f, c.cin, shape(gc, 0, 2, 0, 0, 0)));
                 } else {
                     if (c.lrelu) return refuse_(why, "ESRGAN RDB last conv"), nullptr;
                     const float sc = eg.rdb_scale[i * 3 + r] * (r == 2 ? eg.rrdb_scale[i] : 1.f);
-                    i_dense.push_back(add_conv(c, sc, e->DS, shape(64, 0, 0, r == 2 ? 2 : 1, 0, 0)));
+                    i_dense.push_back(add_conv(c, sc, e->DS, shape(nf, 0, 0, r == 2 ? 2 : 1, 0, 0)));
                 }
             }
     Conv cb, chr, cl;
     if (!rd.conv(eg.body, &cb, why) || !rd.conv(eg.hr, &chr, why) || !rd.conv(eg.last, &cl, why)) return nullptr;
     if (cb.lrelu || !chr.lrelu || cl.lrelu) return refuse_(why, "ESRGAN output activations"), nullptr;
-    const int i_body = add_conv(cb, 1.f, 64, shape(64, 0, 0, 1, 0, 0));
+    const int i_body = add_conv(cb, 1.f, nf, shape(nf, 0, 0, 1, 0, 0));
     std::vector<int> i_ups;
     for (const ajinative::OnnxNode *un : eg.ups) {
         Conv cu;
         if (!rd.conv(un, &cu, why)) return nullptr;
         if (!cu.lrelu) return refuse_(why, "ESRGAN upsample activation"), nullptr;
-        i_ups.push_back(add_conv(cu, 1.f, 64, shape(64, 0, 2, 0, 1, 0)));
+        i_ups.push_back(add_conv(cu, 1.f, nf, shape(nf, 0, 2, 0, 1, 0)));
     }
-    const int i_hr = add_conv(chr, 1.f, 64, shape(64, 0, 2, 0, 0, 0));
-    const int i_last = add_conv(cl, 1.f, 64, shape(16, 0, 0, 0, 0, 3));
+    const int i_hr = add_conv(chr, 1.f, nf, shape(nf, 0, 2, 0, 0, 0));
+    const int i_last = add_conv(cl, 1.f, nf, shape(16, 0, 0, 0, 0, 3));
 
     // buffers: the tile in and out (owned), the intermediates in the arena
     const VkDeviceSize px = (VkDeviceSize)bw * bh;
