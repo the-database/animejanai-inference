@@ -39,13 +39,17 @@ The network's residual on these weights has a 24.6-level std; native differs by 
 | Model | Params | ms/page, 512 tiles | vs HAT-L | ms/page, 576 tiles | vs HAT-L | weights + activations (512 / 576) |
 |---|---|---|---|---|---|---|
 | HAT-L (IllustrationJaNai V3) | 40.8M | 3440 | 1.00x | 2949 | 1.00x | 88 + 1136 / 1438 MB |
+| HAT-M (base HAT) | 20.8M | 1745 | 0.51x | 1474 | 0.50x | 45 + 1136 / 1438 MB |
 | SST | 12.1M | 2992 | 0.87x | 2553 | 0.87x | 85 + 1160 / 1468 MB |
 | SST+ | 12.1M | 4222 | 1.23x | 3588 | 1.22x | 124 + 1160 / 1468 MB |
 | SST-L | 21.3M | 3487 | 1.01x | 2958 | 1.00x | 88 + 1352 / 1711 MB |
 | SST-L+ | 21.3M | 4489 | 1.30x | 3797 | 1.29x | 125 + 1352 / 1711 MB |
 | SST-XL+ | 34.9M | 6793 | 1.97x | 5733 | 1.94x | 189 + 1384 / 1752 MB |
 
-Per 512 tile (AJI_NATIVE_PROFILE): HAT-L 378 ms (window attention 100 ms); SST-L 385 ms
+HAT-M is traiNNer-redux's `hat_m` with seeded weights (each parameter nudged so the legacy exporter
+keeps them as separate tensors), exported at opset 22 so its GELU is one op, as the shipped HAT-L's.
+
+Per 512 tile (AJI_NATIVE_PROFILE): HAT-M 182 ms; HAT-L 378 ms (window attention 100 ms); SST-L 385 ms
 (attention 209); SST-L+ 495 ms (attention 319, ~120 TFLOPS). SST's FLOPs (1.33x / 2.1x HAT-L's
 for L / L+) mostly land in large-window attention, which runs near the tensor cores' rate; HAT-L's
 mix of small GEMMs, 16x16 windows and the CAB convs runs at about half that.
