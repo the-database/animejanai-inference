@@ -137,8 +137,9 @@ inline void img_range_first(const ImgRange &r, Conv *c)
 }
 
 // The tail after conv_last (c, its output y): a Div by the range (or a Mul by its inverse), the Add of
-// the mean, a Clip(0, 1). Folds the scale into c's weights and bias, the mean into its bias. False when
-// the Add of a 3-vector is missing.
+// the mean, a Clip(0, 1). Folds the scale into c's weights and bias, the mean into its bias. Each is
+// optional (an optimizer may have fused the mean into conv_last's bias already); false for a Div or
+// Mul that isn't by a scalar.
 inline bool img_range_tail(const Reader &rd, const std::string &y, Conv *c, ImgRange *r)
 {
     std::string x = y;
@@ -153,12 +154,16 @@ inline bool img_range_tail(const Reader &rd, const std::string &y, Conv *c, ImgR
         k = v[0];
         x = m->out[0];
     }
-    const OnnxNode *a = consumer(rd, x, "Add");
-    if (!a || !init_input(rd, a, &v) || v.size() != 3 || (int)c->b.size() != 3) return false;
-    if (k != 1.f)
+    if (k != 1.f) {
         for (float &w : c->w) w *= k;
-    for (int o = 0; o < 3; o++) c->b[o] = c->b[o] * k + v[o];
-    r->clamp = clip01(rd, consumer(rd, a->out[0], "Clip"));
+        for (float &b : c->b) b *= k;
+    }
+    const OnnxNode *a = consumer(rd, x, "Add");
+    if (a && init_input(rd, a, &v) && v.size() == 3 && c->b.size() == 3) {
+        for (int o = 0; o < 3; o++) c->b[o] += v[o];
+        x = a->out[0];
+    }
+    r->clamp = clip01(rd, consumer(rd, x, "Clip"));
     return true;
 }
 
