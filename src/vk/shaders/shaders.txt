@@ -411,6 +411,8 @@ tfm_imgin       tfm.comp  PASS=12
 tfm_colsum2     tfm.comp  PASS=13
 tfm_convert     tfm.comp  PASS=14
 tfm_imgout      tfm.comp  PASS=15
+tfm_tgate       tfm.comp  PASS=16
+tfm_mix         tfm.comp  PASS=17
 tfm_gemm_cm16   tfm_gemm_cm16.comp
 
 # General 3x3 conv (gconv_common.glsl), the shapes ESRGAN, RIFE, FDAT and HAT use; input channels and offsets are per

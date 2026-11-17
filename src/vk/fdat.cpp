@@ -231,31 +231,18 @@ std::unique_ptr<ImgNet> VkFdat::build(Device &dev, const ajinative::OnnxGraph &g
             n.gemm(hm(N1, CP), M, n.add_mat(b.qkv, {}, C, 3 * C), hm(QKV, QS));
             n.dwconv(hm(N1, CP), hm(CF, CP), bh, bw, C, n.add_wf(b.dw), -1, true, b.spatial ? SUMS : ~0ull);
             if (b.spatial) {
-                const int nwx = (bw + B.ws - 1) / B.ws, nwy = (bh + B.ws - 1) / B.ws;
-                TArgs a;
-                a.map(0, hm(QKV, QS));
-                a.map(1, hm(AT, CP));
-                a.v[16] = bh;
-                a.v[17] = bw;
-                a.v[18] = heads;
-                a.v[19] = hd;
-                a.v[20] = a.v[21] = B.ws;
-                a.v[22] = a.v[23] = b.shift;
-                a.v[28] = nwx;
-                a.v[29] = bh;
-                a.v[30] = bw;
-                a.f(31, b.scale);
-                a.v[32] = n.add_wf(b.bias);
-                a.v[33] = 0;
-                a.v[34] = C;
-                a.v[35] = 2 * C;
-                const int nqb = (B.ws * B.ws + 63) / 64;
-                const long long wg = (long long)nwx * nwy * heads * nqb;
-                a.v[36] = (int32_t)wg;
-                a.v[37] = nqb;
-                a.v[42] = -1;  // the bias is the full table at 32, not a relative-position one
-                const uint32_t gx = (uint32_t)std::min<long long>(wg, 65535), gy = (uint32_t)((wg + gx - 1) / gx);
-                n.pass(5, a, gx, gy, "winattn");
+                TWin a;
+                a.H = bh;
+                a.W = bw;
+                a.heads = heads;
+                a.hd = hd;
+                a.wh = a.ww = B.ws;
+                a.sy = a.sx = b.shift;
+                a.scale = b.scale;
+                a.bias = n.add_wf(b.bias);
+                a.ko = C;
+                a.vo = 2 * C;
+                n.winattn(a, hm(QKV, QS), hm(AT, CP));
                 n.chan_gate(SUMS, M, C, B.cgr, n.add_wf(b.cg1), -1, n.add_wf(b.cg2), -1, false, 1.f, CM, CP);
                 n.gemm(hm(AT, CP), M, n.add_mat(b.wp, b.bp, C, C), hm(X, CP), 0, false, (int)(CM / 4), hm(CF, CP), hm(X, CP));
             } else {

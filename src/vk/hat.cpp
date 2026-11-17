@@ -97,33 +97,6 @@ bool scalar(const Reader &rd, const std::string &name, float *v)
     return true;
 }
 
-// The relative-position table behind a full bias [heads][wh*ww][Tk] (native/tfm.cu's tbias_table):
-// bias(q, k) = tab[h][(ky - kpad - qy + offy) * tw + (kx - kpad - qx + offx)].
-bool bias_table(const std::vector<float> &bias, int heads, int ws, int kws, int kpad, Attn *a)
-{
-    const int kh = kws ? kws : ws, kw = kh, kp = kws ? kpad : 0, Tq = ws * ws, Tk = kh * kw;
-    const int th = kh + ws - 1, tw = kw + ws - 1, offy = kp + ws - 1, offx = kp + ws - 1;
-    if ((int)bias.size() != heads * Tq * Tk) return false;
-    a->rtab.assign((size_t)heads * th * tw, 0.f);
-    std::vector<char> seen(a->rtab.size(), 0);
-    for (int h = 0; h < heads; h++)
-        for (int r = 0; r < Tq; r++)
-            for (int c = 0; c < Tk; c++) {
-                const int dy = c / kw - kp - r / ws + offy, dx = c % kw - kp - r % ws + offx;
-                if (dy < 0 || dy >= th || dx < 0 || dx >= tw) return false;
-                const size_t ti = ((size_t)h * th + dy) * tw + dx;
-                const float v = bias[((size_t)h * Tq + r) * Tk + c];
-                if (seen[ti] && a->rtab[ti] != v) return false;
-                seen[ti] = 1;
-                a->rtab[ti] = v;
-            }
-    a->rt_w = tw;
-    a->rt_offy = offy;
-    a->rt_offx = offx;
-    a->tn = th * tw;
-    return true;
-}
-
 bool attn(const Reader &rd, const std::string &pre, const char *scale_mul, int C, int heads, int ws, int kws, int kpad, Attn *a, std::string *why)
 {
     if (!linear(rd, pre + "qkv", C, 3 * C, &a->qkv, why) || !linear(rd, pre + "proj", C, C, &a->proj, why)) return false;
@@ -132,7 +105,8 @@ bool attn(const Reader &rd, const std::string &pre, const char *scale_mul, int C
     std::vector<int64_t> d;
     const int Tq = ws * ws, Tk = kws ? kws * kws : Tq;
     if (!init_input(rd, rd.node(pre + "Add"), &bias, &d) || d != std::vector<int64_t>{1, heads, Tq, Tk}) return refuse_(why, pre + ": bias");
-    if (!bias_table(bias, heads, ws, kws, kpad, a)) return refuse_(why, pre + ": bias is not a relative-position table");
+    if (!bias_table(bias, heads, ws, ws, kws, kws, kpad, &a->rtab, &a->rt_w, &a->rt_offy, &a->rt_offx, &a->tn))
+        return refuse_(why, pre + ": bias is not a relative-position table");
     return true;
 }
 
@@ -338,39 +312,28 @@ std::unique_ptr<ImgNet> VkHat::build(Device &dev, const ajinative::OnnxGraph &g,
     };
     const auto mat = [&](const Lin &l) { return n.add_mat(l.w, l.b, l.K, l.N); };
     const auto lnorm = [&](const Ln &l, const TMap &in, const TMap &out) { n.layernorm(in, out, M, C, CP, n.add_wf(l.g), n.add_wf(l.b), l.eps); };
-    const int nwx = pw / ws, nwy = ph / ws, nqb = (ws * ws + 63) / 64;
     const auto attend = [&](const Attn &a, bool overlap) {
-        TArgs t;
-        t.map(0, hm(QKV, QS));
-        t.map(1, hm(AT, CP));
-        t.v[16] = ph;
-        t.v[17] = pw;
-        t.v[18] = heads;
-        t.v[19] = hd;
-        t.v[20] = t.v[21] = ws;
-        t.v[22] = t.v[23] = overlap ? 0 : a.shift;
-        t.v[28] = nwx;
-        t.v[29] = ph;
-        t.v[30] = pw;
-        t.f(31, a.scale);
-        t.v[32] = -1;
-        t.v[33] = 0;
-        t.v[34] = C;
-        t.v[35] = 2 * C;
-        const long long wg = (long long)nwx * nwy * heads * nqb;
-        t.v[36] = (int32_t)wg;
-        t.v[37] = nqb;
-        t.v[38] = overlap ? kws : 0;
-        t.v[39] = overlap ? kws : 0;
-        t.v[40] = overlap ? kpad : 0;
-        t.v[41] = !overlap && a.shift ? 1 : 0;
-        t.v[42] = n.add_wf(a.rtab);
-        t.v[43] = a.rt_w;
-        t.v[44] = a.rt_offy;
-        t.v[45] = a.rt_offx;
-        t.v[46] = a.tn;
-        const uint32_t gx = (uint32_t)std::min<long long>(wg, 65535), gy = (uint32_t)((wg + gx - 1) / gx);
-        n.pass(5, t, gx, gy, overlap ? "winattn ocab" : "winattn");
+        TWin t;
+        t.H = ph;
+        t.W = pw;
+        t.heads = heads;
+        t.hd = hd;
+        t.wh = t.ww = ws;
+        t.sy = t.sx = overlap ? 0 : a.shift;
+        t.mask = !overlap && a.shift;
+        t.scale = a.scale;
+        t.ko = C;
+        t.vo = 2 * C;
+        if (overlap) {
+            t.kwh = t.kww = kws;
+            t.kpad = kpad;
+        }
+        t.rtab = n.add_wf(a.rtab);
+        t.rt_w = a.rt_w;
+        t.rt_offy = a.rt_offy;
+        t.rt_offx = a.rt_offx;
+        t.tn = a.tn;
+        n.winattn(t, hm(QKV, QS), hm(AT, CP), overlap ? "winattn ocab" : "winattn");
     };
     const auto mlp_step = [&](const Ln &n2, const Mlp &m) {
         lnorm(n2, fm(S, CP), hm(N1, CP));

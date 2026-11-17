@@ -475,12 +475,12 @@ std::unique_ptr<ImgNet> ImgNet::frame(Device &dev, const ajinative::OnnxGraph &g
     // the probe: buffers per input pixel (they scale with the area; what does not makes the
     // estimate high, not low)
     constexpr int P = 128;
-    // the image models: ESRGAN, FDAT, HAT ("not an ESRGAN graph" when none of them)
+    // the image models: ESRGAN, FDAT, HAT, DAT ("not an ESRGAN graph" when none of them)
     using Builder = std::unique_ptr<ImgNet> (*)(Device &, const ajinative::OnnxGraph &, int, int, std::string *);
     Builder bld = nullptr;
     std::string we;
     std::unique_ptr<ImgNet> probe;
-    for (Builder b : {&build_esrgan, &build_fdat, &build_hat}) {
+    for (Builder b : {&build_esrgan, &build_fdat, &build_hat, &build_dat}) {
         bld = b;
         probe = bld(dev, g, P, P, &we);
         if (probe || we.rfind("not a", 0) != 0) break;
@@ -526,6 +526,11 @@ std::unique_ptr<ImgNet> ImgNet::create(Device &dev, const ajinative::OnnxGraph &
     }
     if (auto n = build_hat(dev, g, w, h, &we)) return n;
     if (we.rfind("not a HAT", 0) != 0) {
+        if (why) *why = we;
+        return nullptr;
+    }
+    if (auto n = build_dat(dev, g, w, h, &we)) return n;
+    if (we.rfind("not a DAT", 0) != 0) {
         if (why) *why = we;
         return nullptr;
     }

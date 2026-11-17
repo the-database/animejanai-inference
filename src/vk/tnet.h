@@ -28,6 +28,25 @@ struct TMap {
 inline TMap hmap(VkDeviceSize bytes, int stride, int off = 0) { return TMap{bytes, stride, off, false, false}; }
 inline TMap fmap(VkDeviceSize bytes, int stride, int off = 0) { return TMap{bytes, stride, off, true, false}; }
 
+// The relative-position table behind a full attention bias [heads][wh*ww][Tk] (key windows kwh x
+// kww with kpad, or kwh = 0: the query window), if the bias is one (each relative offset one
+// value; native/tfm.cu's tbias_table): bias(q, k) = tab[h][(ky - kpad - qy + offy) * tw + (kx -
+// kpad - qx + offx)], tn = the table's size per head.
+bool bias_table(const std::vector<float> &bias, int heads, int wh, int ww, int kwh, int kww, int kpad, std::vector<float> *tab, int *tw,
+                int *offy, int *offx, int *tn);
+
+// One window attention (tfm.comp pass 5): q, k, v at channels qo / ko / vo + head * hd of qkv,
+// windows wh x ww over Hp x Wp (tokens beyond H x W zero), rolled by (sy, sx) with Swin's mask
+// when mask; the bias a full table (bias, [heads][T][Tk] in the fp32 store) or a relative-position
+// one (rtab); key windows kwh x kww at the window's origin less kpad (0: the query window).
+struct TWin {
+    int H = 0, W = 0, Hp = 0, Wp = 0, heads = 0, hd = 0, wh = 0, ww = 0, sy = 0, sx = 0;
+    int qo = 0, ko = 0, vo = 0, kwh = 0, kww = 0, kpad = 0;
+    bool mask = false;
+    float scale = 1.f;
+    int bias = -1, rtab = -1, rt_w = 0, rt_offy = 0, rt_offx = 0, tn = 0;
+};
+
 // One tfm.comp parameter entry (64 ints).
 struct TArgs {
     int32_t v[64] = {};
@@ -82,7 +101,13 @@ public:
               const TMap &add1 = TMap{}, const TMap &add2 = TMap{}, float slope = 0.2f, int add2scale = -1);
     void layernorm(const TMap &in, const TMap &out, int M, int C, int cpad, int gamma, int beta, float eps);
     // dw 3x3 + bias, GELU; with sums >= 0 (arena float offset), the channel sums of its output there
-    void dwconv(const TMap &in, const TMap &out, int H, int W, int C, int w, int bias, bool gelu, VkDeviceSize sums = ~0ull);
+    void dwconv(const TMap &in, const TMap &out, int H, int W, int C, int w, int bias, bool gelu, VkDeviceSize sums = ~0ull,
+                const TMap &mul = TMap{});
+    void winattn(const TWin &a, const TMap &qkv, const TMap &out, const std::string &label = "winattn");
+    // DAT: per token tg = sigmoid(w2 . gelu(W1 x + b1) + b2) (r <= 16) into tg (arena floats [M])
+    void token_gate(const TMap &x, int M, int C, int r, int w1, int b1, int w2, float b2, VkDeviceSize tg);
+    // DAT: z = a * cg[c] + b * tg[t] (mode 0) or a * tg[t] + b * cg[c] (mode 1), zero from C to cpad
+    void mix(const TMap &a, const TMap &b, const TMap &z, int M, int C, int cpad, VkDeviceSize cg, VkDeviceSize tg, int mode);
     // A 3x3 conv (zero padding) as an im2col GEMM, fp32 sums: in (cinp channels) at H x W
     void conv_gemm(const TMap &in, int H, int W, int cinp, const Mat &w, const TMap &out, const TMap &add1 = TMap{});
     // The network input (NCHW fp16, h x w) minus a mean into an NHWC map (16 channels, zero beyond 3)
