@@ -5,7 +5,9 @@
 // row of 16 pixels. A lane loads its own pixel's 16 input channels from the shared halo tile and
 // its own 16 weights (packed per lane); the inputs reach the other lanes through
 // subgroupBroadcast with constant lane ids, which Intel's compiler turns into register-region
-// operands. fp16 partial sums per tap, then fp32 (the spike's ACC=3). Results go through the
+// operands; they travel as packed fp16 pairs in 32-bit values, so the family needs no fp16 subgroup
+// operations (Mali drivers may not offer them). fp16 partial sums per tap, then fp32 (the spike's
+// ACC=3). Results go through the
 // staging tile (conv_common.glsl) as fp16 pairs, a lane and its neighbour writing one pair.
 // Defines: CINP, COUTP, IN, ACT, GATE, OUT, TH (tile rows), RPS (rows per subgroup).
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -13,7 +15,6 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_subgroup_extended_types_float16 : require
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_GOOGLE_include_directive : require
 
@@ -41,12 +42,31 @@ void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
     p = unpackFloat2x16(u1.w); v[14] = p.x; v[15] = p.y;
 }
 
+// The 16 input channels of a lane's pixel as 8 packed fp16 pairs, as shared memory holds them.
+void pairs8(uvec4 u0, uvec4 u1, out uint v[8])
+{
+    v[0] = u0.x; v[1] = u0.y; v[2] = u0.z; v[3] = u0.w;
+    v[4] = u1.x; v[5] = u1.y; v[6] = u1.z; v[7] = u1.w;
+}
+
+// acc[m] += sum over k of channel k of lane m's pixel * w[k], k ascending. The pairs travel
+// between lanes as uint (subgroupBroadcast of 32-bit values needs no fp16 subgroup support).
+void fma16(uint a[8], float16_t w[16], inout float16_t acc[16])
+{
+    [[unroll]] for (int kp = 0; kp < 8; kp++)
+        [[unroll]] for (int m = 0; m < 16; m++) {
+            const f16vec2 v = unpackFloat2x16(subgroupBroadcast(a[kp], m));
+            acc[m] = fma(v.x, w[2 * kp], acc[m]);
+            acc[m] = fma(v.y, w[2 * kp + 1], acc[m]);
+        }
+}
+
 // Lane pairs (2j, 2j+1) hold channels (2j, 2j+1) of one pixel: the even lane writes the pair.
 void stage(int px, int ch, int lane, float v)
 {
-    const float16_t h = float16_t(v);
-    const float16_t odd = subgroupShuffleXor(h, 1u);
-    if ((lane & 1) == 0) sm_set_pair(px * SP + ch, packFloat2x16(f16vec2(h, odd)));
+    const uint h = packFloat2x16(f16vec2(float16_t(v), float16_t(0.0)));
+    const uint odd = subgroupShuffleXor(h, 1u);
+    if ((lane & 1) == 0) sm_set_pair(px * SP + ch, (h & 0xffffu) | (odd << 16));
 }
 
 void main()
@@ -73,10 +93,9 @@ void main()
             unpack16(wp[wi], wp[wi + 1], w);
             [[unroll]] for (int r = 0; r < RPS; r++) {
                 const int ai = ((row0 + r + dy) * (TW + 2) + lane + dx) * (CP / 8) + kc * 2;
-                float16_t a[16];
-                unpack16(sm[ai], sm[ai + 1], a);
-                [[unroll]] for (int k = 0; k < 16; k++)
-                    [[unroll]] for (int m = 0; m < 16; m++) acc[r][m] = fma(subgroupBroadcast(a[k], m), w[k], acc[r][m]);
+                uint a[8];
+                pairs8(sm[ai], sm[ai + 1], a);
+                fma16(a, w, acc[r]);
             }
         }
         [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) tot[r][m] += float(acc[r][m]);
@@ -97,12 +116,11 @@ void main()
             float16_t w[16];
             unpack16(wpa[wi], wpa[wi + 1], w);
             const int ai = ((row0 + r) * TW + lane) * (SP / 8) + kc * 2;
-            float16_t a[16];
-            unpack16(sm[ai], sm[ai + 1], a);
+            uint a[8];
+            pairs8(sm[ai], sm[ai + 1], a);
             float16_t part[16];
             [[unroll]] for (int m = 0; m < 16; m++) part[m] = float16_t(0.0);
-            [[unroll]] for (int k = 0; k < 16; k++)
-                [[unroll]] for (int m = 0; m < 16; m++) part[m] = fma(subgroupBroadcast(a[k], m), w[k], part[m]);
+            fma16(a, w, part);
             [[unroll]] for (int m = 0; m < 16; m++) ga[r][m] += float(part[m]);
         }
     }

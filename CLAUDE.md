@@ -248,19 +248,25 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
 `plans/vulkan-backend/plan.md`. Built with `AJI_VULKAN=ON`; not shipped yet.
 
 - **`src/vk/vk.h`:** the Vulkan entry points, loaded at run time from `vulkan-1.dll` /
-  `libvulkan.so.1` (nothing links a Vulkan SDK), on one process-wide instance.
+  `libvulkan.so.1` / Android's `libvulkan.so` (nothing links a Vulkan SDK), on one process-wide
+  instance.
 - **`vk/device`:** a device by index or by the D3D11 adapter's LUID; which kernel family it runs
-  (`AJI_VK_FAMILY=cm16|sg16` overrides); buffers; one-shot and frame submits; pipelines from the
+  (`AJI_VK_FAMILY=cm16|sg16|plain` overrides); `capability_report()`, everything a device offers
+  the families; buffers; one-shot and frame submits; pipelines from the
   embedded SPIR-V. Its variant and pipeline caches go in the model directory as
   `aji-vk-<vendor>-<device>-<driver>.variants` / `.vkcache` (`AJI_VK_RETUNE=1` times again).
 - **`vk/kernels`, `src/vk/shaders`:** the fused conv and concat kernels of a `Plan`, with the CUDA
-  kernels' semantics, in two families:
+  kernels' semantics, in three families:
   - **cm16:** `VK_KHR_cooperative_matrix` 16x16x16 with fp16 accumulate (NVIDIA Ampere+, AMD
     RDNA3/4). The epilogue runs on the accumulators: bias, slopes and the attention bias load as
     matrices with every row the same vector, a gate's block input loads from its feature buffer,
     and activations are element-wise. That needs the slack after each feature buffer.
   - **sg16:** register-blocked with the subgroup pinned to 16 lanes (Intel Xe, Mali); fp16 per tap,
-    then fp32.
+    then fp32. Inputs travel between lanes as packed fp16 pairs in 32-bit values, so no fp16
+    subgroup operations are needed.
+  - **plain:** sg16's blocking with no subgroup operations and no subgroup size: a thread owns two
+    output channels and reads its inputs from shared memory. For what has neither of the others
+    (Adreno's 64/128-lane waves); within 1 level of sg16, about 2x slower than it on a UHD 770.
 
   `shaders.txt` lists exactly the modules built (phase 1: what SPANF3 Performance and Compact lower
   to); a step whose module isn't there refuses the model.
@@ -279,8 +285,11 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
     Vulkan reads wrong chroma on NVIDIA, and Intel allows no arrays.
 - **`aji_vk_model_test`** (by hand): one model on the executor, timed, against the fp32 CPU
   reference of its plan (`sanity/native_ref.h`), and against the CUDA executor when built with CUDA.
-  `aji_vk_model_test list` prints the devices and families. `aji_harness_dml --adapter N` runs a
-  chain on another GPU, e.g. the iGPU.
+  `aji_vk_model_test list` prints the devices and families, `info [N]` the full capability
+  report, and `--seconds S` keeps the model running and prints its time per second (thermal
+  throttling). It builds for android-arm64 (NDK, `-DANDROID_ABI=arm64-v8a`, `AJI_CUDA=OFF`
+  `AJI_VULKAN=ON`) and runs from an `adb shell`. `aji_harness_dml --adapter N` runs a chain on
+  another GPU, e.g. the iGPU.
 
 ## Build system
 

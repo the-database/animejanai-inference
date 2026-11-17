@@ -1,6 +1,7 @@
 // vk/spirv: the embedded Vulkan compute modules (AJI_VULKAN=ON) are well-formed SPIR-V and
 // declare what their kernel family needs: the cooperative-matrix modules the
-// CooperativeMatrixKHR capability, the subgroup-16 ones fp16 and subgroup operations. Walks the
+// CooperativeMatrixKHR capability, the subgroup-16 ones fp16 and subgroup operations, the plain
+// ones fp16 and no subgroup operations. Walks the
 // instruction stream only; no Vulkan device. CPU only.
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +50,10 @@ int check_module(const SpirvModule &m)
         CHECK(caps.count(kCapGroupNonUniform));
         CHECK(!caps.count(kCapCooperativeMatrixKHR));
     }
+    if (std::strstr(m.name, "_plain_")) {  // no subgroup operations at all
+        CHECK(!caps.count(kCapGroupNonUniform));
+        CHECK(!caps.count(kCapCooperativeMatrixKHR));
+    }
     return 0;
 }
 
@@ -66,6 +71,7 @@ int main()
         CHECK(spirv_find(m.name) == &m);
     }
     CHECK(spirv_find("c3_cm16_i48_o48_n0a1g0o0_w4r4") && spirv_find("c3_sg16_i64_o64_n0a2g0o0_t8r1"));
+    CHECK(spirv_find("c3_plain_i48_o48_n0a0g2o0_t4r1") && spirv_find("cat_plain_c48_s4_b4"));
     CHECK(!spirv_find("no_such_module"));
     std::printf("vk spirv: %zu modules, all checks passed\n", kSpirvModuleCount);
     return 0;

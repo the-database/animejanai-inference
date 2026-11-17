@@ -1,0 +1,93 @@
+#version 450
+// 1x1 conv over the virtual channel concatenation of NSRC NHWC tensors of C channels each, bias
+// only, NHWC output with C channels (SPAN's conv_cat), with no subgroup operations (the plain
+// family). concat1x1_sg16's blocking with the inputs read from the shared tile: a thread owns two
+// adjacent output channels for 16 consecutive pixels. Same accumulation order as sg16.
+// Defines: C, NSRC, PB (16-pixel blocks per workgroup).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+const int GT = 8, NG = C / 16, M = PB * 16, CP = C + 8, VPP = C / 8, KC = NSRC * C / 16;
+layout(local_size_x = GT * NG * PB) in;
+
+layout(push_constant) uniform PC { int npx; int u0; int u1; int u2; } pc;
+layout(std430, binding = 0) readonly buffer S0 { uvec4 s0[]; };
+layout(std430, binding = 1) readonly buffer S1 { uvec4 s1[]; };
+layout(std430, binding = 2) readonly buffer S2 { uvec4 s2[]; };
+layout(std430, binding = 3) readonly buffer S3 { uvec4 s3[]; };
+layout(std430, binding = 4) writeonly buffer Dst { uint dst[]; };  // fp16 pairs
+layout(std430, binding = 5) readonly buffer Wt { uvec4 wp[]; };   // [NSRC*C/16][NG][16 lanes][16 k], as sg16
+layout(std430, binding = 6) readonly buffer Bias { float16_t bias[]; };
+
+shared uvec4 sm[NSRC * M * CP / 8];
+
+uvec4 src_at(int s, int i)
+{
+    if (s == 0) return s0[i];
+    if (s == 1) return s1[i];
+    if (s == 2) return s2[i];
+    return s3[i];
+}
+
+void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
+{
+    f16vec2 p;
+    p = unpackFloat2x16(u0.x); v[0] = p.x; v[1] = p.y;
+    p = unpackFloat2x16(u0.y); v[2] = p.x; v[3] = p.y;
+    p = unpackFloat2x16(u0.z); v[4] = p.x; v[5] = p.y;
+    p = unpackFloat2x16(u0.w); v[6] = p.x; v[7] = p.y;
+    p = unpackFloat2x16(u1.x); v[8] = p.x; v[9] = p.y;
+    p = unpackFloat2x16(u1.y); v[10] = p.x; v[11] = p.y;
+    p = unpackFloat2x16(u1.z); v[12] = p.x; v[13] = p.y;
+    p = unpackFloat2x16(u1.w); v[14] = p.x; v[15] = p.y;
+}
+
+void main()
+{
+    const int tid = int(gl_LocalInvocationIndex), nth = GT * NG * PB;
+    // a 2-D grid of pixel blocks (one dimension caps at 65535 groups); the last row may overshoot
+    const int p0 = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * M, npx = pc.npx;
+    if (p0 >= npx) return;  // the whole workgroup, before any barrier
+    [[unroll]] for (int s = 0; s < NSRC; s++)
+        for (int i = tid; i < M * VPP; i += nth) {
+            const int px = i / VPP, v = i % VPP;
+            sm[(s * M + px) * (CP / 8) + v] = p0 + px < npx ? src_at(s, (p0 + px) * VPP + v) : uvec4(0);
+        }
+    barrier();
+
+    const int grp = tid / GT, lane = tid % GT;
+    const int g = grp % NG, blk = grp / NG, ch = g * 16 + 2 * lane;
+    float tot0[16], tot1[16];
+    [[unroll]] for (int m = 0; m < 16; m++) {
+        tot0[m] = 0.0;
+        tot1[m] = 0.0;
+    }
+    [[unroll]] for (int kc = 0; kc < KC; kc++) {
+        const int s = kc / (C / 16), kk = kc % (C / 16);
+        const int wi = ((kc * NG + g) * 16 + 2 * lane) * 2;
+        float16_t w0[16], w1[16];
+        unpack16(wp[wi], wp[wi + 1], w0);
+        unpack16(wp[wi + 2], wp[wi + 3], w1);
+        [[unroll]] for (int m = 0; m < 16; m++) {
+            const int ai = (s * M + blk * 16 + m) * (CP / 8) + kk * 2;
+            const uvec4 u0 = sm[ai], u1 = sm[ai + 1];
+            const uint a[8] = uint[8](u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w);
+            float16_t p0h = float16_t(0.0), p1h = float16_t(0.0);
+            [[unroll]] for (int kp = 0; kp < 8; kp++) {
+                const f16vec2 v = unpackFloat2x16(a[kp]);
+                p0h = fma(v.x, w0[2 * kp], p0h);
+                p0h = fma(v.y, w0[2 * kp + 1], p0h);
+                p1h = fma(v.x, w1[2 * kp], p1h);
+                p1h = fma(v.y, w1[2 * kp + 1], p1h);
+            }
+            tot0[m] += float(p0h);
+            tot1[m] += float(p1h);
+        }
+    }
+    const float b0 = float(bias[ch]), b1 = float(bias[ch + 1]);
+    [[unroll]] for (int m = 0; m < 16; m++) {
+        const int p = p0 + blk * 16 + m;
+        if (p < npx) dst[(p * C + ch) >> 1] = packFloat2x16(f16vec2(float16_t(tot0[m] + b0), float16_t(tot1[m] + b1)));
+    }
+}
