@@ -268,8 +268,12 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
     output channels and reads its inputs from shared memory. For what has neither of the others
     (Adreno's 64/128-lane waves); within 1 level of sg16, about 2x slower than it on a UHD 770.
 
-  `shaders.txt` lists exactly the modules built (phase 1: what SPANF3 Performance and Compact lower
-  to); a step whose module isn't there refuses the model.
+  `shaders.txt` lists the modules built: the CUDA native kernel table (`native/conv.cu` kConv,
+  kConcat: 32/48/64 channels, every activation and gate, the heads and tails, concats of 2..4) in
+  each family; a step whose module isn't there refuses the model. Where 64-pixel concat blocks
+  pass the 32 KB of shared memory of Intel and phones (64 channels x 4 sources), sg16 and plain
+  take 32-pixel ones (`_b2`). `aji_vk_conv_test` (`ctest -L gpu`) checks every entry against the
+  CPU reference on the device's family, both tile variants.
 - **`vk/executor`:** the `Plan` on the device, from the shared `native/layout`. Each kernel's tile
   variant is timed once per size (identical steps share the timing) and stored. `bind_io` points
   the model input and output at caller-owned buffers.
