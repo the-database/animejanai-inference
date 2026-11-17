@@ -93,3 +93,49 @@ jobs:
         run: |
           ctest --test-dir build -L cpu --output-on-failure
           echo 'GPU tests (`ctest -L gpu`, aji_kernel_test, the harnesses) were built but not run: no GPU on hosted runners.' >> "$GITHUB_STEP_SUMMARY"
+
+  # The Vulkan backend (AJI_VULKAN=ON, in development) without CUDA: every shader compiled and
+  # checked (aji_vk_spirv_test in ctest -L cpu), libaji_vk.so and the Vulkan tools built, and
+  # the same targets cross-built for android-arm64 with the runner's NDK. No GPU, so the Vulkan
+  # GPU tests (aji_vk_conv_test, the harnesses) are built but not run.
+  vulkan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # glslc and the Vulkan headers from the LunarG SDK: Ubuntu 24.04's glslc (shaderc 2023.8)
+      # crashes on the cooperative-matrix kernels
+      - uses: actions/cache@v6
+        id: vksdk
+        with:
+          path: vulkansdk
+          key: vulkansdk-linux-1.4.309.0
+      - name: Vulkan SDK
+        if: steps.vksdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p vulkansdk
+          curl -fsSL https://sdk.lunarg.com/sdk/download/1.4.309.0/linux/vulkansdk-linux-x86_64-1.4.309.0.tar.xz | tar -xJ -C vulkansdk
+      - name: Build (Linux, AJI_CUDA=OFF, AJI_VULKAN=ON)
+        run: |
+          sudo apt-get install -y --no-install-recommends ninja-build
+          SDK="$PWD/vulkansdk/1.4.309.0/x86_64"
+          "$SDK/bin/glslc" --version | head -1
+          cmake -S . -B build-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_CUDA=OFF -DAJI_VULKAN=ON \
+            -DAJI_GLSLC="$SDK/bin/glslc" -DAJI_VK_INCLUDE="$SDK/include"
+          cmake --build build-vk
+      - name: CPU-only tests
+        run: ctest --test-dir build-vk -L cpu --output-on-failure
+      - name: Build for android-arm64 (NDK)
+        run: |
+          # the SDK's Vulkan headers alone (vulkan/, vk_video/): its whole include dir would bring
+          # other headers onto the NDK's include path
+          SDK="$PWD/vulkansdk/1.4.309.0/x86_64"
+          mkdir -p vkinc && cp -r "$SDK/include/vulkan" "$SDK/include/vk_video" vkinc/
+          cmake -S . -B build-android -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-31 \
+            -DAJI_CUDA=OFF -DAJI_VULKAN=ON -DAJI_GLSLC="$SDK/bin/glslc" -DAJI_VK_INCLUDE="$PWD/vkinc"
+          cmake --build build-android --target aji_vk aji_vk_model_test aji_harness_vk aji_image
+          echo 'Vulkan: built for Linux and android-arm64; the GPU tests (`aji_vk_conv_test`, the harnesses) were not run (no GPU).' >> "$GITHUB_STEP_SUMMARY"
