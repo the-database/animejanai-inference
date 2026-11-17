@@ -559,8 +559,10 @@ matrices, so cm16), readback for the encoder, 4:2:0 only, held-frame copies thro
 `aji_copy_frame`. Each AVVkFrame is an `aji_vk_image` in `vkw[]`, read from the frame in
 `fill_aji_frame` and written back by `vk_sync` after every libaji call. SPANF3 1080p to 4K ffv1:
 55 fps on the 5090, within 1 level of `--backend directml` with the same backend=Vulkan conf, the
-same 23 of 191 frames reused. The Linux release's `aji_encode` still links CUDA (a CUDA-free
-start needs CUDA loaded lazily, as `/DELAYLOAD` does on Windows).
+same 23 of 191 frames reused. On Linux `aji_encode` loads CUDA when first used
+(`encode_cuda_dl.h`: dlopen of libcuda.so.1 and libcudart.so.<major>, each call a macro onto the
+dlsym table, so a missed one fails to link), as `/DELAYLOAD` does on Windows: it starts without the
+NVIDIA driver. CI checks it has no NEEDED CUDA library and runs it on the driverless runner.
 
 ### The CUDA-architecture trap
 
