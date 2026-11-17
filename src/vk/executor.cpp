@@ -7,6 +7,7 @@
 #include <map>
 
 #include "native/layout.h"
+#include "native/pack.h"
 
 namespace ajivk {
 
@@ -139,9 +140,19 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
         *out = b.buf;
         return true;
     };
-    auto upload_conv = [&](const PlanWeights &pw, int cin_pad, int cout_pad, VkBuffer *w, VkBuffer *bias, VkBuffer *slope) -> bool {
+    // norm: a step reading the normalized model input, whose mean and scale follow the bias
+    auto upload_conv = [&](const PlanWeights &pw, int cin_pad, int cout_pad, VkBuffer *w, VkBuffer *bias, VkBuffer *slope,
+                           const PlanStep *norm = nullptr) -> bool {
         if (!upload(pack_weights(fam, pw.w.data(), pw.taps, pw.cin, cin_pad, pw.cout, cout_pad), w)) return false;
-        if (!upload(pack_vector(pw.bias.data(), pw.cout, cout_pad), bias)) return false;
+        std::vector<uint16_t> bv = pack_vector(pw.bias.data(), pw.cout, cout_pad);
+        if (norm) {
+            bv.resize((size_t)cout_pad + 8, 0);
+            for (int c = 0; c < 3; c++) {
+                bv[(size_t)cout_pad + c] = ajinative::float_to_half_bits(norm->in_mean[c]);
+                bv[(size_t)cout_pad + 3 + c] = ajinative::float_to_half_bits(norm->in_scale[c]);
+            }
+        }
+        if (!upload(bv, bias)) return false;
         if (slope && !pw.slope.empty() && !upload(pack_vector(pw.slope.data(), pw.cout, cout_pad), slope)) return false;
         return true;
     };
@@ -186,7 +197,8 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
             b[1] = tensor(p.resid);
             b[2] = tensor(p.dst);
             st.has_resid = p.resid != -1;
-            if (!upload_conv(p.w, k.cinp, k.coutp, &b[3], &b[4], &b[5])) return fail("weights: " + reason);
+            st.in_norm = p.in_norm && p.in != (int)ajinative::Input::NHWC;
+            if (!upload_conv(p.w, k.cinp, k.coutp, &b[3], &b[4], &b[5], st.in_norm ? &p : nullptr)) return fail("weights: " + reason);
             if (p.gate == (int)ajinative::Gate::Tanh1x1 &&
                 !upload_conv(p.att, p.att.cin, p.att.cout, &b[6], &b[7], nullptr))
                 return fail("attention weights: " + reason);
@@ -321,6 +333,7 @@ void Executor::record_step(VkCommandBuffer cb, const Step &st, int v, int W, int
         pc[0] = H;
         pc[1] = W;
         pc[2] = st.has_resid ? 1 : 0;
+        pc[3] = st.in_norm ? 1 : 0;
         gx = (uint32_t)((W + 15) / 16);
         gy = (uint32_t)((H + d.tile_h - 1) / d.tile_h);
     }

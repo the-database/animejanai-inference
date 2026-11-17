@@ -227,6 +227,11 @@ cudaError_t launch(const Conv3x3 &op, const Tensors &t, int H, int W, int varian
     p.batt = op.att ? static_cast<const half2 *>(op.att->bias) : nullptr;
     p.H = H;
     p.W = W;
+    p.in_norm = op.in_norm && op.in != Input::NHWC;
+    for (int c = 0; c < 3; c++) {
+        p.in_mean[c] = op.in_mean[c];
+        p.in_scale[c] = op.in_scale[c];
+    }
     return e->fn[variant](p, s);
 }
 

@@ -59,6 +59,7 @@ private:
         Dispatch disp[kConvVariants];
         int nvar = 1, variant = 0;
         bool has_resid = false;
+        bool in_norm = false;  // the bias buffer carries the input normalization (conv_common.glsl)
         VkDescriptorSet set = VK_NULL_HANDLE;
     };
     void record_step(VkCommandBuffer cb, const Step &st, int v, int W, int H) const;
