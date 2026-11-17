@@ -1,15 +1,43 @@
 # Vulkan compute modules embedded with AJI_VULKAN=ON (cmake/aji_spirv.cmake):
 #   <module name> <shader file> [define=value ...]
-# Names spell out the variant: kernel family, channels, tile shape.
+# Names spell out the variant (vk/conv.cpp builds them): kernel, family, padded input and
+# output channels, the fused ops (n<Input>a<Act>g<Gate>o<Output>, values of native/ops.h),
+# tile shape. Phase 1 has exactly what SPANF3 Performance and Compact lower to.
 
-# 3x3 conv, VK_KHR_cooperative_matrix 16x16x16 with fp16 accumulate (RDNA3/4; NVIDIA as the
-# development reference). Workgroup = WARPS subgroups (local_size_x is specialization
-# constant 0), tile WARPS*WR rows x 16 pixels.
-conv3x3_cm16_c48_w4_r4  conv3x3_cm16.comp  C=48 WARPS=4 WR=4
-conv3x3_cm16_c64_w4_r4  conv3x3_cm16.comp  C=64 WARPS=4 WR=4
+# 3x3 conv, VK_KHR_cooperative_matrix 16x16x16 with fp16 accumulate (cm16). Tile WARPS*WR
+# rows x 16 pixels; local_size_x (specialization constant 0) = WARPS * subgroup size.
+c3_cm16_i16_o48_n2a0g0o0_w8r2  conv3x3_cm16.comp  CINP=16 COUTP=48 IN=2 ACT=0 GATE=0 OUT=0 WARPS=8 WR=2
+c3_cm16_i16_o48_n2a0g0o0_w4r4  conv3x3_cm16.comp  CINP=16 COUTP=48 IN=2 ACT=0 GATE=0 OUT=0 WARPS=4 WR=4
+c3_cm16_i48_o48_n0a1g0o0_w8r2  conv3x3_cm16.comp  CINP=48 COUTP=48 IN=0 ACT=1 GATE=0 OUT=0 WARPS=8 WR=2
+c3_cm16_i48_o48_n0a1g0o0_w4r4  conv3x3_cm16.comp  CINP=48 COUTP=48 IN=0 ACT=1 GATE=0 OUT=0 WARPS=4 WR=4
+c3_cm16_i48_o48_n0a0g2o0_w8r2  conv3x3_cm16.comp  CINP=48 COUTP=48 IN=0 ACT=0 GATE=2 OUT=0 WARPS=8 WR=2
+c3_cm16_i48_o48_n0a0g2o0_w4r4  conv3x3_cm16.comp  CINP=48 COUTP=48 IN=0 ACT=0 GATE=2 OUT=0 WARPS=4 WR=4
+c3_cm16_i48_o48_n0a0g0o2_w8r2  conv3x3_cm16.comp  CINP=48 COUTP=48 IN=0 ACT=0 GATE=0 OUT=2 WARPS=8 WR=2
+c3_cm16_i48_o48_n0a0g0o2_w4r4  conv3x3_cm16.comp  CINP=48 COUTP=48 IN=0 ACT=0 GATE=0 OUT=2 WARPS=4 WR=4
+c3_cm16_i16_o64_n1a2g0o0_w8r2  conv3x3_cm16.comp  CINP=16 COUTP=64 IN=1 ACT=2 GATE=0 OUT=0 WARPS=8 WR=2
+c3_cm16_i16_o64_n1a2g0o0_w4r4  conv3x3_cm16.comp  CINP=16 COUTP=64 IN=1 ACT=2 GATE=0 OUT=0 WARPS=4 WR=4
+c3_cm16_i64_o64_n0a2g0o0_w8r2  conv3x3_cm16.comp  CINP=64 COUTP=64 IN=0 ACT=2 GATE=0 OUT=0 WARPS=8 WR=2
+c3_cm16_i64_o64_n0a2g0o0_w4r4  conv3x3_cm16.comp  CINP=64 COUTP=64 IN=0 ACT=2 GATE=0 OUT=0 WARPS=4 WR=4
+c3_cm16_i64_o16_n0a0g0o1_w8r2  conv3x3_cm16.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=1 WARPS=8 WR=2
+c3_cm16_i64_o16_n0a0g0o1_w4r4  conv3x3_cm16.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=1 WARPS=4 WR=4
 
-# 3x3 conv without a matrix extension, for subgroup-16 GPUs (Intel Xe, Mali): one output channel
-# per lane, fp16 partial sums per tap then fp32 (ACC=3). Tile TH rows x 16 pixels, RPS rows per
-# subgroup.
-conv3x3_sg16_c48_t8_r1  conv3x3_sg16.comp  C=48 TH=8 RPS=1 ACC=3
-conv3x3_sg16_c64_t8_r1  conv3x3_sg16.comp  C=64 TH=8 RPS=1 ACC=3
+# 3x3 conv for 16-lane subgroups (sg16): a lane per output channel, fp16 per tap then fp32.
+# Tile TH rows x 16 pixels, RPS rows per subgroup.
+c3_sg16_i16_o48_n2a0g0o0_t8r1  conv3x3_sg16.comp  CINP=16 COUTP=48 IN=2 ACT=0 GATE=0 OUT=0 TH=8 RPS=1
+c3_sg16_i16_o48_n2a0g0o0_t4r1  conv3x3_sg16.comp  CINP=16 COUTP=48 IN=2 ACT=0 GATE=0 OUT=0 TH=4 RPS=1
+c3_sg16_i48_o48_n0a1g0o0_t8r1  conv3x3_sg16.comp  CINP=48 COUTP=48 IN=0 ACT=1 GATE=0 OUT=0 TH=8 RPS=1
+c3_sg16_i48_o48_n0a1g0o0_t4r1  conv3x3_sg16.comp  CINP=48 COUTP=48 IN=0 ACT=1 GATE=0 OUT=0 TH=4 RPS=1
+c3_sg16_i48_o48_n0a0g2o0_t8r1  conv3x3_sg16.comp  CINP=48 COUTP=48 IN=0 ACT=0 GATE=2 OUT=0 TH=8 RPS=1
+c3_sg16_i48_o48_n0a0g2o0_t4r1  conv3x3_sg16.comp  CINP=48 COUTP=48 IN=0 ACT=0 GATE=2 OUT=0 TH=4 RPS=1
+c3_sg16_i48_o48_n0a0g0o2_t8r1  conv3x3_sg16.comp  CINP=48 COUTP=48 IN=0 ACT=0 GATE=0 OUT=2 TH=8 RPS=1
+c3_sg16_i48_o48_n0a0g0o2_t4r1  conv3x3_sg16.comp  CINP=48 COUTP=48 IN=0 ACT=0 GATE=0 OUT=2 TH=4 RPS=1
+c3_sg16_i16_o64_n1a2g0o0_t8r1  conv3x3_sg16.comp  CINP=16 COUTP=64 IN=1 ACT=2 GATE=0 OUT=0 TH=8 RPS=1
+c3_sg16_i16_o64_n1a2g0o0_t4r1  conv3x3_sg16.comp  CINP=16 COUTP=64 IN=1 ACT=2 GATE=0 OUT=0 TH=4 RPS=1
+c3_sg16_i64_o64_n0a2g0o0_t8r1  conv3x3_sg16.comp  CINP=64 COUTP=64 IN=0 ACT=2 GATE=0 OUT=0 TH=8 RPS=1
+c3_sg16_i64_o64_n0a2g0o0_t4r1  conv3x3_sg16.comp  CINP=64 COUTP=64 IN=0 ACT=2 GATE=0 OUT=0 TH=4 RPS=1
+c3_sg16_i64_o16_n0a0g0o1_t8r1  conv3x3_sg16.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=1 TH=8 RPS=1
+c3_sg16_i64_o16_n0a0g0o1_t4r1  conv3x3_sg16.comp  CINP=64 COUTP=16 IN=0 ACT=0 GATE=0 OUT=1 TH=4 RPS=1
+
+# 1x1 conv over the concat of NSRC NHWC sources (SPAN's conv_cat).
+cat_cm16_c48_s4_w4  concat1x1_cm16.comp  C=48 NSRC=4 WARPS=4
+cat_sg16_c48_s4_b4  concat1x1_sg16.comp  C=48 NSRC=4 PB=4

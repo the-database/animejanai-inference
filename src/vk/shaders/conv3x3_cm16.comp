@@ -1,91 +1,171 @@
 #version 450
-// 3x3 conv, NHWC fp16, bias + ReLU, on VK_KHR_cooperative_matrix (16x16x16, fp16 accumulate).
-// The same tiling as libaji's CUDA k_conv3x3: a workgroup computes TH x 16 output pixels for all
-// output channels; its input tile with a one-pixel halo sits in shared memory (pixel stride C+8);
-// each subgroup computes WR rows of 16 pixels as an implicit GEMM over 9 taps x C, A from shared,
-// B straight from the weight buffer. The accumulators are staged in shared memory and written out
-// with bias and ReLU. Defines: C, WARPS (subgroups per workgroup), WR (rows per subgroup).
+// Fused 3x3 conv on VK_KHR_cooperative_matrix 16x16x16 with fp16 accumulate (the cm16 family):
+// libaji's CUDA k_conv3x3 (src/native/conv_kernels.cuh) on cooperative matrices. A workgroup
+// computes TH x 16 output pixels for all output channels; its input tile with a one-pixel halo
+// sits in shared memory; each subgroup computes WR rows of 16 pixels as an implicit GEMM over
+// 9 taps x CINP, A from shared memory, B (weights, row-major [9][CINP][COUTP]) from the buffer.
+// The epilogue runs on the accumulators: bias (and PReLU slopes, the attention bias) load as
+// matrices whose rows are all the same vector, a gate's block input x loads from its feature
+// buffer as a matrix (rows past the image read slack or another row; they are never written),
+// and activations, tanh and the gates are element-wise. The tanh gate's 1x1 attention conv
+// reads the subgroup's own staged rows as A. One store to the staging tile, then the writer
+// (conv_common.glsl).
+// Defines: CINP, COUTP, IN, ACT, GATE, OUT, WARPS (subgroups), WR (rows per subgroup).
+// local_size_x (specialization constant 0) = WARPS * the subgroup size.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x_id = 0) in;
 
-const int TW = 16, TH = WARPS * WR, CP = C + 8, SP = C + 8, KC = C / 16, NT = C / 16, VPP = C / 8;
-const int HP = (TH + 2) * (TW + 2);
-const int SM_HALO = HP * CP / 8, SM_STAGE = TH * TW * SP / 8;
-const int SM = SM_HALO > SM_STAGE ? SM_HALO : SM_STAGE;
+const int TH = WARPS * WR;
+const int SM_EXTRA = 0;
+#include "conv_common.glsl"
 
-layout(push_constant) uniform PC { int H; int W; } pc;
-layout(std430, binding = 0) readonly buffer Src { uvec4 src[]; };
-layout(std430, binding = 1) readonly buffer Wt { uvec4 wt[]; };     // [9][C][C] fp16
-layout(std430, binding = 2) readonly buffer Bias { f16vec2 bias[]; };
-layout(std430, binding = 3) writeonly buffer Dst { uvec4 dst[]; };
+layout(std430, binding = 3) readonly buffer Wt { uvec4 wt[]; };      // [9][CINP][COUTP]
+#if GATE == 2
+layout(std430, binding = 6) readonly buffer Watt { uvec4 watt[]; };  // [COUTP][COUTP]
+#endif
 
-shared uvec4 sm[SM];
+#define ACC_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define A_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define B_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
 
-uint relu_bias(uint v, f16vec2 b)
+// Channels n*16 .. n*16+15 of a per-channel vector, as a matrix whose 16 rows all hold them.
+ACC_T bias_rows(int n)
 {
-    f16vec2 h = unpackFloat2x16(v) + b;
-    return packFloat2x16(max(h, f16vec2(0.0)));
+    ACC_T m;
+    coopMatLoad(m, bias_h, uint(n * 16), 0u, gl_CooperativeMatrixLayoutRowMajor);
+    return m;
 }
+#if ACT == 2
+ACC_T slope_rows(int n)
+{
+    ACC_T m;
+    coopMatLoad(m, slope_h, uint(n * 16), 0u, gl_CooperativeMatrixLayoutRowMajor);
+    return m;
+}
+#endif
+#if GATE == 2
+ACC_T batt_rows(int n)
+{
+    ACC_T m;
+    coopMatLoad(m, batt_h, uint(n * 16), 0u, gl_CooperativeMatrixLayoutRowMajor);
+    return m;
+}
+#endif
 
 void main()
 {
-    const int tid = int(gl_LocalInvocationIndex), nthreads = int(gl_WorkGroupSize.x);
+    const int KC = CINP / 16, NT = COUTP / 16;
+    const int tid = int(gl_LocalInvocationIndex), nth = int(gl_WorkGroupSize.x);
     const int sg = int(gl_SubgroupID);
     const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
     const int H = pc.H, W = pc.W;
 
-    for (int i = tid; i < HP * VPP; i += nthreads) {
-        const int px = i / VPP, v = i % VPP;
-        const int yy = ty0 - 1 + px / (TW + 2), xx = tx0 - 1 + px % (TW + 2);
-        const bool ok = yy >= 0 && yy < H && xx >= 0 && xx < W;
-        sm[px * (CP / 8) + v] = ok ? src[(yy * W + xx) * VPP + v] : uvec4(0);
-    }
+    fill_halo(tid, nth, tx0, ty0, H, W);
     barrier();
 
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[WR][NT];
+    ACC_T acc[WR][NT];
     [[unroll]] for (int i = 0; i < WR; i++)
-        [[unroll]] for (int n = 0; n < NT; n++)
-            acc[i][n] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        [[unroll]] for (int n = 0; n < NT; n++) acc[i][n] = ACC_T(0.0);
     const int row0 = sg * WR;
 
     [[dont_unroll]] for (int t = 0; t < 9; t++) {
         const int dy = t / 3, dx = t % 3;
         [[unroll]] for (int kc = 0; kc < KC; kc++) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[NT];
+            B_T b[NT];
             [[unroll]] for (int n = 0; n < NT; n++)
-                coopMatLoad(b[n], wt, uint(((t * C + kc * 16) * C + n * 16) / 8), uint(C / 8),
+                coopMatLoad(b[n], wt, uint(((t * CINP + kc * 16) * COUTP + n * 16) / 8), uint(COUTP / 8),
                             gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (int i = 0; i < WR; i++) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
-                coopMatLoad(a, sm, uint(((row0 + i + dy) * (TW + 2) + dx) * (CP / 8) + kc * 2),
-                            uint(CP / 8), gl_CooperativeMatrixLayoutRowMajor);
+                A_T a;
+                coopMatLoad(a, sm, uint(((row0 + i + dy) * (TW + 2) + dx) * (CP / 8) + kc * 2), uint(CP / 8),
+                            gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (int n = 0; n < NT; n++) acc[i][n] = coopMatMulAdd(a, b[n], acc[i][n]);
             }
         }
     }
-    barrier();  // the halo is no longer read: shared memory becomes the staging tile [TH*TW][SP]
 
+    // epilogue on the accumulators
+    [[unroll]] for (int n = 0; n < NT; n++) {
+        const ACC_T bm = bias_rows(n);
+        [[unroll]] for (int i = 0; i < WR; i++) acc[i][n] = acc[i][n] + bm;
+    }
+#if GATE == 0 && ACT == 1
+    [[unroll]] for (int i = 0; i < WR; i++)
+        [[unroll]] for (int n = 0; n < NT; n++)
+            for (int e = 0; e < acc[i][n].length(); e++) acc[i][n][e] = max(acc[i][n][e], float16_t(0.0));
+#elif GATE == 0 && ACT == 2
+    [[unroll]] for (int n = 0; n < NT; n++) {
+        const ACC_T sl = slope_rows(n);
+        [[unroll]] for (int i = 0; i < WR; i++)
+            for (int e = 0; e < acc[i][n].length(); e++) {
+                const float16_t v = acc[i][n][e];
+                acc[i][n][e] = v >= float16_t(0.0) ? v : v * sl[e];
+            }
+    }
+#elif GATE == 0 && ACT == 3
+    [[unroll]] for (int i = 0; i < WR; i++)
+        [[unroll]] for (int n = 0; n < NT; n++)
+            for (int e = 0; e < acc[i][n].length(); e++) {
+                const float v = float(acc[i][n][e]);
+                acc[i][n][e] = float16_t(v / (1.0 + exp(-v)));
+            }
+#elif GATE != 0
+    // x, the block input, at this subgroup's rows: the row is clamped into the image, and columns
+    // past W read the next row or the buffer's slack (those pixels are never written)
+#if GATE == 2
+    barrier();  // the halo is no longer read: this subgroup's staging rows are free
+#endif
+    [[unroll]] for (int i = 0; i < WR; i++) {
+        const int oy = min(ty0 + row0 + i, H - 1);
+#if GATE == 2
+        // the 1x1 attention conv on o (biased, fp16), A = this row's 16 pixels from shared memory
+        [[unroll]] for (int n = 0; n < NT; n++)
+            coopMatStore(acc[i][n], sm, uint((row0 + i) * TW * (SP / 8) + n * 2), uint(SP / 8), gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        ACC_T ga[NT];
+        [[unroll]] for (int n = 0; n < NT; n++) ga[n] = batt_rows(n);
+        [[unroll]] for (int kc = 0; kc < NT; kc++) {
+            A_T a;
+            coopMatLoad(a, sm, uint((row0 + i) * TW * (SP / 8) + kc * 2), uint(SP / 8), gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (int n = 0; n < NT; n++) {
+                B_T b;
+                coopMatLoad(b, watt, uint(((kc * 16) * COUTP + n * 16) / 8), uint(COUTP / 8), gl_CooperativeMatrixLayoutRowMajor);
+                ga[n] = coopMatMulAdd(a, b, ga[n]);
+            }
+        }
+#endif
+        [[unroll]] for (int n = 0; n < NT; n++) {
+            ACC_T x;
+            coopMatLoad(x, resid_u, uint(((oy * W + tx0) * COUTP + n * 16) / 2), uint(COUTP / 2), gl_CooperativeMatrixLayoutRowMajor);
+#if GATE == 1
+            acc[i][n] = x + acc[i][n];
+#elif GATE == 2
+            for (int e = 0; e < ga[n].length(); e++) ga[n][e] = float16_t(tanh(float(ga[n][e])));
+            acc[i][n] = (x + acc[i][n]) * ga[n];
+#else
+            ACC_T s = acc[i][n];
+            for (int e = 0; e < s.length(); e++) s[e] = float16_t(1.0 / (1.0 + exp(-float(s[e]))) - 0.5);
+            acc[i][n] = (x + acc[i][n]) * s;
+#endif
+        }
+    }
+#endif
+#if GATE != 2
+    barrier();  // the halo is no longer read: shared memory becomes the staging tile [TH*TW][SP]
+#endif
     [[unroll]] for (int i = 0; i < WR; i++)
         [[unroll]] for (int n = 0; n < NT; n++)
             coopMatStore(acc[i][n], sm, uint((row0 + i) * TW * (SP / 8) + n * 2), uint(SP / 8),
                          gl_CooperativeMatrixLayoutRowMajor);
     barrier();
 
-    const int VPR = TW * VPP;
-    for (int q = tid; q < TH * VPR; q += nthreads) {
-        const int r = q / VPR, w = q % VPR, px = w / VPP, v = w % VPP, oy = ty0 + r, ox = tx0 + px;
-        if (oy >= H || ox >= W) continue;
-        uvec4 o = sm[(r * TW + px) * (SP / 8) + v];
-        o.x = relu_bias(o.x, bias[v * 4 + 0]);
-        o.y = relu_bias(o.y, bias[v * 4 + 1]);
-        o.z = relu_bias(o.z, bias[v * 4 + 2]);
-        o.w = relu_bias(o.w, bias[v * 4 + 3]);
-        dst[(oy * W + ox) * VPP + v] = o;
-    }
+    write_out(tid, nth, tx0, ty0, H, W);
 }

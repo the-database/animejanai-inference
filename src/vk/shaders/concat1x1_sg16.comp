@@ -1,0 +1,86 @@
+#version 450
+// 1x1 conv over the virtual channel concatenation of NSRC NHWC tensors of C channels each, bias
+// only, NHWC output with C channels (SPAN's conv_cat), for 16-lane subgroups (the sg16 family).
+// A subgroup computes 16 consecutive pixels for one 16-channel output group, a lane per output
+// channel, as conv3x3_sg16 does: inputs from the shared tile reach the lanes by
+// subgroupBroadcast. fp16 partial sums per 16-channel chunk, then fp32.
+// Defines: C, NSRC, PB (16-pixel blocks per workgroup).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+const int NG = C / 16, M = PB * 16, CP = C + 8, VPP = C / 8, KC = NSRC * C / 16;
+layout(local_size_x = 16 * NG * PB) in;
+
+layout(push_constant) uniform PC { int npx; int u0; int u1; int u2; } pc;
+layout(std430, binding = 0) readonly buffer S0 { uvec4 s0[]; };
+layout(std430, binding = 1) readonly buffer S1 { uvec4 s1[]; };
+layout(std430, binding = 2) readonly buffer S2 { uvec4 s2[]; };
+layout(std430, binding = 3) readonly buffer S3 { uvec4 s3[]; };
+layout(std430, binding = 4) writeonly buffer Dst { float16_t dst[]; };
+layout(std430, binding = 5) readonly buffer Wt { uvec4 wp[]; };  // [NSRC*C/16][NG][16 lanes][16 k]
+layout(std430, binding = 6) readonly buffer Bias { float16_t bias[]; };
+
+shared uvec4 sm[NSRC * M * CP / 8];
+
+uvec4 src_at(int s, int i)
+{
+    if (s == 0) return s0[i];
+    if (s == 1) return s1[i];
+    if (s == 2) return s2[i];
+    return s3[i];
+}
+
+void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
+{
+    f16vec2 p;
+    p = unpackFloat2x16(u0.x); v[0] = p.x; v[1] = p.y;
+    p = unpackFloat2x16(u0.y); v[2] = p.x; v[3] = p.y;
+    p = unpackFloat2x16(u0.z); v[4] = p.x; v[5] = p.y;
+    p = unpackFloat2x16(u0.w); v[6] = p.x; v[7] = p.y;
+    p = unpackFloat2x16(u1.x); v[8] = p.x; v[9] = p.y;
+    p = unpackFloat2x16(u1.y); v[10] = p.x; v[11] = p.y;
+    p = unpackFloat2x16(u1.z); v[12] = p.x; v[13] = p.y;
+    p = unpackFloat2x16(u1.w); v[14] = p.x; v[15] = p.y;
+}
+
+void main()
+{
+    const int tid = int(gl_LocalInvocationIndex), nth = 16 * NG * PB;
+    const int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
+    // a 2-D grid of pixel blocks (one dimension caps at 65535 groups); the last row may overshoot
+    const int p0 = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * M, npx = pc.npx;
+    if (p0 >= npx) return;  // the whole workgroup, before any barrier
+    [[unroll]] for (int s = 0; s < NSRC; s++)
+        for (int i = tid; i < M * VPP; i += nth) {
+            const int px = i / VPP, v = i % VPP;
+            sm[(s * M + px) * (CP / 8) + v] = p0 + px < npx ? src_at(s, (p0 + px) * VPP + v) : uvec4(0);
+        }
+    barrier();
+
+    const int g = sg % NG, blk = sg / NG, ch = g * 16 + lane;
+    float tot[16];
+    [[unroll]] for (int m = 0; m < 16; m++) tot[m] = 0.0;
+    [[unroll]] for (int kc = 0; kc < KC; kc++) {
+        const int s = kc / (C / 16), kk = kc % (C / 16);
+        const int wi = ((kc * NG + g) * 16 + lane) * 2;
+        float16_t w[16];
+        unpack16(wp[wi], wp[wi + 1], w);
+        const int ai = (s * M + blk * 16 + lane) * (CP / 8) + kk * 2;
+        float16_t a[16];
+        unpack16(sm[ai], sm[ai + 1], a);
+        float16_t part[16];
+        [[unroll]] for (int m = 0; m < 16; m++) part[m] = float16_t(0.0);
+        [[unroll]] for (int k = 0; k < 16; k++)
+            [[unroll]] for (int m = 0; m < 16; m++) part[m] = fma(subgroupBroadcast(a[k], m), w[k], part[m]);
+        [[unroll]] for (int m = 0; m < 16; m++) tot[m] += float(part[m]);
+    }
+    const float b = float(bias[ch]);
+    [[unroll]] for (int m = 0; m < 16; m++) {
+        const int p = p0 + blk * 16 + m;
+        if (p < npx) dst[p * C + ch] = float16_t(tot[m] + b);
+    }
+}

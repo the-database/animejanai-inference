@@ -5,8 +5,9 @@
  * (3.3.x semantics: case-insensitive; "directml" -> DML, "ncnn" -> DML
  * with a warning (NCNN is retired; DirectML serves its audience),
  * "tensorrt-rtx" (also "tensorrt_rtx", "trt-rtx", "trtrtx") -> TensorRT
- * for RTX, anything else incl. absent/no conf -> TensorRT). Loads the
- * sibling backend library (aji_trt / aji_trtrtx / aji_dml) from its own
+ * for RTX, "vulkan" (also "vk") -> aji_vk, anything else incl. absent/no
+ * conf -> TensorRT). Loads the
+ * sibling backend library (aji_trt / aji_trtrtx / aji_dml / aji_vk) from its own
  * directory and
  * forwards the whole C ABI. Keeps nvinfer/onnxruntime out of the
  * process until the chosen backend actually needs them.
@@ -254,6 +255,8 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         stem = "aji_trtrtx";
     } else if (lower == "directml") {
         stem = "aji_dml";
+    } else if (lower == "vulkan" || lower == "vk") {
+        stem = "aji_vk";
     } else if (lower == "ncnn") {
         logf_to(params->log, params->log_opaque, 2,
                 "backend=NCNN is retired; using DirectML instead");
