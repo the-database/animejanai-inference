@@ -3,7 +3,7 @@
  * (aji_img_vk.cpp), the counterpart of native/imgnet.h, or a whole frame on the video path
  * (aji_vk's model steps), the counterpart of native/framenet.h. create() recognises ESRGAN
  * (RRDBNet, as traiNNer/chaiNNer export it, with or without the 2x pixel-unshuffle; vk/esrgan.cpp,
- * on the general conv) and otherwise lowers the graph to the conv nets the video path runs (SPAN,
+ * on the general conv), FDAT (vk/fdat.cpp, on tfm.comp) and otherwise lowers the graph to the conv nets the video path runs (SPAN,
  * SPANF3, Compact; on vk/executor.h). Input and output are buffers it owns, NCHW fp16 RGB at the
  * input size and at scale times it, until bind_io points it at the caller's.
  */
@@ -38,6 +38,14 @@ public:
     virtual size_t device_bytes() const = 0;  // all its device memory
     virtual size_t weight_bytes() const = 0;  // of which the weights
     virtual std::string describe() const = 0;
+    // GPU time per kind of step for one run, one line each ("" when the network can't say).
+    virtual std::string profile(Device &dev) const
+    {
+        (void)dev;
+        return "";
+    }
+    // Appends s to describe() (the video path's ", whole frame").
+    virtual void suffix(const std::string &s) = 0;
     // record() on a one-shot command buffer, submitted and waited for.
     bool run(Device &dev, int w, int h, std::string *why) const;
 
@@ -54,6 +62,8 @@ public:
 
 // ESRGAN at w x h, or null with *why ("not an ESRGAN graph" when it is some other network).
 std::unique_ptr<ImgNet> build_esrgan(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why);
+// FDAT (vk/fdat.cpp) the same way ("not an FDAT graph").
+std::unique_ptr<ImgNet> build_fdat(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why);
 
 }  // namespace ajivk
 

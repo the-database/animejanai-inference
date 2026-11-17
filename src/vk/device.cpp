@@ -112,6 +112,10 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
             shape |= c.MSize == 16 && c.NSize == 16 && c.KSize == 16 && c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                      c.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                      c.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.scope == VK_SCOPE_SUBGROUP_KHR;
+        for (const auto &c : cm)
+            d.cm16_acc32 |= c.MSize == 16 && c.NSize == 16 && c.KSize == 16 && c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                            c.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                            c.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && c.scope == VK_SCOPE_SUBGROUP_KHR;
         if (!shape) d.cm16_why = "no 16x16x16 fp16-accumulate cooperative matrix";
         // Intel Arc reports other shapes only; RDNA2 and older emulate the extension (plan
         // section 3: gate on the architecture). Until the device tables land, only NVIDIA and AMD.

@@ -45,6 +45,7 @@ struct DeviceInfo {
     double timestamp_ns = 0.0;           // timestampPeriod; 0 if the queue can't time
     uint64_t device_local_bytes = 0;     // the largest device-local heap
     bool cm16 = false, sg16 = false, plain = false;  // the device can run that family
+    bool cm16_acc32 = false;  // a 16x16x16 cooperative matrix with fp16 operands and fp32 sums too
     std::string cm16_why, sg16_why, plain_why;       // why not, when it can't
     Family family = Family::None;        // the one aji_vk uses (AJI_VK_FAMILY overrides)
 };

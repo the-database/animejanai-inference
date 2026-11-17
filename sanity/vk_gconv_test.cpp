@@ -1,7 +1,8 @@
 // aji_vk_gconv_test: the general conv (vk/gconv.h) in each mode the networks use, against a CPU
 // reference on random data: channel prefixes and slices of wider buffers, runtime input channels
 // (every halo chunk size), stride 2, NCHW planes at an offset, residuals, LeakyReLU, and the
-// phase scatters (R = 2, 4) of the transposed convs. Each tile variant, at a ragged size.
+// phase scatters (R = 2, 4) of the transposed convs, GELU, output slices. Each tile variant, at a
+// ragged size.
 // Fails above --max-err (default 0.02: fp16 sums, outputs of order 1).
 //   aji_vk_gconv_test [--device N]   (AJI_VK_FAMILY picks the kernel family)
 #include <cmath>
@@ -92,6 +93,7 @@ bool run_case(Device &dev, const Case &k, double max_err, int *runs)
                     float v = acc[o] + bias[o];
                     if (hasr) v += k.c1 * res[((size_t)y * W + x) * k.dst_stride + k.dst_off + o];
                     if (s.act == 2 && v < 0) v *= 0.2f;
+                    if (s.act == 1) v = 0.5f * v * (1.f + std::erf(v / 1.4140625f));  // GELU, as CUDA's
                     size_t d;
                     if (R > 1) {
                         const int sx = o / CHP, ch = o % CHP;
@@ -279,6 +281,7 @@ int main(int argc, char **argv)
         {"nhwc s1 192->192 in 12 slices res", shape(16, 0, 2, 1, 1, 0), 192, 192, 192, 21, 35, 192, 0, 256, 32, 1.f, 12},
         {"nhwc s1 128->128 in 2 slices res", shape(64, 0, 2, 1, 1, 0), 128, 128, 128, 19, 37, 128, 0, 128, 0, 1.f, 2},
         {"nhwc s2 96->96 in 2 slices", shape(48, 0, 2, 0, 2, 0), 96, 96, 96, 30, 42, 96, 0, 96, 0, 1.f, 2},
+        {"phase R2 GELU 2x32 in 2 slices", shape(32, 0, 1, 0, 1, 4), 48, 64, 48, 13, 27, 48, 0, 32, 0, 1.f, 2},
         {"phase R2 32->2x8", shape(16, 0, 0, 0, 1, 4), 32, 16, 32, 13, 27, 32, 0, 8, 0, 1.f},
         {"phase R2 32->2x16", shape(32, 0, 0, 0, 1, 4), 32, 32, 32, 13, 27, 32, 0, 16, 0, 1.f},
         {"phase R4 64->4x8", shape(32, 0, 0, 0, 1, 5), 64, 32, 64, 11, 19, 64, 0, 8, 0, 1.f},
