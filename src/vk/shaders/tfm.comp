@@ -14,6 +14,11 @@
 //   9 chanfold: the softmax folded into the projection: fp16 GEMM weights, and the bias copied
 //   10 aimcg: the channel gate (FDAT spatial blocks): sigmoid(W2 gelu(W1 mean))
 //   11 aimsg: x += attn + conv * sigmoid(attn . wsg) (FDAT channel blocks)
+//   12 imgin: the network input (NCHW fp16, binding 0) minus a mean into an NHWC map, zeros to 16,
+//      reflect-padded to a larger size
+//   15 imgout: an NHWC map's first 3 channels, cropped, into the network output (NCHW fp16, binding 3)
+//   13 colsum2: partial column sums of a map over token chunks (then colsum adds them up)
+//   14 convert: a map into another (fp32 <-> fp16), n channels
 //
 // Tensors are maps into the arena (binding 2) as in tfix.comp: {base, stride, off, f32}, element
 // pix*stride + off + c. Binding 4: fp32 vectors and matrices (LayerNorm, dw weights, biases, gates);
@@ -40,6 +45,18 @@ layout(std430, binding = 2) buffer ArU { uint aru[]; };
 layout(std430, binding = 4) readonly buffer WF { float wf[]; };
 layout(std430, binding = 5) buffer WH { float16_t wh[]; };
 layout(std430, binding = 6) buffer Part { float part[]; };
+layout(std430, binding = 0) readonly buffer In { float16_t inh[]; };
+layout(std430, binding = 3) writeonly buffer Out { float16_t outh[]; };
+
+// torch's reflect padding: index i of a padded axis of a source of n
+int reflect_i(int i, int n)
+{
+    if (n == 1) return 0;
+    const int p = 2 * (n - 1);
+    i %= p;
+    if (i < 0) i += p;
+    return i < n ? i : p - i;
+}
 
 int prm(int k) { return params[pc.entry * 16 + (k >> 2)][k & 3]; }
 float prmf(int k) { return intBitsToFloat(prm(k)); }
@@ -106,6 +123,18 @@ float act(float v, int a, float slope)
     return v;
 }
 
+// The GEMM's A element (row r, column k). As a 3x3 conv (im2col, 31 > 0): row r the pixel (r / W,
+// r % W) of an H x W map, column k the tap k / CPin (row-major 3x3, zero outside the map), channel
+// k % CPin of the input (32 H, 33 W, 34 CPin).
+float a_elem(Map A, int r, int k, int M)
+{
+    if (r >= M) return 0.0;
+    if (prm(31) == 0) return ld(A, uint(r), k);
+    const int W = prm(33), cp = prm(34), t = k / cp, c = k % cp;
+    const int y = r / W + t / 3 - 1, x = r % W + t % 3 - 1;
+    if (y < 0 || y >= prm(32) || x < 0 || x >= W) return 0.0;
+    return ld(A, uint(y * W + x), c);
+}
 #if PASS == 1
 // 64 x 64 outputs per workgroup, each thread a 4 x 4 block; K in steps of 16 through shared memory
 shared float sa_[16][64 + 1], sb_[16][64 + 1];
@@ -143,7 +172,7 @@ void main()
         // A tile 64 x 16 (transposed into sa_[k][m]); W tile 16 x 64
         for (int i = tid; i < 64 * 16; i += 256) {
             const int mm = i / 16, kk = i % 16, gm = m0 + mm;
-            sa_[kk][mm] = gm < M ? ld(A, uint(gm), k0 + kk) : 0.0;
+            sa_[kk][mm] = a_elem(A, gm, k0 + kk, M);
             const int kb = i / 64, nn = i % 64, gn = n0 + nn;
             sb_[kb][nn] = gn < N ? float(wh[wo + (k0 + kb) * N + gn]) : 0.0;
         }
@@ -167,7 +196,7 @@ void main()
             if (last == 0) v = act(v, acti, slope);
             if (cso >= 0) v *= arf[cso + c];
             if (!A1.none) v += ld(A1, uint(r), c);
-            if (!A2.none) v += ld(A2, uint(r), c) * (a2s >= 0 ? wf[a2s + c] : 1.0);
+            if (!A2.none) v += ld(A2, uint(r), c) * (a2s >= 0 ? arf[a2s + c] : 1.0);
             if (last != 0) v = act(v, acti, slope);
             st(O, uint(r), c, v);
         }
@@ -293,8 +322,12 @@ void main()
     arf[oo + c] = s;
 #elif PASS == 5
     // 16 H, 17 W, 18 heads, 19 hd, 20 wh, 21 ww, 22 sy, 23 sx, 28 nwx, 29 Hp, 30 Wp, 31 scale (float),
-    // 32 bias (wf, [heads][T][T], < 0 none), 33 qo, 34 ko, 35 vo, 36 windows x heads x query blocks,
-    // 37 query blocks (of 64) per window; m0 qkv (stride sq), m1 out
+    // 32 bias (wf, [heads][Tq][Tk], < 0 none), 33 qo, 34 ko, 35 vo, 36 windows x heads x query blocks,
+    // 37 query blocks (of 64) per window, 38 kwh, 39 kww (key windows: kwh x kww tokens at
+    // (wy*wh - kpad, wx*ww - kpad), zero outside the image; 0: the query window), 40 kpad, 41 Swin
+    // mask (-100 between the regions the shift joins), 42 rtab (wf, [heads][tn]: the bias as a
+    // relative-position table, < 0 none), 43 its row width, 44 offy, 45 offx, 46 tn;
+    // m0 qkv (stride sq), m1 out
     const int H = prm(16), W = prm(17), heads = prm(18), hd = prm(19), wh_ = prm(20), ww = prm(21), sy = prm(22), sx = prm(23);
     const int nwx = prm(28), Hp = prm(29), Wp = prm(30), bo = prm(32), qo = prm(33), ko = prm(34), vo = prm(35);
     const float scale = prmf(31);
@@ -306,6 +339,11 @@ void main()
     const int T = wh_ * ww, win = wgh / heads, h = wgh % heads, tid = qb * 64 + int(gl_LocalInvocationIndex),
               lid = int(gl_LocalInvocationIndex);
     const int wy = win / nwx, wx = win % nwx;
+    const int kwh = prm(38), kww = prm(39), kpad = prm(40), msk = prm(41), rto = prm(42), rtw = prm(43), roy = prm(44), rox = prm(45),
+              rtn = prm(46);
+    const int kw = kwh > 0 ? kww : ww, Tk = (kwh > 0 ? kwh : wh_) * kw;
+    // the Swin region (0..2 per axis) of rolled coordinate v on an axis of n with window w, shift s
+    #define SWIN_RID(v, n, w, s) ((v) < (n) - (w) ? 0 : ((v) < (n) - (s) ? 1 : 2))
     // token t of this window: its pixel, or -1 (beyond the image: zero q, k, v and no output)
     #define TOKPIX(t, pix)                                                                  \
         {                                                                                   \
@@ -321,6 +359,8 @@ void main()
         }
     int qp;
     TOKPIX(tid, qp);
+    const int qy = tid / ww, qx = tid % ww;
+    const int qreg = msk != 0 ? SWIN_RID(wy * wh_ + qy, Hp, wh_, sy) * 3 + SWIN_RID(wx * ww + qx, Wp, ww, sx) : 0;
     // q, the output and the shared k / v rows as vec4s (8 of them: hd <= 32, zero beyond)
     vec4 q4[8], o4[8];
     [[unroll]] for (int d4 = 0; d4 < 8; d4++) {
@@ -333,13 +373,20 @@ void main()
         o4[d4] = vec4(0.0);
     }
     float mrow = -1e30, lrow = 0.0;
-    for (int kb = 0; kb < T; kb += 32) {
+    for (int kb = 0; kb < Tk; kb += 32) {
         barrier();
         // fp16 pairs as 32-bit words (the head offsets and hd are even, the map fp16)
         [[unroll]] for (int r = 0; r < 4; r++) {
             const int i = lid + r * 64, kt = kb + i / 8, d4 = i % 8;
             int kp = -1;
-            if (kt < T) TOKPIX(kt, kp);
+            if (kt < Tk) {
+                if (kwh > 0) {
+                    const int y_ = wy * wh_ - kpad + kt / kw, x_ = wx * ww - kpad + kt % kw;
+                    if (y_ >= 0 && y_ < H && x_ >= 0 && x_ < W) kp = y_ * W + x_;
+                } else {
+                    TOKPIX(kt, kp);
+                }
+            }
             vec4 kv = vec4(0.0), vv = vec4(0.0);
             if (kp >= 0) {
                 const uint rowk = QKV.base + uint(kp) * uint(QKV.stride) + uint(QKV.off + ko + h * hd + d4 * 4);
@@ -359,14 +406,23 @@ void main()
         }
         barrier();
         if (tid >= T) continue;
-        const int nk = min(32, T - kb);
+        const int nk = min(32, Tk - kb);
         float s[32];
         float mx = mrow;
         [[unroll]] for (int j = 0; j < 32; j++) {
             float v = 0.0;
             [[unroll]] for (int d4 = 0; d4 < 8; d4++) v += dot(q4[d4], sk[j][d4]);
             v *= scale;
-            if (bo >= 0 && j < nk) v += wf[bo + (h * T + tid) * T + kb + j];
+            const int cc = kb + j;
+            if (j < nk) {
+                if (rto >= 0) {
+                    const int ky = cc / kw - (kwh > 0 ? kpad : 0), kx = cc % kw - (kwh > 0 ? kpad : 0);
+                    v += wf[rto + h * rtn + (ky - qy + roy) * rtw + (kx - qx + rox)];
+                } else if (bo >= 0) {
+                    v += wf[bo + (h * T + tid) * Tk + cc];
+                }
+                if (msk != 0 && SWIN_RID(wy * wh_ + cc / ww, Hp, wh_, sy) * 3 + SWIN_RID(wx * ww + cc % ww, Wp, ww, sx) != qreg) v -= 100.0;
+            }
             s[j] = j < nk ? v : -1e30;
             mx = max(mx, s[j]);
         }
@@ -463,19 +519,22 @@ void main()
     wh[oo + k * np_ + n] = float16_t(s);
 #elif PASS == 10
     // 16 sums (arena floats), 17 M, 18 C, 19 r, 20 w1 (wf [r][C]), 21 w2 (wf [C][r]), 22 cm out (arena
-    // floats), 23 cpad. One workgroup.
+    // floats), 23 cpad, 24 b1 (wf, < 0 none), 25 b2 (wf, < 0 none), 26 act (0 GELU, 1 ReLU), 27 the mean's
+    // scale (float). One workgroup (fdat_kernels.cu's k_aim_cg / k_chan_gate).
     const int so = prm(16), M = prm(17), C = prm(18), r = prm(19), w1 = prm(20), w2 = prm(21), co = prm(22), cpad = prm(23);
+    const int b1 = prm(24), b2 = prm(25), relu = prm(26);
+    const float isc = prmf(27);
     const int tid = int(gl_LocalInvocationIndex);
-    for (int c = tid; c < C; c += 256) smean[c] = arf[so + c] / float(M);
+    for (int c = tid; c < C; c += 256) smean[c] = arf[so + c] / float(M) * isc;
     barrier();
     for (int j = tid; j < r; j += 256) {
-        float s = 0.0;
+        float s = b1 >= 0 ? wf[b1 + j] : 0.0;
         for (int c = 0; c < C; c++) s += wf[w1 + j * C + c] * smean[c];
-        shid[j] = gelu(s);
+        shid[j] = relu != 0 ? max(s, 0.0) : gelu(s);
     }
     barrier();
     for (int c = tid; c < cpad; c += 256) {
-        float s = 0.0;
+        float s = c < C && b2 >= 0 ? wf[b2 + c] : 0.0;
         if (c < C)
             for (int j = 0; j < r; j++) s += wf[w2 + c * r + j] * shid[j];
         arf[co + c] = c < C ? sigm(s) : 0.0;
@@ -505,5 +564,36 @@ void main()
         const int c = lane + 32 * i;
         if (c < C) st(X, uint(t), c, ld(X, uint(t), c) + a[i] + ld(CV, uint(t), c) * g);
     }
+#elif PASS == 12
+    // 16 h, 17 w (the input), 18-20 the mean (floats), 21 ph, 22 pw (the map, reflect-padded);
+    // m0 out (stride >= 16)
+    const int t = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int h = prm(16), w = prm(17), n = h * w, ph = prm(21), pw = prm(22);
+    if (t >= ph * pw) return;
+    const int src = reflect_i(t / pw, h) * w + reflect_i(t % pw, w);
+    const Map O = map(0);
+    for (int c = 0; c < 16; c++) st(O, uint(t), c, c < 3 ? float(inh[c * n + src]) - prmf(18 + c) : 0.0);
+#elif PASS == 13
+    // 16 M, 17 C, 18 tokens a chunk, 19 partials (part, [chunks][C]); m0 in. A thread a channel.
+    const int c = int(gl_GlobalInvocationID.x), chunk = int(gl_WorkGroupID.y), M = prm(16), C = prm(17), tpc = prm(18), po = prm(19);
+    if (c >= C) return;
+    const Map I = map(0);
+    float s = 0.0;
+    for (int t = chunk * tpc; t < min(M, chunk * tpc + tpc); t++) s += ld(I, uint(t), c);
+    part[po + chunk * C + c] = s;
+#elif PASS == 14
+    // 16 M, 17 n; m0 in, m1 out
+    const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int M = prm(16), n = prm(17);
+    if (i >= M * n) return;
+    st(map(1), uint(i / n), i % n, ld(map(0), uint(i / n), i % n));
+#elif PASS == 15
+    // 16 h, 17 w (the output), 18 the map's width; m0 in
+    const int t = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int h = prm(16), w = prm(17), mw = prm(18), n = h * w;
+    if (t >= n) return;
+    const Map I = map(0);
+    const uint pix = uint((t / w) * mw + t % w);
+    for (int c = 0; c < 3; c++) outh[c * n + t] = float16_t(ld(I, pix, c));
 #endif
 }

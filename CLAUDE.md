@@ -166,7 +166,7 @@ off; any other value, or no key, is on. Image path: `AJI_NATIVE=off` (or `0`, `n
 | Models | Video path (`aji_trt.cpp`) | Image path (`aji_img_trt.cpp`) |
 |---|---|---|
 | SPAN, SPANF3, span_s, Compact (SRVGG) | `native/lower` + `native/executor` at the chain's size | the same plan and executor behind `ImgNet` (`build_lowered`, `native/framenet.cpp`), per tile |
-| ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory (ESRGAN and FDAT also on Vulkan: `vk/esrgan.cpp`, `vk/fdat.cpp`) | the `native/imgnet` builders, per tile |
+| ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory (ESRGAN, FDAT and HAT also on Vulkan: `vk/esrgan.cpp`, `vk/fdat.cpp`, `vk/hat.cpp`) | the `native/imgnet` builders, per tile |
 | TFDAT, TemporalFix | `native/vidnet` in the temporal stage (TemporalFix also on Vulkan: `vk/tfix`) | — |
 | RIFE | `native/rife` (the graph read by `native/rife_plan`, which Vulkan's `vk/rife` shares) | — |
 
@@ -304,8 +304,8 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   ESRGAN (RRDBNet 64/32, 2x unshuffle and 4x) follows `native/esrgan.cpp`'s plan on it, with its
   intermediates in one arena by lifetime; a tile whose buffers exceed `maxStorageBufferRange` is
   refused. `ImgNet::create` tries ESRGAN, then the lowering.
-- **`vk/tnet`, `vk/fdat.cpp`, `tfm.comp`: the transformer image models on Vulkan** (FDAT now;
-  HAT, DAT and TFDAT to follow). `TNet` is one arena of maps (as `tfix.comp`'s), fp32 / fp16 weight
+- **`vk/tnet`, `vk/fdat.cpp`, `vk/hat.cpp`, `tfm.comp`: the transformer image models on Vulkan**
+  (FDAT and HAT now; DAT and TFDAT to follow). `TNet` is one arena of maps (as `tfix.comp`'s), fp32 / fp16 weight
   stores, a partial-sums buffer and a list of steps: gconv dispatches, `tfm.comp` passes, copies,
   fills. `tfm.comp` ports `native/tfm.cu` and `fdat_kernels.cu`: the GEMM (fp32 sums, tfm's
   epilogue: bias, act, column scale, two residuals, act last), LayerNorm (32 lanes a token),
@@ -315,9 +315,19 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   softmax and fold (into fp16 GEMM weights on the GPU), and FDAT's gates. On cm16 GPUs with fp32-sum
   cooperative matrices (`DeviceInfo::cm16_acc32`) the GEMM is `tfm_gemm_cm16.comp`. gconv gained
   GELU (ACT 1) and phase scatters split into output slices (FDAT's 2x C-channel transposed conv).
-  `ImgNet::create` and `ImgNet::frame` (video) try ESRGAN, then FDAT, then the lowering. FDAT_M
-  and FDAT_XL (the shipped IllustrationJaNai exports; the op23 "dynamo" exports aren't read, as on
-  CUDA) match CUDA native at 69-71 dB; 720x480 2x page on the 5090: 46 ms (DirectML 2238, CUDA 23).
+  `ImgNet::create` and `ImgNet::frame` (video) try ESRGAN, then FDAT, then HAT, then the lowering.
+  FDAT_M and FDAT_XL (the shipped IllustrationJaNai exports; the op23 "dynamo" exports aren't read,
+  as on CUDA) match CUDA native at 69-71 dB; 720x480 2x page on the 5090: 46 ms (DirectML 2238, CUDA
+  23). HAT-L (`vk/hat.cpp`, native/hat.cpp's plan) keeps the residual stream fp32; its window
+  attention is the general form (a relative-position table instead of a full bias, Swin's mask in
+  the shifted blocks, the OCAB's overlapping zero-padded key windows); the CAB's channel gate runs
+  on the GPU (`TNet::chan_gate`, ReLU and biases) and scales the CAB in the proj GEMM's epilogue
+  (the add2 scale is an arena offset); the group conv is the GEMM on an implicit im2col (params
+  31-34) for fp32 sums, output and residual. The input is reflect-padded to the window multiple
+  inside the net (`imgin`) and the output cropped (`imgout`), so any tile or frame size runs. Both
+  shipped exports match CUDA native at 72 dB; 512x512 on the 5090: 846 ms (CUDA 365; DirectML can't
+  load them). Most of the gap is window attention on scalar math (CUDA's is on tensor cores).
+  Pass 5's parameter 42 (the table) must be -1 when there is none: 0 is an offset.
   `AJI_TNET_SKIP=<step label prefix>` records no dispatch for those steps: per-step timestamps
   attribute time to the wrong step on NVIDIA, so this is how to see what a kind of step costs.
   `aji_vk_model_test image <onnx> W H` (any image model vs CUDA native), `gemm M K N [act]`,

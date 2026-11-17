@@ -162,6 +162,7 @@ int attn_main(int argc, char **argv)
         const long long wg = (long long)nwx * nwy * heads * nqb;
         a.v[36] = (int32_t)wg;
         a.v[37] = nqb;
+        a.v[42] = -1;
         const uint32_t gx = (uint32_t)std::min<long long>(wg, 65535), gy = (uint32_t)((wg + gx - 1) / gx);
         n.pass(5, a, gx, gy, "winattn");
     }
@@ -287,14 +288,35 @@ int image_main(int argc, char **argv)
         if (!cn) {
             std::printf("vs CUDA native: not run (%s)\n", why.c_str());
         } else {
+            // a size the CUDA model refuses (HAT: its window multiple) runs reflect-padded and cropped,
+            // as native/framenet.cpp runs whole frames
+            int a = 1;
+            while (a <= 64 && !cn->accepts(a, a)) a *= 2;
+            const int pw = (w + a - 1) / a * a, ph = (h + a - 1) / a * a, S = n->out_w() / w;
+            const auto refl = [](int i, int m) {
+                if (m == 1) return 0;
+                const int p = 2 * (m - 1);
+                i %= p;
+                return i < m ? i : p - i;
+            };
+            std::vector<uint16_t> pin((size_t)3 * pw * ph);
+            for (int c = 0; c < 3; c++)
+                for (int y = 0; y < ph; y++)
+                    for (int x = 0; x < pw; x++)
+                        pin[((size_t)c * ph + y) * pw + x] = hin[((size_t)c * h + refl(y, h)) * w + refl(x, w)];
+            if (pw != w || ph != h) cn = ajinative::ImgNet::create(g, pw, ph, s, &why);
             void *din = nullptr, *dout = nullptr;
-            cudaMalloc(&din, hin.size() * 2);
-            cudaMalloc(&dout, out.size() * 2);
-            cudaMemcpy(din, hin.data(), hin.size() * 2, cudaMemcpyHostToDevice);
-            cn->run(din, false, dout, false, w, h, s);
+            const size_t pout = (size_t)3 * pw * S * ph * S;
+            cudaMalloc(&din, pin.size() * 2);
+            cudaMalloc(&dout, pout * 2);
+            cudaMemcpy(din, pin.data(), pin.size() * 2, cudaMemcpyHostToDevice);
+            if (!cn || cn->run(din, false, dout, false, pw, ph, s) != cudaSuccess) std::printf("vs CUDA native: run failed\n");
             cudaStreamSynchronize(s);
-            std::vector<uint16_t> co(out.size());
-            cudaMemcpy(co.data(), dout, co.size() * 2, cudaMemcpyDeviceToHost);
+            std::vector<uint16_t> cpo(pout), co(out.size());
+            cudaMemcpy(cpo.data(), dout, pout * 2, cudaMemcpyDeviceToHost);
+            for (int c = 0; c < 3; c++)
+                for (int y = 0; y < h * S; y++)
+                    std::memcpy(&co[((size_t)c * h * S + y) * w * S], &cpo[((size_t)c * ph * S + y) * pw * S], (size_t)w * S * 2);
             size_t same = 0;
             std::vector<float> cf(co.size());
             for (size_t i = 0; i < co.size(); i++) {

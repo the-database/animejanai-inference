@@ -65,6 +65,33 @@ float act(float v, int a, float slope)
     return v;
 }
 
+// The GEMM's A element (row r, column k). As a 3x3 conv (im2col, 31 > 0): row r the pixel (r / W,
+// r % W) of an H x W map, column k the tap k / CPin (row-major 3x3, zero outside the map), channel
+// k % CPin of the input (32 H, 33 W, 34 CPin).
+float a_elem(Map A, int r, int k, int M)
+{
+    if (r >= M) return 0.0;
+    if (prm(31) == 0) return ld(A, uint(r), k);
+    const int W = prm(33), cp = prm(34), t = k / cp, c = k % cp;
+    const int y = r / W + t / 3 - 1, x = r % W + t % 3 - 1;
+    if (y < 0 || y >= prm(32) || x < 0 || x >= W) return 0.0;
+    return ld(A, uint(y * W + x), c);
+}
+// 8 channels of the A row from column k (k a multiple of 8), or zeros: the conv's tap and pixel
+uvec4 a_vec8(Map A, int r, int k, int M)
+{
+    if (r >= M) return uvec4(0);
+    uint pix = uint(r);
+    if (prm(31) != 0) {
+        const int W = prm(33), cp = prm(34), t = k / cp;
+        const int y = r / W + t / 3 - 1, x = r % W + t % 3 - 1;
+        if (y < 0 || y >= prm(32) || x < 0 || x >= W) return uvec4(0);
+        pix = uint(y * W + x);
+        k = k % cp;
+    }
+    return arv[(A.base + pix * uint(A.stride) + uint(A.off + k)) >> 3];
+}
+
 #define ACC_T coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define A_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 #define B_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
@@ -83,7 +110,7 @@ void main()
     const Map A = map(0), O = map(1), A1 = map(2), A2 = map(3);
     const int tid = int(gl_LocalInvocationIndex), sg = int(gl_SubgroupID);
     const int m0 = int(gl_WorkGroupID.y) * 64, n0 = int(gl_WorkGroupID.x) * 64;
-    const bool va = !A.f32 && (A.stride & 7) == 0 && (A.base & 7u) == 0u && (A.off & 7) == 0;
+    const bool va = !A.f32 && (A.stride & 7) == 0 && (A.base & 7u) == 0u && (A.off & 7) == 0 && (prm(31) == 0 || (prm(34) & 7) == 0);
     ACC_T acc[4];
     [[unroll]] for (int j = 0; j < 4; j++) acc[j] = ACC_T(0.0);
     for (int kb = 0; kb < K; kb += KC) {
@@ -92,15 +119,14 @@ void main()
         for (int i = tid; i < 64 * (kn / 8); i += 128) {
             const int r = i / (kn / 8), c = (i % (kn / 8)) * 8, gm = m0 + r;
             if (va) {
-                uvec4 q = uvec4(0);
-                if (gm < M) q = arv[(A.base + uint(gm) * uint(A.stride) + uint(A.off + kb + c)) >> 3];
+                const uvec4 q = a_vec8(A, gm, kb + c, M);
                 [[unroll]] for (int j = 0; j < 4; j++) {
                     const f16vec2 h = unpackFloat2x16(q[j]);
                     sa[r * AP + c + 2 * j] = h.x;
                     sa[r * AP + c + 2 * j + 1] = h.y;
                 }
             } else {
-                [[unroll]] for (int j = 0; j < 8; j++) sa[r * AP + c + j] = float16_t(gm < M ? ld(A, uint(gm), kb + c + j) : 0.0);
+                [[unroll]] for (int j = 0; j < 8; j++) sa[r * AP + c + j] = float16_t(a_elem(A, gm, kb + c + j, M));
             }
         }
         barrier();
@@ -127,7 +153,7 @@ void main()
         if (last == 0) v = act(v, acti, slope);
         if (cso >= 0) v *= arf[cso + c];
         if (!A1.none) v += ld(A1, uint(r), c);
-        if (!A2.none) v += ld(A2, uint(r), c) * (a2s >= 0 ? wf[a2s + c] : 1.0);
+        if (!A2.none) v += ld(A2, uint(r), c) * (a2s >= 0 ? arf[a2s + c] : 1.0);
         if (last != 0) v = act(v, acti, slope);
         st(O, uint(r), c, v);
     }

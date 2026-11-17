@@ -54,12 +54,15 @@ public:
         int w = 0, bias = -1, K = 0, N = 0, Kp = 0, Np = 0;
     };
     Mat add_mat(const std::vector<float> &w, const std::vector<float> &bias, int K, int N);
+    // A 3x3 conv as GEMM weights for conv_gemm: taps [9][cin][cout] (fp16 bits) into [9 * cinp][pad16(cout)].
+    Mat add_conv_mat(const std::vector<uint16_t> &taps, const std::vector<float> &bias, int cin, int cinp, int cout);
     VkDeviceSize arena_bytes() const { return ar_; }
 
     // ---- steps
     // A 3x3 conv (conv c with bias b, taps [9][cin][cout]): output slices of the widths given.
     struct ConvIO {
         int in = 0, act = 0, stride = 1, out = 0;  // gconv's IN / ACT / STRIDE / OUT
+        float slope = 0.2f;                        // ACT 2: the LeakyReLU slope
         bool src_in = false, dst_out = false;      // src the network input / dst the output
         VkDeviceSize src = 0, dst = 0, r1 = 0;     // arena offsets (r1: when nres)
         VkDeviceSize src_bytes = 0, dst_bytes = 0, r1_bytes = 0;
@@ -76,10 +79,24 @@ public:
 
     // tfm.comp passes with their usual geometry
     void gemm(const TMap &a, int M, const Mat &w, const TMap &out, int act = 0, bool act_last = false, int colscale = -1,
-              const TMap &add1 = TMap{}, const TMap &add2 = TMap{}, float slope = 0.2f);
+              const TMap &add1 = TMap{}, const TMap &add2 = TMap{}, float slope = 0.2f, int add2scale = -1);
     void layernorm(const TMap &in, const TMap &out, int M, int C, int cpad, int gamma, int beta, float eps);
     // dw 3x3 + bias, GELU; with sums >= 0 (arena float offset), the channel sums of its output there
     void dwconv(const TMap &in, const TMap &out, int H, int W, int C, int w, int bias, bool gelu, VkDeviceSize sums = ~0ull);
+    // A 3x3 conv (zero padding) as an im2col GEMM, fp32 sums: in (cinp channels) at H x W
+    void conv_gemm(const TMap &in, int H, int W, int cinp, const Mat &w, const TMap &out, const TMap &add1 = TMap{});
+    // The network input (NCHW fp16, h x w) minus a mean into an NHWC map (16 channels, zero beyond 3)
+    // of ph x pw, reflect-padded
+    void imgin(const TMap &out, int h, int w, int ph, int pw, const float mean[3]);
+    // A map's first 3 channels (its width mw) cropped to h x w into the network output (NCHW fp16)
+    void imgout(const TMap &in, int h, int w, int mw);
+    // The channel sums of a map (C channels over M tokens) into sums (arena float offset)
+    void colsums(const TMap &in, int M, int C, VkDeviceSize sums);
+    // A map into another of n channels (fp32 <-> fp16)
+    void convert(const TMap &in, const TMap &out, int M, int n);
+    // cm = sigmoid(W2 act(W1 (sums / M * in_scale) + b1) + b2), act GELU or ReLU (b1, b2 < 0: none)
+    void chan_gate(VkDeviceSize sums, int M, int C, int r, int w1, int b1, int w2, int b2, bool relu, float in_scale, VkDeviceSize cm,
+                   int cpad);
 
     // ---- build: input / output (NCHW fp16) of the given bytes, uploads, pipelines, sets, variants
     bool finish(VkDeviceSize in_bytes, VkDeviceSize out_bytes, std::string *why);
