@@ -62,8 +62,13 @@ bool gconv_dispatch(const Device &dev, const GConvShape &s, int cinp, int v, Dis
     default:
         return fail(why, "no kernel family");
     }
-    // the chunk: the largest of 64 / 32 / 16 within KMAX that divides cinp (NCHW inputs: 16)
+    // the chunk: the largest of 64 / 32 / 16 within KMAX that divides cinp (NCHW inputs: 16; the 4x
+    // pixel-unshuffle's 48 channels: one chunk of 48)
     *kch = 16;
+    if (s.in == 3) {
+        if (cinp != 48 || kmax < 48) return fail(why, "the 4x pixel-unshuffle input needs one 48-channel chunk");
+        *kch = 48;
+    }
     for (int k : {64, 32})
         if (k <= kmax && cinp % k == 0 && s.in == 0) {
             *kch = k;

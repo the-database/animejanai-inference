@@ -1,5 +1,5 @@
-// native/esrgan.cpp — ESRGAN (RRDBNet, as exported by traiNNer/chaiNNer: /model/model.N node names)
-// on gconv, and ImgNet::create.
+// native/esrgan.cpp — ESRGAN (RRDBNet, found by structure: native/esrgan_graph.h) on gconv, and
+// ImgNet::create.
 //
 // Dense blocks without concatenation: each RDB works in one NHWC buffer of nf + 4*gc channels; conv k
 // reads its first nf + (k-1)*gc channels and writes its gc channels into the next slice. The RDB's
@@ -20,6 +20,7 @@
 #include "native/gconv.h"
 #include "native/img_kernels.h"
 #include "native/netres.h"
+#include "native/esrgan_graph.h"
 #include "native/onnx_read.h"
 
 namespace ajinative {
@@ -51,20 +52,24 @@ public:
     size_t weight_bytes() const override { return wbytes; }
     bool accepts(int w, int h) const override
     {
-        return w > 0 && h > 0 && w <= maxw && h <= maxh && (!unshuffle || (w % 2 == 0 && h % 2 == 0));
+        return w > 0 && h > 0 && w <= maxw && h <= maxh && w % unshuffle == 0 && h % unshuffle == 0;
     }
 
 private:
     int scale_ = 4, nf = 64, gc = 32, nb = 0, DS = 0, maxw = 0, maxh = 0;
-    bool unshuffle = false;
-    float rrdb_scale = 0.2f;
+    int unshuffle = 1;   // the input's pixel-unshuffle factor (1, 2, 4)
+    int nup = 2;         // nearest 2x upsample stages (S = 2^nup over the body size)
+    int in_stride = 16;  // channels of the unshuffled input (16, or 48 for 4x unshuffle)
+    bool clamp = false;  // a final Clip(0, 1)
+    std::vector<float> rrdb_scale;  // per RRDB
     int acc_mode = 0;
-    GOp first, body, up1, up2, hr, last;
+    GOp first, body, hr, last;
+    std::vector<GOp> ups;    // nup
     std::vector<GOp> dense;  // nb * 3 RDBs * 5 convs
     std::vector<GWeights *> weights;
     std::vector<void *> bufs;
     size_t bytes = 0, wbytes = 0;  // all device memory; of which the weights
-    void *in16 = nullptr, *F0 = nullptr, *D[3] = {}, *T = nullptr, *U1 = nullptr, *P = nullptr, *Q = nullptr, *O16 = nullptr;
+    void *in16 = nullptr, *F0 = nullptr, *D[3] = {}, *T = nullptr, *U[3] = {}, *Q = nullptr, *O16 = nullptr;
     float *ws = nullptr;
     size_t ws_floats = 0;
     std::string what;
@@ -116,7 +121,7 @@ void Esrgan::plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops)
     ops->clear();
     const GAct L = GAct::LRelu, N = GAct::None;
     // first conv -> F0 (also the trunk's global residual); its copy into D[0] is done by run()
-    ops->push_back({&first, args(in16, 16, bh, bw, F0, nf, bh, bw, N)});
+    ops->push_back({&first, args(in16, in_stride, bh, bw, F0, nf, bh, bw, N)});
     for (int i = 0; i < nb; i++)
         for (int r = 0; r < 3; r++) {
             void *src = D[r], *nxt = D[(r + 1) % 3];
@@ -128,8 +133,8 @@ void Esrgan::plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops)
             a.r1_stride = DS;
             a.c1 = 1.f;
             if (r == 2) {
-                // out = s * (conv + x3) + x: weights x s (at upload), x3 x s, x (in place, D[0])
-                a.c1 = rrdb_scale;
+                // out = s * (s_rdb * conv + x3) + x: weights x s * s_rdb (at upload), x3 x s, x (in place, D[0])
+                a.c1 = rrdb_scale[i];
                 a.r2 = D[0];
                 a.r2_stride = DS;
                 a.c2 = 1.f;
@@ -140,14 +145,18 @@ void Esrgan::plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops)
     b.r1 = F0;
     b.r1_stride = nf;
     ops->push_back({&body, b});
-    GConvArgs u = args(T, nf, 2 * bh, 2 * bw, U1, nf, 2 * bh, 2 * bw, L);
-    u.up2 = true;
-    ops->push_back({&up1, u});
-    GConvArgs u2 = args(U1, nf, 4 * bh, 4 * bw, P, nf, 4 * bh, 4 * bw, L);
-    u2.up2 = true;
-    ops->push_back({&up2, u2});
-    ops->push_back({&hr, args(P, nf, 4 * bh, 4 * bw, Q, nf, 4 * bh, 4 * bw, L)});
-    ops->push_back({&last, args(Q, nf, 4 * bh, 4 * bw, O16, 16, 4 * bh, 4 * bw, N)});
+    // nup nearest 2x upsample stages, each conv reading its input upsampled on the fly
+    void *cur = T;
+    int s = 1;
+    for (int k = 0; k < nup; k++) {
+        s *= 2;
+        GConvArgs u = args(cur, nf, s * bh, s * bw, U[k], nf, s * bh, s * bw, L);
+        u.up2 = true;
+        ops->push_back({&ups[k], u});
+        cur = U[k];
+    }
+    ops->push_back({&hr, args(cur, nf, s * bh, s * bw, Q, nf, s * bh, s * bw, L)});
+    ops->push_back({&last, args(Q, nf, s * bh, s * bw, O16, 16, s * bh, s * bw, N)});
     // accumulation: acc_mode 0 fp16 everywhere, 1 fp32 everywhere, 2 fp32 on the deep convs (cin >= 128)
     for (auto &o : *ops) {
         o.second.ws = ws;
@@ -159,93 +168,83 @@ void Esrgan::plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops)
 std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
 {
     Reader rd(g);
-    if (!rd.node("/model/model.0/Conv")) return refuse(why, "not an ESRGAN graph"), nullptr;
+    EsrganGraph eg;
+    if (!find_esrgan(rd, &eg, why)) return nullptr;
     std::unique_ptr<Esrgan> e(new Esrgan);
-    Conv c0;
-    if (!rd.conv("/model/model.0/Conv", &c0, why)) return nullptr;
-    if (c0.cin != 3 && c0.cin != 12) return refuse(why, "ESRGAN input channels"), nullptr;
-    e->unshuffle = c0.cin == 12;
-    e->nf = c0.cout;
+    e->unshuffle = eg.unshuffle;
+    e->nup = eg.nup;
+    e->clamp = eg.clamp;
+    e->nf = eg.nf;
+    e->gc = eg.gc;
+    e->nb = eg.nb;
+    e->rrdb_scale = eg.rrdb_scale;
+    e->in_stride = pad16(3 * eg.unshuffle * eg.unshuffle);
     if (e->nf % 16 || e->nf > 128) return refuse(why, "ESRGAN feature count"), nullptr;
-    // RRDBs
-    int nb = 0;
-    // the RDB's last conv: node conv5/conv5.0/Conv (its output is named RDBn/Mul: the export folded the 0.2 in)
-    const auto c5name = [&](const std::string &pre) {
-        return rd.node(pre + "conv5/conv5.0/Conv") ? pre + "conv5/conv5.0/Conv" : pre + "Mul";
-    };
-    while (rd.node(c5name("/model/model.1/sub/sub." + std::to_string(nb) + "/RDB1/"))) nb++;
-    if (nb < 1) return refuse(why, "no RRDB blocks"), nullptr;
-    e->nb = nb;
-    Conv probe;
-    if (!rd.conv("/model/model.1/sub/sub.0/RDB1/conv1/conv1.0/Conv", &probe, why)) return nullptr;
-    e->gc = probe.cout;
     if (e->gc % 16) return refuse(why, "ESRGAN growth channels"), nullptr;
+    if (e->nup > 3) return refuse(why, "ESRGAN upsample stages"), nullptr;
     e->DS = e->nf + 4 * e->gc;
-    {
-        const OnnxNode *m = rd.node("/model/model.1/sub/sub.0/Mul");
-        std::vector<float> v;
-        if (!m || m->in.size() != 2 || !rd.floats(m->in[1], &v) || v.size() != 1) return refuse(why, "RRDB residual scale"), nullptr;
-        e->rrdb_scale = v[0];
-    }
-    if (!rd.node("/model/model.10/Conv") || !rd.node("/model/model.2/Resize_output_cast_0") && !rd.node("/model/model.2/Resize"))
-        return refuse(why, "not the two-upsample ESRGAN layout"), nullptr;
-    e->scale_ = e->unshuffle ? 2 : 4;
+    e->scale_ = eg.scale();
     // fp16 accumulation by default (what TensorRT does too); AJI_NATIVE_ACC32=1 accumulates in fp32,
     // which this network's last blocks are sensitive to (closer to the fp32 model, ~TensorRT's speed)
     if (const char *am = getenv("AJI_NATIVE_ACC32")) e->acc_mode = atoi(am) ? 1 : 0;
     // weights
-    e->first.w = e->upload(c0, 1.f, 16);
-    for (int i = 0; i < nb; i++)
-        for (int r = 1; r <= 3; r++) {
-            const std::string pre = "/model/model.1/sub/sub." + std::to_string(i) + "/RDB" + std::to_string(r) + "/";
-            for (int k = 1; k <= 4; k++) {
+    Conv c0;
+    if (!rd.conv(eg.first, &c0, why)) return nullptr;
+    if (!eg.cin_from.empty()) {  // SpaceToDepth's channel order -> the kernels' (CRD)
+        std::vector<float> w(c0.w.size());
+        for (int o = 0; o < c0.cout; o++)
+            for (int i = 0; i < c0.cin; i++)
+                for (int t = 0; t < 9; t++) w[((size_t)o * c0.cin + i) * 9 + t] = c0.w[((size_t)o * c0.cin + eg.cin_from[i]) * 9 + t];
+        c0.w.swap(w);
+    }
+    e->first.w = e->upload(c0, 1.f, e->in_stride);
+    for (int i = 0; i < e->nb; i++)
+        for (int r = 0; r < 3; r++)
+            for (int k = 0; k < 5; k++) {
                 Conv c;
-                if (!rd.conv(pre + "conv" + std::to_string(k) + "/conv" + std::to_string(k) + ".0/Conv", &c, why)) return nullptr;
-                if (c.cin != e->nf + (k - 1) * e->gc || c.cout != e->gc || c.stride != 1 || !c.lrelu)
-                    return refuse(why, pre + ": dense conv shape"), nullptr;
+                if (!rd.conv(eg.dense[(i * 3 + r) * 5 + k], &c, why)) return nullptr;
+                if (k < 4 && (!c.lrelu || c.stride != 1)) return refuse(why, "ESRGAN dense conv"), nullptr;
+                if (k == 4 && c.lrelu) return refuse(why, "ESRGAN RDB last conv"), nullptr;
+                const float sc = k < 4 ? 1.f : eg.rdb_scale[i * 3 + r] * (r == 2 ? eg.rrdb_scale[i] : 1.f);
                 GOp op;
-                op.w = e->upload(c, 1.f, c.cin);
+                op.w = e->upload(c, sc, c.cin);
                 e->dense.push_back(op);
             }
-            Conv c5;
-            if (!rd.conv(c5name(pre), &c5, why)) return nullptr;
-            if (c5.cin != e->DS || c5.cout != e->nf || c5.lrelu) return refuse(why, pre + ": last conv shape"), nullptr;
-            GOp op;
-            op.w = e->upload(c5, r == 3 ? e->rrdb_scale : 1.f, c5.cin);
-            e->dense.push_back(op);
-        }
-    Conv cb, cu1, cu2, chr, cl;
-    if (!rd.conv("/model/model.1/sub/sub." + std::to_string(nb) + "/Conv", &cb, why) || !rd.conv("/model/model.3/Conv", &cu1, why) ||
-        !rd.conv("/model/model.6/Conv", &cu2, why) || !rd.conv("/model/model.8/Conv", &chr, why) || !rd.conv("/model/model.10/Conv", &cl, why))
-        return nullptr;
-    if (cb.cin != e->nf || cb.cout != e->nf || cb.lrelu || !cu1.lrelu || !cu2.lrelu || !chr.lrelu || cl.lrelu || cl.cout != 3 ||
-        cu1.cin != e->nf || cu2.cin != e->nf || chr.cin != e->nf || cl.cin != e->nf)
-        return refuse(why, "ESRGAN upsampler shape"), nullptr;
+    Conv cb, chr, cl;
+    if (!rd.conv(eg.body, &cb, why) || !rd.conv(eg.hr, &chr, why) || !rd.conv(eg.last, &cl, why)) return nullptr;
+    if (cb.lrelu || !chr.lrelu || cl.lrelu) return refuse(why, "ESRGAN output activations"), nullptr;
     e->body.w = e->upload(cb, 1.f, e->nf);
-    e->up1.w = e->upload(cu1, 1.f, e->nf);
-    e->up2.w = e->upload(cu2, 1.f, e->nf);
     e->hr.w = e->upload(chr, 1.f, e->nf);
     e->last.w = e->upload(cl, 1.f, e->nf);
+    for (const OnnxNode *u : eg.ups) {
+        Conv cu;
+        if (!rd.conv(u, &cu, why)) return nullptr;
+        if (!cu.lrelu) return refuse(why, "ESRGAN upsample activation"), nullptr;
+        GOp op;
+        op.w = e->upload(cu, 1.f, e->nf);
+        e->ups.push_back(op);
+    }
     for (GWeights *w : e->weights)
         if (!w) return refuse(why, "weight upload failed"), nullptr;
 
     // buffers for the largest tile
     e->maxw = max_w;
     e->maxh = max_h;
-    const int bw = e->unshuffle ? max_w / 2 : max_w, bh = e->unshuffle ? max_h / 2 : max_h;
+    const int bw = max_w / e->unshuffle, bh = max_h / e->unshuffle;
     if (bw < 1 || bh < 1) return refuse(why, "tile too small"), nullptr;
     const size_t px = (size_t)bw * bh;
+    const int S = 1 << e->nup;
     // One arena shared by lifetime (steps of run(): 1 in16, 2 F0 and its copy into D[0], 3 the
-    // dense blocks, 4 T, 5 U1, 6 P, 7 Q, 8 O16, 9 out): the upsampler's buffers reuse the trunk's.
+    // dense blocks, 4 T, 5.. the upsample stages, then Q, O16, out): the upsampler's buffers reuse
+    // the trunk's.
     Lifetimes lt;
-    lt.add(&e->in16, px * 16 * 2, {{1, 2}});
+    lt.add(&e->in16, px * e->in_stride * 2, {{1, 2}});
     lt.add(&e->F0, px * e->nf * 2, {{2, 4}});
     for (auto &d : e->D) lt.add(&d, px * e->DS * 2, {{2, 4}});
     lt.add(&e->T, px * e->nf * 2, {{4, 5}});
-    lt.add(&e->U1, px * 4 * e->nf * 2, {{5, 6}});
-    lt.add(&e->P, px * 16 * e->nf * 2, {{6, 7}});
-    lt.add(&e->Q, px * 16 * e->nf * 2, {{7, 8}});
-    lt.add(&e->O16, px * 16 * 16 * 2, {{8, 9}});
+    for (int k = 0; k < e->nup; k++) lt.add(&e->U[k], px * ((size_t)1 << (2 * (k + 1))) * e->nf * 2, {{5 + k, 6 + k}});
+    lt.add(&e->Q, px * S * S * e->nf * 2, {{5 + e->nup, 6 + e->nup}});
+    lt.add(&e->O16, px * S * S * 16 * 2, {{6 + e->nup, 7 + e->nup}});
     if (!lt.assign([&](size_t n) { return e->alloc((n + 1) / 2); })) return refuse(why, "out of GPU memory"), nullptr;
     // split-K workspace: the most any op needs at the largest and at a small tile
     std::vector<std::pair<GOp *, GConvArgs>> ops;
@@ -275,8 +274,9 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
         o.first->variant = it->second;
     }
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
-    char buf[128];
-    snprintf(buf, sizeof(buf), "ESRGAN %dx, %d RRDB, %d features, growth %d", e->scale_, nb, e->nf, e->gc);
+    char buf[160];
+    snprintf(buf, sizeof(buf), "ESRGAN %dx, %d RRDB, %d features, growth %d%s%s", e->scale_, e->nb, e->nf, e->gc,
+             e->unshuffle > 1 ? (e->unshuffle == 2 ? ", pixel-unshuffle 2" : ", pixel-unshuffle 4") : "", e->clamp ? ", clamped" : "");
     e->what = buf;
     return std::unique_ptr<ImgNet>(e.release());
 }
@@ -284,8 +284,8 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
 cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s)
 {
     if (!accepts(w, h)) return cudaErrorInvalidValue;
-    const int bw = unshuffle ? w / 2 : w, bh = unshuffle ? h / 2 : h;
-    cudaError_t e = img_to_nhwc(in, in_f32, w, h, unshuffle, in16, 16, s);
+    const int bw = w / unshuffle, bh = h / unshuffle, S = 1 << nup;
+    cudaError_t e = img_to_nhwc_by(in, in_f32, w, h, unshuffle, in16, in_stride, s);
     if (e != cudaSuccess) return e;
     std::vector<std::pair<GOp *, GConvArgs>> ops;
     plan(bw, bh, &ops);
@@ -298,7 +298,7 @@ cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, in
             if (e != cudaSuccess) return e;
         }
     }
-    return img_from_nhwc(O16, 16, 4 * bw, 4 * bh, out, out_f32, s);
+    return img_from_nhwc(O16, 16, S * bw, S * bh, out, out_f32, s, clamp);
 }
 
 }  // namespace

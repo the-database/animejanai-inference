@@ -70,6 +70,14 @@ struct Reader {
         *c = Conv();
         const OnnxNode *n = node(name);
         if (!n || (n->op != "Conv" && n->op != "ConvTranspose")) return refuse(why, "missing " + name);
+        return conv(n, c, why);
+    }
+    // The same for a node found by structure (names may be empty or repeated).
+    bool conv(const OnnxNode *n, Conv *c, std::string *why) const
+    {
+        *c = Conv();
+        if (!n || (n->op != "Conv" && n->op != "ConvTranspose")) return refuse(why, "missing conv");
+        const std::string name = n->name.empty() ? n->out[0] : n->name;
         c->transposed = n->op == "ConvTranspose";
         const OnnxTensor *w = n->in.size() > 1 ? tensor(n->in[1]) : nullptr;
         if (!w || w->dims.size() != 4 || !w->floats(&c->w)) return refuse(why, name + ": weights");

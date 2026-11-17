@@ -4,7 +4,8 @@
 // strides and offsets given per dispatch, so dense blocks and concatenations cost nothing.
 //
 // Compile-time (the module): COUTP (output channels computed, 16..64), IN (0 NHWC at a stride, 1
-// three NCHW fp16 planes at an offset, 2 the 2x pixel-unshuffle of three NCHW planes), ACT (0 none,
+// three NCHW fp16 planes at an offset, 2 / 3 the 2x / 4x pixel-unshuffle of three NCHW planes:
+// 12 / 48 channels, one chunk), ACT (0 none,
 // 2 LeakyReLU), NRES (residuals added: 0, 1 or 2), UP2 (1: the input is nearest-upsampled by 2 on
 // the fly), STRIDE (1 or 2), OUT (0 NHWC at a stride, 3 three NCHW fp16 planes from channels 0..2,
 // 4 / 5 a phase scatter by R = 2 / 4: channel sx*COUTP/R + c of output pixel (y, x) lands at
@@ -27,7 +28,8 @@
 // Parameters: entry pc.entry of the Params buffer, 32 ints (offsets and strides in halfs,
 // multiples of 8): 0 H, 1 W (the conv's output size), 2 src offset, 3 src stride, 4 dst offset,
 // 5 dst stride, 6 r1 offset, 7 r1 stride, 8 r2 offset, 9 r2 stride, 10 c1, 11 c2, 12 slope (float
-// bits), 13 cinp, 14 IH, 15 IW (the input size: with UP2 the upsampled one), 16 sy, 17 kch.
+// bits), 13 cinp, 14 IH, 15 IW (the input size: with UP2 the upsampled one), 16 sy, 17 kch, 18 clamp
+// (OUT 3: the output clamped to [0, 1], a final Clip).
 
 const int TW = 16, S = STRIDE;
 const int HR = (TH - 1) * S + 3, HC = (TW - 1) * S + 3, HP = HR * HC;  // halo rows, columns
@@ -112,6 +114,22 @@ void fill_chunk(int chunk, int kch, int tid, int nth, int tx0, int ty0)
         sm[px * kp8] = a;
         sm[px * kp8 + 1] = uvec4(0);
     }
+#elif IN == 3
+    // pixel-unshuffle by 4: channel c*16 + ry*4 + rx (PyTorch order); (rx, rx + 1) is one pair
+    for (int px = tid; px < HP; px += nth) {
+        const int yy = iy0 + px / HC, xx = ix0 + px % HC;
+        uvec4 q[6] = uvec4[6](uvec4(0), uvec4(0), uvec4(0), uvec4(0), uvec4(0), uvec4(0));
+        if (yy >= 0 && yy < IH && xx >= 0 && xx < IW) {
+            const int W4 = 4 * IW, H4 = 4 * IH, x4 = 4 * xx, y4 = 4 * yy;
+            for (int c = 0; c < 3; c++)
+                for (int ry = 0; ry < 4; ry++)
+                    for (int hh = 0; hh < 2; hh++) {
+                        const int k = c * 8 + ry * 2 + hh;
+                        q[k >> 2][k & 3] = src_u[((c * H4 + y4 + ry) * W4 + x4 + 2 * hh) >> 1];
+                    }
+        }
+        for (int k = 0; k < 6; k++) sm[px * kp8 + k] = q[k];
+    }
 #else
     // pixel-unshuffle by 2: channel c*4 + ry*2 + rx (PyTorch order); (rx 0, 1) is one pair
     for (int px = tid; px < HP; px += nth) {
@@ -163,7 +181,8 @@ void write_out(int tid, int nth, int tx0, int ty0, int H, int W)
         if (oy >= H || ox >= W) continue;
         const vec2 pr = vec2(unpackFloat2x16(sm_pair(p * SP + (c & ~1))));
         const float x = ((c & 1) != 0 ? pr.y : pr.x) + float(bias_h[c]);
-        dst_h[(c * H + oy) * W + ox] = float16_t(act(x));
+        const float y = prm(18) != 0 ? clamp(act(x), 0.0, 1.0) : act(x);
+        dst_h[(c * H + oy) * W + ox] = float16_t(y);
     }
 #else
     const int zc = zs() * COUTP;

@@ -41,7 +41,8 @@ struct GConvParams {
     int32_t r1_off = 0, r1_stride = 0, r2_off = 0, r2_stride = 0;
     float c1 = 1.f, c2 = 1.f, slope = 0.2f;
     int32_t cinp = 16, IH = 0, IW = 0, sy = 0, kch = 16;
-    int32_t pad[14] = {};
+    int32_t clamp = 0;  // OUT 3: clamp to [0, 1]
+    int32_t pad[13] = {};
 };
 static_assert(sizeof(GConvParams) == 128, "one Params entry");
 

@@ -39,7 +39,7 @@ __global__ void k_to_nhwc(const void *in, bool f32, int w, int h, int un, half *
     for (int c = 16; c < ds; c += 8) *reinterpret_cast<uint4 *>(d + c) = make_uint4(0, 0, 0, 0);
 }
 
-__global__ void k_from_nhwc(const half *src, int ss, int w, int h, void *out, bool f32)
+__global__ void k_from_nhwc(const half *src, int ss, int w, int h, void *out, bool f32, bool clamp)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -47,9 +47,26 @@ __global__ void k_from_nhwc(const half *src, int ss, int w, int h, void *out, bo
     const half *p = src + pix * ss;
 #pragma unroll
     for (int c = 0; c < 3; c++) {
-        if (f32) ((float *)out)[c * plane + pix] = __half2float(p[c]);
-        else ((half *)out)[c * plane + pix] = p[c];
+        half v = p[c];
+        if (clamp) v = __hmin(__hmax(v, __float2half(0.f)), __float2half(1.f));
+        if (f32) ((float *)out)[c * plane + pix] = __half2float(v);
+        else ((half *)out)[c * plane + pix] = v;
     }
+}
+
+// pixel-unshuffle by f (1, 2, 4) into NHWC with ds channels (channel c*f*f + ry*f + rx, the rest 0)
+__global__ void k_to_nhwc_by(const void *in, bool f32, int w, int h, int f, half *dst, int ds)
+{
+    const int ow = w / f, oh = h / f;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= ow || y >= oh) return;
+    const size_t plane = (size_t)w * h;
+    half *d = dst + ((size_t)y * ow + x) * ds;
+    const int n = 3 * f * f;
+    for (int c = 0; c < 3; c++)
+        for (int ry = 0; ry < f; ry++)
+            for (int rx = 0; rx < f; rx++) d[c * f * f + ry * f + rx] = __float2half(ld(in, f32, c * plane + (size_t)(f * y + ry) * w + f * x + rx));
+    for (int c = n; c < ds; c++) d[c] = __float2half(0.f);
 }
 
 __device__ __forceinline__ int reflect_idx(int i, int n)
@@ -106,10 +123,19 @@ cudaError_t img_to_nhwc(const void *in, bool in_f32, int w, int h, bool unshuffl
     return cudaGetLastError();
 }
 
-cudaError_t img_from_nhwc(const void *src, int sstride, int w, int h, void *out, bool out_f32, cudaStream_t s)
+cudaError_t img_to_nhwc_by(const void *in, bool in_f32, int w, int h, int factor, void *dst, int dstride, cudaStream_t s)
+{
+    if (factor == 1 || factor == 2) return img_to_nhwc(in, in_f32, w, h, factor == 2, dst, dstride, s);
+    if (factor != 4 || dstride < 48 || dstride % 8 || w % 4 || h % 4) return cudaErrorInvalidValue;
+    const dim3 b(16, 8), g((w / 4 + 15) / 16, (h / 4 + 7) / 8);
+    k_to_nhwc_by<<<g, b, 0, s>>>(in, in_f32, w, h, 4, (half *)dst, dstride);
+    return cudaGetLastError();
+}
+
+cudaError_t img_from_nhwc(const void *src, int sstride, int w, int h, void *out, bool out_f32, cudaStream_t s, bool clamp)
 {
     const dim3 b(16, 8), g((w + 15) / 16, (h + 7) / 8);
-    k_from_nhwc<<<g, b, 0, s>>>((const half *)src, sstride, w, h, out, out_f32);
+    k_from_nhwc<<<g, b, 0, s>>>((const half *)src, sstride, w, h, out, out_f32, clamp);
     return cudaGetLastError();
 }
 
