@@ -1,0 +1,68 @@
+#version 450
+// General 3x3 conv on VK_KHR_cooperative_matrix 16x16x16 with fp16 accumulate (cm16), for the
+// image networks (gconv_common.glsl). A workgroup computes TH x 16 output pixels for all COUTP
+// output channels; each subgroup WR rows of 16 pixels as an implicit GEMM over 9 taps x CINP, the
+// input tile in shared memory KCH channels at a time, the weights (row-major [9][CINP][COUTP])
+// from the buffer. The sum goes to the staging tile and through the writer's epilogue.
+// Defines: CINP, COUTP, IN, ACT, NRES, UP2, OUT, WARPS (subgroups), WR (rows per subgroup).
+// local_size_x (specialization constant 0) = WARPS * the subgroup size.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x_id = 0) in;
+
+const int TH = WARPS * WR;
+#include "gconv_common.glsl"
+
+layout(std430, binding = 3) readonly buffer Wt { uvec4 wt[]; };  // [9][CINP][COUTP]
+
+#define ACC_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define A_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define B_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+void main()
+{
+    const int KCC = KCH / 16, NT = COUTP / 16;
+    const int tid = int(gl_LocalInvocationIndex), nth = int(gl_WorkGroupSize.x);
+    const int sg = int(gl_SubgroupID);
+    const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
+    const int H = prm(0), W = prm(1);
+
+    ACC_T acc[WR][NT];
+    [[unroll]] for (int i = 0; i < WR; i++)
+        [[unroll]] for (int n = 0; n < NT; n++) acc[i][n] = ACC_T(0.0);
+    const int row0 = sg * WR;
+
+    [[dont_unroll]] for (int ch = 0; ch < NCHUNK; ch++) {
+        if (ch > 0) barrier();  // the previous chunk is no longer read
+        fill_chunk(ch, tid, nth, tx0, ty0, H, W);
+        barrier();
+        [[dont_unroll]] for (int t = 0; t < 9; t++) {
+            const int dy = t / 3, dx = t % 3;
+            [[unroll]] for (int kc = 0; kc < KCC; kc++) {
+                const int k0 = ch * KCH + kc * 16;
+                B_T b[NT];
+                [[unroll]] for (int n = 0; n < NT; n++)
+                    coopMatLoad(b[n], wt, uint(((t * CINP + k0) * COUTP + n * 16) / 8), uint(COUTP / 8),
+                                gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (int i = 0; i < WR; i++) {
+                    A_T a;
+                    coopMatLoad(a, sm, uint(((row0 + i + dy) * (TW + 2) + dx) * (KP / 8) + kc * 2), uint(KP / 8),
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (int n = 0; n < NT; n++) acc[i][n] = coopMatMulAdd(a, b[n], acc[i][n]);
+                }
+            }
+        }
+    }
+    barrier();  // the halo is no longer read: shared memory becomes the staging tile [TH*TW][SP]
+    [[unroll]] for (int i = 0; i < WR; i++)
+        [[unroll]] for (int n = 0; n < NT; n++)
+            coopMatStore(acc[i][n], sm, uint((row0 + i) * TW * (SP / 8) + n * 2), uint(SP / 8), gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    write_out(tid, nth, tx0, ty0, H, W);
+}

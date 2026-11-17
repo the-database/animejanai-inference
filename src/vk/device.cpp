@@ -74,6 +74,8 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
     d.max_invocations = pr.limits.maxComputeWorkGroupInvocations;
     d.max_groups[0] = pr.limits.maxComputeWorkGroupCount[0];
     d.max_groups[1] = pr.limits.maxComputeWorkGroupCount[1];
+    d.max_storage_range = pr.limits.maxStorageBufferRange;
+    d.storage_align = pr.limits.minStorageBufferOffsetAlignment ? pr.limits.minStorageBufferOffsetAlignment : 16;
     d.timestamp_ns = pr.limits.timestampComputeAndGraphics ? pr.limits.timestampPeriod : 0.0;
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(p, &mp);

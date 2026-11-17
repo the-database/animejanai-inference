@@ -1,0 +1,86 @@
+#version 450
+// General 3x3 conv for 16-lane subgroups (sg16), for the image networks (gconv_common.glsl):
+// conv3x3_sg16's register blocking (a lane per output channel of a 16-channel group, a row of 16
+// pixels, inputs broadcast between lanes as packed fp16 pairs), the input tile in shared memory
+// KCH channels at a time. fp16 partial sums per (chunk, tap), then fp32; the sum is staged as
+// fp16 and goes through the writer's epilogue.
+// Defines: CINP, COUTP, IN, ACT, NRES, UP2, OUT, TH (tile rows), RPS (rows per subgroup).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "gconv_common.glsl"
+
+const int NG = COUTP / 16, KCC = KCH / 16, NSG = NG * (TH / RPS);
+layout(local_size_x = 16 * NSG) in;
+
+layout(std430, binding = 3) readonly buffer Wt { uvec4 wp[]; };  // [9][CINP/16][NG][16 lanes][16 k]
+
+void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
+{
+    f16vec2 p;
+    p = unpackFloat2x16(u0.x); v[0] = p.x; v[1] = p.y;
+    p = unpackFloat2x16(u0.y); v[2] = p.x; v[3] = p.y;
+    p = unpackFloat2x16(u0.z); v[4] = p.x; v[5] = p.y;
+    p = unpackFloat2x16(u0.w); v[6] = p.x; v[7] = p.y;
+    p = unpackFloat2x16(u1.x); v[8] = p.x; v[9] = p.y;
+    p = unpackFloat2x16(u1.y); v[10] = p.x; v[11] = p.y;
+    p = unpackFloat2x16(u1.z); v[12] = p.x; v[13] = p.y;
+    p = unpackFloat2x16(u1.w); v[14] = p.x; v[15] = p.y;
+}
+
+void fma16(uvec4 u0, uvec4 u1, float16_t w[16], inout float16_t acc[16])
+{
+    const uint a[8] = uint[8](u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w);
+    [[unroll]] for (int kp = 0; kp < 8; kp++)
+        [[unroll]] for (int m = 0; m < 16; m++) {
+            const f16vec2 v = unpackFloat2x16(subgroupBroadcast(a[kp], m));
+            acc[m] = fma(v.x, w[2 * kp], acc[m]);
+            acc[m] = fma(v.y, w[2 * kp + 1], acc[m]);
+        }
+}
+
+void main()
+{
+    const int tid = int(gl_LocalInvocationIndex), nth = 16 * NSG;
+    const int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
+    const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
+    const int H = prm(0), W = prm(1);
+    const int g = sg % NG, row0 = (sg / NG) * RPS, ch = g * 16 + lane;
+    float tot[RPS][16];
+    float16_t acc[RPS][16];
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) tot[r][m] = 0.0;
+
+    [[dont_unroll]] for (int c = 0; c < NCHUNK; c++) {
+        if (c > 0) barrier();
+        fill_chunk(c, tid, nth, tx0, ty0, H, W);
+        barrier();
+        [[dont_unroll]] for (int t = 0; t < 9; t++) {
+            const int dy = t / 3, dx = t % 3;
+            [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) acc[r][m] = float16_t(0.0);
+            [[unroll]] for (int kc = 0; kc < KCC; kc++) {
+                const int wi = (((t * (CINP / 16) + c * KCC + kc) * NG + g) * 16 + lane) * 2;
+                float16_t w[16];
+                unpack16(wp[wi], wp[wi + 1], w);
+                [[unroll]] for (int r = 0; r < RPS; r++) {
+                    const int ai = ((row0 + r + dy) * (TW + 2) + lane + dx) * (KP / 8) + kc * 2;
+                    fma16(sm[ai], sm[ai + 1], w, acc[r]);
+                }
+            }
+            [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) tot[r][m] += float(acc[r][m]);
+        }
+    }
+    barrier();  // the halo is no longer read: shared memory becomes the staging tile
+    // lane pairs (2j, 2j+1) hold channels (2j, 2j+1) of one pixel: the even lane writes the pair
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+        const uint h = packFloat2x16(f16vec2(float16_t(tot[r][m]), float16_t(0.0)));
+        const uint odd = subgroupShuffleXor(h, 1u);
+        if ((lane & 1) == 0) sm_set_pair(((row0 + r) * TW + m) * SP + ch, (h & 0xffffu) | (odd << 16));
+    }
+    barrier();
+    write_out(tid, nth, tx0, ty0, H, W);
+}
