@@ -405,7 +405,9 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   window gathered padded to 32 (PASS 2) with the same clamping and cut rules, the model's frame
   cache, stacked stages through `rec_ensure`; `aji_ingest` and `aji_infer_seq` are one submit
   each, their per-dispatch parameters written in the command buffer (`vkCmdUpdateBuffer`).
-  Not yet there, passed through or left out with the reason in the log: frame diff, and models
+  `aji_frame_diff` (so the dispatcher's held-frame engine) on two Vulkan frames:
+  `frame_diff.comp`, the HLSL cs_frame_diff with the same weights table and atomics, synchronous,
+  its own scratch. Not yet there, passed through or left out with the reason in the log: models
   without Vulkan kernels (no DirectML on this path). On
   Windows `aji_vk.dll`'s exports (aji_dml.cpp) forward a Vulkan-frames context (`c->vkv`); on Linux
   `aji_vk_frames.cpp` is the video ABI. The dispatcher's `aji_create_vk` always loads aji_vk.
@@ -414,7 +416,8 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   within 1 level of the D3D12 path. `--rife --rife-model-dir` is aji_harness_dml `--rife`'s loop:
   rife_v4.14 1080p 4.3 ms, 74.6 dB against the D3D12 path; same scene skips on cut clips. A
   temporal chain runs aji_harness_dml's ingest loop (`--reset-at K`): TFDAT 2x 720x480 within 2
-  levels of the D3D12 path, TemporalFix 62.9 dB (5.4 ms a frame).
+  levels of the D3D12 path, TemporalFix 62.9 dB (5.4 ms a frame). `--diff` prints aji_frame_diff
+  of consecutive frames (exact against frame_diff.h's arithmetic; 1.8 ms a pair at 720x480).
 - **`aji_img_vk.cpp`: the image ABI on Vulkan (`AJI_IMG_VULKAN`, `aji_image --backend vulkan`).**
   A `core/tiling` `TileModel` over the executor at the model's tile: the same cover, reflect pad
   and blend as the other backends. Every model must lower; one that doesn't is refused with the

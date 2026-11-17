@@ -4248,7 +4248,7 @@ extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
                                          void *cu_stream)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return AJI_ERR;
+    if (c && c->vkv) return c->vkv->frame_diff(a, b, out);
 #endif
     (void)cu_stream;
     return frame_diff(c, a, b, out, 0);
@@ -4260,7 +4260,7 @@ extern "C" AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
                                                 void *cu_stream, uint64_t mark)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return AJI_ERR;
+    if (c && c->vkv) return c->vkv->frame_diff(a, b, out);
 #endif
     (void)cu_stream;
     return frame_diff(c, a, b, out, mark);

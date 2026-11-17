@@ -715,3 +715,4 @@ g3_plain_o64_n2a0r0u0s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2
 g3_plain_o64_n2a0r0u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
 fr_tdiff       frame_temporal.comp  PASS=1
 fr_tgather     frame_temporal.comp  PASS=2
+fr_diff        frame_diff.comp

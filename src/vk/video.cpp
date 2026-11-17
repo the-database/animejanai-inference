@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "core/fileio.h"
+#include "frame_diff.h"
 #include "native/lower.h"
 #include "native/onnx_graph.h"
 #include "onnx_shape.h"
@@ -122,6 +123,7 @@ VkVideo::~VkVideo()
     if (!dev_) return;
     wait(ticket_);
     teardown();
+    diff_teardown();
     if (tl_) vkDestroySemaphore(dev_->device(), tl_, nullptr);
     dev_->save_caches();
 }
@@ -1269,6 +1271,167 @@ int VkVideo::infer_seq(uint64_t seq, const aji_frame *out)
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     oi->queue_family = dev_->queue_family();
+    return AJI_OK;
+}
+
+// ---- aji_frame_diff ------------------------------------------------------------------------------
+
+void VkVideo::diff_teardown()
+{
+    DiffState &D = diff_;
+    if (D.pool) vkDestroyDescriptorPool(dev_->device(), D.pool, nullptr);
+    for (Buffer *b : {&D.y[0], &D.y[1], &D.uv[0], &D.uv[1], &D.acc, &D.read, &D.weights, &D.params}) dev_->destroy(*b);
+    D = DiffState{};
+}
+
+bool VkVideo::diff_setup(int w, int h, int fmt, std::string *why)
+{
+    DiffState &D = diff_;
+    if (D.pool && D.w == w && D.h == h && D.fmt == fmt) return true;
+    if (ticket_) wait(ticket_);
+    diff_teardown();
+    const uint32_t bps = fmt == AJI_FMT_P010 ? 2 : 1;
+    D.pitch = ((uint32_t)w * bps + 255) & ~255u;
+    for (int i = 0; i < 2; i++)
+        if (!dev_->make_buffer(&D.y[i], (VkDeviceSize)D.pitch * h, false, why) ||
+            !dev_->make_buffer(&D.uv[i], (VkDeviceSize)D.pitch * ((h + 1) / 2), false, why))
+            return false;
+    // weights[n] = scale / n for a tile of n pixels, as every backend computes it
+    float inv[65] = {0.0f};
+    const float scale = aji_frame_diff_scale(fmt);
+    for (int n = 1; n <= 64; n++) inv[n] = aji_frame_diff_tile_inv(scale, n);
+    struct KA {
+        int32_t di[4], dj[4];
+        float f[8];
+    } ka[2] = {};
+    for (int p = 0; p < 2; p++) {
+        // 4:2:0's second plane is CbCr interleaved at half size
+        ka[p].di[0] = p ? (w + 1) / 2 : w;
+        ka[p].di[1] = p ? (h + 1) / 2 : h;
+        ka[p].di[2] = p ? 2 : 1;
+        ka[p].di[3] = p == 0;
+        ka[p].dj[0] = ka[p].dj[1] = (int32_t)D.pitch;
+        ka[p].dj[2] = bps == 2 ? 1 : 0;
+    }
+    if (!dev_->make_buffer(&D.acc, 33 * 4, false, why) || !dev_->make_buffer(&D.read, 33 * 4, true, why) ||
+        !dev_->make_buffer(&D.weights, sizeof inv, false, why) || !dev_->upload(D.weights, inv, sizeof inv, why) ||
+        !dev_->make_buffer(&D.params, sizeof ka, false, why) || !dev_->upload(D.params, ka, sizeof ka, why))
+        return false;
+    if (!(D.pipe = dev_->pipeline("fr_diff", 0, 0, why))) return false;
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * Device::kBindings};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 2;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(dev_->device(), &pi, nullptr, &D.pool) != VK_SUCCESS) return *why = "descriptor pool", false;
+    for (int p = 0; p < 2; p++) {
+        VkDescriptorSetLayout l = dev_->set_layout();
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = D.pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &l;
+        if (vkAllocateDescriptorSets(dev_->device(), &ai, &D.sets[p]) != VK_SUCCESS) return *why = "descriptor set", false;
+        VkDescriptorBufferInfo bi[Device::kBindings];
+        for (auto &b : bi) b = {dev_->dummy(), 0, VK_WHOLE_SIZE};
+        bi[1] = {D.weights.buf, 0, VK_WHOLE_SIZE};
+        bi[2] = {p ? D.uv[0].buf : D.y[0].buf, 0, VK_WHOLE_SIZE};
+        bi[3] = {p ? D.uv[1].buf : D.y[1].buf, 0, VK_WHOLE_SIZE};
+        bi[4] = {D.acc.buf, 0, VK_WHOLE_SIZE};
+        bi[7] = {D.params.buf, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet wr[Device::kBindings];
+        for (int j = 0; j < Device::kBindings; j++) {
+            wr[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr[j].dstSet = D.sets[p];
+            wr[j].dstBinding = (uint32_t)j;
+            wr[j].descriptorCount = 1;
+            wr[j].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wr[j].pBufferInfo = &bi[j];
+        }
+        vkUpdateDescriptorSets(dev_->device(), Device::kBindings, wr, 0, nullptr);
+    }
+    D.w = w;
+    D.h = h;
+    D.fmt = fmt;
+    return true;
+}
+
+int VkVideo::frame_diff(const aji_frame *a, const aji_frame *b, aji_frame_diff_result *out)
+{
+    if (!a || !b || !out || !a->plane[0] || !b->plane[0]) return AJI_ERR;
+    const int fmt = a->format;
+    if (fmt != AJI_FMT_NV12 && fmt != AJI_FMT_P010) {
+        fail("aji_frame_diff: unsupported format %d (Vulkan frames are NV12 or P010)", fmt);
+        return AJI_ERR_FORMAT;
+    }
+    if (b->format != fmt) {
+        fail("aji_frame_diff requires matching formats");
+        return AJI_ERR_FORMAT;
+    }
+    if (a->width != b->width || a->height != b->height || a->width < 2 || a->height < 2 || (a->width & 1) || (a->height & 1)) {
+        fail("aji_frame_diff dims %dx%d vs %dx%d", a->width, a->height, b->width, b->height);
+        return AJI_ERR_SHAPE;
+    }
+    if (a->plane[0] == b->plane[0]) {  // one image: no difference (and no second transition of it)
+        *out = aji_frame_diff_result{};
+        return AJI_OK;
+    }
+    std::string why;
+    if (!diff_setup(a->width, a->height, fmt, &why)) {
+        fail("aji_frame_diff: %s", why.c_str());
+        diff_teardown();
+        return AJI_ERR;
+    }
+    DiffState &D = diff_;
+    aji_vk_image *im[2] = {static_cast<aji_vk_image *>(a->plane[0]), static_cast<aji_vk_image *>(b->plane[0])};
+    int slot = 0;
+    VkCommandBuffer cb = dev_->frame_begin(&slot);
+    if (!cb) {
+        fail("aji_frame_diff: an earlier Vulkan submit has not finished after 10 s");
+        return AJI_ERR;
+    }
+    full_barrier(cb);
+    const uint32_t bps = fmt == AJI_FMT_P010 ? 2 : 1;
+    const int nimg = 2;
+    for (int i = 0; i < 2; i++) copy_planes(cb, im[i], D.y[i].buf, D.uv[i].buf, D.pitch, a->width, a->height, bps, true);
+    vkCmdFillBuffer(cb, D.acc.buf, 0, 33 * 4, 0);
+    step_barrier(cb);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.pipe);
+    for (int p = 0; p < 2; p++) {
+        const int pw = p ? (a->width + 1) / 2 : a->width, ph = p ? (a->height + 1) / 2 : a->height;
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev_->pipeline_layout(), 0, 1, &D.sets[p], 0, nullptr);
+        const int32_t pc[4] = {p, 0, 0, 0};
+        vkCmdPushConstants(cb, dev_->pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        // a tile per invocation: (tiles + 31) / 32 x (tiles + 7) / 8 groups
+        vkCmdDispatch(cb, (uint32_t)(((pw + 7) / 8 + 31) / 32), (uint32_t)(((ph + 7) / 8 + 7) / 8), 1);
+    }
+    mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    const VkBufferCopy c{0, 0, 33 * 4};
+    vkCmdCopyBuffer(cb, D.acc.buf, D.read.buf, 1, &c);
+    mem_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    Device::SemValue waits[2], sig[3];
+    sig[0] = {tl_, ticket_ + 1};
+    for (int i = 0; i < nimg; i++) {
+        waits[i] = {static_cast<VkSemaphore>(im[i]->semaphore), im[i]->value};
+        sig[1 + i] = {static_cast<VkSemaphore>(im[i]->semaphore), im[i]->value + 1};
+    }
+    if (!dev_->frame_submit(slot, waits, (uint32_t)nimg, sig, (uint32_t)(1 + nimg), &why)) {
+        fail("aji_frame_diff: %s", why.c_str());
+        return AJI_ERR;
+    }
+    ticket_++;
+    for (int i = 0; i < nimg; i++) {
+        im[i]->value += 1;
+        im[i]->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        im[i]->access = VK_ACCESS_2_TRANSFER_READ_BIT;
+        im[i]->queue_family = dev_->queue_family();
+    }
+    if (wait(ticket_) != AJI_OK) return AJI_ERR;
+    uint32_t acc[33];
+    std::memcpy(acc, D.read.map, sizeof acc);
+    std::memcpy(&out->max_tile, &acc[0], sizeof(float));
+    long long sum[16];
+    for (int i = 0; i < 16; i++) sum[i] = (long long)(int32_t)acc[17 + i] * 65536 + (long long)acc[1 + i];
+    aji_frame_diff_regions(a->width, a->height, fmt, 1, sum, out->region_mean);
     return AJI_OK;
 }
 

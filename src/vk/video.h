@@ -11,8 +11,9 @@
  *
  * RIFE as the other backends run it (padded to 64, centred, bilinear BT.709 pre / post, the scene
  * detection's readback). Not yet here (the chain is passed through, or the step left out, with the
- * reason logged): the pre-RIFE resize hoist (RIFE-first interpolates at the source size), frame
- * differences, models without Vulkan kernels (there is no DirectML to fall back to on this path).
+ * reason logged): the pre-RIFE resize hoist (RIFE-first interpolates at the source size), models
+ * without Vulkan kernels (there is no DirectML to fall back to on this path). aji_frame_diff (and
+ * so the held-frame engine) on Vulkan frames.
  * Temporal models as the other backends run them (aji_ingest + aji_infer_seq).
  */
 #ifndef AJI_VK_VIDEO_H
@@ -58,6 +59,9 @@ public:
     int ingest(const aji_frame *in, uint64_t seq);
     int infer_seq(uint64_t seq, const aji_frame *out);
     void temporal_reset();
+    // aji_frame_diff on two Vulkan frames (NV12 / P010, same dims): synchronous, its own scratch,
+    // configured or not.
+    int frame_diff(const aji_frame *a, const aji_frame *b, aji_frame_diff_result *out);
 
 private:
     VkVideo() = default;
@@ -128,6 +132,17 @@ private:
     void rec_store(VkCommandBuffer cb, size_t lv, int64_t seq, int format, int matrix, int range);
     void rec_stage(VkCommandBuffer cb, size_t lv, int64_t center, int cslot);
     void rec_ensure(VkCommandBuffer cb, size_t lv, int64_t p);
+    // aji_frame_diff's scratch, for one size and format
+    struct DiffState {
+        int w = 0, h = 0, fmt = 0;
+        uint32_t pitch = 0;
+        Buffer y[2], uv[2], acc, read, weights, params;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet sets[2] = {};
+        VkPipeline pipe = VK_NULL_HANDLE;
+    } diff_;
+    bool diff_setup(int w, int h, int fmt, std::string *why);
+    void diff_teardown();
     bool rife_setup(const AjiChainConf &chain, int w, int h, double fps);
     bool rife_formats(int fmt, int range, std::string *why);
     void rife_teardown();
