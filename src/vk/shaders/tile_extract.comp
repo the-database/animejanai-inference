@@ -1,0 +1,44 @@
+#version 450
+// Cut tile (ox, oy) out of the 8-bit image (W x H x ci, packed), reflect-padded to tw x th, as the
+// model input: in_ch fp16 planes, each value p / 255 as upscale_tiled computes it (core/tiling_gpu's
+// k_extract). An invocation writes one 32-bit word: two consecutive fp16 values of the flat
+// in_ch x th x tw tensor.
+// Params: 0 W, 1 H, 2 ci, 3 ox, 4 oy, 5 tw, 6 th, 7 in_ch, 8 inv255 (float bits).
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "tile_common.glsl"
+
+layout(std430, binding = 0) readonly buffer Img { uint img[]; };    // bytes, packed in words
+layout(std430, binding = 1) writeonly buffer Dst { uint dst[]; };   // fp16 pairs
+
+uint img_byte(uint b) { return (img[b >> 2] >> ((b & 3u) * 8u)) & 0xffu; }
+
+float value(int e)
+{
+    const int W = prm(0), H = prm(1), ci = prm(2), ox = prm(3), oy = prm(4), tw = prm(5), th = prm(6), in_ch = prm(7);
+    const float inv255 = intBitsToFloat(prm(8));
+    const int plane = tw * th, c = e / plane, i = e % plane, y = i / tw, x = i % tw;
+    const uint p = uint((reflect_i(oy + y, H) * W + reflect_i(ox + x, W)) * ci);
+    precise float v;
+    if (in_ch == 3) {
+        const uint k = ci == 1 ? 0u : uint(c);
+        v = float(img_byte(p + k)) * inv255;
+    } else if (ci == 1) {
+        v = float(img_byte(p)) * inv255;
+    } else {
+        precise float l = 0.299 * float(img_byte(p)) + 0.587 * float(img_byte(p + 1u));
+        l = l + 0.114 * float(img_byte(p + 2u));
+        v = l * inv255;
+    }
+    return v;
+}
+
+void main()
+{
+    const int n = prm(7) * prm(5) * prm(6);
+    const int e = int(flat_id()) * 2;
+    if (e >= n) return;
+    const uint lo = f32_to_f16(value(e));
+    const uint hi = e + 1 < n ? f32_to_f16(value(e + 1)) : 0u;
+    dst[e >> 1] = lo | (hi << 16);
+}

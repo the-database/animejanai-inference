@@ -59,3 +59,9 @@ c3_plain_i64_o16_n0a0g0o1_t4r1  conv3x3_plain.comp  CINP=64 COUTP=16 IN=0 ACT=0 
 cat_cm16_c48_s4_w4   concat1x1_cm16.comp   C=48 NSRC=4 WARPS=4
 cat_sg16_c48_s4_b4   concat1x1_sg16.comp   C=48 NSRC=4 PB=4
 cat_plain_c48_s4_b4  concat1x1_plain.comp  C=48 NSRC=4 PB=4
+
+# The image path's tiling on the GPU (aji_img_vk.cpp): cut a tile out, blend its output into the
+# float band, flush finished rows to 8-bit. No family: plain compute.
+tile_extract  tile_extract.comp
+tile_blend    tile_blend.comp
+band_flush    band_flush.comp

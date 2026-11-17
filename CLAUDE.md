@@ -291,8 +291,12 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   list position plus one (phones). `aji_img_memory_get` uses `VK_EXT_memory_budget` when there;
   `aji_img_native_probe` is a load and a release. One upscale at a time per context. It's in
   `aji_vk.dll` on Windows (in place of `aji_img_dml.cpp`) and is `libaji_vk.so` elsewhere,
-  Android included. Tiling is on the host for now, so it's as fast as DirectML's image path, not
-  the CUDA path's GPU tiling.
+  Android included. Tiling runs on the GPU, as `core/tiling_gpu` does for CUDA: one upload of
+  the 8-bit image, then per tile row one command buffer of `tile_extract` -> model ->
+  `tile_blend` per tile and a `band_flush` into a host-visible buffer (`src/vk/shaders/tile_*`,
+  `band_flush.comp`; parameters per dispatch in a buffer, since the push constants are 16 bytes).
+  Bit-identical to the host path (`AJI_IMG_CPU_TILING=1`): `precise` arithmetic and integer fp16
+  conversions.
 - **`aji_vk_model_test`** (by hand): one model on the executor, timed, against the fp32 CPU
   reference of its plan (`sanity/native_ref.h`), and against the CUDA executor when built with CUDA.
   `aji_vk_model_test list` prints the devices and families, `info [N]` the full capability
