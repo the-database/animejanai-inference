@@ -21,6 +21,7 @@
 //   16 + 3j, j < 6: block j's output offset, scale, kstride.
 // Push constants: the entry.
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 layout(local_size_x = 16, local_size_y = 8) in;
 
@@ -40,34 +41,14 @@ layout(std430, binding = 3) writeonly buffer Out { uint outb[]; };
 
 int prm(int k) { return params[pc.entry * 16 + (k >> 2)][k & 3]; }
 
-// fp32 -> fp16 bits, round to nearest even (as __float2half), subnormals and overflow included
-uint f32_to_f16(float f)
-{
-    const uint x = floatBitsToUint(f);
-    const uint sign = (x >> 16) & 0x8000u;
-    uint mant = x & 0x7fffffu;
-    int e = int((x >> 23) & 0xffu);
-    if (e == 0xff) return sign | 0x7c00u | (mant != 0u ? 0x200u : 0u);
-    e = e - 127 + 15;
-    if (e >= 0x1f) return sign | 0x7c00u;
-    if (e <= 0) {
-        if (e < -10) return sign;
-        mant |= 0x800000u;
-        const uint shift = uint(14 - e);
-        uint h = mant >> shift;
-        const uint rem = mant & ((1u << shift) - 1u);
-        const uint mid = 1u << (shift - 1u);
-        if (rem > mid || (rem == mid && (h & 1u) != 0u)) h++;
-        return sign | h;
-    }
-    uint h = sign | (uint(e) << 10) | (mant >> 13);
-    const uint rem = mant & 0x1fffu;
-    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h++;
-    return h;
-}
+// fp32 -> fp16 through the device's conversion: Vulkan rounds narrowing conversions to nearest
+// even, as __float2half does (fp16 denormals may flush to zero: values under 6e-5, below what
+// a frame or a flow can tell apart)
+uint f32_to_f16(float f) { return packFloat2x16(f16vec2(float16_t(f), float16_t(0.0))) & 0xffffu; }
+uint pack2(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
 // fp16 -> fp32 is exact
 float h2f(uint h) { return unpackHalf2x16(h).x; }
-float rh(float v) { return h2f(f32_to_f16(v)); }
+float rh(float v) { return float(float16_t(v)); }
 float ld_in(uint i) { return h2f((in11[i >> 1] >> ((i & 1u) * 16u)) & 0xffffu); }
 // 8 channels at half offset o (a multiple of 8)
 void ld8(uint o, out float v[8])
@@ -294,7 +275,7 @@ void main()
     const uint d = (uint(prm(10)) + uint(y * bw + x) * uint(dstride)) >> 3;
     [[unroll]] for (int c = 0; c < CP8; c += 8) {
         uvec4 q;
-        [[unroll]] for (int j = 0; j < 4; j++) q[j] = f32_to_f16(acc[c + 2 * j]) | (f32_to_f16(acc[c + 2 * j + 1]) << 16);
+        [[unroll]] for (int j = 0; j < 4; j++) q[j] = pack2(acc[c + 2 * j], acc[c + 2 * j + 1]);
         outv[d + uint(c / 8)] = q;
     }
     for (int c = CP8; c < dstride; c += 8) outv[d + uint(c / 8)] = uvec4(0);
@@ -312,8 +293,8 @@ void main()
     const float f0 = rh((a01.x + b23.x) * 0.5), f1 = rh((a01.y + b23.y) * 0.5);
     const float f2 = rh((a23.x + b01.x) * 0.5), f3 = rh((a23.y + b01.y) * 0.5);
     const float m = (a45.x - b45.x) * 0.5;
-    qa.x = f32_to_f16(f0) | (f32_to_f16(f1) << 16);
-    qa.y = f32_to_f16(f2) | (f32_to_f16(f3) << 16);
+    qa.x = pack2(f0, f1);
+    qa.y = pack2(f2, f3);
     qa.z = (qa.z & 0xffff0000u) | f32_to_f16(m);  // channel 5 kept
     pv[a] = qa;
 #else
