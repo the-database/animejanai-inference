@@ -21,6 +21,9 @@
 // conv (NHWC output only): its weights follow slice 0's (9 * cinp * COUTP halfs each), its bias
 // slice 0's, and its channels (and residual channels) are offset by z*COUTP.
 //
+// ACT 1 is GELU (erf). A phase scatter's channels per phase are its dst stride, so a transposed conv
+// of any width runs as output slices too.
+//
 // Parameters: entry pc.entry of the Params buffer, 32 ints (offsets and strides in halfs,
 // multiples of 8): 0 H, 1 W (the conv's output size), 2 src offset, 3 src stride, 4 dst offset,
 // 5 dst stride, 6 r1 offset, 7 r1 stride, 8 r2 offset, 9 r2 stride, 10 c1, 11 c2, 12 slope (float
@@ -129,10 +132,22 @@ void fill_chunk(int chunk, int kch, int tid, int nth, int tx0, int ty0)
 #endif
 }
 
+#if ACT == 1
+// erf (Abramowitz & Stegun 7.1.26, |error| < 1.2e-7) for GELU as CUDA's erff gives it, far below
+// the fp16 output's step
+float erf_(float x)
+{
+    const float s = sign(x), a = abs(x);
+    const float t = 1.0 / (1.0 + 0.3275911 * a);
+    return s * (1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a));
+}
+#endif
 float act(float v)
 {
 #if ACT == 2
     return v >= 0.0 ? v : v * prmf(12);
+#elif ACT == 1
+    return 0.5 * v * (1.0 + erf_(v / 1.4140625));
 #else
     return v;
 #endif
@@ -162,7 +177,7 @@ void write_out(int tid, int nth, int tx0, int ty0, int H, int W)
     const float c2 = prmf(11);
 #endif
 #if R > 1
-    const int sy = prm(16), VPH = VPO / R;  // uvec4s of channels per phase
+    const int sy = prm(16);
 #endif
     for (int q = tid; q < TH * TW * VPO; q += nth) {
         const int p = q / VPO, v = q % VPO, oy = ty0 + p / TW, ox = tx0 + p % TW;
@@ -189,9 +204,11 @@ void write_out(int tid, int nth, int tx0, int ty0, int H, int W)
             o[j] = packFloat2x16(f16vec2(act(x.x), act(x.y)));
         }
 #if R > 1
-        const int sx = v / VPH, vc = v % VPH;
+        // output channel zc + 8v of the transposed conv: phase sx = it / dstride (the channels per
+        // phase), channel it % dstride of pixel (R*oy + sy, R*ox + sx); with slices, any slice width
+        const int gch = zc + v * 8, sx = gch / dstride, ch = gch % dstride;
         const int dp = (R * oy + sy) * (R * W) + R * ox + sx;
-        dst_v[(dp * dstride + doff) / 8 + vc] = o;
+        dst_v[(dp * dstride + prm(4) + ch) / 8] = o;
 #else
         dst_v[(op * dstride + doff) / 8 + v] = o;
 #endif

@@ -99,7 +99,7 @@ public:
     const Buffer &output() const override { return out_; }
     void bind_io(VkBuffer in, VkBuffer out) override;
     bool record(VkCommandBuffer cb, int w, int h) const override;
-    void suffix(const std::string &s) { what_ += s; }
+    void suffix(const std::string &s) override { what_ += s; }
     int out_w() const override { return w_ * scale_; }
     int out_h() const override { return h_ * scale_; }
     size_t device_bytes() const override { return bytes_; }
@@ -431,6 +431,7 @@ public:
     const Buffer &input() const override { return ex_->input(); }
     const Buffer &output() const override { return ex_->output(); }
     void bind_io(VkBuffer in, VkBuffer out) override { ex_->bind_io(in, out); }
+    void suffix(const std::string &s) override { desc_ += s; }
     bool record(VkCommandBuffer cb, int w, int h) const override { return ex_->record(cb, w, h); }
     int out_w() const override { return ex_->out_w(); }
     int out_h() const override { return ex_->out_h(); }
@@ -474,8 +475,20 @@ std::unique_ptr<ImgNet> ImgNet::frame(Device &dev, const ajinative::OnnxGraph &g
     // the probe: buffers per input pixel (they scale with the area; what does not makes the
     // estimate high, not low)
     constexpr int P = 128;
-    std::unique_ptr<ImgNet> probe = Esrgan::build(dev, g, P, P, why);
-    if (!probe) return nullptr;
+    // the image models: ESRGAN, then FDAT
+    using Builder = std::unique_ptr<ImgNet> (*)(Device &, const ajinative::OnnxGraph &, int, int, std::string *);
+    Builder bld = &build_esrgan;
+    std::string we;
+    std::unique_ptr<ImgNet> probe = bld(dev, g, P, P, &we);
+    if (!probe && we.rfind("not an ESRGAN", 0) == 0) {
+        bld = &build_fdat;
+        probe = bld(dev, g, P, P, &we);
+        if (!probe && we.rfind("not an FDAT", 0) == 0) we = "not an ESRGAN graph";
+    }
+    if (!probe) {
+        if (why) *why = we;
+        return nullptr;
+    }
     const double per_px = (double)(probe->device_bytes() - probe->weight_bytes()) / ((double)P * P);
     const double need = (double)probe->weight_bytes() + per_px * w * h;
     probe.reset();
@@ -491,9 +504,9 @@ std::unique_ptr<ImgNet> ImgNet::frame(Device &dev, const ajinative::OnnxGraph &g
         return refuse_(why, "a whole " + std::to_string(w) + "x" + std::to_string(h) + " frame needs ~" + gb(need) + ", " +
                                 gb((double)free_b) + " free (keeping " + gb(keep) + ")"),
                nullptr;
-    std::unique_ptr<ImgNet> n = Esrgan::build(dev, g, w, h, why);
+    std::unique_ptr<ImgNet> n = bld(dev, g, w, h, why);
     if (!n) return nullptr;
-    static_cast<Esrgan *>(n.get())->suffix(", whole frame");
+    n->suffix(", whole frame");
     return n;
 }
 
@@ -502,6 +515,11 @@ std::unique_ptr<ImgNet> ImgNet::create(Device &dev, const ajinative::OnnxGraph &
     std::string we;
     if (auto n = Esrgan::build(dev, g, w, h, &we)) return n;
     if (we.rfind("not an ESRGAN", 0) != 0) {
+        if (why) *why = we;
+        return nullptr;
+    }
+    if (auto n = build_fdat(dev, g, w, h, &we)) return n;
+    if (we.rfind("not an FDAT", 0) != 0) {
         if (why) *why = we;
         return nullptr;
     }

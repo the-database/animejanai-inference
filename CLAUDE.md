@@ -166,7 +166,7 @@ off; any other value, or no key, is on. Image path: `AJI_NATIVE=off` (or `0`, `n
 | Models | Video path (`aji_trt.cpp`) | Image path (`aji_img_trt.cpp`) |
 |---|---|---|
 | SPAN, SPANF3, span_s, Compact (SRVGG) | `native/lower` + `native/executor` at the chain's size | the same plan and executor behind `ImgNet` (`build_lowered`, `native/framenet.cpp`), per tile |
-| ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory | the `native/imgnet` builders, per tile |
+| ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory (ESRGAN and FDAT also on Vulkan: `vk/esrgan.cpp`, `vk/fdat.cpp`) | the `native/imgnet` builders, per tile |
 | TFDAT, TemporalFix | `native/vidnet` in the temporal stage (TemporalFix also on Vulkan: `vk/tfix`) | — |
 | RIFE | `native/rife` (the graph read by `native/rife_plan`, which Vulkan's `vk/rife` shares) | — |
 
@@ -304,6 +304,24 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   ESRGAN (RRDBNet 64/32, 2x unshuffle and 4x) follows `native/esrgan.cpp`'s plan on it, with its
   intermediates in one arena by lifetime; a tile whose buffers exceed `maxStorageBufferRange` is
   refused. `ImgNet::create` tries ESRGAN, then the lowering.
+- **`vk/tnet`, `vk/fdat.cpp`, `tfm.comp`: the transformer image models on Vulkan** (FDAT now;
+  HAT, DAT and TFDAT to follow). `TNet` is one arena of maps (as `tfix.comp`'s), fp32 / fp16 weight
+  stores, a partial-sums buffer and a list of steps: gconv dispatches, `tfm.comp` passes, copies,
+  fills. `tfm.comp` ports `native/tfm.cu` and `fdat_kernels.cu`: the GEMM (fp32 sums, tfm's
+  epilogue: bias, act, column scale, two residuals, act last), LayerNorm (32 lanes a token),
+  depthwise 3x3 (an 8-channel group of a column over an 8-row strip, the rows reused; channel sums
+  as per-workgroup partials, no float atomics), window attention (a workgroup per window, head and
+  64 queries; keys in blocks of 32, P rounded to fp16 as tfm's), the channel-attention statistics,
+  softmax and fold (into fp16 GEMM weights on the GPU), and FDAT's gates. On cm16 GPUs with fp32-sum
+  cooperative matrices (`DeviceInfo::cm16_acc32`) the GEMM is `tfm_gemm_cm16.comp`. gconv gained
+  GELU (ACT 1) and phase scatters split into output slices (FDAT's 2x C-channel transposed conv).
+  `ImgNet::create` and `ImgNet::frame` (video) try ESRGAN, then FDAT, then the lowering. FDAT_M
+  and FDAT_XL (the shipped IllustrationJaNai exports; the op23 "dynamo" exports aren't read, as on
+  CUDA) match CUDA native at 69-71 dB; 720x480 2x page on the 5090: 46 ms (DirectML 2238, CUDA 23).
+  `AJI_TNET_SKIP=<step label prefix>` records no dispatch for those steps: per-step timestamps
+  attribute time to the wrong step on NVIDIA, so this is how to see what a kind of step costs.
+  `aji_vk_model_test image <onnx> W H` (any image model vs CUDA native), `gemm M K N [act]`,
+  `attn H W heads hd [ws]` benchmark the kernels.
 - **`vk/tfix`: TemporalFix on Vulkan** (`TemporalNet`), native/tfix.cpp's graph reading and step
   order: the 3x3 convs on gconv, the depthwise / pointwise convs (fp32 sums, as CUDA's tfm) and
   the resampling, warps and blend in `tfix.comp`, the six supports one after another. Its
@@ -439,7 +457,7 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_vk_spirv_test` | EXE | — | **`AJI_VULKAN` only**: CPU check that each embedded module is well-formed SPIR-V with its family's capabilities |
 | `aji_vk_core` | OBJECT | — (Vulkan loaded at run time) | **`AJI_VULKAN` only**: `src/vk` device, kernels, executor |
 | `aji_vk` | SHARED | `d3d12 d3d11 dxgi d3dcompiler` | **`AJI_VULKAN` + WIN32 only**: `aji_dml.cpp` with `AJI_VULKAN`, model steps on the Vulkan executor |
-| `aji_vk_model_test` | EXE | — | **`AJI_VULKAN` only**, by hand: one model on the Vulkan executor against the fp32 CPU reference (and the CUDA executor with `AJI_CUDA`); `rife <onnx> W H`: Vulkan RIFE, timed, against CUDA native RIFE; `temporal <onnx> W H`: TemporalFix (whole window and cached), against CUDA native |
+| `aji_vk_model_test` | EXE | — | **`AJI_VULKAN` only**, by hand: one model on the Vulkan executor against the fp32 CPU reference (and the CUDA executor with `AJI_CUDA`); `rife <onnx> W H`: Vulkan RIFE, timed, against CUDA native RIFE; `temporal <onnx> W H`: TemporalFix (whole window and cached), against CUDA native; `image <onnx> W H`: an image model against CUDA native; `gemm` / `attn`: kernel benchmarks |
 | `aji_vk_gconv_test` | EXE | — | **`AJI_VULKAN` only** (`ctest -L gpu`): the general conv's modes against a CPU reference, each tile variant |
 | `aji_native_conv_test` | EXE | `aji_native`, `CUDA::cudart` | every native kernel against a CPU reference (sm_80+, skips below) |
 | `aji_native_bench` | EXE | `aji_native`, `CUDA::cudart` | **EXCLUDE_FROM_ALL**; whole-model native timing on `experimental/native-span` data |

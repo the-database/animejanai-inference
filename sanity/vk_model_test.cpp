@@ -6,6 +6,7 @@
 //   aji_vk_model_test rife <rife.onnx> <w> <h> [--t T] [--device N] [--iters N] [--min-db D]
 //                     [--max-levels L]
 //   aji_vk_model_test temporal <temporalfix.onnx> <w> <h> [--device N] [--iters N] [--min-db D]
+//   aji_vk_model_test image <model.onnx> <w> <h> [--device N] [--iters N] [--min-db D]
 // Runs the model at w x h on a synthetic frame and times it (GPU timestamps, model only, and the
 // executor's create time; --cache keeps the variant and pipeline caches in DIR, as aji_vk keeps
 // them in the model directory, so a second run shows a warm configure). Then, per --ref size (default 256x144 and a ragged 202x118), compares
@@ -20,6 +21,8 @@
 // the warps amplify fp16 differences in the conv sums).
 // temporal: TemporalFix (vk/tfix.h) on 7 frames of a synthetic pan, timed; with AJI_CUDA, compared
 // with CUDA native TemporalFix (--min-db, default 60).
+// image: an image model (vk/imgnet.h: ESRGAN, FDAT, the lowered nets) on one w x h tile of a synthetic
+// frame, timed (AJI_VK_PROFILE=1: per kind of step); with AJI_CUDA, compared with CUDA native's.
 // Plain C++ with the Vulkan loader opened at run time: it also builds for android-arm64 and runs
 // from an adb shell.
 #include <algorithm>
@@ -40,12 +43,15 @@
 #include "vk/device.h"
 #include "vk/executor.h"
 #include "vk/rife.h"
+#include "vk/imgnet.h"
 #include "vk/tfix.h"
+#include "vk/tnet.h"
 
 #ifdef AJI_VK_TEST_CUDA
 #include <cuda_runtime.h>
 #include "native/executor.h"
 #include "native/rife.h"
+#include "native/imgnet.h"
 #include "native/vidnet.h"
 #endif
 
@@ -117,6 +123,196 @@ bool run_vk(ajivk::Device &dev, const Plan &plan, int w, int h, const std::vecto
     if (!dev.download(ex->output(), out->data(), out->size() * 2, why)) return false;
     if (keep) *keep = std::move(ex);
     return true;
+}
+
+int attn_main(int argc, char **argv)
+{
+    // aji_vk_model_test attn H W heads hd ws: one tfm window attention (vk/tnet.h) timed x 20
+    std::string why;
+    const int H = std::atoi(argv[2]), W = std::atoi(argv[3]), heads = std::atoi(argv[4]), hd = std::atoi(argv[5]),
+              ws = argc > 6 ? std::atoi(argv[6]) : 8;
+    auto dev = ajivk::Device::create(-1, nullptr, &why);
+    if (!dev) {
+        std::fprintf(stderr, "device: %s\n", why.c_str());
+        return 1;
+    }
+    ajivk::TNet n(*dev);
+    const int C = heads * hd, QS = (3 * C + 15) / 16 * 16, CP = (C + 15) / 16 * 16, M = H * W, T = ws * ws;
+    const VkDeviceSize Q = n.place((VkDeviceSize)M * QS * 2), O = n.place((VkDeviceSize)M * CP * 2);
+    std::vector<float> bias((size_t)heads * T * T, 0.01f);
+    const int bo = n.add_wf(bias);
+    const int nwx = (W + ws - 1) / ws, nwy = (H + ws - 1) / ws, nqb = (T + 63) / 64;
+    for (int i = 0; i < 20; i++) {
+        ajivk::TArgs a;
+        a.map(0, ajivk::hmap(Q, QS));
+        a.map(1, ajivk::hmap(O, CP));
+        a.v[16] = H;
+        a.v[17] = W;
+        a.v[18] = heads;
+        a.v[19] = hd;
+        a.v[20] = a.v[21] = ws;
+        a.v[28] = nwx;
+        a.v[29] = H;
+        a.v[30] = W;
+        a.f(31, 0.18f);
+        a.v[32] = bo;
+        a.v[33] = 0;
+        a.v[34] = C;
+        a.v[35] = 2 * C;
+        const long long wg = (long long)nwx * nwy * heads * nqb;
+        a.v[36] = (int32_t)wg;
+        a.v[37] = nqb;
+        const uint32_t gx = (uint32_t)std::min<long long>(wg, 65535), gy = (uint32_t)((wg + gx - 1) / gx);
+        n.pass(5, a, gx, gy, "winattn");
+    }
+    if (!n.finish(16, 16, &why)) {
+        std::fprintf(stderr, "attn: %s\n", why.c_str());
+        return 1;
+    }
+    std::printf("%s", n.profile(*dev).c_str());
+    return 0;
+}
+
+int gemm_main(int argc, char **argv)
+{
+    // aji_vk_model_test gemm M K N [act]: one tfm GEMM (vk/tnet.h) timed, against a CPU reference
+    std::string why;
+    const int M = std::atoi(argv[2]), K = std::atoi(argv[3]), N = std::atoi(argv[4]), act = argc > 5 ? std::atoi(argv[5]) : 0;
+    auto dev = ajivk::Device::create(-1, nullptr, &why);
+    if (!dev) {
+        std::fprintf(stderr, "device: %s\n", why.c_str());
+        return 1;
+    }
+    ajivk::TNet n(*dev);
+    const int Kp = (K + 15) / 16 * 16, Np = (N + 15) / 16 * 16;
+    const VkDeviceSize A = n.place((VkDeviceSize)M * Kp * 2), O = n.place((VkDeviceSize)M * Np * 2);
+    std::vector<float> w((size_t)K * N), b(N);
+    uint32_t sd = 99u;
+    auto rnd = [&]() {
+        sd = sd * 1664525u + 1013904223u;
+        return ((sd >> 9) & 0xffff) / 65535.f - 0.5f;
+    };
+    for (float &v : w) v = rnd() * 0.2f;
+    for (float &v : b) v = rnd();
+    const ajivk::TNet::Mat mt = n.add_mat(w, b, K, N);
+    for (int i = 0; i < 20; i++) n.gemm(ajivk::hmap(A, Kp), M, mt, ajivk::hmap(O, Np), act);
+    if (!n.finish(16, 16, &why)) {
+        std::fprintf(stderr, "gemm: %s\n", why.c_str());
+        return 1;
+    }
+    std::printf("%s", n.profile(*dev).c_str());
+    std::printf("%.2f GFLOP a GEMM\n", 2.0 * M * Kp * Np / 1e9);
+    return 0;
+}
+
+int image_main(int argc, char **argv)
+{
+    std::string why;
+    const char *model = argv[2];
+    const int w = std::atoi(argv[3]), h = std::atoi(argv[4]);
+    int device = -1, iters = 5;
+    double min_db = 50.0;
+    for (int i = 5; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--device") && i + 1 < argc) device = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--min-db") && i + 1 < argc) min_db = std::atof(argv[++i]);
+    }
+    std::ifstream f(model, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(f)), {});
+    OnnxGraph g;
+    if (bytes.empty() || !parse_onnx(bytes.data(), bytes.size(), &g, &why)) {
+        std::fprintf(stderr, "%s: %s\n", model, why.empty() ? "unreadable" : why.c_str());
+        return 1;
+    }
+    auto dev = ajivk::Device::create(device, nullptr, &why);
+    if (!dev) {
+        std::fprintf(stderr, "device: %s\n", why.c_str());
+        return 1;
+    }
+    std::printf("device %u: %s, family %s\n", dev->info().index, dev->info().name.c_str(), ajivk::family_name(dev->family()));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto n = ajivk::ImgNet::create(*dev, g, w, h, &why);
+    const double cs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!n) {
+        std::fprintf(stderr, "vulkan image model %dx%d: %s\n", w, h, why.c_str());
+        return 1;
+    }
+    std::printf("%s (create %.2f s, %.0f MB)\n", n->describe().c_str(), cs, n->device_bytes() / 1048576.0);
+    const auto in = synth(w, h);
+    const auto hin = to_half(in);
+    std::vector<uint16_t> out((size_t)3 * n->out_w() * n->out_h());
+    if (!dev->upload(n->input(), hin.data(), hin.size() * 2, &why) || !n->run(*dev, w, h, &why) ||
+        !dev->download(n->output(), out.data(), out.size() * 2, &why)) {
+        std::fprintf(stderr, "vulkan run: %s\n", why.c_str());
+        return 1;
+    }
+    size_t nonfinite = 0;
+    for (uint16_t v : out) nonfinite += !std::isfinite(half_bits_to_float(v));
+    int bad = nonfinite != 0;
+    if (nonfinite) std::printf("%zu non-finite outputs: FAIL\n", nonfinite);
+    if (dev->info().timestamp_ns > 0 && iters > 0) {
+        VkQueryPool qp = VK_NULL_HANDLE;
+        VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpi.queryCount = 2;
+        vkCreateQueryPool(dev->device(), &qpi, nullptr, &qp);
+        VkCommandBuffer cb = dev->begin();
+        vkCmdResetQueryPool(cb, qp, 0, 2);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        for (int i = 0; i < iters; i++) {
+            if (i)
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            n->record(cb, w, h);
+        }
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+        if (dev->submit_wait(cb, &why)) {
+            uint64_t ts[2];
+            vkGetQueryPoolResults(dev->device(), qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            std::printf("vulkan %dx%d: %.3f ms per run (%d iterations)\n", w, h, (double)(ts[1] - ts[0]) * dev->info().timestamp_ns / 1e6 / iters,
+                        iters);
+        }
+        vkDestroyQueryPool(dev->device(), qp, nullptr);
+    }
+    if (std::getenv("AJI_VK_PROFILE")) std::printf("%s", n->profile(*dev).c_str());
+    dev->save_caches();
+#ifdef AJI_VK_TEST_CUDA
+    {
+        cudaStream_t s;
+        cudaStreamCreate(&s);
+        auto cn = ajinative::ImgNet::create(g, w, h, s, &why);
+        if (!cn) {
+            std::printf("vs CUDA native: not run (%s)\n", why.c_str());
+        } else {
+            void *din = nullptr, *dout = nullptr;
+            cudaMalloc(&din, hin.size() * 2);
+            cudaMalloc(&dout, out.size() * 2);
+            cudaMemcpy(din, hin.data(), hin.size() * 2, cudaMemcpyHostToDevice);
+            cn->run(din, false, dout, false, w, h, s);
+            cudaStreamSynchronize(s);
+            std::vector<uint16_t> co(out.size());
+            cudaMemcpy(co.data(), dout, co.size() * 2, cudaMemcpyDeviceToHost);
+            size_t same = 0;
+            std::vector<float> cf(co.size());
+            for (size_t i = 0; i < co.size(); i++) {
+                same += co[i] == out[i];
+                cf[i] = half_bits_to_float(co[i]);
+            }
+            const Cmp c = compare(out, cf);
+            const bool ok = c.nan == 0 && c.db >= min_db;
+            std::printf("vs CUDA native at %dx%d: %.1f dB, max %.4f (%.1f levels), %.2f%% bit-identical: %s\n", w, h, c.db, c.maxd, c.maxd * 255,
+                        100.0 * same / co.size(), ok ? "ok" : "FAIL");
+            bad += !ok;
+            cudaFree(din);
+            cudaFree(dout);
+        }
+        cudaStreamDestroy(s);
+    }
+#endif
+    return bad ? 1 : 0;
 }
 
 int temporal_main(int argc, char **argv)
@@ -416,6 +612,9 @@ int main(int argc, char **argv)
     }
     if (argc >= 5 && !std::strcmp(argv[1], "rife")) return rife_main(argc, argv);
     if (argc >= 5 && !std::strcmp(argv[1], "temporal")) return temporal_main(argc, argv);
+    if (argc >= 5 && !std::strcmp(argv[1], "image")) return image_main(argc, argv);
+    if (argc >= 5 && !std::strcmp(argv[1], "gemm")) return gemm_main(argc, argv);
+    if (argc >= 6 && !std::strcmp(argv[1], "attn")) return attn_main(argc, argv);
     if (argc >= 2 && !std::strcmp(argv[1], "info")) {
         const auto devs = ajivk::list_devices(&why);
         if (devs.empty()) std::printf("no Vulkan devices: %s\n", why.c_str());

@@ -1,0 +1,509 @@
+#version 450
+// The transformer kernels of the image models on Vulkan (vk/tfm.h), ports of native/tfm.cu and
+// native/fdat_kernels.cu, by PASS:
+//   1 gemm: out = epilogue(A W), A tokens [M][sa] fp16, W [Kpad][Npad] fp16 (row-major), fp32 sums;
+//     the epilogue as tfm's: + bias, act (unless last), * colscale, + add1 + add2, act (if last)
+//   2 ln: LayerNorm of the first C channels, zeros to the padding
+//   3 dw: depthwise 3x3 (zero padding) + bias, then GELU; with sums, the workgroup's channel sums
+//   4 colsum: the per-workgroup channel sums of dw added up
+//   5 winattn: window attention, one workgroup per (window, head), a thread per query token;
+//     keys in blocks of 32, online softmax, the probabilities rounded to fp16 as tfm's P
+//   6 chanstats: partial channel statistics of q and k (gram per head, |q|^2, |k|^2) per token chunk
+//   7 chanreduce: the partials added up
+//   8 chansoft: the channel attention's per-head softmax (FDAT)
+//   9 chanfold: the softmax folded into the projection: fp16 GEMM weights, and the bias copied
+//   10 aimcg: the channel gate (FDAT spatial blocks): sigmoid(W2 gelu(W1 mean))
+//   11 aimsg: x += attn + conv * sigmoid(attn . wsg) (FDAT channel blocks)
+//
+// Tensors are maps into the arena (binding 2) as in tfix.comp: {base, stride, off, f32}, element
+// pix*stride + off + c. Binding 4: fp32 vectors and matrices (LayerNorm, dw weights, biases, gates);
+// binding 5: fp16 GEMM weights (written by chanfold); binding 6: the partial sums; 7: Params.
+// Params (64 ints): maps m0..m4 at 0, 4, 8, 12, 24; ints from 16 per pass (see each).
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#if PASS == 1
+layout(local_size_x = 256) in;
+#elif PASS == 5
+layout(local_size_x = 64) in;  // one query token per thread, 64 per workgroup
+#else
+layout(local_size_x = 256) in;
+#endif
+
+layout(push_constant) uniform PC { int entry; int u0; int u1; int u2; } pc;
+layout(std430, binding = 7) readonly buffer Params { ivec4 params[]; };
+layout(std430, binding = 2) buffer ArH { float16_t arh[]; };
+layout(std430, binding = 2) buffer ArF { float arf[]; };
+layout(std430, binding = 2) buffer ArV { uvec4 arv[]; };
+layout(std430, binding = 2) buffer ArU { uint aru[]; };
+layout(std430, binding = 4) readonly buffer WF { float wf[]; };
+layout(std430, binding = 5) buffer WH { float16_t wh[]; };
+layout(std430, binding = 6) buffer Part { float part[]; };
+
+int prm(int k) { return params[pc.entry * 16 + (k >> 2)][k & 3]; }
+float prmf(int k) { return intBitsToFloat(prm(k)); }
+
+struct Map {
+    uint base;
+    int stride, off;
+    bool f32, none;
+};
+Map map(int k)
+{
+    const int at = k < 4 ? 4 * k : 24;
+    Map m;
+    m.none = prm(at) < 0;
+    m.base = uint(max(prm(at), 0));
+    m.stride = prm(at + 1);
+    m.off = prm(at + 2);
+    m.f32 = prm(at + 3) != 0;
+    return m;
+}
+float ld(Map m, uint pix, int c)
+{
+    const uint i = m.base + pix * uint(m.stride) + uint(m.off + c);
+    return m.f32 ? arf[i] : float(arh[i]);
+}
+// fp16 maps whose channels [c, c + 8) start on an 8-half boundary: one 16-byte load / store
+bool vec8at(Map m, int c) { return !m.f32 && (m.stride & 7) == 0 && (m.base & 7u) == 0u && ((m.off + c) & 7) == 0; }
+void ld8(Map m, uint pix, int c, out float v[8])
+{
+    const uvec4 q = arv[(m.base + pix * uint(m.stride) + uint(m.off + c)) >> 3];
+    [[unroll]] for (int j = 0; j < 4; j++) {
+        const vec2 h = unpackHalf2x16(q[j]);
+        v[2 * j] = h.x;
+        v[2 * j + 1] = h.y;
+    }
+}
+void st8(Map m, uint pix, int c, float v[8])
+{
+    uvec4 q;
+    [[unroll]] for (int j = 0; j < 4; j++) q[j] = packFloat2x16(f16vec2(float16_t(v[2 * j]), float16_t(v[2 * j + 1])));
+    arv[(m.base + pix * uint(m.stride) + uint(m.off + c)) >> 3] = q;
+}
+void st(Map m, uint pix, int c, float v)
+{
+    const uint i = m.base + pix * uint(m.stride) + uint(m.off + c);
+    if (m.f32) arf[i] = v;
+    else arh[i] = float16_t(v);
+}
+
+// erf, Abramowitz & Stegun 7.1.26 refined (|error| < 1.2e-7): far below the fp16 outputs' step
+float erf_(float x)
+{
+    const float s = sign(x), a = abs(x);
+    const float t = 1.0 / (1.0 + 0.3275911 * a);
+    const float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a);
+    return s * y;
+}
+float gelu(float v) { return 0.5 * v * (1.0 + erf_(v / 1.4140625)); }
+float sigm(float v) { return 1.0 / (1.0 + exp(-v)); }
+float act(float v, int a, float slope)
+{
+    if (a == 1) return gelu(v);
+    if (a == 2) return v < 0.0 ? v * slope : v;
+    return v;
+}
+
+#if PASS == 1
+// 64 x 64 outputs per workgroup, each thread a 4 x 4 block; K in steps of 16 through shared memory
+shared float sa_[16][64 + 1], sb_[16][64 + 1];
+#elif PASS == 2
+shared float sln[8][32];
+#elif PASS == 3
+shared float ssum[256 * 8];
+#elif PASS == 5
+shared vec4 sk[32][8], sv[32][8];
+#elif PASS == 6
+shared float sq[64][33], skk[64][33];
+#elif PASS == 10
+shared float smean[512], shid[512];
+#elif PASS == 11
+shared float sred[256];
+#endif
+
+void main()
+{
+#if PASS == 1
+    // 16 M, 17 K (padded: a multiple of 16), 18 N (padded), 19 act, 20 act_last, 21 W offset
+    // (halfs), 22 bias offset (floats, < 0 none), 23 colscale (arena floats via m3, or none),
+    // 24.. m4 unused; maps m0 A, m1 out, m2 add1, m3 add2, slope float 28, colscale offset 29
+    // (arena float index, < 0: none), add2 colscale 30 (wf offset, < 0 none)
+    const int M = prm(16), K = prm(17), N = prm(18), acti = prm(19), last = prm(20), wo = prm(21), bo = prm(22);
+    const int cso = prm(29), a2s = prm(30);
+    const float slope = prmf(28);
+    const Map A = map(0), O = map(1), A1 = map(2), A2 = map(3);
+    const int tid = int(gl_LocalInvocationIndex);
+    const int m0 = int(gl_WorkGroupID.y) * 64, n0 = int(gl_WorkGroupID.x) * 64;
+    const int tr = tid / 16, tc = tid % 16;  // thread's rows tr*4.., columns tc*4..
+    float acc[4][4];
+    [[unroll]] for (int i = 0; i < 4; i++) [[unroll]] for (int j = 0; j < 4; j++) acc[i][j] = 0.0;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        // A tile 64 x 16 (transposed into sa_[k][m]); W tile 16 x 64
+        for (int i = tid; i < 64 * 16; i += 256) {
+            const int mm = i / 16, kk = i % 16, gm = m0 + mm;
+            sa_[kk][mm] = gm < M ? ld(A, uint(gm), k0 + kk) : 0.0;
+            const int kb = i / 64, nn = i % 64, gn = n0 + nn;
+            sb_[kb][nn] = gn < N ? float(wh[wo + (k0 + kb) * N + gn]) : 0.0;
+        }
+        barrier();
+        [[unroll]] for (int kk = 0; kk < 16; kk++) {
+            float a[4], b[4];
+            [[unroll]] for (int i = 0; i < 4; i++) a[i] = sa_[kk][tr * 4 + i];
+            [[unroll]] for (int j = 0; j < 4; j++) b[j] = sb_[kk][tc * 4 + j];
+            [[unroll]] for (int i = 0; i < 4; i++) [[unroll]] for (int j = 0; j < 4; j++) acc[i][j] += a[i] * b[j];
+        }
+        barrier();
+    }
+    [[unroll]] for (int i = 0; i < 4; i++) {
+        const int r = m0 + tr * 4 + i;
+        if (r >= M) continue;
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            const int c = n0 + tc * 4 + j;
+            if (c >= N) continue;
+            float v = acc[i][j];
+            if (bo >= 0) v += wf[bo + c];
+            if (last == 0) v = act(v, acti, slope);
+            if (cso >= 0) v *= arf[cso + c];
+            if (!A1.none) v += ld(A1, uint(r), c);
+            if (!A2.none) v += ld(A2, uint(r), c) * (a2s >= 0 ? wf[a2s + c] : 1.0);
+            if (last != 0) v = act(v, acti, slope);
+            st(O, uint(r), c, v);
+        }
+    }
+#elif PASS == 2
+    // 16 M, 17 C (<= 256), 18 cpad, 19 gamma (wf), 20 beta (wf), eps float 21; m0 in, m1 out.
+    // As tfm.cu's k_ln: 32 lanes a token (8 tokens a workgroup), the lanes across its channels.
+    const int lane = int(gl_LocalInvocationIndex) % 32, slot = int(gl_LocalInvocationIndex) / 32;
+    const int t = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 8 + slot;
+    const int M = prm(16), C = prm(17), cpad = prm(18), go = prm(19), bo = prm(20);
+    const float eps = prmf(21);
+    const Map I = map(0), O = map(1);
+    const bool live = t < M;
+    float v[8];
+    int n = 0;
+    float s = 0.0;
+    [[unroll]] for (int i = 0; i < 8; i++) {
+        const int c = lane + 32 * i;
+        v[i] = live && c < C ? ld(I, uint(t), c) : 0.0;
+        s += v[i];
+    }
+    sln[slot][lane] = s;
+    barrier();
+    for (int k = 16; k > 0; k >>= 1) {
+        if (lane < k) sln[slot][lane] += sln[slot][lane + k];
+        barrier();
+    }
+    const float mean = sln[slot][0] / float(C);
+    barrier();
+    float q = 0.0;
+    [[unroll]] for (int i = 0; i < 8; i++) {
+        const int c = lane + 32 * i;
+        if (c < C) q += (v[i] - mean) * (v[i] - mean);
+    }
+    sln[slot][lane] = q;
+    barrier();
+    for (int k = 16; k > 0; k >>= 1) {
+        if (lane < k) sln[slot][lane] += sln[slot][lane + k];
+        barrier();
+    }
+    const float rs = inversesqrt(sln[slot][0] / float(C) + eps);
+    if (!live) return;
+    [[unroll]] for (int i = 0; i < 8; i++) {
+        const int c = lane + 32 * i;
+        if (c < C) st(O, uint(t), c, (v[i] - mean) * rs * wf[go + c] + wf[bo + c]);
+        else if (c < cpad) st(O, uint(t), c, 0.0);
+    }
+#elif PASS == 3
+    // 16 H, 17 W, 18 C (<= 2048; the last group of 8 may be partial), 19 w (wf, [C][9]), 20 bias (wf, < 0 none), 21 gelu,
+    // 22 sums (part offset, < 0 none: then [workgroups][C] partials there); m0 in, m1 out.
+    // As tfm.cu's k_dw8s: a thread is one 8-channel group of one column over a strip of 8 rows,
+    // the three input rows of its window kept as it moves down; adjacent threads take adjacent
+    // channel groups of a pixel (NP = 256 / (C / 8) columns a workgroup).
+    const int H = prm(16), W = prm(17), C = prm(18), wo = prm(19), bo = prm(20), ge = prm(21), so = prm(22);
+    const int G = (C + 7) / 8, NP = 256 / G, lid = int(gl_LocalInvocationIndex);
+    const int wgi = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+    const int strips = (H + 7) / 8, cols = W * strips;
+    const int g = lid % G, pidx = wgi * NP + lid / G, c0 = g * 8;
+    const bool live = lid < NP * G && pidx < cols;
+    const Map I = map(0), O = map(1);
+    const int nc = min(8, C - c0);  // channels of this group
+    const bool vi = vec8at(I, c0), vo = vec8at(O, c0) && nc == 8;
+    float part8[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    if (live) {
+        const int x = pidx % W, y0 = (pidx / W) * 8;
+        float wt[9][8];
+        [[unroll]] for (int k = 0; k < 9; k++) [[unroll]] for (int j = 0; j < 8; j++) wt[k][j] = j < nc ? wf[wo + (c0 + j) * 9 + k] : 0.0;
+        float r[3][3][8];  // rows y-1, y, y+1; columns x-1, x, x+1
+        [[unroll]] for (int rr = 0; rr < 2; rr++)
+            [[unroll]] for (int dx = 0; dx < 3; dx++) {
+                const int yy = y0 + rr - 1, xx = x + dx - 1;
+                const bool inb = yy >= 0 && yy < H && xx >= 0 && xx < W;
+                if (inb && vi) ld8(I, uint(yy * W + xx), c0, r[rr][dx]);
+                else [[unroll]] for (int j = 0; j < 8; j++) r[rr][dx][j] = inb ? ld(I, uint(yy * W + xx), c0 + j) : 0.0;
+            }
+        for (int y = y0; y < min(H, y0 + 8); y++) {
+            [[unroll]] for (int dx = 0; dx < 3; dx++) {
+                const int yy = y + 1, xx = x + dx - 1;
+                const bool inb = yy < H && xx >= 0 && xx < W;
+                if (inb && vi) ld8(I, uint(yy * W + xx), c0, r[2][dx]);
+                else [[unroll]] for (int j = 0; j < 8; j++) r[2][dx][j] = inb ? ld(I, uint(yy * W + xx), c0 + j) : 0.0;
+            }
+            float a[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            [[unroll]] for (int dx = 0; dx < 3; dx++)
+                [[unroll]] for (int j = 0; j < 8; j++) {
+                    a[j] += r[0][dx][j] * wt[dx][j];
+                    a[j] += r[1][dx][j] * wt[3 + dx][j];
+                    a[j] += r[2][dx][j] * wt[6 + dx][j];
+                }
+            [[unroll]] for (int j = 0; j < 8; j++) {
+                if (bo >= 0 && j < nc) a[j] += wf[bo + c0 + j];
+                if (ge != 0) a[j] = gelu(a[j]);
+                if (j < nc) part8[j] += a[j];
+            }
+            if (vo) st8(O, uint(y * W + x), c0, a);
+            else [[unroll]] for (int j = 0; j < 8; j++)
+                if (j < nc) st(O, uint(y * W + x), c0 + j, a[j]);
+            [[unroll]] for (int dx = 0; dx < 3; dx++)
+                [[unroll]] for (int j = 0; j < 8; j++) {
+                    r[0][dx][j] = r[1][dx][j];
+                    r[1][dx][j] = r[2][dx][j];
+                }
+        }
+    }
+    if (so >= 0) {
+        // the workgroup's channel sums (fp32, as CUDA sums before it stores): thread g of each
+        // channel group adds its columns
+        [[unroll]] for (int j = 0; j < 8; j++) ssum[lid * 8 + j] = part8[j];
+        barrier();
+        if (lid < G) {
+            float t8[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            for (int k = 0; k < NP; k++) [[unroll]] for (int j = 0; j < 8; j++) t8[j] += ssum[(k * G + lid) * 8 + j];
+            [[unroll]] for (int j = 0; j < 8; j++)
+                if (lid * 8 + j < C) part[so + wgi * C + lid * 8 + j] = t8[j];
+        }
+    }
+#elif PASS == 4
+    // 16 C, 17 groups, 18 partials (part), 19 out (arena floats)
+    const int c = int(gl_GlobalInvocationID.x), C = prm(16), ng = prm(17), po = prm(18), oo = prm(19);
+    if (c >= C) return;
+    float s = 0.0;
+    for (int i = 0; i < ng; i++) s += part[po + i * C + c];
+    arf[oo + c] = s;
+#elif PASS == 5
+    // 16 H, 17 W, 18 heads, 19 hd, 20 wh, 21 ww, 22 sy, 23 sx, 28 nwx, 29 Hp, 30 Wp, 31 scale (float),
+    // 32 bias (wf, [heads][T][T], < 0 none), 33 qo, 34 ko, 35 vo, 36 windows x heads x query blocks,
+    // 37 query blocks (of 64) per window; m0 qkv (stride sq), m1 out
+    const int H = prm(16), W = prm(17), heads = prm(18), hd = prm(19), wh_ = prm(20), ww = prm(21), sy = prm(22), sx = prm(23);
+    const int nwx = prm(28), Hp = prm(29), Wp = prm(30), bo = prm(32), qo = prm(33), ko = prm(34), vo = prm(35);
+    const float scale = prmf(31);
+    const Map QKV = map(0), O = map(1);
+    // a 2-D grid of (window, head, block of 64 queries)
+    const int wg = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x), nqb = prm(37);
+    if (wg >= prm(36)) return;  // the whole workgroup, before any barrier
+    const int qb = wg % nqb, wgh = wg / nqb;
+    const int T = wh_ * ww, win = wgh / heads, h = wgh % heads, tid = qb * 64 + int(gl_LocalInvocationIndex),
+              lid = int(gl_LocalInvocationIndex);
+    const int wy = win / nwx, wx = win % nwx;
+    // token t of this window: its pixel, or -1 (beyond the image: zero q, k, v and no output)
+    #define TOKPIX(t, pix)                                                                  \
+        {                                                                                   \
+            int y_ = wy * wh_ + (t) / ww, x_ = wx * ww + (t) % ww;                          \
+            pix = -1;                                                                       \
+            if (y_ < Hp && x_ < Wp) {                                                       \
+                if (sy != 0 || sx != 0) {                                                   \
+                    y_ = (y_ + sy) % Hp;                                                    \
+                    x_ = (x_ + sx) % Wp;                                                    \
+                }                                                                           \
+                if (y_ < H && x_ < W) pix = y_ * W + x_;                                    \
+            }                                                                               \
+        }
+    int qp;
+    TOKPIX(tid, qp);
+    // q, the output and the shared k / v rows as vec4s (8 of them: hd <= 32, zero beyond)
+    vec4 q4[8], o4[8];
+    [[unroll]] for (int d4 = 0; d4 < 8; d4++) {
+        vec4 v = vec4(0.0);
+        [[unroll]] for (int e = 0; e < 4; e++) {
+            const int d = d4 * 4 + e;
+            v[e] = (tid < T && qp >= 0 && d < hd) ? ld(QKV, uint(qp), qo + h * hd + d) : 0.0;
+        }
+        q4[d4] = v;
+        o4[d4] = vec4(0.0);
+    }
+    float mrow = -1e30, lrow = 0.0;
+    for (int kb = 0; kb < T; kb += 32) {
+        barrier();
+        // fp16 pairs as 32-bit words (the head offsets and hd are even, the map fp16)
+        [[unroll]] for (int r = 0; r < 4; r++) {
+            const int i = lid + r * 64, kt = kb + i / 8, d4 = i % 8;
+            int kp = -1;
+            if (kt < T) TOKPIX(kt, kp);
+            vec4 kv = vec4(0.0), vv = vec4(0.0);
+            if (kp >= 0) {
+                const uint rowk = QKV.base + uint(kp) * uint(QKV.stride) + uint(QKV.off + ko + h * hd + d4 * 4);
+                const uint rowv = QKV.base + uint(kp) * uint(QKV.stride) + uint(QKV.off + vo + h * hd + d4 * 4);
+                [[unroll]] for (int e = 0; e < 4; e += 2) {
+                    if (d4 * 4 + e < hd) {
+                        const vec2 a = unpackHalf2x16(aru[(rowk + uint(e)) >> 1]), b = unpackHalf2x16(aru[(rowv + uint(e)) >> 1]);
+                        kv[e] = a.x;
+                        kv[e + 1] = a.y;
+                        vv[e] = b.x;
+                        vv[e + 1] = b.y;
+                    }
+                }
+            }
+            sk[i / 8][d4] = kv;
+            sv[i / 8][d4] = vv;
+        }
+        barrier();
+        if (tid >= T) continue;
+        const int nk = min(32, T - kb);
+        float s[32];
+        float mx = mrow;
+        [[unroll]] for (int j = 0; j < 32; j++) {
+            float v = 0.0;
+            [[unroll]] for (int d4 = 0; d4 < 8; d4++) v += dot(q4[d4], sk[j][d4]);
+            v *= scale;
+            if (bo >= 0 && j < nk) v += wf[bo + (h * T + tid) * T + kb + j];
+            s[j] = j < nk ? v : -1e30;
+            mx = max(mx, s[j]);
+        }
+        const float al = exp(mrow - mx);
+        mrow = mx;
+        float ls = 0.0;
+        [[unroll]] for (int j = 0; j < 32; j++) {
+            s[j] = j < nk ? exp(s[j] - mx) : 0.0;
+            ls += s[j];
+        }
+        lrow = lrow * al + ls;
+        [[unroll]] for (int d4 = 0; d4 < 8; d4++) o4[d4] *= al;
+        [[unroll]] for (int j = 0; j < 32; j++) {
+            const float pj = float(float16_t(s[j]));  // P in fp16, as the mma's operand
+            [[unroll]] for (int d4 = 0; d4 < 8; d4++) o4[d4] += pj * sv[j][d4];
+        }
+    }
+    if (tid < T && qp >= 0) {
+        const float inv = 1.0 / lrow;
+        for (int d = 0; d < hd; d++) st(O, uint(qp), h * hd + d, o4[d / 4][d % 4] * inv);
+    }
+#elif PASS == 6
+    // 16 M, 17 heads, 18 hd, 19 qo, 20 ko, 21 tokens per chunk, 22 partials (part, [chunks][S]),
+    // S = heads*hd*hd + 2*heads*hd; m0 qkv. One workgroup per (chunk, head): gram [hd][hd] of the head,
+    // then |q|^2, |k|^2 of its channels.
+    const int M = prm(16), heads = prm(17), hd = prm(18), qo = prm(19), ko = prm(20), tpc = prm(21), po = prm(22);
+    const int C = heads * hd, S = heads * hd * hd + 2 * C;
+    const int chunk = int(gl_WorkGroupID.x), h = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationIndex);
+    const Map QKV = map(0);
+    const int t0 = chunk * tpc, t1 = min(M, t0 + tpc);
+    // thread: up to 4 gram entries (d, e) = (tid / hd .., tid % hd) over hd*hd <= 1024
+    float g4[4] = float[4](0.0, 0.0, 0.0, 0.0), nq = 0.0, nk = 0.0;
+    for (int tb = t0; tb < t1; tb += 64) {
+        barrier();
+        for (int i = tid; i < 64 * 32; i += 256) {
+            const int tt = tb + i / 32, d = i % 32;
+            const bool ok = tt < t1 && d < hd;
+            sq[i / 32][d] = ok ? ld(QKV, uint(tt), qo + h * hd + d) : 0.0;
+            skk[i / 32][d] = ok ? ld(QKV, uint(tt), ko + h * hd + d) : 0.0;
+        }
+        barrier();
+        [[unroll]] for (int r = 0; r < 4; r++) {
+            const int idx = tid + r * 256;
+            if (idx >= hd * hd) continue;
+            const int d = idx / hd, e = idx % hd;
+            for (int k = 0; k < 64; k++) g4[r] += sq[k][d] * skk[k][e];
+        }
+        if (tid < hd)
+            for (int k = 0; k < 64; k++) nq += sq[k][tid] * sq[k][tid];
+        else if (tid >= 128 && tid - 128 < hd)
+            for (int k = 0; k < 64; k++) nk += skk[k][tid - 128] * skk[k][tid - 128];
+    }
+    const int base = po + chunk * S;
+    [[unroll]] for (int r = 0; r < 4; r++) {
+        const int idx = tid + r * 256;
+        if (idx < hd * hd) part[base + h * hd * hd + idx] = g4[r];
+    }
+    if (tid < hd) part[base + heads * hd * hd + h * hd + tid] = nq;
+    else if (tid >= 128 && tid - 128 < hd) part[base + heads * hd * hd + C + h * hd + tid - 128] = nk;
+#elif PASS == 7
+    // 16 S, 17 chunks, 18 partials (part), 19 out (part offset)
+    const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int S = prm(16), nc = prm(17), po = prm(18), oo = prm(19);
+    if (i >= S) return;
+    float s = 0.0;
+    for (int c = 0; c < nc; c++) s += part[po + c * S + i];
+    part[oo + i] = s;
+#elif PASS == 8
+    // 16 heads, 17 hd, 18 stats (part), 19 temp (wf), 20 attn out (part), eps float 21
+    const int i = int(gl_GlobalInvocationID.x), heads = prm(16), hd = prm(17), so = prm(18), to = prm(19), ao = prm(20);
+    const float eps = prmf(21);
+    if (i >= heads * hd) return;
+    const int h = i / hd, d = i % hd, C = heads * hd;
+    const int gram = so + i * hd, nq = so + heads * hd * hd, nk = nq + C;
+    const float qn = max(sqrt(part[nq + h * hd + d]), eps);
+    float v[64], mx = -1e30;
+    for (int e = 0; e < hd; e++) {
+        v[e] = part[gram + e] / (qn * max(sqrt(part[nk + h * hd + e]), eps)) * wf[to + h];
+        mx = max(mx, v[e]);
+    }
+    float s = 0.0;
+    for (int e = 0; e < hd; e++) s += (v[e] = exp(v[e] - mx));
+    for (int e = 0; e < hd; e++) part[ao + i * hd + e] = v[e] / s;
+#elif PASS == 9
+    // 16 heads, 17 hd, 18 attn (part), 19 wp (wf, [C][C]), 20 out W (wh, [C][Npad]), 21 Npad, 22 bias
+    // src (wf), 23 bias dst (wf can't be written: arena floats)
+    const int heads = prm(16), hd = prm(17), ao = prm(18), wpo = prm(19), oo = prm(20), np_ = prm(21);
+    const int C = heads * hd;
+    const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    if (i >= C * C) return;
+    const int k = i / C, n = i % C, h = k / hd, e = k % hd;
+    float s = 0.0;
+    for (int d = 0; d < hd; d++) s += part[ao + (h * hd + d) * hd + e] * wf[wpo + (h * hd + d) * C + n];
+    wh[oo + k * np_ + n] = float16_t(s);
+#elif PASS == 10
+    // 16 sums (arena floats), 17 M, 18 C, 19 r, 20 w1 (wf [r][C]), 21 w2 (wf [C][r]), 22 cm out (arena
+    // floats), 23 cpad. One workgroup.
+    const int so = prm(16), M = prm(17), C = prm(18), r = prm(19), w1 = prm(20), w2 = prm(21), co = prm(22), cpad = prm(23);
+    const int tid = int(gl_LocalInvocationIndex);
+    for (int c = tid; c < C; c += 256) smean[c] = arf[so + c] / float(M);
+    barrier();
+    for (int j = tid; j < r; j += 256) {
+        float s = 0.0;
+        for (int c = 0; c < C; c++) s += wf[w1 + j * C + c] * smean[c];
+        shid[j] = gelu(s);
+    }
+    barrier();
+    for (int c = tid; c < cpad; c += 256) {
+        float s = 0.0;
+        if (c < C)
+            for (int j = 0; j < r; j++) s += wf[w2 + c * r + j] * shid[j];
+        arf[co + c] = c < C ? sigm(s) : 0.0;
+    }
+#elif PASS == 11
+    // 16 M, 17 C (<= 256), 18 wsg (wf); m0 attn, m1 conv, m2 x (updated). 32 lanes a token, as LN.
+    const int lane = int(gl_LocalInvocationIndex) % 32, slot = int(gl_LocalInvocationIndex) / 32;
+    const int t = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 8 + slot;
+    const int M = prm(16), C = prm(17), wo = prm(18);
+    const Map A = map(0), CV = map(1), X = map(2);
+    const bool live = t < M;
+    float a[8], s = 0.0;
+    [[unroll]] for (int i = 0; i < 8; i++) {
+        const int c = lane + 32 * i;
+        a[i] = live && c < C ? ld(A, uint(t), c) : 0.0;
+        if (c < C) s += a[i] * wf[wo + c];
+    }
+    sred[slot * 32 + lane] = s;
+    barrier();
+    for (int k = 16; k > 0; k >>= 1) {
+        if (lane < k) sred[slot * 32 + lane] += sred[slot * 32 + lane + k];
+        barrier();
+    }
+    const float g = sigm(sred[slot * 32]);
+    if (!live) return;
+    [[unroll]] for (int i = 0; i < 8; i++) {
+        const int c = lane + 32 * i;
+        if (c < C) st(X, uint(t), c, ld(X, uint(t), c) + a[i] + ld(CV, uint(t), c) * g);
+    }
+#endif
+}
