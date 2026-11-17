@@ -381,6 +381,20 @@ rife_gather_f16_m9_k2_t2_b0_r0  rife.comp  PASS=1 F=16 NM=9 KV=2 NT=2 B0=0 REV=0
 rife_merge   rife.comp  PASS=2
 rife_final   rife.comp  PASS=3
 
+# TemporalFix's other kernels (vk/tfix.cpp): depthwise / pointwise convs, resampling, warps, the blend.
+tfix_dw       tfix.comp  PASS=1
+tfix_pw       tfix.comp  PASS=2
+tfix_resize   tfix.comp  PASS=3
+tfix_down     tfix.comp  PASS=4
+tfix_warp     tfix.comp  PASS=5
+tfix_frame    tfix.comp  PASS=6
+tfix_full     tfix.comp  PASS=7
+tfix_fill     tfix.comp  PASS=8
+tfix_conf_in  tfix.comp  PASS=9
+tfix_accum    tfix.comp  PASS=10
+tfix_final    tfix.comp  PASS=11
+tfix_select   tfix.comp  PASS=12
+
 # General 3x3 conv (gconv_common.glsl), the shapes ESRGAN and RIFE use; input channels and offsets are per
 # dispatch. g3_<family>_o<COUTP>_n<IN>a<ACT>r<NRES>u<UP2>s<STRIDE>o<OUT>_<tile>; KMAX: the halo chunk sizing.
 g3_cm16_o16_n0a0r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2

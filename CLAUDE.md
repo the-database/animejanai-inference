@@ -167,7 +167,7 @@ off; any other value, or no key, is on. Image path: `AJI_NATIVE=off` (or `0`, `n
 |---|---|---|
 | SPAN, SPANF3, span_s, Compact (SRVGG) | `native/lower` + `native/executor` at the chain's size | the same plan and executor behind `ImgNet` (`build_lowered`, `native/framenet.cpp`), per tile |
 | ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory | the `native/imgnet` builders, per tile |
-| TFDAT, TemporalFix | `native/vidnet` in the temporal stage | — |
+| TFDAT, TemporalFix | `native/vidnet` in the temporal stage (TemporalFix also on Vulkan: `vk/tfix`) | — |
 | RIFE | `native/rife` (the graph read by `native/rife_plan`, which Vulkan's `vk/rife` shares) | — |
 
 Video, single-frame models: in `aji_configure` (`try_native` in `aji_trt.cpp`) the model's ONNX
@@ -304,6 +304,19 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   ESRGAN (RRDBNet 64/32, 2x unshuffle and 4x) follows `native/esrgan.cpp`'s plan on it, with its
   intermediates in one arena by lifetime; a tile whose buffers exceed `maxStorageBufferRange` is
   refused. `ImgNet::create` tries ESRGAN, then the lowering.
+- **`vk/tfix`: TemporalFix on Vulkan** (`TemporalNet`), native/tfix.cpp's graph reading and step
+  order: the 3x3 convs on gconv, the depthwise / pointwise convs (fp32 sums, as CUDA's tfm) and
+  the resampling, warps and blend in `tfix.comp`, the six supports one after another. Its
+  intermediates are maps into one arena (fp16 or fp32, offset / stride / channel offset, as
+  `TxMap`); a map can name a window position and read entry `sel[pos]` of a stack. The frame cache
+  (as aji_trt's): `record_encode` puts one input frame's encoder output into an entry,
+  `record_cached` runs a window from entries, each position's entry picked on the GPU under the
+  gather's scene-cut rule (`tfix_select`, from the stage's diff sums). In `aji_vk` the temporal
+  stage keeps a gen per ring slot and per entry, gathers the window's missing frames into the
+  model input, then encodes them and runs the window in one submit (`AJI_NATIVE_FRAME_CACHE=off`
+  encodes the whole window, bit-identical). 1080p on an RTX 5090: 14.3 ms per frame (DirectML
+  18.5, CUDA native 8.1); 69.3 dB from CUDA native over 16 frames (DirectML: 51.2 dB);
+  `aji_vk_model_test temporal` checks the cache against the whole window bit for bit.
 - **`vk/rife`: RIFE v4 on Vulkan,** from the graph `native/rife_plan` reads (shared with CUDA's
   `native/rife`): the encoder, each block's convs on gconv, and the resampling (block inputs
   with their warps, the ensemble merge, the output blend) in `rife.comp`, ports of
@@ -426,7 +439,7 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_vk_spirv_test` | EXE | — | **`AJI_VULKAN` only**: CPU check that each embedded module is well-formed SPIR-V with its family's capabilities |
 | `aji_vk_core` | OBJECT | — (Vulkan loaded at run time) | **`AJI_VULKAN` only**: `src/vk` device, kernels, executor |
 | `aji_vk` | SHARED | `d3d12 d3d11 dxgi d3dcompiler` | **`AJI_VULKAN` + WIN32 only**: `aji_dml.cpp` with `AJI_VULKAN`, model steps on the Vulkan executor |
-| `aji_vk_model_test` | EXE | — | **`AJI_VULKAN` only**, by hand: one model on the Vulkan executor against the fp32 CPU reference (and the CUDA executor with `AJI_CUDA`); `rife <onnx> W H`: Vulkan RIFE, timed, against CUDA native RIFE |
+| `aji_vk_model_test` | EXE | — | **`AJI_VULKAN` only**, by hand: one model on the Vulkan executor against the fp32 CPU reference (and the CUDA executor with `AJI_CUDA`); `rife <onnx> W H`: Vulkan RIFE, timed, against CUDA native RIFE; `temporal <onnx> W H`: TemporalFix (whole window and cached), against CUDA native |
 | `aji_vk_gconv_test` | EXE | — | **`AJI_VULKAN` only** (`ctest -L gpu`): the general conv's modes against a CPU reference, each tile variant |
 | `aji_native_conv_test` | EXE | `aji_native`, `CUDA::cudart` | every native kernel against a CPU reference (sm_80+, skips below) |
 | `aji_native_bench` | EXE | `aji_native`, `CUDA::cudart` | **EXCLUDE_FROM_ALL**; whole-model native timing on `experimental/native-span` data |
