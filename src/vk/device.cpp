@@ -2,6 +2,7 @@
 #include "vk/device.h"
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -81,11 +82,13 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
     const bool cm_ext = has_ext(p, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) && vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR;
     f.chain(cm_ext);
     vkGetPhysicalDeviceFeatures2(p, &f.f2);
-    std::string base;
-    if (!f.f12.shaderFloat16) base = "no fp16 shader arithmetic";
-    else if (!f.f11.storageBuffer16BitAccess) base = "no 16-bit storage buffers";
-    else if (!f.f13.subgroupSizeControl || !f.f13.computeFullSubgroups) base = "no subgroup size control";
-    else if (!(sp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)) base = "no subgroup operations in compute shaders";
+    // core: what every family needs; base: what the subgroup families (cm16, sg16) add
+    std::string core;
+    if (!f.f12.shaderFloat16) core = "no fp16 shader arithmetic";
+    else if (!f.f11.storageBuffer16BitAccess) core = "no 16-bit storage buffers";
+    std::string base = core;
+    if (base.empty() && (!f.f13.subgroupSizeControl || !f.f13.computeFullSubgroups)) base = "no subgroup size control";
+    else if (base.empty() && !(sp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)) base = "no subgroup operations in compute shaders";
 
     // cm16: 16x16x16 fp16 x fp16 + fp16 at subgroup scope
     if (!base.empty()) d.cm16_why = base;
@@ -108,23 +111,27 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
         else if (!(ssp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) d.cm16_why = "compute shaders can't require a subgroup size";
         else d.cm16 = true;
     }
-    // sg16: subgroups of exactly 16 lanes with fp16 broadcasts and shuffles
+    // sg16: subgroups of exactly 16 lanes with broadcasts and shuffles (of 32-bit values: fp16
+    // pairs travel packed, so no fp16 subgroup operations are needed)
     const VkSubgroupFeatureFlags need = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
     if (!base.empty()) d.sg16_why = base;
     else if (d.min_subgroup > 16 || d.max_subgroup < 16) d.sg16_why = "no 16-lane subgroups";
     else if ((sp.supportedOperations & need) != need) d.sg16_why = "no subgroup ballot and shuffle";
-    else if (!f.f12.shaderSubgroupExtendedTypes) d.sg16_why = "no fp16 subgroup operations";
     else if (!(ssp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) d.sg16_why = "compute shaders can't require a subgroup size";
     else d.sg16 = true;
+    // plain: fp16 arithmetic and 16-bit storage only
+    if (!core.empty()) d.plain_why = core;
+    else d.plain = true;
 
     // cm16 on AMD hasn't run on an AMD GPU yet (stride-0 matrix loads, element indexing, wave32):
     // only on request, AJI_VK_FAMILY=cm16, until it has
     const bool cm16_default = d.cm16 && d.vendor == kVendorNvidia;
-    d.family = cm16_default ? Family::CM16 : d.sg16 ? Family::SG16 : Family::None;
+    d.family = cm16_default ? Family::CM16 : d.sg16 ? Family::SG16 : d.plain ? Family::PLAIN : Family::None;
     if (d.cm16 && !cm16_default && d.family == Family::None) d.cm16_why = "untested on this vendor (AJI_VK_FAMILY=cm16 enables it)";
     if (const char *e = std::getenv("AJI_VK_FAMILY")) {
         if (!std::strcmp(e, "cm16")) d.family = d.cm16 ? Family::CM16 : Family::None;
         else if (!std::strcmp(e, "sg16")) d.family = d.sg16 ? Family::SG16 : Family::None;
+        else if (!std::strcmp(e, "plain")) d.family = d.plain ? Family::PLAIN : Family::None;
     }
     (void)kVendorIntel;
     return d;
@@ -152,6 +159,7 @@ const char *family_name(Family f)
     switch (f) {
     case Family::CM16: return "cm16";
     case Family::SG16: return "sg16";
+    case Family::PLAIN: return "plain";
     default: return "none";
     }
 }
@@ -163,6 +171,134 @@ std::vector<DeviceInfo> list_devices(std::string *why)
     const auto pds = physical_devices();
     for (uint32_t i = 0; i < pds.size(); i++) out.push_back(probe(pds[i], i));
     return out;
+}
+
+namespace {
+
+void addf(std::string *s, const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    *s += buf;
+}
+
+const char *component_name(VkComponentTypeKHR t)
+{
+    switch (t) {
+    case VK_COMPONENT_TYPE_FLOAT16_KHR: return "f16";
+    case VK_COMPONENT_TYPE_FLOAT32_KHR: return "f32";
+    case VK_COMPONENT_TYPE_FLOAT64_KHR: return "f64";
+    case VK_COMPONENT_TYPE_SINT8_KHR: return "s8";
+    case VK_COMPONENT_TYPE_SINT16_KHR: return "s16";
+    case VK_COMPONENT_TYPE_SINT32_KHR: return "s32";
+    case VK_COMPONENT_TYPE_UINT8_KHR: return "u8";
+    case VK_COMPONENT_TYPE_UINT16_KHR: return "u16";
+    case VK_COMPONENT_TYPE_UINT32_KHR: return "u32";
+    default: return "other";
+    }
+}
+
+std::string subgroup_ops(VkSubgroupFeatureFlags f)
+{
+    static const std::pair<VkSubgroupFeatureFlagBits, const char *> names[] = {
+        {VK_SUBGROUP_FEATURE_BASIC_BIT, "basic"}, {VK_SUBGROUP_FEATURE_VOTE_BIT, "vote"},
+        {VK_SUBGROUP_FEATURE_ARITHMETIC_BIT, "arithmetic"}, {VK_SUBGROUP_FEATURE_BALLOT_BIT, "ballot"},
+        {VK_SUBGROUP_FEATURE_SHUFFLE_BIT, "shuffle"}, {VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT, "shuffle_relative"},
+        {VK_SUBGROUP_FEATURE_CLUSTERED_BIT, "clustered"}, {VK_SUBGROUP_FEATURE_QUAD_BIT, "quad"}};
+    std::string s;
+    for (const auto &n : names)
+        if (f & n.first) s += std::string(s.empty() ? "" : " ") + n.second;
+    return s;
+}
+
+}  // namespace
+
+std::string capability_report(uint32_t index, std::string *why)
+{
+    if (!instance(why)) return {};
+    const auto pds = physical_devices();
+    if (index >= pds.size()) {
+        if (why) *why = "no Vulkan device " + std::to_string(index);
+        return {};
+    }
+    VkPhysicalDevice p = pds[index];
+    const DeviceInfo d = probe(p, index);
+    std::string s;
+
+    VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceSubgroupSizeControlProperties ssp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, &drv};
+    VkPhysicalDeviceSubgroupProperties sp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &ssp};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sp};
+    vkGetPhysicalDeviceProperties2(p, &p2);
+    const VkPhysicalDeviceProperties &pr = p2.properties;
+    const VkPhysicalDeviceLimits &l = pr.limits;
+    addf(&s, "device %u: %s, vendor %04x device %04x, type %d\n", index, pr.deviceName, pr.vendorID, pr.deviceID,
+         (int)pr.deviceType);
+    addf(&s, "  api %u.%u.%u, driver %s (%s), driver version %08x\n", VK_API_VERSION_MAJOR(pr.apiVersion),
+         VK_API_VERSION_MINOR(pr.apiVersion), VK_API_VERSION_PATCH(pr.apiVersion), drv.driverName, drv.driverInfo,
+         pr.driverVersion);
+    addf(&s, "  subgroup %u, size control [%u..%u], required-size stages 0x%x, ops in stages 0x%x: %s\n", sp.subgroupSize,
+         ssp.minSubgroupSize, ssp.maxSubgroupSize, ssp.requiredSubgroupSizeStages, sp.supportedStages,
+         subgroup_ops(sp.supportedOperations).c_str());
+
+    Features f;
+    const bool cm_ext = has_ext(p, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) && vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR;
+    if (pr.apiVersion >= VK_API_VERSION_1_3) {
+        f.chain(cm_ext);
+        vkGetPhysicalDeviceFeatures2(p, &f.f2);
+        addf(&s, "  fp16 arithmetic %d, int8 arithmetic %d, 16-bit storage %d, 8-bit storage %d, fp16 subgroup ops %d, "
+                 "subgroup size control %d, full subgroups %d, integer dot product %d\n",
+             f.f12.shaderFloat16, f.f12.shaderInt8, f.f11.storageBuffer16BitAccess, f.f12.storageBuffer8BitAccess,
+             f.f12.shaderSubgroupExtendedTypes, f.f13.subgroupSizeControl, f.f13.computeFullSubgroups,
+             f.f13.shaderIntegerDotProduct);
+    }
+    if (cm_ext) {
+        uint32_t n = 0;
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(p, &n, nullptr);
+        std::vector<VkCooperativeMatrixPropertiesKHR> cm(n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(p, &n, cm.data());
+        addf(&s, "  cooperative matrix (feature %d): %u shapes\n", f.cm.cooperativeMatrix, n);
+        for (const auto &c : cm)
+            addf(&s, "    %ux%ux%u  A %s B %s C %s result %s  scope %d%s\n", c.MSize, c.NSize, c.KSize, component_name(c.AType),
+                 component_name(c.BType), component_name(c.CType), component_name(c.ResultType), (int)c.scope,
+                 c.saturatingAccumulation ? " saturating" : "");
+    } else {
+        s += "  cooperative matrix: none\n";
+    }
+    addf(&s, "  compute: shared %u B, invocations %u, group size %ux%ux%u, groups %ux%ux%u, push constants %u B, "
+             "storage buffer range %u B\n",
+         l.maxComputeSharedMemorySize, l.maxComputeWorkGroupInvocations, l.maxComputeWorkGroupSize[0],
+         l.maxComputeWorkGroupSize[1], l.maxComputeWorkGroupSize[2], l.maxComputeWorkGroupCount[0],
+         l.maxComputeWorkGroupCount[1], l.maxComputeWorkGroupCount[2], l.maxPushConstantsSize, l.maxStorageBufferRange);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(p, &mp);
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        addf(&s, "  heap %u: %.0f MiB%s\n", i, mp.memoryHeaps[i].size / 1048576.0,
+             (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? ", device-local" : "");
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        addf(&s, "  memory type %u: heap %u, flags 0x%x\n", i, mp.memoryTypes[i].heapIndex, mp.memoryTypes[i].propertyFlags);
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(p, &nq, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(nq);
+    vkGetPhysicalDeviceQueueFamilyProperties(p, &nq, qf.data());
+    for (uint32_t i = 0; i < nq; i++)
+        addf(&s, "  queue family %u: flags 0x%x, %u queues, timestamp bits %u\n", i, qf[i].queueFlags, qf[i].queueCount,
+             qf[i].timestampValidBits);
+    addf(&s, "  timestamps: compute and graphics %d, period %.3f ns\n", l.timestampComputeAndGraphics, l.timestampPeriod);
+
+    uint32_t ne = 0;
+    vkEnumerateDeviceExtensionProperties(p, nullptr, &ne, nullptr);
+    std::vector<VkExtensionProperties> ext(ne);
+    vkEnumerateDeviceExtensionProperties(p, nullptr, &ne, ext.data());
+    addf(&s, "  %u device extensions:", ne);
+    for (const auto &e : ext) s += std::string(" ") + e.extensionName;
+    s += "\n";
+    addf(&s, "  aji_vk: family %s (cm16: %s; sg16: %s; plain: %s)\n", family_name(d.family), d.cm16 ? "yes" : d.cm16_why.c_str(),
+         d.sg16 ? "yes" : d.sg16_why.c_str(), d.plain ? "yes" : d.plain_why.c_str());
+    return s;
 }
 
 std::unique_ptr<Device> Device::create(int index, const uint8_t *luid, std::string *why)
@@ -202,7 +338,8 @@ std::unique_ptr<Device> Device::create(int index, const uint8_t *luid, std::stri
     d->info_ = probe(d->phys_, (uint32_t)pick);
     const DeviceInfo &in = d->info_;
     if (in.family == Family::None)
-        return fail(in.name + ": no aji_vk kernel family runs here (cm16: " + in.cm16_why + "; sg16: " + in.sg16_why + ")");
+        return fail(in.name + ": no aji_vk kernel family runs here (cm16: " + in.cm16_why + "; sg16: " + in.sg16_why +
+                    "; plain: " + in.plain_why + ")");
     vkGetPhysicalDeviceMemoryProperties(d->phys_, &d->mem_);
 
     // a compute queue, compute-only when there is one
@@ -230,11 +367,11 @@ std::unique_ptr<Device> Device::create(int index, const uint8_t *luid, std::stri
     f.chain(cm);
     f.f11.storageBuffer16BitAccess = VK_TRUE;
     f.f12.shaderFloat16 = VK_TRUE;
-    f.f12.shaderSubgroupExtendedTypes = in.family == Family::SG16 ? VK_TRUE : VK_FALSE;
     f.f12.vulkanMemoryModel = cm ? VK_TRUE : VK_FALSE;
     f.f12.vulkanMemoryModelDeviceScope = cm ? VK_TRUE : VK_FALSE;
-    f.f13.subgroupSizeControl = VK_TRUE;
-    f.f13.computeFullSubgroups = VK_TRUE;
+    // plain pins no subgroup size, and its devices may lack the feature
+    f.f13.subgroupSizeControl = in.family != Family::PLAIN ? VK_TRUE : VK_FALSE;
+    f.f13.computeFullSubgroups = in.family != Family::PLAIN ? VK_TRUE : VK_FALSE;
     f.f13.synchronization2 = VK_TRUE;
     f.f12.timelineSemaphore = VK_TRUE;  // required by Vulkan 1.3
     f.cm.cooperativeMatrix = cm ? VK_TRUE : VK_FALSE;

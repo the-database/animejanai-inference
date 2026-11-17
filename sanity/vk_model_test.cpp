@@ -1,6 +1,8 @@
 // aji_vk_model_test: one lowered model on aji_vk's executor (vk/executor.h), by hand.
 //   aji_vk_model_test list
+//   aji_vk_model_test info [N]       (everything device N, default all, offers the kernel families)
 //   aji_vk_model_test <model.onnx> <w> <h> [--device N] [--iters N] [--ref WxH ...] [--cache DIR]
+//                     [--seconds S]
 // Runs the model at w x h on a synthetic frame and times it (GPU timestamps, model only, and the
 // executor's create time; --cache keeps the variant and pipeline caches in DIR, as aji_vk keeps
 // them in the model directory, so a second run shows a warm configure). Then, per --ref size (default 256x144 and a ragged 202x118), compares
@@ -8,6 +10,10 @@
 // max error. With AJI_CUDA, also compares the w x h output with the CUDA native executor's.
 // Exit 1 when a comparison is under its limits: --min-db (default 50) and --max-levels, the
 // largest error in 8-bit levels (default 2), since PSNR alone can hide a few wrong pixels.
+// --seconds S keeps the GPU on the model for S seconds and prints the model time per second, to
+// show thermal throttling (phones and tablets).
+// Plain C++ with the Vulkan loader opened at run time: it also builds for android-arm64 and runs
+// from an adb shell.
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -113,13 +119,24 @@ int main(int argc, char **argv)
                         ajivk::family_name(d.family), d.cm16 ? "yes" : d.cm16_why.c_str(), d.sg16 ? "yes" : d.sg16_why.c_str());
         return 0;
     }
+    if (argc >= 2 && !std::strcmp(argv[1], "info")) {
+        const auto devs = ajivk::list_devices(&why);
+        if (devs.empty()) std::printf("no Vulkan devices: %s\n", why.c_str());
+        for (const auto &d : devs) {
+            if (argc >= 3 && (uint32_t)std::atoi(argv[2]) != d.index) continue;
+            std::printf("%s", ajivk::capability_report(d.index, &why).c_str());
+        }
+        return 0;
+    }
     if (argc < 4) {
-        std::fprintf(stderr, "usage: aji_vk_model_test list | <model.onnx> <w> <h> [--device N] [--iters N] [--ref WxH ...] [--min-db D]\n");
+        std::fprintf(stderr, "usage: aji_vk_model_test list | info [N] | <model.onnx> <w> <h> [--device N] [--iters N] [--ref WxH ...] "
+                             "[--min-db D] [--max-levels L] [--cache DIR] [--seconds S]\n");
         return 2;
     }
     const char *model = argv[1];
     const int w = std::atoi(argv[2]), h = std::atoi(argv[3]);
     int device = -1, iters = 20;
+    double seconds = 0;
     double min_db = 50.0, max_levels = 2.0;
     std::string cache;
     std::vector<std::pair<int, int>> refs;
@@ -129,6 +146,7 @@ int main(int argc, char **argv)
         else if (!std::strcmp(argv[i], "--min-db") && i + 1 < argc) min_db = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--max-levels") && i + 1 < argc) max_levels = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--cache") && i + 1 < argc) cache = argv[++i];
+        else if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--ref") && i + 1 < argc) {
             int rw = 0, rh = 0;
             if (std::sscanf(argv[++i], "%dx%d", &rw, &rh) == 2) refs.push_back({rw, rh});
@@ -174,32 +192,66 @@ int main(int argc, char **argv)
     std::printf("%s", ex->describe().c_str());
     dev->save_caches();
     double best = -1;
+    VkQueryPool qp = VK_NULL_HANDLE;
+    // one batch of iters runs between two timestamps: ms per frame, or -1 on failure
+    auto timed_batch = [&]() -> double {
+        VkCommandBuffer cb = dev->begin();
+        vkCmdResetQueryPool(cb, qp, 0, 2);
+        ex->record(cb, w, h);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+        for (int i = 0; i < iters; i++) ex->record(cb, w, h);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+        if (!dev->submit_wait(cb, &why)) return -1;
+        uint64_t t[2];
+        vkGetQueryPoolResults(dev->device(), qp, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        return (double)(t[1] - t[0]) * dev->info().timestamp_ns * 1e-6 / iters;
+    };
     if (dev->info().timestamp_ns > 0) {
         VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qpi.queryCount = 2;
-        VkQueryPool qp;
         vkCreateQueryPool(dev->device(), &qpi, nullptr, &qp);
         for (int rep = 0; rep < 3; rep++) {
-            VkCommandBuffer cb = dev->begin();
-            vkCmdResetQueryPool(cb, qp, 0, 2);
-            ex->record(cb, w, h);
-            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
-            for (int i = 0; i < iters; i++) ex->record(cb, w, h);
-            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
-            if (!dev->submit_wait(cb, &why)) {
+            const double ms = timed_batch();
+            if (ms < 0) {
                 std::fprintf(stderr, "timing: %s\n", why.c_str());
                 return 1;
             }
-            uint64_t t[2];
-            vkGetQueryPoolResults(dev->device(), qp, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-            const double ms = (double)(t[1] - t[0]) * dev->info().timestamp_ns * 1e-6 / iters;
             if (best < 0 || ms < best) best = ms;
         }
-        vkDestroyQueryPool(dev->device(), qp, nullptr);
     }
     std::printf("vulkan %dx%d -> %dx%d: %.3f ms per frame (model only), create %.3f s (first in this process), %.3f s (again), %.1f MB on the device\n", w, h,
                 ex->out_w(), ex->out_h(), best, cold, warm, ex->device_bytes() / 1048576.0);
+    if (seconds > 0 && qp) {
+        // sustained: batches back to back; per wall-clock second, the mean and the slowest batch
+        const auto start = std::chrono::steady_clock::now();
+        double sum = 0, worst = 0, first = -1, last = 0;
+        int n = 0, sec = 1;
+        for (;;) {
+            const double ms = timed_batch();
+            if (ms < 0) {
+                std::fprintf(stderr, "sustained: %s\n", why.c_str());
+                return 1;
+            }
+            sum += ms;
+            worst = ms > worst ? ms : worst;
+            n++;
+            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            if (el >= sec || el >= seconds) {
+                last = sum / n;
+                if (first < 0) first = last;
+                std::printf("  sustained %4ds: %.3f ms per frame (slowest batch %.3f)\n", sec, last, worst);
+                std::fflush(stdout);
+                sum = worst = 0;
+                n = 0;
+                sec++;
+            }
+            if (el >= seconds) break;
+        }
+        std::printf("sustained %.0f s: first second %.3f ms, last second %.3f ms (%.0f%% of the first's speed)\n", seconds, first,
+                    last, last > 0 ? 100.0 * first / last : 0.0);
+    }
+    if (qp) vkDestroyQueryPool(dev->device(), qp, nullptr);
 
     int bad = 0;
     for (const auto &r : refs) {

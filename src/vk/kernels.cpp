@@ -41,7 +41,7 @@ const char *conv_variant_name(Family f, int v)
     static const char *cm[kConvVariants] = {"8 subgroups x 2 rows", "4 subgroups x 4 rows"};
     static const char *sg[kConvVariants] = {"8 rows", "4 rows"};
     if (v < 0 || v >= kConvVariants) return "";
-    return f == Family::CM16 ? cm[v] : f == Family::SG16 ? sg[v] : "";
+    return f == Family::CM16 ? cm[v] : f == Family::SG16 || f == Family::PLAIN ? sg[v] : "";
 }
 
 bool conv_dispatch(const Device &dev, const ConvKey &k, int v, Dispatch *d, std::string *why)
@@ -68,6 +68,13 @@ bool conv_dispatch(const Device &dev, const ConvKey &k, int v, Dispatch *d, std:
         d->threads = (uint32_t)(16 * (k.coutp / 16) * d->tile_h);  // a subgroup per row and 16-channel group
         d->shared_bytes = conv_shared(k, d->tile_h, 0);
         break;
+    case Family::PLAIN:
+        d->module = "c3_plain" + ops + "_t" + std::to_string(kSgRows[v]) + "r1";
+        d->subgroup = 0;  // any
+        d->tile_h = kSgRows[v];
+        d->threads = (uint32_t)(8 * (k.coutp / 16) * d->tile_h);  // 8 threads (2 channels each) per row and 16-channel group
+        d->shared_bytes = conv_shared(k, d->tile_h, 0);
+        break;
     default:
         return fail(why, "no kernel family");
     }
@@ -92,6 +99,11 @@ bool concat_dispatch(const Device &dev, int c, int nsrc, Dispatch *d, std::strin
         d->subgroup = 16;
         d->threads = (uint32_t)(16 * (c / 16) * 4);
         break;
+    case Family::PLAIN:
+        d->module = "cat_plain" + base + "_b4";
+        d->subgroup = 0;
+        d->threads = (uint32_t)(8 * (c / 16) * 4);
+        break;
     default:
         return fail(why, "no kernel family");
     }
@@ -101,7 +113,7 @@ bool concat_dispatch(const Device &dev, int c, int nsrc, Dispatch *d, std::strin
 std::vector<uint16_t> pack_weights(Family f, const uint16_t *w, int taps, int cin, int cin_pad, int cout, int cout_pad)
 {
     std::vector<uint16_t> out((size_t)taps * cin_pad * cout_pad, 0);
-    if (f == Family::SG16) {
+    if (f == Family::SG16 || f == Family::PLAIN) {
         const int KC = cin_pad / 16, NG = cout_pad / 16;
         for (int t = 0; t < taps; t++)
             for (int kc = 0; kc < KC; kc++)

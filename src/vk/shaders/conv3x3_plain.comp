@@ -1,0 +1,139 @@
+#version 450
+// Fused 3x3 conv with no subgroup operations and no subgroup size (the plain family: GPUs with
+// neither a usable matrix extension nor 16-lane subgroups, e.g. Adreno, whose waves are 64 or 128
+// lanes). conv3x3_sg16's register blocking, with the inputs read straight from the shared halo
+// tile instead of broadcast between lanes: the threads of a 16-channel group read the same
+// address, which shared memory serves as one broadcast. A thread owns two adjacent output
+// channels for a row of 16 pixels, so it writes the staging tile's fp16 pairs itself. Every output
+// accumulates in sg16's order (fp16 per tap, k ascending, then fp32); compilers still round the two
+// differently (within 1 level of sg16 on a UHD 770).
+// Defines: CINP, COUTP, IN, ACT, GATE, OUT, TH (tile rows), RPS (rows per thread group).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+const int SM_EXTRA = 0;
+#include "conv_common.glsl"
+
+// GT threads per 16-channel group, each with channels 2*lane and 2*lane + 1
+const int GT = 8, NG = COUTP / 16, KC = CINP / 16, NGR = NG * (TH / RPS);
+layout(local_size_x = GT * NGR) in;
+
+layout(std430, binding = 3) readonly buffer Wt { uvec4 wp[]; };     // [9][KC][NG][16 lanes][16 k], as sg16
+#if GATE == 2
+layout(std430, binding = 6) readonly buffer Watt { uvec4 wpa[]; };  // [COUTP/16][NG][16 lanes][16 k]
+#endif
+
+void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
+{
+    f16vec2 p;
+    p = unpackFloat2x16(u0.x); v[0] = p.x; v[1] = p.y;
+    p = unpackFloat2x16(u0.y); v[2] = p.x; v[3] = p.y;
+    p = unpackFloat2x16(u0.z); v[4] = p.x; v[5] = p.y;
+    p = unpackFloat2x16(u0.w); v[6] = p.x; v[7] = p.y;
+    p = unpackFloat2x16(u1.x); v[8] = p.x; v[9] = p.y;
+    p = unpackFloat2x16(u1.y); v[10] = p.x; v[11] = p.y;
+    p = unpackFloat2x16(u1.z); v[12] = p.x; v[13] = p.y;
+    p = unpackFloat2x16(u1.w); v[14] = p.x; v[15] = p.y;
+}
+
+// acc0/acc1 += the 16 channels of the pixel whose two uvec4s are at sm[ai] times w0/w1, k ascending
+void fma_px(int ai, float16_t w0[16], float16_t w1[16], inout float16_t acc0, inout float16_t acc1)
+{
+    const uvec4 u0 = sm[ai], u1 = sm[ai + 1];
+    const uint a[8] = uint[8](u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w);
+    [[unroll]] for (int kp = 0; kp < 8; kp++) {
+        const f16vec2 v = unpackFloat2x16(a[kp]);
+        acc0 = fma(v.x, w0[2 * kp], acc0);
+        acc0 = fma(v.y, w0[2 * kp + 1], acc0);
+        acc1 = fma(v.x, w1[2 * kp], acc1);
+        acc1 = fma(v.y, w1[2 * kp + 1], acc1);
+    }
+}
+
+void main()
+{
+    const int tid = int(gl_LocalInvocationIndex), nth = GT * NGR;
+    const int grp = tid / GT, lane = tid % GT;
+    const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
+    const int H = pc.H, W = pc.W;
+
+    fill_halo(tid, nth, tx0, ty0, H, W);
+    barrier();
+
+    const int g = grp % NG, row0 = (grp / NG) * RPS, ch = g * 16 + 2 * lane;
+    float tot0[RPS][16], tot1[RPS][16];
+    float16_t acc0[RPS][16], acc1[RPS][16];
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+        tot0[r][m] = 0.0;
+        tot1[r][m] = 0.0;
+    }
+
+    [[dont_unroll]] for (int t = 0; t < 9; t++) {
+        const int dy = t / 3, dx = t % 3;
+        [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+            acc0[r][m] = float16_t(0.0);
+            acc1[r][m] = float16_t(0.0);
+        }
+        [[unroll]] for (int kc = 0; kc < KC; kc++) {
+            const int wi = (((t * KC + kc) * NG + g) * 16 + 2 * lane) * 2;
+            float16_t w0[16], w1[16];
+            unpack16(wp[wi], wp[wi + 1], w0);
+            unpack16(wp[wi + 2], wp[wi + 3], w1);
+            [[unroll]] for (int r = 0; r < RPS; r++)
+                [[unroll]] for (int m = 0; m < 16; m++)
+                    fma_px(((row0 + r + dy) * (TW + 2) + m + dx) * (CP / 8) + kc * 2, w0, w1, acc0[r][m], acc1[r][m]);
+        }
+        [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+            tot0[r][m] += float(acc0[r][m]);
+            tot1[r][m] += float(acc1[r][m]);
+        }
+    }
+    barrier();  // the halo is no longer read: shared memory becomes the staging tile
+
+    const float b0 = float(bias_h[ch]), b1 = float(bias_h[ch + 1]);
+#if GATE == 2
+    // stage o (biased, fp16), then the 1x1 attention conv over all channels of each pixel
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++)
+        sm_set_pair(((row0 + r) * TW + m) * SP + ch, packFloat2x16(f16vec2(float16_t(tot0[r][m] + b0), float16_t(tot1[r][m] + b1))));
+    barrier();
+    float ga0[RPS][16], ga1[RPS][16];
+    [[unroll]] for (int r = 0; r < RPS; r++) {
+        [[unroll]] for (int m = 0; m < 16; m++) {
+            ga0[r][m] = 0.0;
+            ga1[r][m] = 0.0;
+        }
+        [[unroll]] for (int kc = 0; kc < COUTP / 16; kc++) {
+            const int wi = ((kc * NG + g) * 16 + 2 * lane) * 2;
+            float16_t w0[16], w1[16];
+            unpack16(wpa[wi], wpa[wi + 1], w0);
+            unpack16(wpa[wi + 2], wpa[wi + 3], w1);
+            [[unroll]] for (int m = 0; m < 16; m++) {
+                float16_t p0 = float16_t(0.0), p1 = float16_t(0.0);
+                fma_px(((row0 + r) * TW + m) * (SP / 8) + kc * 2, w0, w1, p0, p1);
+                ga0[r][m] += float(p0);
+                ga1[r][m] += float(p1);
+            }
+        }
+    }
+    barrier();  // every thread has read o
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+        const int oy = ty0 + row0 + r, ox = tx0 + m;
+        const float o0 = float(float16_t(tot0[r][m] + b0)), o1 = float(float16_t(tot1[r][m] + b1));
+        sm_set_pair(((row0 + r) * TW + m) * SP + ch,
+                    packFloat2x16(f16vec2(float16_t(tanh_gate(o0, ga0[r][m], ch, oy, ox, H, W)),
+                                          float16_t(tanh_gate(o1, ga1[r][m], ch + 1, oy, ox, H, W)))));
+    }
+#else
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+        const int oy = ty0 + row0 + r, ox = tx0 + m;
+        sm_set_pair(((row0 + r) * TW + m) * SP + ch,
+                    packFloat2x16(f16vec2(float16_t(epilogue(tot0[r][m] + b0, ch, oy, ox, H, W)),
+                                          float16_t(epilogue(tot1[r][m] + b1, ch + 1, oy, ox, H, W)))));
+    }
+#endif
+    barrier();
+
+    write_out(tid, nth, tx0, ty0, H, W);
+}

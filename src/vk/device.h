@@ -6,7 +6,8 @@
  *
  * Kernel families (plan section 3): cm16, VK_KHR_cooperative_matrix 16x16x16 with fp16
  * accumulate, for NVIDIA Ampere+ and AMD RDNA3/4; sg16, register-blocked with the subgroup pinned
- * to 16 lanes, for Intel Xe and Mali. AJI_VK_FAMILY=cm16|sg16 overrides the choice.
+ * to 16 lanes, for Intel Xe and Mali; plain, sg16's blocking with no subgroup operations at all,
+ * for the rest (Adreno's 64/128-lane waves). AJI_VK_FAMILY=cm16|sg16|plain overrides the choice.
  */
 #ifndef AJI_VK_DEVICE_H
 #define AJI_VK_DEVICE_H
@@ -22,7 +23,7 @@
 
 namespace ajivk {
 
-enum class Family { None = 0, CM16 = 1, SG16 = 2 };
+enum class Family { None = 0, CM16 = 1, SG16 = 2, PLAIN = 3 };
 const char *family_name(Family f);
 
 struct DeviceInfo {
@@ -37,13 +38,20 @@ struct DeviceInfo {
     uint32_t max_groups[2] = {0, 0};     // maxComputeWorkGroupCount x, y
     double timestamp_ns = 0.0;           // timestampPeriod; 0 if the queue can't time
     uint64_t device_local_bytes = 0;     // the largest device-local heap
-    bool cm16 = false, sg16 = false;     // the device can run that family
-    std::string cm16_why, sg16_why;      // why not, when it can't
+    bool cm16 = false, sg16 = false, plain = false;  // the device can run that family
+    std::string cm16_why, sg16_why, plain_why;       // why not, when it can't
     Family family = Family::None;        // the one aji_vk uses (AJI_VK_FAMILY overrides)
 };
 
 // Every Vulkan 1.3 physical device. Empty (and *why) without a Vulkan loader.
 std::vector<DeviceInfo> list_devices(std::string *why);
+
+// What a device offers the kernel families, as text: API and driver, subgroup sizes and
+// operations, fp16 and 16-bit storage, every cooperative matrix shape, compute limits, memory
+// heaps, timestamps, and the extensions that matter here. For first contact with a new GPU
+// (a phone over adb) before any family is written for it. Empty (and *why) if index is out of
+// range or there is no loader.
+std::string capability_report(uint32_t index, std::string *why);
 
 struct Buffer {
     VkBuffer buf = VK_NULL_HANDLE;

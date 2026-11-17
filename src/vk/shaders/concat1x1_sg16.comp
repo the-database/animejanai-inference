@@ -3,13 +3,13 @@
 // only, NHWC output with C channels (SPAN's conv_cat), for 16-lane subgroups (the sg16 family).
 // A subgroup computes 16 consecutive pixels for one 16-channel output group, a lane per output
 // channel, as conv3x3_sg16 does: inputs from the shared tile reach the lanes by
-// subgroupBroadcast. fp16 partial sums per 16-channel chunk, then fp32.
+// subgroupBroadcast, as packed fp16 pairs in 32-bit values. fp16 partial sums per 16-channel
+// chunk, then fp32.
 // Defines: C, NSRC, PB (16-pixel blocks per workgroup).
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_ballot : require
-#extension GL_EXT_shader_subgroup_extended_types_float16 : require
 #extension GL_EXT_control_flow_attributes : require
 
 const int NG = C / 16, M = PB * 16, CP = C + 8, VPP = C / 8, KC = NSRC * C / 16;
@@ -47,6 +47,25 @@ void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
     p = unpackFloat2x16(u1.w); v[14] = p.x; v[15] = p.y;
 }
 
+// The 16 input channels of a lane's pixel as 8 packed fp16 pairs, as shared memory holds them.
+void pairs8(uvec4 u0, uvec4 u1, out uint v[8])
+{
+    v[0] = u0.x; v[1] = u0.y; v[2] = u0.z; v[3] = u0.w;
+    v[4] = u1.x; v[5] = u1.y; v[6] = u1.z; v[7] = u1.w;
+}
+
+// acc[m] += sum over k of channel k of lane m's pixel * w[k], k ascending. The pairs travel
+// between lanes as uint (subgroupBroadcast of 32-bit values needs no fp16 subgroup support).
+void fma16(uint a[8], float16_t w[16], inout float16_t acc[16])
+{
+    [[unroll]] for (int kp = 0; kp < 8; kp++)
+        [[unroll]] for (int m = 0; m < 16; m++) {
+            const f16vec2 v = unpackFloat2x16(subgroupBroadcast(a[kp], m));
+            acc[m] = fma(v.x, w[2 * kp], acc[m]);
+            acc[m] = fma(v.y, w[2 * kp + 1], acc[m]);
+        }
+}
+
 void main()
 {
     const int tid = int(gl_LocalInvocationIndex), nth = 16 * NG * PB;
@@ -70,12 +89,11 @@ void main()
         float16_t w[16];
         unpack16(wp[wi], wp[wi + 1], w);
         const int ai = (s * M + blk * 16 + lane) * (CP / 8) + kk * 2;
-        float16_t a[16];
-        unpack16(sm[ai], sm[ai + 1], a);
+        uint a[8];
+        pairs8(sm[ai], sm[ai + 1], a);
         float16_t part[16];
         [[unroll]] for (int m = 0; m < 16; m++) part[m] = float16_t(0.0);
-        [[unroll]] for (int k = 0; k < 16; k++)
-            [[unroll]] for (int m = 0; m < 16; m++) part[m] = fma(subgroupBroadcast(a[k], m), w[k], part[m]);
+        fma16(a, w, part);
         [[unroll]] for (int m = 0; m < 16; m++) tot[m] += float(part[m]);
     }
     const float b = float(bias[ch]);
