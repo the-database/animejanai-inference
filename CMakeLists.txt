@@ -619,6 +619,12 @@ if(AJI_VULKAN)
         target_link_libraries(aji_vk_model_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
     endif()
     add_dependencies(aji_image aji_vk)
+    # aji_encode --backend vulkan: libav's Vulkan hwcontext needs the Vulkan headers
+    if(TARGET aji_encode)
+        target_compile_definitions(aji_encode PRIVATE AJI_ENCODE_VULKAN=1)
+        target_include_directories(aji_encode SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
+        add_dependencies(aji_encode aji_vk)
+    endif()
 endif()
 
 # Self-contained tests for ctest. CI runs `ctest -L cpu` (no GPU on hosted
