@@ -3,11 +3,17 @@ REM The release build of the aji engine: every architecture, clean build.
 REM Dependency layout and rationale: docs\BUILD-WINDOWS.md.
 REM   AJI_WIN  the SDK working area (default %USERPROFILE%\aji-win)
 REM   AJI_TRTRTX_ROOT  TensorRT for RTX SDK for aji_trtrtx (default %AJI_WIN%\trtrtx171)
+REM   AJI_GLSLC  glslc for aji_vk's shaders (default C:\msys64\ucrt64\bin\glslc.exe, MSYS2's shaderc)
+REM   AJI_VK_HEADERS  the Vulkan headers: a directory holding vulkan\ and vk_video\ (default %AJI_WIN%\vulkan-headers)
 REM Builds this checkout into build-win-release\ and prints AJI-RELEASE-BUILD-OK.
 setlocal
 if not defined AJI_BUILD_ANALYSIS set "AJI_BUILD_ANALYSIS=OFF"
 if not defined AJI_WIN set "AJI_WIN=%USERPROFILE%\aji-win"
 if not defined AJI_TRTRTX_ROOT set "AJI_TRTRTX_ROOT=%AJI_WIN%\trtrtx171"
+if not defined AJI_GLSLC set "AJI_GLSLC=C:\msys64\ucrt64\bin\glslc.exe"
+if not defined AJI_VK_HEADERS set "AJI_VK_HEADERS=%AJI_WIN%\vulkan-headers"
+if not exist "%AJI_GLSLC%" (echo glslc not found: %AJI_GLSLC% ^(docs\BUILD-WINDOWS.md, 2c^) & exit /b 1)
+if not exist "%AJI_VK_HEADERS%\vulkan\vulkan_core.h" (echo Vulkan headers not found in %AJI_VK_HEADERS% ^(docs\BUILD-WINDOWS.md, 2c^) & exit /b 1)
 for %%i in ("%~dp0..\..") do set "SRC=%%~fi"
 set "BLD=%SRC%\build-win-release"
 for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -version [18.0^,19.0^) -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
@@ -27,6 +33,7 @@ cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_BUILD_ANAL
   -DAJI_ORT_ROOT=%AJI_WIN%/ort/Microsoft.ML.OnnxRuntime.DirectML ^
   -DAJI_DML_ROOT=%AJI_WIN%/ort/Microsoft.AI.DirectML ^
   -DAJI_FFMPEG_ROOT=%AJI_WIN%/ffmpeg-shared/ffmpeg-9.0.2-full_build-shared ^
+  -DAJI_VULKAN=ON "-DAJI_GLSLC=%AJI_GLSLC%" "-DAJI_VK_INCLUDE=%AJI_VK_HEADERS%" ^
   "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler" || exit /b 1
 cmake --build "%BLD%" --clean-first || exit /b 1
 echo AJI-RELEASE-BUILD-OK
