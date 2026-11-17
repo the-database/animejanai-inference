@@ -1,0 +1,34 @@
+#version 450
+// Blend the model output (out_ch fp16 planes of tow x toh) into the fp32 band: for output columns
+// [ux0, ux0 + cols) and rows [uy0, uy0 + rows) of the image, band += (wy[v] * wx[u]) * tile, as
+// upscale_tiled does (core/tiling_gpu's k_blend). The band is a ring of rows: image row Y lives at
+// band row Y % band_rows. An invocation per (u, v), over the co channels the image has.
+// Params: 0 out_ch, 1 tow, 2 toh, 3 cols, 4 rows, 5 ux0, 6 uy0, 7 co, 8 band_rows, 9 OW,
+// 10 wx offset, 11 wy offset (floats into the Wx / Wy buffers).
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "tile_common.glsl"
+
+layout(std430, binding = 0) readonly buffer Tile { uint tile[]; };  // fp16 pairs
+layout(std430, binding = 1) readonly buffer Wx { float wx[]; };
+layout(std430, binding = 2) readonly buffer Wy { float wy[]; };
+layout(std430, binding = 3) buffer Band { float band[]; };
+
+void main()
+{
+    const int out_ch = prm(0), tow = prm(1), toh = prm(2), cols = prm(3), rows = prm(4), ux0 = prm(5), uy0 = prm(6);
+    const int co = prm(7), band_rows = prm(8), OW = prm(9), wxo = prm(10), wyo = prm(11);
+    const int id = int(flat_id());
+    if (id >= cols * rows) return;
+    const int u = id % cols, v = id / cols;
+    precise float w = wy[wyo + v] * wx[wxo + u];
+    const int r = (uy0 + v) % band_rows, plane = tow * toh;
+    for (int c = 0; c < co; c++) {
+        const int mc = (out_ch == 1 || co == 1) ? 0 : c;
+        const uint e = uint(mc * plane + v * tow + u);
+        const float s = f16_to_f32((tile[e >> 1] >> ((e & 1u) * 16u)) & 0xffffu);
+        const int b = (c * band_rows + r) * OW + ux0 + u;
+        precise float acc = band[b] + w * s;
+        band[b] = acc;
+    }
+}

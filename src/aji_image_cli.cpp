@@ -2,8 +2,8 @@
  * aji_image — CLI harness for the image ABI (aji_image.h).
  *
  * Usage:
- *   aji_image --list-devices [--backend trt|trtrtx|dml]
- *   aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID]
+ *   aji_image --list-devices [--backend trt|trtrtx|dml|vulkan]
+ *   aji_image --model M.onnx [--backend trt|trtrtx|dml|vulkan] [--device ID]
  *             [--tile N|WxH] [--overlap N] [--cache DIR] [--trtexec PATH] [--gray]
  *             [--repeat N] [--async] [--even] [--probe] IN.(pgm|ppm) OUT.(pgm|ppm)
  *
@@ -107,8 +107,8 @@ double now_ms()
 int usage()
 {
     fprintf(stderr,
-            "usage: aji_image --list-devices [--backend trt|trtrtx|dml]\n"
-            "       aji_image --model M.onnx [--backend trt|trtrtx|dml] [--device ID]\n"
+            "usage: aji_image --list-devices [--backend trt|trtrtx|dml|vulkan]\n"
+            "       aji_image --model M.onnx [--backend trt|trtrtx|dml|vulkan] [--device ID]\n"
             "                 [--tile N|WxH] [--overlap N] [--cache DIR] [--trtexec PATH]\n"
             "                 [--gray] [--repeat N] [--async] [--even] [--probe] IN.(pgm|ppm) OUT.(pgm|ppm)\n");
     return 2;
@@ -136,6 +136,7 @@ int main(int argc, char **argv)
             if (!v) return usage();
             backend = !strcmp(v, "dml")      ? AJI_IMG_DIRECTML
                     : !strcmp(v, "trtrtx")   ? AJI_IMG_TENSORRT_RTX
+                    : !strcmp(v, "vulkan") || !strcmp(v, "vk") ? AJI_IMG_VULKAN
                                              : AJI_IMG_TENSORRT;
         }
         else if (a == "--model") model = next();

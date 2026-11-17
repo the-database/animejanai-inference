@@ -48,12 +48,19 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
 {
     DeviceInfo d;
     d.index = index;
-    VkPhysicalDeviceIDProperties idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+    const bool has_pci = has_ext(p, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);
+    VkPhysicalDeviceIDProperties idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES, has_pci ? &pci : nullptr};
     VkPhysicalDeviceSubgroupSizeControlProperties ssp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, &idp};
     VkPhysicalDeviceSubgroupProperties sp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &ssp};
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sp};
     vkGetPhysicalDeviceProperties2(p, &p2);
     const VkPhysicalDeviceProperties &pr = p2.properties;
+    d.discrete = pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    d.pci_valid = has_pci;
+    d.pci_domain = pci.pciDomain;
+    d.pci_bus = pci.pciBus;
+    d.pci_device = pci.pciDevice;
     d.name = pr.deviceName;
     d.vendor = pr.vendorID;
     d.device_id = pr.deviceID;
@@ -653,6 +660,10 @@ bool Device::make_buffer(Buffer *b, VkDeviceSize size, bool host, std::string *w
         return false;
     }
     b->size = size;
+    if (!host) {
+        b->alloc = mr.size;
+        allocated_ += mr.size;
+    }
     return true;
 }
 
@@ -660,7 +671,31 @@ void Device::destroy(Buffer &b)
 {
     if (b.buf) vkDestroyBuffer(dev_, b.buf, nullptr);
     if (b.mem) vkFreeMemory(dev_, b.mem, nullptr);
+    allocated_ -= b.alloc;
     b = Buffer{};
+}
+
+void Device::memory(uint64_t *free_bytes, uint64_t *total_bytes) const
+{
+    uint32_t heap = UINT32_MAX;
+    for (uint32_t i = 0; i < mem_.memoryHeapCount; i++)
+        if ((mem_.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            (heap == UINT32_MAX || mem_.memoryHeaps[i].size > mem_.memoryHeaps[heap].size))
+            heap = i;
+    if (heap == UINT32_MAX) {
+        *free_bytes = *total_bytes = 0;
+        return;
+    }
+    *total_bytes = mem_.memoryHeaps[heap].size;
+    const uint64_t own = allocated_;
+    *free_bytes = *total_bytes > own ? *total_bytes - own : 0;
+    if (has_ext(phys_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &bp};
+        vkGetPhysicalDeviceMemoryProperties2(phys_, &mp2);
+        if (bp.heapBudget[heap] > 0)
+            *free_bytes = bp.heapBudget[heap] > bp.heapUsage[heap] ? bp.heapBudget[heap] - bp.heapUsage[heap] : 0;
+    }
 }
 
 VkCommandBuffer Device::begin()

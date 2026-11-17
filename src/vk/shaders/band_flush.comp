@@ -1,0 +1,30 @@
+#version 450
+// Convert image rows [y0, y0 + n) of the band to 8-bit interleaved rows (n x OW x co, packed) and
+// zero them in the band for reuse (core/tiling_gpu's k_flush). An invocation writes one 32-bit
+// word: four consecutive bytes, each read from (and cleared in) its own band element.
+// Params: 0 co, 1 band_rows, 2 OW, 3 y0, 4 n.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "tile_common.glsl"
+
+layout(std430, binding = 0) buffer Band { float band[]; };
+layout(std430, binding = 1) writeonly buffer Rows { uint rows[]; };
+
+void main()
+{
+    const int co = prm(0), band_rows = prm(1), OW = prm(2), y0 = prm(3), n = prm(4);
+    const int total = n * OW * co;
+    const int b0 = int(flat_id()) * 4;
+    if (b0 >= total) return;
+    uint word = 0u;
+    for (int k = 0; k < 4 && b0 + k < total; k++) {
+        const int b = b0 + k, c = b % co, X = (b / co) % OW, row = b / (co * OW);
+        const int r = (y0 + row) % band_rows;
+        const int i = (c * band_rows + r) * OW + X;
+        precise float f = band[i] * 255.0 + 0.5;
+        const uint q = f <= 0.0 ? 0u : f >= 255.0 ? 255u : uint(f);
+        word |= q << (8 * k);
+        band[i] = 0.0;
+    }
+    rows[b0 >> 2] = word;
+}

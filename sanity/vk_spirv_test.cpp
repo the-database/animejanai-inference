@@ -44,7 +44,8 @@ int check_module(const SpirvModule &m)
     }
     CHECK(i == m.words);
     CHECK(entry_points == 1);
-    CHECK(caps.count(kCapFloat16));
+    const bool kernel = !std::strncmp(m.name, "c3_", 3) || !std::strncmp(m.name, "cat_", 4);
+    if (kernel) CHECK(caps.count(kCapFloat16));  // the model kernels; the tiling ones are fp32
     if (std::strstr(m.name, "_cm16_")) CHECK(caps.count(kCapCooperativeMatrixKHR));
     if (std::strstr(m.name, "_sg16_")) {
         CHECK(caps.count(kCapGroupNonUniform));
@@ -72,6 +73,7 @@ int main()
     }
     CHECK(spirv_find("c3_cm16_i48_o48_n0a1g0o0_w4r4") && spirv_find("c3_sg16_i64_o64_n0a2g0o0_t8r1"));
     CHECK(spirv_find("c3_plain_i48_o48_n0a0g2o0_t4r1") && spirv_find("cat_plain_c48_s4_b4"));
+    CHECK(spirv_find("tile_extract") && spirv_find("tile_blend") && spirv_find("band_flush"));
     CHECK(!spirv_find("no_such_module"));
     std::printf("vk spirv: %zu modules, all checks passed\n", kSpirvModuleCount);
     return 0;
