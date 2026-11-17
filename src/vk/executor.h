@@ -60,6 +60,7 @@ private:
         int nvar = 1, variant = 0;
         bool has_resid = false;
         bool in_norm = false;  // the bias buffer carries the input normalization (conv_common.glsl)
+        bool out_clamp = false;  // a depth-to-space output clamped to [0, 1]
         VkDescriptorSet set = VK_NULL_HANDLE;
     };
     void record_step(VkCommandBuffer cb, const Step &st, int v, int W, int H) const;

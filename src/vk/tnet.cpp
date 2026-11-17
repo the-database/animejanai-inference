@@ -277,13 +277,14 @@ void TNet::mix(const TMap &a, const TMap &b, const TMap &z, int M, int C, int cp
     pass_threads(17, t, (long long)M * (cpad / 8), "mix");
 }
 
-void TNet::imgout(const TMap &in, int h, int w, int mw)
+void TNet::imgout(const TMap &in, int h, int w, int mw, bool clamp)
 {
     TArgs t;
     t.map(0, in);
     t.v[16] = h;
     t.v[17] = w;
     t.v[18] = mw;
+    t.v[19] = clamp ? 1 : 0;
     pass_threads(15, t, (long long)h * w, "imgout");
 }
 
@@ -306,13 +307,14 @@ void TNet::colsums(const TMap &in, int M, int C, VkDeviceSize sums)
     pass_threads(4, r, C, "colsum");
 }
 
-void TNet::convert(const TMap &in, const TMap &out, int M, int n)
+void TNet::convert(const TMap &in, const TMap &out, int M, int n, float scale)
 {
     TArgs t;
     t.map(0, in);
     t.map(1, out);
     t.v[16] = M;
     t.v[17] = n;
+    t.f(18, scale);
     pass_threads(14, t, (long long)M * n, "convert");
 }
 
@@ -385,6 +387,7 @@ void TNet::conv(const std::vector<uint16_t> &taps, const std::vector<float> &bia
     o.nres = io.nres;
     o.src_in = io.src_in;
     o.dst_out = io.dst_out;
+    o.p.clamp = io.clamp ? 1 : 0;
     o.src = io.src;
     o.dst = io.dst;
     o.r1 = io.r1;

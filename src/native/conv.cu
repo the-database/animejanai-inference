@@ -47,7 +47,7 @@ struct Entry {
 #define AJI_HEAD(C)                                                                  \
     AJI_CONV(16, C, 1, 0, 0, 0), AJI_CONV(16, C, 1, 1, 0, 0), AJI_CONV(16, C, 1, 2, 0, 0), \
     AJI_CONV(16, C, 2, 0, 0, 0), AJI_CONV(16, C, 2, 1, 0, 0), AJI_CONV(16, C, 2, 2, 0, 0)
-#define AJI_TAIL(C) AJI_CONV(C, 16, 0, 0, 0, 1), AJI_CONV(C, 48, 0, 0, 0, 2)
+#define AJI_TAIL(C) AJI_CONV(C, 16, 0, 0, 0, 1), AJI_CONV(C, 48, 0, 0, 0, 2), AJI_CONV(C, 16, 0, 0, 0, 3), AJI_CONV(C, 32, 0, 0, 0, 4)
 
 const Entry kConv[] = {AJI_BODY(32), AJI_BODY(48), AJI_BODY(64), AJI_HEAD(32), AJI_HEAD(48), AJI_HEAD(64),
                        AJI_TAIL(32), AJI_TAIL(48), AJI_TAIL(64)};
@@ -112,6 +112,14 @@ bool key_of(const Conv3x3 &op, Key &k, std::string *why)
     case Output::DepthToSpace4:
         if (op.cout != 48) return fail(why, "depth-to-space 4 output has 48 channels");
         k.coutp = 48;
+        break;
+    case Output::DepthToSpace1:
+        if (op.cout != 3) return fail(why, "depth-to-space 1 output has 3 channels");
+        k.coutp = 16;
+        break;
+    case Output::DepthToSpace3:
+        if (op.cout != 27) return fail(why, "depth-to-space 3 output has 27 channels");
+        k.coutp = 32;
         break;
     }
     if (op.w->cin != op.cin || op.w->cout != op.cout || op.w->cin_pad != k.cinp || op.w->cout_pad != k.coutp)
@@ -228,6 +236,7 @@ cudaError_t launch(const Conv3x3 &op, const Tensors &t, int H, int W, int varian
     p.H = H;
     p.W = W;
     p.in_norm = op.in_norm && op.in != Input::NHWC;
+    p.out_clamp = op.out_clamp && op.out != Output::NHWC;
     for (int c = 0; c < 3; c++) {
         p.in_mean[c] = op.in_mean[c];
         p.in_scale[c] = op.in_scale[c];

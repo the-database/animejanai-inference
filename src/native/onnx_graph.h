@@ -50,6 +50,11 @@ struct OnnxNode {
     const OnnxAttr *attr(const char *name) const;
     int64_t attr_i(const char *name, int64_t dflt) const;
     std::string attr_s(const char *name, const char *dflt) const;
+    float attr_f(const char *name, float dflt) const
+    {
+        const OnnxAttr *a = attr(name);
+        return a ? a->f : dflt;
+    }
 };
 
 struct OnnxGraph {

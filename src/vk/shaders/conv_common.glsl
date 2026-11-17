@@ -15,7 +15,8 @@ const int TW = 16, CP = CINP + 8, SP = COUTP + 8, HP = (TH + 2) * (TW + 2);
 const int SM_HALO = HP * CP / 8, SM_STAGE = TH * TW * SP / 8;
 const int SM_TOTAL = SM_HALO > SM_STAGE + SM_EXTRA ? SM_HALO : SM_STAGE + SM_EXTRA;
 
-// H, W: the conv resolution. has_resid: a depth-to-space output adds the model input. in_norm:
+// H, W: the conv resolution. has_resid: bit 0, a depth-to-space output adds the model input; bit 1,
+// it is clamped to [0, 1] after (a final Clip). in_norm:
 // an NCHW input is normalized as it is loaded, (x - mean[c]) * scale[c], the six fp16 values after
 // the bias (bias_h[COUTP + c], bias_h[COUTP + 3 + c]).
 layout(push_constant) uniform PC { int H; int W; int has_resid; int in_norm; } pc;
@@ -34,6 +35,8 @@ layout(std430, binding = 1) readonly buffer Resid { float16_t resid_h[]; };  // 
 #endif
 #if OUT == 0
 layout(std430, binding = 2) writeonly buffer Dst { uvec4 dst_v[]; };     // NHWC [H][W][COUTP]
+#elif OUT >= 3
+layout(std430, binding = 2) writeonly buffer Dst { float16_t dst_h[]; };  // NCHW [3][R*H][R*W] (odd R)
 #else
 layout(std430, binding = 2) writeonly buffer Dst { uint dst_u[]; };      // NCHW [3][R*H][R*W], half pairs
 #endif
@@ -160,10 +163,27 @@ void write_out(int tid, int nth, int tx0, int ty0, int H, int W)
         if (oy >= H || ox >= W) continue;
         dst_v[(oy * W + ox) * VPO + v] = sm[(r * TW + px) * (SP / 8) + v];
     }
+#elif OUT >= 3
+    // odd factors (1, 3): one fp16 element per invocation (output rows may be odd lengths)
+    const int R = OUT == 3 ? 1 : 3, CPR = TW * R;  // output columns per tile row
+    const int OH = R * H, OW = R * W;
+    const bool add = (pc.has_resid & 1) != 0, clampv = (pc.has_resid & 2) != 0;
+    for (int q = tid; q < 3 * TH * R * CPR; q += nth) {
+        const int e = q % CPR, ry = (q / CPR) % R, r = (q / (CPR * R)) % TH, c = q / (CPR * R * TH);
+        const int oy = ty0 + r, lx = e / R, rx = e % R, ox = tx0 + lx;
+        if (oy >= H || ox >= W) continue;
+        const int h = (r * TW + lx) * SP + c * R * R + ry * R + rx;
+        float v = unpackFloat2x16(sm_pair(h & ~1))[h & 1];
+#if GATE == 0
+        if (add) v += float(resid_h[(c * H + oy) * W + ox]);
+#endif
+        if (clampv) v = clamp(v, 0.0, 1.0);
+        dst_h[(c * OH + R * oy + ry) * OW + R * tx0 + e] = float16_t(v);
+    }
 #else
     const int R = OUT == 1 ? 2 : 4, CPO = TW * R / 2;  // output pairs per tile row
     const int OH = R * H, OW = R * W;
-    const bool add = pc.has_resid != 0;
+    const bool add = (pc.has_resid & 1) != 0, clampv = (pc.has_resid & 2) != 0;
     for (int q = tid; q < 3 * TH * R * CPO; q += nth) {
         const int k = q % CPO, ry = (q / CPO) % R, r = (q / (CPO * R)) % TH, c = q / (CPO * R * TH);
         const int oy = ty0 + r, e = 2 * k, lx = e / R, rx = e % R, ox = tx0 + lx;
@@ -172,6 +192,7 @@ void write_out(int tid, int nth, int tx0, int ty0, int H, int W)
 #if GATE == 0
         if (add) v += float(resid_h[(c * H + oy) * W + ox]);
 #endif
+        if (clampv) v = clamp(v, vec2(0.0), vec2(1.0));
         dst_u[((c * OH + R * oy + ry) * OW + R * tx0 + e) >> 1] = packFloat2x16(f16vec2(v));
     }
 #endif

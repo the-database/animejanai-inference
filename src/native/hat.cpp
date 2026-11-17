@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "native/fdat_kernels.h"
+#include "native/hat_graph.h"
 #include "native/img_kernels.h"
 #include "native/imgnet.h"
 #include "native/netres.h"
@@ -59,7 +60,7 @@ class Hat : public ImgNet {
 public:
     static std::unique_ptr<ImgNet> build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
     cudaError_t run(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s) override;
-    int scale() const override { return 4; }
+    int scale() const override { return 1 << nup; }
     std::string describe() const override { return what; }
     size_t device_bytes() const override { return res.bytes; }
     size_t weight_bytes() const override { return res.weight_bytes; }
@@ -69,6 +70,8 @@ private:
     DevRes res;
     int C = 0, CP = 0, QS = 0, HS = 0, heads = 0, hd = 0, ws = 16, kws = 24, kpad = 4, cr = 0, crp = 0, cs = 0, maxw = 0, maxh = 0;
     float mean[3] = {}, cbu_slope = 0.01f;
+    bool clamp = false;
+    int nup = 2;  // pixel-shuffle 2 steps
     Ln pe, fin;
     std::vector<Group> groups;
     GOp first, after, cbu, up0[2], up2[2], last;
@@ -82,189 +85,100 @@ private:
                      std::vector<std::pair<GOp *, GConvArgs>> *collect);
 };
 
-bool ln(const Reader &rd, DevRes &r, const std::string &name, int C, Ln *l, std::string *why)
+void up_ln(DevRes &r, const HatLn &h, int C, Ln *l)
 {
-    const OnnxNode *n = rd.node(name);
-    std::vector<float> g, b;
-    if (!n || n->op != "LayerNormalization" || !tensor_floats(rd, n, 1, &g) || !tensor_floats(rd, n, 2, &b) || (int)g.size() != C ||
-        (int)b.size() != C)
-        return refuse(why, "missing " + name);
-    l->g = r.dfl(g, C);
-    l->b = r.dfl(b, C);
-    l->eps = n->attr("epsilon") ? n->attr("epsilon")->f : 1e-5f;
-    return true;
+    l->g = r.dfl(h.g, C);
+    l->b = r.dfl(h.b, C);
+    l->eps = h.eps;
 }
 
-// Linear: MatMul [K][N] then Add of the bias.
-TMat *linear(const Reader &rd, DevRes &r, const std::string &pre, int K, int N, std::string *why)
+bool up_attn(DevRes &r, const HatGraph &hg, const HatAttn &h, bool overlap, Attn *a, std::string *why)
 {
-    std::vector<float> w, b;
-    std::vector<int64_t> d;
-    if (!tensor_floats(rd, rd.node(pre + "/MatMul"), 1, &w, &d) || d != std::vector<int64_t>{K, N} || !init_input(rd, rd.node(pre + "/Add"), &b) ||
-        (int)b.size() != N)
-        return refuse(why, "missing linear " + pre), nullptr;
-    return r.mat(w, &b, K, N);
-}
-
-// The scalar constant input of a Mul (attention scales, the CAB scale).
-bool scalar(const Reader &rd, const std::string &name, float *v)
-{
-    std::vector<float> x;
-    if (!init_input(rd, rd.node(name), &x) || x.size() != 1) return false;
-    *v = x[0];
-    return true;
-}
-
-bool attn(const Reader &rd, DevRes &r, const std::string &pre, const char *scale_mul, int C, int heads, int ws, int kws, int kpad, Attn *a,
-          std::string *why)
-{
-    if (!(a->qkv = linear(rd, r, pre + "qkv", C, 3 * C, why)) || !(a->proj = linear(rd, r, pre + "proj", C, C, why))) return false;
-    if (!scalar(rd, pre + scale_mul, &a->scale)) return refuse(why, pre + ": attention scale");
-    std::vector<float> bias;
-    std::vector<int64_t> d;
-    const int Tq = ws * ws, Tk = kws ? kws * kws : Tq;
-    if (!init_input(rd, rd.node(pre + "Add"), &bias, &d) || d != std::vector<int64_t>{1, heads, Tq, Tk}) return refuse(why, pre + ": bias");
+    const int C = hg.C;
+    a->qkv = r.mat(h.qkv.w, &h.qkv.b, C, 3 * C);
+    a->proj = r.mat(h.proj.w, &h.proj.b, C, C);
+    a->scale = h.scale;
+    a->shift = h.shift;
     std::vector<float> tab;
-    if (!tbias_table(bias, heads, ws, ws, kws, kws, kpad, &tab, &a->rt_w, &a->rt_offy, &a->rt_offx))
-        return refuse(why, pre + ": bias is not a relative-position table");
+    if (!tbias_table(h.bias, hg.heads, hg.ws, hg.ws, overlap ? hg.kws : 0, overlap ? hg.kws : 0, overlap ? hg.kpad : 0, &tab, &a->rt_w,
+                     &a->rt_offy, &a->rt_offx))
+        return refuse(why, "HAT bias is not a relative-position table");
     a->rtab = r.dfl(tab, tab.size());
     return true;
 }
 
-bool mlp(const Reader &rd, DevRes &r, const std::string &pre, int C, int hid, Mlp *m, std::string *why)
+void up_mlp(DevRes &r, const HatGraph &hg, const HatLin &fc1, const HatLin &fc2, Mlp *m)
 {
-    if (!rd.node(pre + "act/Gelu")) return refuse(why, pre + ": activation");
-    return (m->fc1 = linear(rd, r, pre + "fc1", C, hid, why)) && (m->fc2 = linear(rd, r, pre + "fc2", hid, C, why));
+    m->fc1 = r.mat(fc1.w, &fc1.b, hg.C, hg.hid);
+    m->fc2 = r.mat(fc2.w, &fc2.b, hg.hid, hg.C);
 }
 
 std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
 {
     Reader rd(g);
     rd.any_slope = true;
-    if (!rd.node("/layers.0/residual_group/blocks.0/attn/qkv/MatMul") || !rd.node("/layers.0/residual_group/overlap_attn/qkv/MatMul"))
-        return refuse(why, "not a HAT graph"), nullptr;
+    HatGraph hg;
+    if (!find_hat(rd, &hg, why)) return nullptr;
     std::unique_ptr<Hat> f(new Hat);
     DevRes &r = f->res;
-    std::vector<float> v;
-    std::vector<int64_t> d;
-    if (!init_input(rd, rd.node("/Sub"), &v, &d) || v.size() != 3) return refuse(why, "HAT input mean"), nullptr;
-    std::copy(v.begin(), v.end(), f->mean);
-    Conv c;
-    if (!rd.conv("/conv_first/Conv", &c, why)) return nullptr;
-    if (c.cin != 3 || c.lrelu) return refuse(why, "HAT conv_first"), nullptr;
-    const int C = f->C = c.cout, CP = f->CP = pad16(C);
-    f->first.w = r.gup(conv_taps(c, nullptr), c.b, 3, 16, C, CP);
-    if (!ln(rd, r, "/patch_embed/norm/LayerNormalization", C, &f->pe, why) || !ln(rd, r, "/norm/LayerNormalization", C, &f->fin, why))
-        return nullptr;
-    // window sizes and heads from the first block's bias and the OCAB's
-    {
-        std::vector<float> b;
-        if (!init_input(rd, rd.node("/layers.0/residual_group/blocks.0/attn/Add"), &b, &d) || d.size() != 4) return refuse(why, "HAT bias"), nullptr;
-        f->heads = (int)d[1];
-        f->ws = (int)std::lround(std::sqrt((double)d[2]));
-        if (f->heads < 1 || f->ws < 1 || (int64_t)f->ws * f->ws != d[2] || f->ws * f->ws > 256) return refuse(why, "HAT bias"), nullptr;
-        if (!init_input(rd, rd.node("/layers.0/residual_group/overlap_attn/Add"), &b, &d) || d.size() != 4) return refuse(why, "HAT OCAB bias"), nullptr;
-        f->kws = (int)std::lround(std::sqrt((double)d[3]));
-        if (f->kws < f->ws || (int64_t)f->kws * f->kws != d[3] || (f->kws - f->ws) % 2) return refuse(why, "HAT OCAB bias"), nullptr;
-        f->kpad = (f->kws - f->ws) / 2;
-        std::vector<int64_t> pads;
-        const OnnxNode *pn = rd.node("/layers.0/residual_group/overlap_attn/unfold/Pad");
-        const OnnxTensor *pt = pn && pn->in.size() > 1 ? rd.tensor(pn->in[1]) : nullptr;
-        if (!pt || !pt->ints(&pads) || pads.size() != 8 || pads[2] != f->kpad || pads[3] != f->kpad) return refuse(why, "HAT OCAB padding"), nullptr;
-    }
-    if (C % f->heads) return refuse(why, "HAT heads"), nullptr;
+    std::copy(hg.ir.mean, hg.ir.mean + 3, f->mean);
+    f->clamp = hg.ir.clamp;
+    f->nup = hg.nup;
+    const int C = f->C = hg.C, CP = f->CP = pad16(C);
+    f->heads = hg.heads;
+    f->ws = hg.ws;
+    f->kws = hg.kws;
+    f->kpad = hg.kpad;
     f->hd = C / f->heads;
-    if (f->hd > 32 || f->hd % 2 || f->ws * f->ws % 16 || f->kws * f->kws > 576) return refuse(why, "HAT head size / window"), nullptr;
+    if (f->hd > 32 || f->hd % 2 || f->ws * f->ws % 16 || f->ws * f->ws > 256 || f->kws * f->kws > 576) return refuse(why, "HAT head size / window"), nullptr;
     f->QS = pad16(3 * C);
-    int nl = 0, nb = 0;
-    while (rd.node("/layers." + std::to_string(nl) + "/conv/Conv")) nl++;
-    while (rd.node("/layers.0/residual_group/blocks." + std::to_string(nb) + "/norm1/LayerNormalization")) nb++;
-    if (!nl || !nb) return refuse(why, "HAT layers"), nullptr;
-    int hid = 0;
-    {
-        if (!tensor_floats(rd, rd.node("/layers.0/residual_group/blocks.0/mlp/fc1/MatMul"), 1, &v, &d) || d.size() != 2) return refuse(why, "HAT mlp"), nullptr;
-        hid = (int)d[1];
-        if (hid < 1 || d[0] != C) return refuse(why, "HAT mlp"), nullptr;
-        f->HS = pad16(hid);
-    }
-    for (int l = 0; l < nl; l++) {
+    f->HS = pad16(hg.hid);
+    f->cr = hg.cr;
+    f->crp = pad16(f->cr);
+    f->cs = hg.cs;
+    const int nl = (int)hg.groups.size(), nb = hg.blocks();
+    f->first.w = r.gup(conv_taps(hg.first, nullptr), hg.first.b, 3, 16, C, CP);
+    up_ln(r, hg.pe, C, &f->pe);
+    up_ln(r, hg.fin, C, &f->fin);
+    for (const HatGroup &hgr : hg.groups) {
         Group gr;
-        const std::string L = "/layers." + std::to_string(l) + "/";
-        for (int b = 0; b < nb; b++) {
-            const std::string B = L + "residual_group/blocks." + std::to_string(b) + "/";
+        for (const HatHab &h : hgr.habs) {
             Hab hb;
-            if (!ln(rd, r, B + "norm1/LayerNormalization", C, &hb.n1, why) || !ln(rd, r, B + "norm2/LayerNormalization", C, &hb.n2, why) ||
-                !attn(rd, r, B + "attn/", "Mul", C, f->heads, f->ws, 0, 0, &hb.at, why) || !mlp(rd, r, B + "mlp/", C, hid, &hb.mlp, why))
-                return nullptr;
-            if (const OnnxNode *sl = rd.node(B + "Slice")) {  // the roll before the partition: Slice(start = shift) + Slice(0, shift)
-                std::vector<int64_t> st;
-                const OnnxTensor *t = sl->in.size() > 1 ? rd.tensor(sl->in[1]) : nullptr;
-                if (!t || !t->ints(&st) || st.size() != 1 || st[0] <= 0 || st[0] >= f->ws) return refuse(why, B + "shift"), nullptr;
-                hb.at.shift = (int)st[0];
-            }
-            // CAB: conv scale (the Mul of the block with a scalar outside attn/conv_block)
-            bool got = false;  // (shape arithmetic Muls carry integers >= 1)
-            for (const char *m : {"Mul", "Mul_1", "Mul_2"})
-                if (!got && scalar(rd, B + m, &hb.conv_scale) && hb.conv_scale > 0.f && hb.conv_scale < 1.f) got = true;
-            if (!got) return refuse(why, B + "conv scale"), nullptr;
-            const std::string CB = B + "conv_block/cab/";
-            Conv c0, c2;
-            if (!rd.conv(CB + "cab.0/Conv", &c0, why) || !rd.conv(CB + "cab.2/Conv", &c2, why)) return nullptr;
-            if (c0.cin != C || c2.cout != C || c2.cin != c0.cout || !rd.node(CB + "cab.1/Gelu") || c0.lrelu || c2.lrelu)
-                return refuse(why, B + "CAB"), nullptr;
-            if (f->cr && f->cr != c0.cout) return refuse(why, B + "CAB width"), nullptr;  // the buffers are sized once
-            f->cr = c0.cout;
-            f->crp = pad16(f->cr);
-            hb.cab0.w = r.gup(conv_taps(c0, nullptr), c0.b, C, CP, f->cr, f->crp);
-            std::vector<float> sc(C, hb.conv_scale), b2 = c2.b;
+            up_ln(r, h.n1, C, &hb.n1);
+            up_ln(r, h.n2, C, &hb.n2);
+            if (!up_attn(r, hg, h.at, false, &hb.at, why)) return nullptr;
+            up_mlp(r, hg, h.fc1, h.fc2, &hb.mlp);
+            hb.conv_scale = h.conv_scale;
+            hb.cab0.w = r.gup(conv_taps(h.cab0, nullptr), h.cab0.b, C, CP, f->cr, f->crp);
+            std::vector<float> sc(C, hb.conv_scale), b2 = h.cab2.b;
             for (float &x : b2) x *= hb.conv_scale;
-            hb.cab2.w = r.gup(conv_taps(c2, &sc), b2, f->cr, f->crp, C, CP);
-            std::vector<float> w1, bb1, w2, bb2;
-            const OnnxNode *a1 = rd.node(CB + "cab.3/attention/attention.1/Conv"), *a3 = rd.node(CB + "cab.3/attention/attention.3/Conv");
-            std::vector<int64_t> d3;
-            if (!tensor_floats(rd, a1, 1, &w1, &d) || d.size() != 4 || d[0] < 1 || d[1] != C || d[2] != 1 || d[3] != 1 ||
-                !tensor_floats(rd, a3, 1, &w2, &d3) || d3 != std::vector<int64_t>{C, d[0], 1, 1} || a1->in.size() < 3 ||
-                !rd.floats(a1->in[2], &bb1) || (int64_t)bb1.size() != d[0] || a3->in.size() < 3 || !rd.floats(a3->in[2], &bb2) ||
-                (int)bb2.size() != C || !rd.node(CB + "cab.3/attention/attention.2/Relu"))
-                return refuse(why, B + "CAB channel attention"), nullptr;
-            if (f->cs && f->cs != (int)bb1.size()) return refuse(why, B + "CAB channel attention width"), nullptr;
-            f->cs = (int)bb1.size();
-            hb.ca1 = r.dfl(w1, (size_t)f->cs * C);
-            hb.cab1 = r.dfl(bb1, f->cs);
-            hb.ca2 = r.dfl(w2, (size_t)C * f->cs);
-            hb.cab2b = r.dfl(bb2, C);
+            hb.cab2.w = r.gup(conv_taps(h.cab2, &sc), b2, f->cr, f->crp, C, CP);
+            hb.ca1 = r.dfl(h.ca1, (size_t)f->cs * C);
+            hb.cab1 = r.dfl(h.cab1, f->cs);
+            hb.ca2 = r.dfl(h.ca2, (size_t)C * f->cs);
+            hb.cab2b = r.dfl(h.cab2b, C);
             gr.habs.push_back(hb);
         }
-        const std::string O = L + "residual_group/overlap_attn/";
-        if (!ln(rd, r, O + "norm1/LayerNormalization", C, &gr.oc.n1, why) || !ln(rd, r, O + "norm2/LayerNormalization", C, &gr.oc.n2, why) ||
-            !attn(rd, r, O, "Mul_2", C, f->heads, f->ws, f->kws, f->kpad, &gr.oc.at, why) || !mlp(rd, r, O + "mlp/", C, hid, &gr.oc.mlp, why))
-            return nullptr;
-        if (!rd.conv(L + "conv/Conv", &c, why)) return nullptr;
-        if (c.cin != C || c.cout != C || c.lrelu) return refuse(why, L + "conv"), nullptr;
-        gr.conv.w = r.gup(conv_taps(c, nullptr), c.b, C, CP, C, CP);
+        up_ln(r, hgr.oc.n1, C, &gr.oc.n1);
+        up_ln(r, hgr.oc.n2, C, &gr.oc.n2);
+        if (!up_attn(r, hg, hgr.oc.at, true, &gr.oc.at, why)) return nullptr;
+        up_mlp(r, hg, hgr.oc.fc1, hgr.oc.fc2, &gr.oc.mlp);
+        const std::vector<float> inv(C, 1.f / kStreamScale);  // its input is the stream's scaled fp16 copy
+        gr.conv.w = r.gup(conv_taps(hgr.conv, &inv), hgr.conv.b, C, CP, C, CP);
         f->groups.push_back(std::move(gr));
     }
     // tail
-    if (!rd.conv("/conv_after_body/Conv", &c, why)) return nullptr;
-    f->after.w = r.gup(conv_taps(c, nullptr), c.b, C, CP, C, CP);
-    if (!rd.conv("/conv_before_upsample/conv_before_upsample.0/Conv", &c, why)) return nullptr;
-    if (!c.lrelu || c.cin != C || c.cout != 64) return refuse(why, "HAT conv_before_upsample"), nullptr;
-    f->cbu_slope = c.slope;
-    f->cbu.w = r.gup(conv_taps(c, nullptr), c.b, C, CP, 64, 64);
-    for (int k = 0; k < 2; k++) {
-        if (!rd.conv(k ? "/upsample/upsample.2/Conv" : "/upsample/upsample.0/Conv", &c, why)) return nullptr;
-        if (c.cin != 64 || c.cout != 256 || c.lrelu) return refuse(why, "HAT upsample"), nullptr;
+    f->after.w = r.gup(conv_taps(hg.after, nullptr), hg.after.b, C, CP, C, CP);
+    f->cbu_slope = hg.cbu.slope;
+    f->cbu.w = r.gup(conv_taps(hg.cbu, nullptr), hg.cbu.b, C, CP, 64, 64);
+    for (int k = 0; k < hg.nup; k++)
         for (int sy = 0; sy < 2; sy++) {
             std::vector<uint16_t> wt;
             std::vector<float> bt;
-            ps_weights(c, sy, 64, &wt, &bt);
+            ps_weights(hg.ups[k], sy, 64, &wt, &bt);
             (k ? f->up2 : f->up0)[sy].w = r.gup(wt, bt, 64, 64, 128, 128);
         }
-    }
-    if (!rd.node("/upsample/upsample.1/DepthToSpace") || !rd.node("/upsample/upsample.3/DepthToSpace")) return refuse(why, "HAT upsample"), nullptr;
-    if (!rd.conv("/conv_last/Conv", &c, why)) return nullptr;
-    if (c.cin != 64 || c.cout != 3) return refuse(why, "HAT conv_last"), nullptr;
-    f->last.w = r.gup(conv_taps(c, nullptr), c.b, 64, 64, 3, 16);
+    f->last.w = r.gup(conv_taps(hg.last, nullptr), hg.last.b, 64, 64, 3, 16);
     if (r.failed) return refuse(why, "weight upload failed"), nullptr;
 
     // buffers for the largest tile
@@ -286,10 +200,12 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
     lt.add(&f->H1, M * f->HS * 2, {{18, 19}, {25, 26}});
     lt.add(&f->S16, M * CP * 2, {{27, 28}});
     lt.add(&f->TT, M * CP * 2, {{31, 32}});
-    lt.add(&f->U0, M * 64 * 2, {{32, 33}});
-    lt.add(&f->V1, 4 * M * 64 * 2, {{33, 34}});
-    lt.add(&f->V2, 16 * M * 64 * 2, {{34, 35}});
-    lt.add(&f->O16, 16 * M * 16 * 2, {{35, 36}});
+    // (conv_last reads the last of U0 / V1 / V2 at step 35)
+    lt.add(&f->U0, M * 64 * 2, {{32, f->nup == 0 ? 35 : 33}});
+    const size_t S2 = (size_t)1 << (2 * f->nup);  // output pixels per input pixel
+    if (f->nup >= 1) lt.add(&f->V1, 4 * M * 64 * 2, {{33, f->nup == 1 ? 35 : 34}});
+    if (f->nup >= 2) lt.add(&f->V2, 16 * M * 64 * 2, {{34, 35}});
+    lt.add(&f->O16, S2 * M * 16 * 2, {{35, 36}});
     if (!lt.assign(r)) return refuse(why, "out of GPU memory"), nullptr;
     f->sums = (float *)r.alloc(CP * 4);
     f->cm = (float *)r.alloc(CP * 4);
@@ -307,8 +223,8 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
     if (!gprepare(ops, s, why)) return nullptr;
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
     char buf[200];
-    snprintf(buf, sizeof(buf), "HAT 4x, %d groups x %d blocks + OCAB, %d channels, %d heads, %dx%d windows (shifted), fp32 stream", nl, nb, C,
-             f->heads, f->ws, f->ws);
+    snprintf(buf, sizeof(buf), "HAT %dx, %d groups x %d blocks + OCAB, %d channels, %d heads, %dx%d windows (shifted), fp32 stream%s",
+             f->scale(), nl, nb, C, f->heads, f->ws, f->ws, f->clamp ? ", clamped" : "");
     f->what = buf;
     return std::unique_ptr<ImgNet>(f.release());
 }
@@ -416,7 +332,7 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         pr.mark(P_PROJ);
         CK(mlp_step(o.n2, o.mlp));
         // the group conv plus the group input, in fp32
-        K(tconvert(S, true, CP, S16, false, CP, M, CP, s));
+        K(tconvert(S, true, CP, S16, false, CP, M, CP, s, kStreamScale));
         GConvArgs a = ga(S16, CP, h, w, S, CP, h, w);
         a.acc32 = true;
         a.out_f32 = true;
@@ -434,21 +350,23 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
     b.act = GAct::LRelu;
     b.slope = cbu_slope;
     CK(Gc(cbu, b));
-    for (int sy = 0; sy < 2; sy++) {
-        GConvArgs u = ga(U0, 64, h, w, V1, 64, h, w);
-        u.R = 2;
-        u.sy = sy;
-        CK(Gc(up0[sy], u));
+    // the pixel-shuffle steps U0 -> V1 -> V2, then conv_last at the scale
+    void *src = U0;
+    for (int k = 0; k < nup; k++) {
+        void *dst = k ? V2 : V1;
+        const int sc = 1 << k;
+        for (int sy = 0; sy < 2; sy++) {
+            GConvArgs u = ga(src, 64, sc * h, sc * w, dst, 64, sc * h, sc * w);
+            u.R = 2;
+            u.sy = sy;
+            CK(Gc((k ? up2 : up0)[sy], u));
+        }
+        src = dst;
     }
-    for (int sy = 0; sy < 2; sy++) {
-        GConvArgs u = ga(V1, 64, 2 * h, 2 * w, V2, 64, 2 * h, 2 * w);
-        u.R = 2;
-        u.sy = sy;
-        CK(Gc(up2[sy], u));
-    }
-    CK(Gc(last, ga(V2, 64, 4 * h, 4 * w, O16, 16, 4 * h, 4 * w)));
+    const int S_ = 1 << nup;
+    CK(Gc(last, ga(src, 64, S_ * h, S_ * w, O16, 16, S_ * h, S_ * w)));
     pr.mark(P_UP);
-    K(img_from_nhwc(O16, 16, 4 * w, 4 * h, out, out_f32, s));
+    K(img_from_nhwc(O16, 16, S_ * w, S_ * h, out, out_f32, s, clamp));
     pr.mark(P_IO);
 #undef K
 #undef CK

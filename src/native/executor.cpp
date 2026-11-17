@@ -73,6 +73,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
             st.op.cin = ps.cin;
             st.op.cout = ps.cout;
             st.op.in_norm = ps.in_norm;
+            st.op.out_clamp = ps.out_clamp;
             for (int c = 0; c < 3; c++) {
                 st.op.in_mean[c] = ps.in_mean[c];
                 st.op.in_scale[c] = ps.in_scale[c];

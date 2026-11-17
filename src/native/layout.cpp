@@ -36,7 +36,8 @@ bool layout(const Plan &plan, int in_w, int in_h, Layout *out, std::string *why)
             L.cout_pad[i] = ps.w.cout;
         } else {
             L.cin_pad[i] = ps.in == (int)Input::NHWC ? ps.cin : 16;
-            L.cout_pad[i] = ps.out == (int)Output::NHWC ? ps.cout : ps.out == (int)Output::DepthToSpace2 ? 16 : ps.cout;
+            // depth-to-space outputs pad to the kernel's channel tile: 3 / 12 -> 16, 27 -> 32
+            L.cout_pad[i] = ps.out == (int)Output::NHWC ? ps.cout : (ps.cout + 15) / 16 * 16;
         }
     }
 

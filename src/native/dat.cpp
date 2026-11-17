@@ -20,6 +20,7 @@
 #include "native/dat_kernels.h"
 #include "native/fdat_kernels.h"
 #include "native/img_kernels.h"
+#include "native/export_forms.h"
 #include "native/imgnet.h"
 #include "native/netres.h"
 #include "native/static_eval.h"
@@ -65,6 +66,7 @@ private:
     DevRes res;
     int C = 0, CP = 0, C8 = 0, QS = 0, FS = 0, heads = 0, hd = 0, pad_to = 32, maxw = 0, maxh = 0;
     float mean[3] = {}, cbu_slope = 0.01f;
+    bool clamp = false;
     Ln before, fin;
     std::vector<std::vector<Block>> groups;
     std::vector<GOp> gconvs;
@@ -100,6 +102,7 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     rd.any_slope = true;
     if (g.inputs.empty()) return refuse(why, "not a DAT graph"), nullptr;
     // the data path
+    const Lns lns(rd);
     std::set<std::string> data{g.inputs[0]};
     std::vector<Ev> ev;
     const OnnxNode *sub = nullptr;
@@ -118,15 +121,18 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
             allc &= c;
         }
         (void)allc;
-        if (n.op == "LayerNormalization") ev.push_back({Ev::LN, &n});
+        if (lns.is_ln(n)) ev.push_back({Ev::LN, &n});
+        else if (lns.span.count(&n)) continue;  // inside a spelled-out LayerNorm
         else if (n.op == "MatMul" && anyconst) ev.push_back({Ev::MM, &n});
         else if (n.op == "Conv") ev.push_back({Ev::CV, &n});
         else if (n.op == "Softmax") ev.push_back({Ev::SOFTMAX, &n});
-        else if (n.op == "ReduceL2") ev.push_back({Ev::REDUCEL2, &n});
+        else if (n.op == "ReduceL2" || l2_root(rd, n)) ev.push_back({Ev::REDUCEL2, &n});
         else if (n.op == "Split") ev.push_back({Ev::SPLIT, &n});
         else if (n.op == "DepthToSpace") ev.push_back({Ev::D2S, &n});
+        else if (n.op == "Mul" && anyconst && sub && n.in[0] == sub->out[0]) continue;  // the image range
+        else if (n.op == "Mul" && anyconst && gelu_const_mul(rd, n)) continue;           // a spelled-out GELU
         else if (n.op == "Mul" && anyconst) ev.push_back({Ev::MULC, &n});
-        else if (n.op == "Add" && !allin && !anyconst) ev.push_back({Ev::ADDS, &n});
+        else if (n.op == "Add" && !allin && (!anyconst || attn_const(rd, n))) ev.push_back({Ev::ADDS, &n});
         else if (n.op == "Sub" && anyconst && !sub) sub = &n;
     }
     size_t at = 0;
@@ -142,16 +148,21 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
         return false;
     };
     auto conv_w = [&](const OnnxNode *n, std::vector<float> *w, std::vector<float> *b, std::vector<int64_t> *d) -> bool {
-        return n && tensor_floats(rd, n, 1, w, d) && n->in.size() > 2 && rd.floats(n->in[2], b);
+        if (!n || !tensor_floats(rd, n, 1, w, d) || d->empty() || (*d)[0] < 1) return false;
+        if (n->in.size() > 2 && !n->in[2].empty()) {
+            if (!rd.floats(n->in[2], b)) return false;
+        } else {
+            b->assign((size_t)(*d)[0], 0.f);
+        }
+        fold_bn_after(rd, n, w, b);  // a BatchNorm the export left unfolded
+        return true;
     };
     auto lnw = [&](const OnnxNode *n, DevRes &r, Ln *l, int C_) -> bool {
-        std::vector<float> gg, bb;
-        if (!n || n->in.size() < 3 || !tensor_floats(rd, n, 1, &gg) || !tensor_floats(rd, n, 2, &bb) || (int)gg.size() != C_ ||
-            (int)bb.size() != C_)
-            return false;
-        l->g = r.dfl(gg, C_);
-        l->b = r.dfl(bb, C_);
-        l->eps = n->attr("epsilon") ? n->attr("epsilon")->f : 1e-5f;
+        LnW w;
+        if (!lns.weights(rd, n, &w) || (int)w.g.size() != C_) return false;
+        l->g = r.dfl(w.g, C_);
+        l->b = r.dfl(w.b, C_);
+        l->eps = w.eps;
         return true;
     };
 
@@ -160,11 +171,13 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     std::vector<float> v, b;
     std::vector<int64_t> d;
     // head: mean, conv_first, the LayerNorm before the groups
-    if (!sub || !init_input(rd, sub, &v, &d) || v.size() != 3) return refuse(why, "not a DAT graph"), nullptr;
-    std::copy(v.begin(), v.end(), f->mean);
+    ImgRange ir;
+    if (!img_range_head(rd, sub, &ir)) return refuse(why, "not a DAT graph"), nullptr;
+    std::copy(ir.mean, ir.mean + 3, f->mean);
     const OnnxNode *cf = take(Ev::CV);
     Conv c;
     if (!cf || !rd.conv(cf->name, &c, why) || c.cin != 3 || c.lrelu) return refuse(why, "not a DAT graph"), nullptr;
+    img_range_first(ir, &c);
     const int C = f->C = c.cout, CP = f->CP = pad16(C), C8 = f->C8 = (C + 7) / 8 * 8;
     f->QS = pad16(3 * C);
     f->FS = 2 * CP;
@@ -281,8 +294,10 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
                 for (int o = 0; o < 2 * C; o++) b2[o < C ? o : CP + o - C] = b[o];
                 bk.fc1 = r.mat(w2, &b2, C, f->FS);
             }
+            // x1, x2 = chunk(2): a Split, or two Slices (legacy exports); the norm reads x2
             const OnnxNode *sp = take(Ev::SPLIT), *n3 = take(Ev::LN);
-            if (!sp || sp->out.size() != 2 || !n3 || n3->in.empty() || n3->in[0] != sp->out[1] || !lnw(n3, r, &bk.n3, C)) return refuse(why, where + ": SGFN"), nullptr;
+            if (!n3 || n3->in.empty() || !(sp ? sp->out.size() == 2 && lns.input(rd, n3) == sp->out[1] : chunk_slice(rd, lns.input(rd, n3))) || !lnw(n3, r, &bk.n3, C))
+                return refuse(why, where + ": SGFN"), nullptr;
             const OnnxNode *fdw = take(Ev::CV);
             if (!conv_w(fdw, &w0, &b0, &d) || d != std::vector<int64_t>{C, 1, 3, 3} || (int)b0.size() != C)
                 return refuse(why, where + ": SGFN dwconv"), nullptr;
@@ -298,7 +313,8 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
         const OnnxNode *gc = take(Ev::CV);
         if (!gc || !rd.conv(gc->name, &c, why) || c.cin != C || c.cout != C || c.lrelu) return refuse(why, "DAT group conv"), nullptr;
         GOp op;
-        op.w = r.gup(conv_taps(c, nullptr), c.b, C, CP, C, CP);
+        const std::vector<float> inv(C, 1.f / kStreamScale);  // its input is the stream's scaled fp16 copy
+        op.w = r.gup(conv_taps(c, &inv), c.b, C, CP, C, CP);
         f->gconvs.push_back(op);
         f->groups.push_back(std::move(blocks));
     }
@@ -325,9 +341,8 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
         }
     }
     if (!rd.conv(cl->name, &c, why) || c.cin != 64 || c.cout != 3) return refuse(why, "DAT conv_last"), nullptr;
-    for (const OnnxNode &n : g.nodes)  // the mean added back after conv_last: into its bias
-        if (n.op == "Add" && std::find(n.in.begin(), n.in.end(), cl->out[0]) != n.in.end() && init_input(rd, &n, &v) && v.size() == 3)
-            for (int k = 0; k < 3; k++) c.b[k] += v[k];
+    if (!img_range_tail(rd, cl->out[0], &c, &ir)) return refuse(why, "DAT output range"), nullptr;  // into conv_last
+    f->clamp = ir.clamp;
     f->last.w = r.gup(conv_taps(c, nullptr), c.b, 64, 64, 3, 16);
     // the channel attention's per-head mixing, as a GEMM matrix built on the GPU (folded with the identity)
     {
@@ -391,9 +406,9 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
             sh += bk.spatial && bk.br[0].mask;
         }
     char buf[200];
-    snprintf(buf, sizeof(buf), "DAT 4x, %d groups, %d blocks (%d shifted), %d channels, %d heads, %dx%d / %dx%d windows, fp32 stream",
+    snprintf(buf, sizeof(buf), "DAT 4x, %d groups, %d blocks (%d shifted), %d channels, %d heads, %dx%d / %dx%d windows, fp32 stream%s",
              (int)f->groups.size(), nb, sh, C, f->heads, f->groups[0][0].br[0].wh, f->groups[0][0].br[0].ww, f->groups[0][0].br[1].wh,
-             f->groups[0][0].br[1].ww);
+             f->groups[0][0].br[1].ww, f->clamp ? ", clamped" : "");
     f->what = buf;
     return std::unique_ptr<ImgNet>(f.release());
 }
@@ -501,7 +516,7 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             CK(gemm(*b.fc2, PR, CP, S, CP, TAct::None, true));
             pr.mark(P_FC2);
         }
-        K(tconvert(S, true, CP, S16, false, CP, M, CP, s));
+        K(tconvert(S, true, CP, S16, false, CP, M, CP, s, kStreamScale));
         GConvArgs a = ga(S16, CP, h, w, S, CP, h, w);
         a.acc32 = true;
         a.out_f32 = true;
@@ -533,7 +548,7 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
     }
     CK(Gc(last, ga(V2, 64, 4 * h, 4 * w, O16, 16, 4 * h, 4 * w)));
     pr.mark(P_UP);
-    K(img_from_nhwc(O16, 16, 4 * w, 4 * h, out, out_f32, s));
+    K(img_from_nhwc(O16, 16, 4 * w, 4 * h, out, out_f32, s, clamp));
     pr.mark(P_IO);
 #undef K
 #undef CK

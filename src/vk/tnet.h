@@ -96,6 +96,7 @@ public:
         int in = 0, act = 0, stride = 1, out = 0;  // gconv's IN / ACT / STRIDE / OUT
         float slope = 0.2f;                        // ACT 2: the LeakyReLU slope
         bool src_in = false, dst_out = false;      // src the network input / dst the output
+        bool clamp = false;                        // OUT 3: clamp to [0, 1]
         VkDeviceSize src = 0, dst = 0, r1 = 0;     // arena offsets (r1: when nres)
         VkDeviceSize src_bytes = 0, dst_bytes = 0, r1_bytes = 0;
         int nres = 0;
@@ -127,11 +128,14 @@ public:
     // of ph x pw, reflect-padded
     void imgin(const TMap &out, int h, int w, int ph, int pw, const float mean[3]);
     // A map's first 3 channels (its width mw) cropped to h x w into the network output (NCHW fp16)
-    void imgout(const TMap &in, int h, int w, int mw);
+    void imgout(const TMap &in, int h, int w, int mw, bool clamp = false);
     // The channel sums of a map (C channels over M tokens) into sums (arena float offset)
     void colsums(const TMap &in, int M, int C, VkDeviceSize sums);
     // A map into another of n channels (fp32 <-> fp16)
-    void convert(const TMap &in, const TMap &out, int M, int n);
+    void convert(const TMap &in, const TMap &out, int M, int n, float scale = 1.f);
+    // the residual stream's fp16 copy for a group conv, scaled down to stay in fp16's range (the
+    // conv's weights carry the inverse; native/tfm.h's kStreamScale)
+    static constexpr float kStreamScale = 1.f / 32;
     // cm = sigmoid(W2 act(W1 (sums / M * in_scale) + b1) + b2), act GELU or ReLU (b1, b2 < 0: none)
     void chan_gate(VkDeviceSize sums, int M, int C, int r, int w1, int b1, int w2, int b2, bool relu, float in_scale, VkDeviceSize cm,
                    int cpad);

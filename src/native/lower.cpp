@@ -2,9 +2,12 @@
 #include "native/lower.h"
 #include "native/ops.h"
 #include "native/pack.h"
+#include "native/static_eval.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <memory>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -96,8 +99,30 @@ struct Lowerer {
             const OnnxAttr *v = node(p->second).attr("value");
             if (v && v->type == 4) return &v->t;
         }
-        return nullptr;
+        // a constant the exporter left unfolded (an Unsqueeze / Reshape / Cast ... of initializers,
+        // e.g. a PReLU slope): evaluated on the host, once
+        if (p == prod.end() || data.count(canon(name))) return nullptr;
+        auto f = folded.find(name);
+        if (f != folded.end()) return f->second.dims.empty() && f->second.raw.empty() ? nullptr : &f->second;
+        OnnxTensor &t = folded[name];
+        if (!rd) rd.reset(new onnxread::Reader(g));
+        if (!se) se.reset(new static_eval::StaticEval(*rd));
+        static_eval::HT h;
+        if (!se->eval(name, &h)) return nullptr;
+        t.name = name;
+        t.dtype = 1;  // FLOAT
+        t.dims = h.dims;
+        t.raw.resize(h.v.size() * 4);
+        for (size_t i = 0; i < h.v.size(); i++) {
+            const float x = (float)h.v[i];
+            std::memcpy(&t.raw[i * 4], &x, 4);
+        }
+        if (t.dims.empty() && h.v.size() != 1) return nullptr;
+        return &t;
     }
+    std::map<std::string, OnnxTensor> folded;   // constant(): host-evaluated constants
+    std::unique_ptr<onnxread::Reader> rd;
+    std::unique_ptr<static_eval::StaticEval> se;
     bool scalar(const std::string &name, float *v)
     {
         auto p = prod.find(name);
@@ -341,6 +366,30 @@ struct Lowerer {
         return true;
     }
 
+    // Whether tensor t is the model output, directly or through a final Clip(0, 1).
+    bool ends_output(const std::string &t)
+    {
+        if (t == Y) return true;
+        std::string c;
+        return clip01_after(t, &c, false) && c == Y;
+    }
+
+    // A Clip(0, 1) consuming t alone (bounds as inputs, opset 11+, or attributes): marks it used
+    // (unless peek) and gives its output in *out.
+    bool clip01_after(const std::string &t, std::string *out, bool mark = true)
+    {
+        const int c = sole(t, "Clip");
+        if (c < 0) return false;
+        const OnnxNode &n = node(c);
+        float lo = n.attr_f("min", -3.4e38f), hi = n.attr_f("max", 3.4e38f);
+        if (n.in.size() > 1 && !n.in[1].empty() && !scalar(n.in[1], &lo)) return false;
+        if (n.in.size() > 2 && !n.in[2].empty() && !scalar(n.in[2], &hi)) return false;
+        if (lo != 0.f || hi != 1.f) return false;
+        if (mark) used[c] = true;
+        *out = canon(n.out[0]);
+        return true;
+    }
+
     // The 3x3 conv kernel size of node n, from its weights.
     int kernel_of(const OnnxNode &n)
     {
@@ -425,13 +474,20 @@ struct Lowerer {
         bool dcr = false;
         std::vector<int> d2s;
         std::string d2s_out;
-        if (depth_to_space_after(o, &d2s, &r, &dcr, &d2s_out)) {
-            // last conv -> depth-to-space -> output (+ the nearest-upsampled input)
-            const OnnxTensor *wt = constant(n.in[1]);
+        const OnnxTensor *wt0 = constant(n.in[1]);
+        // a last conv of 3 channels whose output is the model's (1x, no depth-to-space)
+        const bool rgb_out = wt0 && wt0->dims.size() == 4 && wt0->dims[0] == 3 && ends_output(o);
+        if (rgb_out || depth_to_space_after(o, &d2s, &r, &dcr, &d2s_out)) {
+            // last conv -> depth-to-space -> output (+ the nearest-upsampled input) (-> Clip(0, 1))
+            const OnnxTensor *wt = wt0;
             if (!wt || wt->dims.size() != 4 || wt->count() == OnnxTensor::kBadCount) return fail("Conv weights are not a constant");
             const int co = (int)wt->dims[0];
-            if (r == 0) r = co == 12 ? 2 : co == 48 ? 4 : 0;
-            if ((r != 2 && r != 4) || co != 3 * r * r) return fail("depth-to-space other than 2x/4x to RGB");
+            if (rgb_out) {
+                r = 1;
+                d2s_out = o;
+            }
+            if (r == 0) r = co == 3 ? 1 : co == 12 ? 2 : co == 27 ? 3 : co == 48 ? 4 : 0;
+            if (r < 1 || r > 4 || co != 3 * r * r) return fail("depth-to-space other than 1x-4x to RGB");
             std::vector<int> cout_from;
             for (int u = 0; u < co; u++) {
                 const int c = u / (r * r), ry = (u / r) % r, rx = u % r;
@@ -439,25 +495,38 @@ struct Lowerer {
             }
             if (!weights(n, 3, &st.w, cin_map, &cout_from)) return false;
             for (int d : d2s) used[d] = true;
-            st.out = (int)(r == 2 ? Output::DepthToSpace2 : Output::DepthToSpace4);
+            st.out = (int)depth_to_space_output(r);
             st.dst = kModelOutput;
-            const std::string dout = canon(d2s_out);
+            std::string dout = canon(d2s_out);
+            // a final Clip(0, 1), straight after the depth-to-space
+            if (dout != Y && clip01_after(dout, &dout)) st.out_clamp = true;
             if (dout != Y) {
                 const int a = sole(dout, "Add");
-                if (a < 0 || canon(node(a).out[0]) != Y) return fail("depth-to-space output is not the model output");
+                if (a < 0) return fail("depth-to-space output is not the model output");
+                std::string aout = canon(node(a).out[0]);
+                if (aout != Y && !clip01_after(aout, &aout)) return fail("depth-to-space output is not the model output");
+                if (aout != Y) return fail("depth-to-space output is not the model output");
+                if (st.out_clamp) return fail("the output adds the input after a clamp");
+                st.out_clamp = canon(node(a).out[0]) != Y;
                 const std::string z = other(a, dout);
                 auto pz = prod.find(z);
-                if (z.empty() || pz == prod.end() || node(pz->second).op != "Resize")
-                    return fail("the output adds something other than the upsampled input");
-                const OnnxNode &rz = node(pz->second);
-                const std::string ct = rz.attr_s("coordinate_transformation_mode", "half_pixel");
-                if (canon(rz.in[0]) != X || rz.attr_s("mode", "nearest") != "nearest" ||
-                    (ct != "asymmetric" && ct != "half_pixel"))
-                    return fail("the output adds an input upsampled other than nearest");
+                if (r == 1 && canon(z) == X) {
+                    // a 1x skip: the input itself (no Resize)
+                } else {
+                    if (z.empty() || pz == prod.end() || node(pz->second).op != "Resize")
+                        return fail("the output adds something other than the upsampled input");
+                    const OnnxNode &rz = node(pz->second);
+                    const std::string ct = rz.attr_s("coordinate_transformation_mode", "half_pixel");
+                    if (canon(rz.in[0]) != X || rz.attr_s("mode", "nearest") != "nearest" ||
+                        (ct != "asymmetric" && ct != "half_pixel"))
+                        return fail("the output adds an input upsampled other than nearest");
+                    used[pz->second] = true;
+                }
                 if (plan.in_norm) return fail("the output adds the input, which the model normalizes");
-                used[a] = used[pz->second] = true;
+                used[a] = true;
                 st.resid = kModelInput;
             }
+            plan.out_clamp = st.out_clamp;
             plan.depth_to_space = r;
             st.cin = st.w.cin;
             st.cout = st.w.cout;

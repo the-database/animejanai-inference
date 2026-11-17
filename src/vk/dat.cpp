@@ -14,6 +14,7 @@
 #include <set>
 #include <vector>
 
+#include "native/export_forms.h"
 #include "native/onnx_graph.h"
 #include "native/onnx_read.h"
 #include "native/static_eval.h"
@@ -103,6 +104,7 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
     rd.any_slope = true;
     if (g.inputs.empty()) return refuse_(why, "not a DAT graph"), nullptr;
     // the data path
+    const Lns lns(rd);
     std::set<std::string> data{g.inputs[0]};
     std::vector<Ev> ev;
     const OnnxNode *sub = nullptr;
@@ -118,15 +120,18 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
             anyconst |= rd.tensor(i) != nullptr;
             allin &= data.count(i) > 0;
         }
-        if (n.op == "LayerNormalization") ev.push_back({Ev::LN, &n});
+        if (lns.is_ln(n)) ev.push_back({Ev::LN, &n});
+        else if (lns.span.count(&n)) continue;  // inside a spelled-out LayerNorm
         else if (n.op == "MatMul" && anyconst) ev.push_back({Ev::MM, &n});
         else if (n.op == "Conv") ev.push_back({Ev::CV, &n});
         else if (n.op == "Softmax") ev.push_back({Ev::SOFTMAX, &n});
-        else if (n.op == "ReduceL2") ev.push_back({Ev::REDUCEL2, &n});
+        else if (n.op == "ReduceL2" || l2_root(rd, n)) ev.push_back({Ev::REDUCEL2, &n});
         else if (n.op == "Split") ev.push_back({Ev::SPLIT, &n});
         else if (n.op == "DepthToSpace") ev.push_back({Ev::D2S, &n});
+        else if (n.op == "Mul" && anyconst && sub && n.in[0] == sub->out[0]) continue;  // the image range
+        else if (n.op == "Mul" && anyconst && gelu_const_mul(rd, n)) continue;           // a spelled-out GELU
         else if (n.op == "Mul" && anyconst) ev.push_back({Ev::MULC, &n});
-        else if (n.op == "Add" && !allin && !anyconst) ev.push_back({Ev::ADDS, &n});
+        else if (n.op == "Add" && !allin && (!anyconst || attn_const(rd, n))) ev.push_back({Ev::ADDS, &n});
         else if (n.op == "Sub" && anyconst && !sub) sub = &n;
     }
     size_t at = 0;
@@ -144,13 +149,21 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
         return false;
     };
     auto conv_w = [&](const OnnxNode *n, std::vector<float> *w_, std::vector<float> *b_, std::vector<int64_t> *d) -> bool {
-        return n && tensor_floats(rd, n, 1, w_, d) && n->in.size() > 2 && rd.floats(n->in[2], b_);
+        if (!n || !tensor_floats(rd, n, 1, w_, d) || d->empty() || (*d)[0] < 1) return false;
+        if (n->in.size() > 2 && !n->in[2].empty()) {
+            if (!rd.floats(n->in[2], b_)) return false;
+        } else {
+            b_->assign((size_t)(*d)[0], 0.f);
+        }
+        fold_bn_after(rd, n, w_, b_);  // a BatchNorm the export left unfolded
+        return true;
     };
     auto lnw = [&](const OnnxNode *n, Ln *l, int C_) -> bool {
-        if (!n || n->in.size() < 3 || !tensor_floats(rd, n, 1, &l->g) || !tensor_floats(rd, n, 2, &l->b) || (int)l->g.size() != C_ ||
-            (int)l->b.size() != C_)
-            return false;
-        l->eps = n->attr("epsilon") ? n->attr("epsilon")->f : 1e-5f;
+        LnW w;
+        if (!lns.weights(rd, n, &w) || (int)w.g.size() != C_) return false;
+        l->g = w.g;
+        l->b = w.b;
+        l->eps = w.eps;
         return true;
     };
 
@@ -158,12 +171,14 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
     std::vector<int64_t> d;
     float mean[3];
     // head: mean, conv_first, the LayerNorm before the groups
-    if (!sub || !init_input(rd, sub, &v, &d) || v.size() != 3) return refuse_(why, "not a DAT graph"), nullptr;
-    std::copy(v.begin(), v.end(), mean);
+    ImgRange ir;
+    if (!img_range_head(rd, sub, &ir)) return refuse_(why, "not a DAT graph"), nullptr;
+    std::copy(ir.mean, ir.mean + 3, mean);
     const OnnxNode *cf = take(Ev::CV);
     Conv cfirst;
     std::string we;
     if (!cf || !rd.conv(cf->name, &cfirst, &we) || cfirst.cin != 3 || cfirst.lrelu) return refuse_(why, "not a DAT graph"), nullptr;
+    img_range_first(ir, &cfirst);
     const int C = cfirst.cout, CP = pad16(C), QS = pad16(3 * C), FS = 2 * CP;
     Ln before, fin;
     if (!lnw(take(Ev::LN), &before, C)) return refuse_(why, "not a DAT graph"), nullptr;
@@ -263,8 +278,9 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
             for (int k = 0; k < C; k++)
                 for (int o = 0; o < 2 * C; o++) bk.fc1.w[(size_t)k * FS + (o < C ? o : CP + o - C)] = f1.w[(size_t)k * 2 * C + o];
             for (int o = 0; o < 2 * C; o++) bk.fc1.b[o < C ? o : CP + o - C] = f1.b[o];
+            // x1, x2 = chunk(2): a Split, or two Slices (legacy exports); the norm reads x2
             const OnnxNode *sp = take(Ev::SPLIT), *n3 = take(Ev::LN);
-            if (!sp || sp->out.size() != 2 || !n3 || n3->in.empty() || n3->in[0] != sp->out[1] || !lnw(n3, &bk.n3, C))
+            if (!n3 || n3->in.empty() || !(sp ? sp->out.size() == 2 && lns.input(rd, n3) == sp->out[1] : chunk_slice(rd, lns.input(rd, n3))) || !lnw(n3, &bk.n3, C))
                 return refuse_(why, where + ": SGFN"), nullptr;
             const OnnxNode *fdw = take(Ev::CV);
             if (!conv_w(fdw, &bk.fdw, &bk.fdwb, &d) || d != std::vector<int64_t>{C, 1, 3, 3} || (int)bk.fdwb.size() != C)
@@ -294,9 +310,7 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
     for (int k = 0; k < 2; k++)
         if (!rd.conv((k ? u2 : u0)->name, &cup[k], why) || cup[k].cin != 64 || cup[k].cout != 256) return refuse_(why, "DAT upsample"), nullptr;
     if (!rd.conv(cl->name, &clast, why) || clast.cin != 64 || clast.cout != 3) return refuse_(why, "DAT conv_last"), nullptr;
-    for (const OnnxNode &n : g.nodes)  // the mean added back after conv_last: into its bias
-        if (n.op == "Add" && std::find(n.in.begin(), n.in.end(), cl->out[0]) != n.in.end() && init_input(rd, &n, &v) && v.size() == 3)
-            for (int k = 0; k < 3; k++) clast.b[k] += v[k];
+    if (!img_range_tail(rd, cl->out[0], &clast, &ir)) return refuse_(why, "DAT output range"), nullptr;  // into conv_last
     if (w < 1 || h < 1) return refuse_(why, "bad tile size"), nullptr;
 
     std::unique_ptr<VkDat> f(new VkDat(dev));
@@ -347,6 +361,7 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
         io.sy = sy;
         if (out == 3) {
             io.dst_out = true;
+            io.clamp = ir.clamp;
         } else {
             io.dst = dst;
             io.dst_bytes = (VkDeviceSize)H * W * dstride * 2 * (out == 4 ? 4 : 1);
@@ -461,8 +476,9 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
             n.gemm(hm(PR, CP), M, mat(bk.fc2), fm(S, CP), 0, false, -1, fm(S, CP));
         }
         // the group conv plus the group input, fp32 sums and output
-        n.convert(fm(S, CP), hm(S16, CP), M, CP);
-        n.conv_gemm(hm(S16, CP), h, w, CP, n.add_conv_mat(conv_taps(gconvs[gi], nullptr), gconvs[gi].b, C, CP, C), fm(S, CP), fm(GIN, CP));
+        n.convert(fm(S, CP), hm(S16, CP), M, CP, TNet::kStreamScale);  // the weights carry the inverse
+        const std::vector<float> inv(C, 1.f / TNet::kStreamScale);
+        n.conv_gemm(hm(S16, CP), h, w, CP, n.add_conv_mat(conv_taps(gconvs[gi], &inv), gconvs[gi].b, C, CP, C), fm(S, CP), fm(GIN, CP));
     }
     // ---- the tail
     lnorm(fin, fm(S, CP), hm(N1, CP));
@@ -486,8 +502,8 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
             sh += bk.spatial && bk.br[0].mask;
         }
     char buf[240];
-    std::snprintf(buf, sizeof buf, "DAT 4x, %d groups, %d blocks (%d shifted), %d channels, %d heads, %dx%d / %dx%d windows, fp32 stream; Vulkan %s",
-                  (int)groups.size(), nb, sh, C, heads, groups[0][0].br[0].wh, groups[0][0].br[0].ww, groups[0][0].br[1].wh, groups[0][0].br[1].ww,
+    std::snprintf(buf, sizeof buf, "DAT 4x, %d groups, %d blocks (%d shifted), %d channels, %d heads, %dx%d / %dx%d windows, fp32 stream%s; Vulkan %s",
+                  (int)groups.size(), nb, sh, C, heads, groups[0][0].br[0].wh, groups[0][0].br[0].ww, groups[0][0].br[1].wh, groups[0][0].br[1].ww, ir.clamp ? ", clamped" : "",
                   family_name(dev.family()));
     f->what_ = buf;
     return std::unique_ptr<ImgNet>(f.release());

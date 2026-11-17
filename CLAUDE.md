@@ -166,7 +166,7 @@ off; any other value, or no key, is on. Image path: `AJI_NATIVE=off` (or `0`, `n
 | Models | Video path (`aji_trt.cpp`) | Image path (`aji_img_trt.cpp`) |
 |---|---|---|
 | SPAN, SPANF3, span_s, Compact (SRVGG) | `native/lower` + `native/executor` at the chain's size | the same plan and executor behind `ImgNet` (`build_lowered`, `native/framenet.cpp`), per tile |
-| ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory (ESRGAN, FDAT, HAT and DAT also on Vulkan: `vk/esrgan.cpp`, `vk/fdat.cpp`, `vk/hat.cpp`, `vk/dat.cpp`) | the `native/imgnet` builders, per tile |
+| ESRGAN (RRDBNet 1x-4x, pixel-unshuffle input, 32 or 64 features), FDAT (M, XL), HAT (S to L, 2x / 4x), DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory (ESRGAN, FDAT, HAT and DAT also on Vulkan: `vk/esrgan.cpp`, `vk/fdat.cpp`, `vk/hat.cpp`, `vk/dat.cpp`) | the `native/imgnet` builders, per tile |
 | TFDAT, TemporalFix | `native/vidnet` in the temporal stage (also on Vulkan: `vk/tfdat.cpp`, `vk/tfix`) | — |
 | RIFE | `native/rife` (the graph read by `native/rife_plan`, which Vulkan's `vk/rife` shares) | — |
 
@@ -209,7 +209,9 @@ through the same `ImgNet` interface (`weight_bytes`, `device_bytes`).
 The lowering works op by op on the graph's data path and folds into each Conv what follows it (activation,
 SPAN gate with the residual, depth-to-space and SRVGG's upsampled-input add); `Concat` + 1x1 `Conv`
 is the concat kernel; pixel-unshuffle (reshape/transpose or `SpaceToDepth`) and `DepthToSpace`
-(CRD or DCR, by reordering weights) fold into the first and last convs. A constant per-channel
+(CRD or DCR, by reordering weights) fold into the first and last convs; a last conv to 3 channels
+is a 1x output, `DepthToSpace` 3 a 3x one, and a final `Clip(0, 1)` clamps in the last conv's
+writer (any other Clip range refuses). A constant per-channel
 Sub / Add / Mul / Div chain on the input (SPAN's `(x - mean) * 255`) comes off the graph as the
 plan's input normalization, applied where the first conv loads the input (CUDA `ConvParams`;
 Vulkan: mean and scale after the bias, push constant 3 the flag), so its zero padding stays zero
@@ -217,6 +219,22 @@ in normalized space; folding it into the weights would not be exact at the borde
 casts, and pads/slices that align to the unshuffle factor are ignored; any other op refuses the
 model with its reason. `aji_native_lower_test` (cpu) checks the plans for SPANF3-, Compact- and
 span_s-shaped graphs written in memory, and the refusals.
+
+**The image builders find their models by structure**, not by module names: ESRGAN
+(`native/esrgan_graph.h`), HAT (`native/hat_graph.h`) and DAT (`native/dat.cpp`, `vk/dat.cpp`)
+walk the data path's ops in order, so exports from chaiNNer / spandrel (fp32 opset 14, fp16 opset
+17), the legacy and the dynamo torch exporters, and unnamed graphs all parse. `native/export_forms.h`
+holds what differs between exports of one model: the SwinIR family's image range (`(x - mean) *
+range` in; `/ range + mean`, at times `Clip(0, 1)`, out; folded into conv_first / conv_last),
+LayerNorm spelled out in primitives (opset < 17), GELU as Erf arithmetic, `F.normalize` as
+Abs / Pow / ReduceSum / Pow, `chunk` as two Slices, and a BatchNorm left after a conv (torch 2.4
+leaves them). The Reader folds constants an exporter left unfolded (Identity / Transpose / Reshape
+/ ... of an initializer: shared buffers, transposed MatMul weights), and `StaticEval` evaluates the
+position-bias subgraphs on the host (Gemm, Gather, GatherND, LayerNorm, ReduceMean / ReduceSum,
+Pow, Sqrt, broadcast arithmetic, Concat, ...). HAT and ESRGAN take 1x-4x scales by the number of
+upsample steps. `AJI_NATIVE_WHY=1` logs every family's refusal, not only the last one tried, and
+`aji_image --probe-only` says whether a model goes native (exit 0) or not (3) without running it.
+`aji_native_forms_test` (cpu) checks the export-form matchers, the folding and the evaluator.
 
 **What's host-only** (no CUDA, shared by any backend that runs a `Plan`): `native/ops.h` (the
 `Input` / `Act` / `Gate` / `Output` values a lowered conv step stores), `onnx_graph`, `lower`,

@@ -198,6 +198,7 @@ std::unique_ptr<Executor> Executor::create(Device &dev, const Plan &plan, int in
             b[2] = tensor(p.dst);
             st.has_resid = p.resid != -1;
             st.in_norm = p.in_norm && p.in != (int)ajinative::Input::NHWC;
+            st.out_clamp = p.out_clamp && p.out != (int)ajinative::Output::NHWC;
             if (!upload_conv(p.w, k.cinp, k.coutp, &b[3], &b[4], &b[5], st.in_norm ? &p : nullptr)) return fail("weights: " + reason);
             if (p.gate == (int)ajinative::Gate::Tanh1x1 &&
                 !upload_conv(p.att, p.att.cin, p.att.cout, &b[6], &b[7], nullptr))
@@ -332,7 +333,7 @@ void Executor::record_step(VkCommandBuffer cb, const Step &st, int v, int W, int
     } else {
         pc[0] = H;
         pc[1] = W;
-        pc[2] = st.has_resid ? 1 : 0;
+        pc[2] = (st.has_resid ? 1 : 0) | (st.out_clamp ? 2 : 0);
         pc[3] = st.in_norm ? 1 : 0;
         gx = (uint32_t)((W + 15) / 16);
         gy = (uint32_t)((H + d.tile_h - 1) / d.tile_h);
