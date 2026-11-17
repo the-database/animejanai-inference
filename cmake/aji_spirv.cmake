@@ -46,6 +46,10 @@ function(aji_spirv_embed name manifest)
         endforeach()
         set(src "${shader_dir}/${shader}")
         set(spv "${out_dir}/${module}.spv")
+        set(pool "")
+        if(AJI_GLSLC_JOBS GREATER 0)
+            set(pool JOB_POOL aji_glslc)
+        endif()
         add_custom_command(
             OUTPUT "${spv}"
             COMMAND "${AJI_GLSLC}" --target-env=vulkan1.3 -O ${dflags}
@@ -54,6 +58,7 @@ function(aji_spirv_embed name manifest)
             DEPENDS "${src}" "${manifest}"
             DEPFILE "${spv}.d"
             COMMENT "glslc ${module}"
+            ${pool}
             VERBATIM)
         list(APPEND spvs "${spv}")
         list(APPEND names "${module}")

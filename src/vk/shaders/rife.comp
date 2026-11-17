@@ -1,0 +1,320 @@
+#version 450
+// RIFE's resampling kernels on Vulkan (vk/rife.cpp), ports of native/rife_kernels.cu, by PASS:
+//   1 gather: a block's input at its scale: [frames, features, timestep] for block 0, else
+//     [warped frames, warped features, timestep, mask (and fed features), flow / s], each the 2x2
+//     mean of full-resolution samples (one sample at scale 1), warps along the summed flow;
+//   2 merge (ensembles): o = (o + swapped r) / 2 for the flow, (o - r) / 2 for the mask;
+//   3 final: the interpolated frame from both warps and the last block's mask, NCHW RGB.
+// As in CUDA, the graph's tensors are rounded to fp16 where it stores them (rh), so positions match.
+//
+// The gather is specialized like CUDA's k_gather template: F (features per frame), NM (mask and
+// fed feature channels), KV (8-channel vectors of the previous block's output), NT (taps per axis:
+// 1 at scale 1, else 2), B0 (block 0's input), REV (an ensemble's time-reversed pass), so its
+// arrays stay in registers.
+//
+// Buffers: 0 the 11-channel NCHW fp16 input (frames at planes 0-2 and 3-5, the timestep plane 6),
+// 2 the block outputs and frame features (NHWC fp16, offsets in halfs, multiples of 8), 3 the
+// output (gather: the block input, NHWC; final: NCHW fp16 RGB), 7 Params (64 ints an entry):
+//   0 W, 1 H (full size), 2 F, 3 fstride, 4 feat A offset, 5 feat B offset,
+//   6 nprev (blocks before; final: all), 7 feeds_feat, 8 K (the previous block's channels), 9 s,
+//   10 dst offset, 11 dstride, 12 cin, 13 rev, 14 merge: the reverse output's offset,
+//   16 + 3j, j < 6: block j's output offset, scale, kstride.
+// Push constants: the entry.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 16, local_size_y = 8) in;
+
+layout(push_constant) uniform PC { int entry; int u0; int u1; int u2; } pc;
+layout(std430, binding = 7) readonly buffer Params { ivec4 params[]; };
+layout(std430, binding = 0) readonly buffer In11 { uint in11[]; };
+#if PASS == 2
+layout(std430, binding = 2) buffer Persist { uvec4 pv[]; };
+#else
+layout(std430, binding = 2) readonly buffer Persist { uvec4 pv[]; };
+#endif
+#if PASS == 1
+layout(std430, binding = 3) writeonly buffer Out { uvec4 outv[]; };
+#elif PASS == 3
+layout(std430, binding = 3) writeonly buffer Out { uint outb[]; };
+#endif
+
+int prm(int k) { return params[pc.entry * 16 + (k >> 2)][k & 3]; }
+
+// fp32 -> fp16 through the device's conversion: Vulkan rounds narrowing conversions to nearest
+// even, as __float2half does (fp16 denormals may flush to zero: values under 6e-5, below what
+// a frame or a flow can tell apart)
+uint f32_to_f16(float f) { return packFloat2x16(f16vec2(float16_t(f), float16_t(0.0))) & 0xffffu; }
+uint pack2(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+// fp16 -> fp32 is exact
+float h2f(uint h) { return unpackHalf2x16(h).x; }
+float rh(float v) { return float(float16_t(v)); }
+float ld_in(uint i) { return h2f((in11[i >> 1] >> ((i & 1u) * 16u)) & 0xffffu); }
+// 8 channels at half offset o (a multiple of 8)
+void ld8(uint o, out float v[8])
+{
+    const uvec4 q = pv[o >> 3];
+    [[unroll]] for (int j = 0; j < 4; j++) {
+        const vec2 p = unpackHalf2x16(q[j]);
+        v[2 * j] = p.x;
+        v[2 * j + 1] = p.y;
+    }
+}
+void ld4(uint o, out float v[4])
+{
+    const uvec4 q = pv[o >> 3];
+    const vec2 a = unpackHalf2x16(q.x), b = unpackHalf2x16(q.y);
+    v[0] = a.x;
+    v[1] = a.y;
+    v[2] = b.x;
+    v[3] = b.y;
+}
+
+int W_() { return prm(0); }
+int H_() { return prm(1); }
+uint boff(int j) { return uint(prm(16 + 3 * j)); }
+int bs(int j) { return prm(17 + 3 * j); }
+uint bks(int j) { return uint(prm(18 + 3 * j)); }
+
+// bilinear taps of a linear upsample by s (half_pixel, clamped) of a bw x bh map at full-res (X, Y)
+struct Taps {
+    uint i00, i01, i10, i11;
+    float wx, wy;
+};
+Taps up_taps(int s, int bw, int bh, int X, int Y)
+{
+    float u = (float(X) + 0.5) / float(s) - 0.5, v = (float(Y) + 0.5) / float(s) - 0.5;
+    u = u < 0.0 ? 0.0 : u;
+    v = v < 0.0 ? 0.0 : v;
+    int x0 = int(u), y0 = int(v);
+    x0 = x0 > bw - 1 ? bw - 1 : x0;
+    y0 = y0 > bh - 1 ? bh - 1 : y0;
+    const int x1 = x0 + 1 < bw ? x0 + 1 : bw - 1, y1 = y0 + 1 < bh ? y0 + 1 : bh - 1;
+    Taps t;
+    t.i00 = uint(y0 * bw + x0);
+    t.i01 = uint(y0 * bw + x1);
+    t.i10 = uint(y1 * bw + x0);
+    t.i11 = uint(y1 * bw + x1);
+    t.wx = u - float(x0);
+    t.wy = v - float(y0);
+    return t;
+}
+Taps block_taps(int j, int X, int Y) { return up_taps(bs(j), W_() / bs(j), H_() / bs(j), X, Y); }
+float lerp4(float a, float b, float c, float d, Taps t)
+{
+    const float top = a + (b - a) * t.wx, bot = c + (d - c) * t.wx;
+    return rh(top + (bot - top) * t.wy);
+}
+// channels [8v, 8v + 8) of block j's output upsampled to full-res (X, Y)
+void up8(int j, Taps t, int v, out float o[8])
+{
+    const uint b = boff(j) + uint(v * 8), ks = bks(j);
+    float a[8], c[8], d[8], e[8];
+    ld8(b + t.i00 * ks, a);
+    ld8(b + t.i01 * ks, c);
+    ld8(b + t.i10 * ks, d);
+    ld8(b + t.i11 * ks, e);
+    [[unroll]] for (int k = 0; k < 8; k++) o[k] = lerp4(a[k], c[k], d[k], e[k], t);
+}
+// block j's flow (channels 0-3) upsampled x s at (X, Y)
+void up_flow(int j, int X, int Y, out float fl[4])
+{
+    const Taps t = block_taps(j, X, Y);
+    const uint b = boff(j), ks = bks(j);
+    float a[4], c[4], d[4], e[4];
+    ld4(b + t.i00 * ks, a);
+    ld4(b + t.i01 * ks, c);
+    ld4(b + t.i10 * ks, d);
+    ld4(b + t.i11 * ks, e);
+    const float s = float(bs(j));
+    [[unroll]] for (int k = 0; k < 4; k++) fl[k] = rh(lerp4(a[k], c[k], d[k], e[k], t) * s);
+}
+// The full-resolution flow: the sum of each block's upsampled flow x s, in block order; the last
+// block's channels come in already upsampled (last).
+vec4 flow_sum(int nb, int X, int Y, vec4 last)
+{
+    vec4 fl = vec4(0.0);
+    for (int j = 0; j < nb - 1; j++) {
+        float t[4];
+        up_flow(j, X, Y, t);
+        [[unroll]] for (int k = 0; k < 4; k++) fl[k] = rh(fl[k] + t[k]);
+    }
+    const float s = float(bs(nb - 1));
+    [[unroll]] for (int k = 0; k < 4; k++) fl[k] = rh(fl[k] + rh(last[k] * s));
+    return fl;
+}
+
+// GridSample (bilinear, border, align_corners) at pixel (X, Y) moved by (fx, fy): the taps
+struct Grid {
+    uint i00, i01, i10, i11;
+    float w00, w01, w10, w11;
+};
+Grid grid(int X, int Y, float fx, float fy)
+{
+    const int W = W_(), H = H_();
+    const float mx = rh(2.0 * float(X) / float(W - 1) - 1.0), my = rh(2.0 * float(Y) / float(H - 1) - 1.0);
+    const float mw = rh(2.0 / float(W - 1)), mh = rh(2.0 / float(H - 1));
+    const float gx = mx + rh(fx) * mw, gy = my + rh(fy) * mh;
+    float ix = (gx + 1.0) * 0.5 * float(W - 1), iy = (gy + 1.0) * 0.5 * float(H - 1);
+    ix = min(max(ix, 0.0), float(W - 1));
+    iy = min(max(iy, 0.0), float(H - 1));
+    const int x0 = int(floor(ix)), y0 = int(floor(iy));
+    const int x1 = x0 + 1 < W ? x0 + 1 : W - 1, y1 = y0 + 1 < H ? y0 + 1 : H - 1;
+    const float wx = ix - float(x0), wy = iy - float(y0);
+    Grid g;
+    g.w00 = (1.0 - wx) * (1.0 - wy);
+    g.w01 = wx * (1.0 - wy);
+    g.w10 = (1.0 - wx) * wy;
+    g.w11 = wx * wy;
+    g.i00 = uint(y0 * W + x0);
+    g.i01 = uint(y0 * W + x1);
+    g.i10 = uint(y1 * W + x0);
+    g.i11 = uint(y1 * W + x1);
+    return g;
+}
+// frame k's image channels warped
+void warp_img(int k, Grid g, out float o[3])
+{
+    const uint plane = uint(W_() * H_()), img = uint(k) * 3u * plane;
+    [[unroll]] for (int c = 0; c < 3; c++) {
+        const uint pl = img + uint(c) * plane;
+        o[c] = rh(g.w00 * ld_in(pl + g.i00) + g.w01 * ld_in(pl + g.i01) + g.w10 * ld_in(pl + g.i10) + g.w11 * ld_in(pl + g.i11));
+    }
+}
+#if PASS == 1 && F > 0
+const int FV = (F + 7) / 8;
+// frame k's F features warped
+void warp_feat(int k, Grid g, out float o[F])
+{
+    const uint ft = uint(prm(k == 0 ? 4 : 5)), st = uint(prm(3));
+    [[unroll]] for (int v = 0; v < FV; v++) {
+        float a[8], b[8], c[8], d[8];
+        ld8(ft + g.i00 * st + uint(v * 8), a);
+        ld8(ft + g.i01 * st + uint(v * 8), b);
+        ld8(ft + g.i10 * st + uint(v * 8), c);
+        ld8(ft + g.i11 * st + uint(v * 8), d);
+        [[unroll]] for (int e = 0; e < 8; e++)
+            if (v * 8 + e < F) o[v * 8 + e] = rh(g.w00 * a[e] + g.w01 * b[e] + g.w10 * c[e] + g.w11 * d[e]);
+    }
+}
+#endif
+
+void main()
+{
+#if PASS == 1
+#if B0
+    const int CIN = 6 + 2 * F + 1;
+#else
+    const int CIN = 6 + 2 * F + 1 + NM + 4;
+#endif
+    const int CP8 = (CIN + 7) / 8 * 8;
+    const int W = W_(), H = H_(), nprev = prm(6), s = prm(9), dstride = prm(11);
+    const int bw = W / s, bh = H / s;
+    const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= bw || y >= bh) return;
+    float acc[CP8];
+    [[unroll]] for (int c = 0; c < CP8; c++) acc[c] = 0.0;
+    const float wt = NT == 1 ? 1.0 : 0.25;
+    const float t0 = ld_in(uint(6 * W * H));  // the timestep plane (fp16: rounded as CUDA's rh(t))
+    const float tt = REV != 0 ? rh(1.0 - t0) : t0;
+    const int A0 = REV != 0 ? 1 : 0;  // the frame that comes first
+    [[unroll]] for (int ty = 0; ty < NT; ty++)
+        [[unroll]] for (int tx = 0; tx < NT; tx++) {
+            const int X = NT == 1 ? x : s * x + s / 2 - 1 + tx, Y = NT == 1 ? y : s * y + s / 2 - 1 + ty;
+#if B0
+            // [frame A, frame B, features A, features B, timestep]
+            const uint plane = uint(W * H), pix = uint(Y * W + X);
+            [[unroll]] for (int c = 0; c < 6; c++) acc[c] += wt * ld_in(uint((c + 3 * A0) % 6) * plane + pix);
+#if F > 0
+            [[unroll]] for (int k = 0; k < 2; k++) {
+                const uint ft = uint(prm(((k ^ A0) == 0) ? 4 : 5)), st = uint(prm(3));
+                [[unroll]] for (int v = 0; v < FV; v++) {
+                    float fv[8];
+                    ld8(ft + pix * st + uint(v * 8), fv);
+                    [[unroll]] for (int e = 0; e < 8; e++)
+                        if (v * 8 + e < F) acc[6 + k * F + v * 8 + e] += wt * fv[e];
+                }
+            }
+#endif
+            acc[6 + 2 * F] += wt * tt;
+#else
+            // [warped A, warped B, warped features A, B, timestep, mask, (features), flow / s]
+            const int last = nprev - 1;
+            const Taps tl = block_taps(last, X, Y);
+            float lv[8 * KV];
+            [[unroll]] for (int v = 0; v < KV; v++) {
+                float o[8];
+                up8(last, tl, v, o);
+                [[unroll]] for (int k = 0; k < 8; k++) lv[v * 8 + k] = o[k];
+            }
+            const vec4 fl = flow_sum(nprev, X, Y, vec4(lv[0], lv[1], lv[2], lv[3]));
+            const Grid ga = REV != 0 ? grid(X, Y, fl[2], fl[3]) : grid(X, Y, fl[0], fl[1]);
+            const Grid gb = REV != 0 ? grid(X, Y, fl[0], fl[1]) : grid(X, Y, fl[2], fl[3]);
+            float wa[3], wb[3];
+            warp_img(A0, ga, wa);
+            warp_img(1 - A0, gb, wb);
+            [[unroll]] for (int c = 0; c < 3; c++) {
+                acc[c] += wt * wa[c];
+                acc[3 + c] += wt * wb[c];
+            }
+#if F > 0
+            float fa[F], fb[F];
+            warp_feat(A0, ga, fa);
+            warp_feat(1 - A0, gb, fb);
+            [[unroll]] for (int c = 0; c < F; c++) {
+                acc[6 + c] += wt * fa[c];
+                acc[6 + F + c] += wt * fb[c];
+            }
+#endif
+            acc[6 + 2 * F] += wt * tt;
+            [[unroll]] for (int c = 0; c < NM; c++) acc[7 + 2 * F + c] += wt * (REV != 0 && c == 0 ? -lv[4] : lv[4 + c]);
+            [[unroll]] for (int c = 0; c < 4; c++)
+                acc[7 + 2 * F + NM + c] += wt * rh(fl[REV != 0 ? (c + 2) % 4 : c] * (1.0 / float(s)));
+#endif
+        }
+    const uint d = (uint(prm(10)) + uint(y * bw + x) * uint(dstride)) >> 3;
+    [[unroll]] for (int c = 0; c < CP8; c += 8) {
+        uvec4 q;
+        [[unroll]] for (int j = 0; j < 4; j++) q[j] = pack2(acc[c + 2 * j], acc[c + 2 * j + 1]);
+        outv[d + uint(c / 8)] = q;
+    }
+    for (int c = CP8; c < dstride; c += 8) outv[d + uint(c / 8)] = uvec4(0);
+#elif PASS == 2
+    const int W = W_(), H = H_(), s = bs(0);
+    const int n = (W / s) * (H / s);
+    const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 16u) + gl_GlobalInvocationID.x);
+    if (i >= n) return;
+    const uint ks = bks(0), a = (boff(0) + uint(i) * ks) >> 3, b = (uint(prm(14)) + uint(i) * ks) >> 3;
+    uvec4 qa = pv[a];
+    const uvec4 qb = pv[b];
+    const vec2 a01 = unpackHalf2x16(qa.x), a23 = unpackHalf2x16(qa.y), a45 = unpackHalf2x16(qa.z);
+    const vec2 b01 = unpackHalf2x16(qb.x), b23 = unpackHalf2x16(qb.y), b45 = unpackHalf2x16(qb.z);
+    // flow: o + the reverse pass's flow with the frames swapped; mask: o - r
+    const float f0 = rh((a01.x + b23.x) * 0.5), f1 = rh((a01.y + b23.y) * 0.5);
+    const float f2 = rh((a23.x + b01.x) * 0.5), f3 = rh((a23.y + b01.y) * 0.5);
+    const float m = (a45.x - b45.x) * 0.5;
+    qa.x = pack2(f0, f1);
+    qa.y = pack2(f2, f3);
+    qa.z = (qa.z & 0xffff0000u) | f32_to_f16(m);  // channel 5 kept
+    pv[a] = qa;
+#else
+    const int W = W_(), H = H_(), nb = prm(6);
+    const int X0 = int(gl_GlobalInvocationID.x) * 2, Y = int(gl_GlobalInvocationID.y);
+    if (X0 >= W || Y >= H) return;
+    uint px[3][2];
+    [[unroll]] for (int k = 0; k < 2; k++) {
+        const int X = X0 + k;
+        float lv[8];
+        up8(nb - 1, block_taps(nb - 1, X, Y), 0, lv);  // flow and mask are channels 0-4
+        const vec4 fl = flow_sum(nb, X, Y, vec4(lv[0], lv[1], lv[2], lv[3]));
+        float wa[3], wb[3];
+        warp_img(0, grid(X, Y, fl[0], fl[1]), wa);
+        warp_img(1, grid(X, Y, fl[2], fl[3]), wb);
+        const float sg = rh(1.0 / (1.0 + exp(-lv[4])));
+        const float isg = rh(1.0 - sg);
+        [[unroll]] for (int c = 0; c < 3; c++) px[c][k] = f32_to_f16(rh(wa[c] * sg) + rh(wb[c] * isg));
+    }
+    const uint plane = uint(W * H), pix = uint(Y * W + X0);
+    [[unroll]] for (int c = 0; c < 3; c++) outb[(uint(c) * plane + pix) >> 1] = px[c][0] | (px[c][1] << 16);
+#endif
+}

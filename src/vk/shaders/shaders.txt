@@ -316,80 +316,6 @@ tile_extract  tile_extract.comp
 tile_blend    tile_blend.comp
 band_flush    band_flush.comp
 
-# General 3x3 conv (gconv_common.glsl) at the shapes ESRGAN (RRDBNet, 64 features, growth 32) uses:
-# g3_<family>_i<CINP>_o<COUTP>_n<IN>a<ACT>r<NRES>u<UP2>o<OUT>_<tile>.
-g3_cm16_i16_o64_n1a0r0u0o0_w8r2  gconv_cm16.comp  CINP=16 COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i16_o64_n1a0r0u0o0_w4r4  gconv_cm16.comp  CINP=16 COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i16_o64_n2a0r0u0o0_w8r2  gconv_cm16.comp  CINP=16 COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i16_o64_n2a0r0u0o0_w4r4  gconv_cm16.comp  CINP=16 COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i64_o32_n0a2r0u0o0_w8r2  gconv_cm16.comp  CINP=64 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i64_o32_n0a2r0u0o0_w4r4  gconv_cm16.comp  CINP=64 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i96_o32_n0a2r0u0o0_w8r2  gconv_cm16.comp  CINP=96 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i96_o32_n0a2r0u0o0_w4r4  gconv_cm16.comp  CINP=96 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i128_o32_n0a2r0u0o0_w8r2  gconv_cm16.comp  CINP=128 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i128_o32_n0a2r0u0o0_w4r4  gconv_cm16.comp  CINP=128 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i160_o32_n0a2r0u0o0_w8r2  gconv_cm16.comp  CINP=160 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i160_o32_n0a2r0u0o0_w4r4  gconv_cm16.comp  CINP=160 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i192_o64_n0a0r1u0o0_w8r2  gconv_cm16.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i192_o64_n0a0r1u0o0_w4r4  gconv_cm16.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i192_o64_n0a0r2u0o0_w8r2  gconv_cm16.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i192_o64_n0a0r2u0o0_w4r4  gconv_cm16.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i64_o64_n0a0r1u0o0_w8r2  gconv_cm16.comp  CINP=64 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i64_o64_n0a0r1u0o0_w4r4  gconv_cm16.comp  CINP=64 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i64_o64_n0a2r0u1o0_w8r2  gconv_cm16.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 OUT=0 WARPS=8 WR=2
-g3_cm16_i64_o64_n0a2r0u1o0_w4r4  gconv_cm16.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 OUT=0 WARPS=4 WR=4
-g3_cm16_i64_o64_n0a2r0u0o0_w8r2  gconv_cm16.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=8 WR=2
-g3_cm16_i64_o64_n0a2r0u0o0_w4r4  gconv_cm16.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 WARPS=4 WR=4
-g3_cm16_i64_o16_n0a0r0u0o3_w8r2  gconv_cm16.comp  CINP=64 COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 OUT=3 WARPS=8 WR=2
-g3_cm16_i64_o16_n0a0r0u0o3_w4r4  gconv_cm16.comp  CINP=64 COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 OUT=3 WARPS=4 WR=4
-g3_sg16_i16_o64_n1a0r0u0o0_t8r1  gconv_sg16.comp  CINP=16 COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i16_o64_n1a0r0u0o0_t4r1  gconv_sg16.comp  CINP=16 COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i16_o64_n2a0r0u0o0_t8r1  gconv_sg16.comp  CINP=16 COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i16_o64_n2a0r0u0o0_t4r1  gconv_sg16.comp  CINP=16 COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i64_o32_n0a2r0u0o0_t8r1  gconv_sg16.comp  CINP=64 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i64_o32_n0a2r0u0o0_t4r1  gconv_sg16.comp  CINP=64 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i96_o32_n0a2r0u0o0_t8r1  gconv_sg16.comp  CINP=96 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i96_o32_n0a2r0u0o0_t4r1  gconv_sg16.comp  CINP=96 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i128_o32_n0a2r0u0o0_t8r1  gconv_sg16.comp  CINP=128 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i128_o32_n0a2r0u0o0_t4r1  gconv_sg16.comp  CINP=128 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i160_o32_n0a2r0u0o0_t8r1  gconv_sg16.comp  CINP=160 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i160_o32_n0a2r0u0o0_t4r1  gconv_sg16.comp  CINP=160 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i192_o64_n0a0r1u0o0_t8r1  gconv_sg16.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i192_o64_n0a0r1u0o0_t4r1  gconv_sg16.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i192_o64_n0a0r2u0o0_t8r1  gconv_sg16.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i192_o64_n0a0r2u0o0_t4r1  gconv_sg16.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i64_o64_n0a0r1u0o0_t8r1  gconv_sg16.comp  CINP=64 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i64_o64_n0a0r1u0o0_t4r1  gconv_sg16.comp  CINP=64 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i64_o64_n0a2r0u1o0_t8r1  gconv_sg16.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 OUT=0 TH=8 RPS=1
-g3_sg16_i64_o64_n0a2r0u1o0_t4r1  gconv_sg16.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 OUT=0 TH=4 RPS=1
-g3_sg16_i64_o64_n0a2r0u0o0_t8r1  gconv_sg16.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_sg16_i64_o64_n0a2r0u0o0_t4r1  gconv_sg16.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_sg16_i64_o16_n0a0r0u0o3_t8r1  gconv_sg16.comp  CINP=64 COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 OUT=3 TH=8 RPS=1
-g3_sg16_i64_o16_n0a0r0u0o3_t4r1  gconv_sg16.comp  CINP=64 COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 OUT=3 TH=4 RPS=1
-g3_plain_i16_o64_n1a0r0u0o0_t8r1  gconv_plain.comp  CINP=16 COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i16_o64_n1a0r0u0o0_t4r1  gconv_plain.comp  CINP=16 COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i16_o64_n2a0r0u0o0_t8r1  gconv_plain.comp  CINP=16 COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i16_o64_n2a0r0u0o0_t4r1  gconv_plain.comp  CINP=16 COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i64_o32_n0a2r0u0o0_t8r1  gconv_plain.comp  CINP=64 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i64_o32_n0a2r0u0o0_t4r1  gconv_plain.comp  CINP=64 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i96_o32_n0a2r0u0o0_t8r1  gconv_plain.comp  CINP=96 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i96_o32_n0a2r0u0o0_t4r1  gconv_plain.comp  CINP=96 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i128_o32_n0a2r0u0o0_t8r1  gconv_plain.comp  CINP=128 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i128_o32_n0a2r0u0o0_t4r1  gconv_plain.comp  CINP=128 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i160_o32_n0a2r0u0o0_t8r1  gconv_plain.comp  CINP=160 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i160_o32_n0a2r0u0o0_t4r1  gconv_plain.comp  CINP=160 COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i192_o64_n0a0r1u0o0_t8r1  gconv_plain.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i192_o64_n0a0r1u0o0_t4r1  gconv_plain.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i192_o64_n0a0r2u0o0_t8r1  gconv_plain.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i192_o64_n0a0r2u0o0_t4r1  gconv_plain.comp  CINP=192 COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i64_o64_n0a0r1u0o0_t8r1  gconv_plain.comp  CINP=64 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i64_o64_n0a0r1u0o0_t4r1  gconv_plain.comp  CINP=64 COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i64_o64_n0a2r0u1o0_t8r1  gconv_plain.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 OUT=0 TH=8 RPS=1
-g3_plain_i64_o64_n0a2r0u1o0_t4r1  gconv_plain.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 OUT=0 TH=4 RPS=1
-g3_plain_i64_o64_n0a2r0u0o0_t8r1  gconv_plain.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=8 RPS=1
-g3_plain_i64_o64_n0a2r0u0o0_t4r1  gconv_plain.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
-g3_plain_i64_o16_n0a0r0u0o3_t8r1  gconv_plain.comp  CINP=64 COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 OUT=3 TH=8 RPS=1
-g3_plain_i64_o16_n0a0r0u0o3_t4r1  gconv_plain.comp  CINP=64 COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 OUT=3 TH=4 RPS=1
 
 # A 4:2:0 frame's pre and post (vk/frame.cpp; the HLSL kernels of dml_shaders.h): u8 = NV12, u16 = P010.
 fr_pre1_u8    frame_pre.comp   PASS=1 T16=0
@@ -402,3 +328,256 @@ fr_pre2_u16   frame_pre.comp   PASS=2 T16=1
 fr_pre3_u16   frame_pre.comp   PASS=3 T16=1
 fr_post1_u16  frame_post.comp  PASS=1 T16=1 TPX=2
 fr_post2_u16  frame_post.comp  PASS=2 T16=1 TPX=1
+
+# RIFE's resampling (vk/rife.cpp): a block's input, the ensemble merge, the interpolated frame.
+rife_gather_f0_m1_k1_t1_b1_r0  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=1 B0=1 REV=0
+rife_gather_f0_m1_k1_t1_b1_r1  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=1 B0=1 REV=1
+rife_gather_f0_m1_k1_t1_b0_r1  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=1 B0=0 REV=1
+rife_gather_f0_m1_k1_t1_b0_r0  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=1 B0=0 REV=0
+rife_gather_f0_m1_k2_t1_b0_r0  rife.comp  PASS=1 F=0 NM=1 KV=2 NT=1 B0=0 REV=0
+rife_gather_f0_m9_k2_t1_b0_r0  rife.comp  PASS=1 F=0 NM=9 KV=2 NT=1 B0=0 REV=0
+rife_gather_f0_m1_k1_t2_b1_r0  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=2 B0=1 REV=0
+rife_gather_f0_m1_k1_t2_b1_r1  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=2 B0=1 REV=1
+rife_gather_f0_m1_k1_t2_b0_r1  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=2 B0=0 REV=1
+rife_gather_f0_m1_k1_t2_b0_r0  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=2 B0=0 REV=0
+rife_gather_f0_m1_k2_t2_b0_r0  rife.comp  PASS=1 F=0 NM=1 KV=2 NT=2 B0=0 REV=0
+rife_gather_f0_m9_k2_t2_b0_r0  rife.comp  PASS=1 F=0 NM=9 KV=2 NT=2 B0=0 REV=0
+rife_gather_f4_m1_k1_t1_b1_r0  rife.comp  PASS=1 F=4 NM=1 KV=1 NT=1 B0=1 REV=0
+rife_gather_f4_m1_k1_t1_b1_r1  rife.comp  PASS=1 F=4 NM=1 KV=1 NT=1 B0=1 REV=1
+rife_gather_f4_m1_k1_t1_b0_r1  rife.comp  PASS=1 F=4 NM=1 KV=1 NT=1 B0=0 REV=1
+rife_gather_f4_m1_k1_t1_b0_r0  rife.comp  PASS=1 F=4 NM=1 KV=1 NT=1 B0=0 REV=0
+rife_gather_f4_m1_k2_t1_b0_r0  rife.comp  PASS=1 F=4 NM=1 KV=2 NT=1 B0=0 REV=0
+rife_gather_f4_m9_k2_t1_b0_r0  rife.comp  PASS=1 F=4 NM=9 KV=2 NT=1 B0=0 REV=0
+rife_gather_f4_m1_k1_t2_b1_r0  rife.comp  PASS=1 F=4 NM=1 KV=1 NT=2 B0=1 REV=0
+rife_gather_f4_m1_k1_t2_b1_r1  rife.comp  PASS=1 F=4 NM=1 KV=1 NT=2 B0=1 REV=1
+rife_gather_f4_m1_k1_t2_b0_r1  rife.comp  PASS=1 F=4 NM=1 KV=1 NT=2 B0=0 REV=1
+rife_gather_f4_m1_k1_t2_b0_r0  rife.comp  PASS=1 F=4 NM=1 KV=1 NT=2 B0=0 REV=0
+rife_gather_f4_m1_k2_t2_b0_r0  rife.comp  PASS=1 F=4 NM=1 KV=2 NT=2 B0=0 REV=0
+rife_gather_f4_m9_k2_t2_b0_r0  rife.comp  PASS=1 F=4 NM=9 KV=2 NT=2 B0=0 REV=0
+rife_gather_f8_m1_k1_t1_b1_r0  rife.comp  PASS=1 F=8 NM=1 KV=1 NT=1 B0=1 REV=0
+rife_gather_f8_m1_k1_t1_b1_r1  rife.comp  PASS=1 F=8 NM=1 KV=1 NT=1 B0=1 REV=1
+rife_gather_f8_m1_k1_t1_b0_r1  rife.comp  PASS=1 F=8 NM=1 KV=1 NT=1 B0=0 REV=1
+rife_gather_f8_m1_k1_t1_b0_r0  rife.comp  PASS=1 F=8 NM=1 KV=1 NT=1 B0=0 REV=0
+rife_gather_f8_m1_k2_t1_b0_r0  rife.comp  PASS=1 F=8 NM=1 KV=2 NT=1 B0=0 REV=0
+rife_gather_f8_m9_k2_t1_b0_r0  rife.comp  PASS=1 F=8 NM=9 KV=2 NT=1 B0=0 REV=0
+rife_gather_f8_m1_k1_t2_b1_r0  rife.comp  PASS=1 F=8 NM=1 KV=1 NT=2 B0=1 REV=0
+rife_gather_f8_m1_k1_t2_b1_r1  rife.comp  PASS=1 F=8 NM=1 KV=1 NT=2 B0=1 REV=1
+rife_gather_f8_m1_k1_t2_b0_r1  rife.comp  PASS=1 F=8 NM=1 KV=1 NT=2 B0=0 REV=1
+rife_gather_f8_m1_k1_t2_b0_r0  rife.comp  PASS=1 F=8 NM=1 KV=1 NT=2 B0=0 REV=0
+rife_gather_f8_m1_k2_t2_b0_r0  rife.comp  PASS=1 F=8 NM=1 KV=2 NT=2 B0=0 REV=0
+rife_gather_f8_m9_k2_t2_b0_r0  rife.comp  PASS=1 F=8 NM=9 KV=2 NT=2 B0=0 REV=0
+rife_gather_f16_m1_k1_t1_b1_r0  rife.comp  PASS=1 F=16 NM=1 KV=1 NT=1 B0=1 REV=0
+rife_gather_f16_m1_k1_t1_b1_r1  rife.comp  PASS=1 F=16 NM=1 KV=1 NT=1 B0=1 REV=1
+rife_gather_f16_m1_k1_t1_b0_r1  rife.comp  PASS=1 F=16 NM=1 KV=1 NT=1 B0=0 REV=1
+rife_gather_f16_m1_k1_t1_b0_r0  rife.comp  PASS=1 F=16 NM=1 KV=1 NT=1 B0=0 REV=0
+rife_gather_f16_m1_k2_t1_b0_r0  rife.comp  PASS=1 F=16 NM=1 KV=2 NT=1 B0=0 REV=0
+rife_gather_f16_m9_k2_t1_b0_r0  rife.comp  PASS=1 F=16 NM=9 KV=2 NT=1 B0=0 REV=0
+rife_gather_f16_m1_k1_t2_b1_r0  rife.comp  PASS=1 F=16 NM=1 KV=1 NT=2 B0=1 REV=0
+rife_gather_f16_m1_k1_t2_b1_r1  rife.comp  PASS=1 F=16 NM=1 KV=1 NT=2 B0=1 REV=1
+rife_gather_f16_m1_k1_t2_b0_r1  rife.comp  PASS=1 F=16 NM=1 KV=1 NT=2 B0=0 REV=1
+rife_gather_f16_m1_k1_t2_b0_r0  rife.comp  PASS=1 F=16 NM=1 KV=1 NT=2 B0=0 REV=0
+rife_gather_f16_m1_k2_t2_b0_r0  rife.comp  PASS=1 F=16 NM=1 KV=2 NT=2 B0=0 REV=0
+rife_gather_f16_m9_k2_t2_b0_r0  rife.comp  PASS=1 F=16 NM=9 KV=2 NT=2 B0=0 REV=0
+rife_merge   rife.comp  PASS=2
+rife_final   rife.comp  PASS=3
+
+# General 3x3 conv (gconv_common.glsl), the shapes ESRGAN and RIFE use; input channels and offsets are per
+# dispatch. g3_<family>_o<COUTP>_n<IN>a<ACT>r<NRES>u<UP2>s<STRIDE>o<OUT>_<tile>; KMAX: the halo chunk sizing.
+g3_cm16_o16_n0a0r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o16_n0a0r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o16_n0a0r0u0s1o3_w8r2  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=3 KMAX=64 WARPS=8 WR=2
+g3_cm16_o16_n0a0r0u0s1o3_w4r4  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=3 KMAX=64 WARPS=4 WR=4
+g3_cm16_o16_n0a0r0u0s1o4_w8r2  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 WARPS=8 WR=2
+g3_cm16_o16_n0a0r0u0s1o4_w4r4  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 WARPS=4 WR=4
+g3_cm16_o16_n0a0r1u0s1o0_w8r2  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o16_n0a0r1u0s1o0_w4r4  gconv_cm16.comp  COUTP=16 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o16_n0a2r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o16_n0a2r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o16_n0a2r0u0s2o0_w4r2  gconv_cm16.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=4 WR=2
+g3_cm16_o16_n0a2r0u0s2o0_w2r4  gconv_cm16.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=2 WR=4
+g3_cm16_o16_n0a2r1u0s1o0_w8r2  gconv_cm16.comp  COUTP=16 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o16_n0a2r1u0s1o0_w4r4  gconv_cm16.comp  COUTP=16 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o16_n1a0r0u0s2o0_w4r2  gconv_cm16.comp  COUTP=16 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=4 WR=2
+g3_cm16_o16_n1a0r0u0s2o0_w2r4  gconv_cm16.comp  COUTP=16 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=2 WR=4
+g3_cm16_o16_n1a2r0u0s2o0_w4r2  gconv_cm16.comp  COUTP=16 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=4 WR=2
+g3_cm16_o16_n1a2r0u0s2o0_w2r4  gconv_cm16.comp  COUTP=16 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=2 WR=4
+g3_cm16_o32_n0a0r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o32_n0a0r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o32_n0a0r0u0s1o4_w8r2  gconv_cm16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 WARPS=8 WR=2
+g3_cm16_o32_n0a0r0u0s1o4_w4r4  gconv_cm16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 WARPS=4 WR=4
+g3_cm16_o32_n0a0r0u0s1o5_w8r2  gconv_cm16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 WARPS=8 WR=2
+g3_cm16_o32_n0a0r0u0s1o5_w4r4  gconv_cm16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 WARPS=4 WR=4
+g3_cm16_o32_n0a0r1u0s1o0_w8r2  gconv_cm16.comp  COUTP=32 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o32_n0a0r1u0s1o0_w4r4  gconv_cm16.comp  COUTP=32 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o32_n0a2r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o32_n0a2r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o32_n0a2r0u0s2o0_w4r2  gconv_cm16.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=4 WR=2
+g3_cm16_o32_n0a2r0u0s2o0_w2r4  gconv_cm16.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=2 WR=4
+g3_cm16_o32_n0a2r1u0s1o0_w8r2  gconv_cm16.comp  COUTP=32 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o32_n0a2r1u0s1o0_w4r4  gconv_cm16.comp  COUTP=32 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o32_n1a0r0u0s2o0_w4r2  gconv_cm16.comp  COUTP=32 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=4 WR=2
+g3_cm16_o32_n1a0r0u0s2o0_w2r4  gconv_cm16.comp  COUTP=32 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=2 WR=4
+g3_cm16_o32_n1a2r0u0s2o0_w4r2  gconv_cm16.comp  COUTP=32 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=4 WR=2
+g3_cm16_o32_n1a2r0u0s2o0_w2r4  gconv_cm16.comp  COUTP=32 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=2 WR=4
+g3_cm16_o48_n0a0r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=48 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o48_n0a0r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=48 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o48_n0a0r1u0s1o0_w8r2  gconv_cm16.comp  COUTP=48 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o48_n0a0r1u0s1o0_w4r4  gconv_cm16.comp  COUTP=48 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o48_n0a2r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o48_n0a2r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o48_n0a2r0u0s2o0_w4r2  gconv_cm16.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=4 WR=2
+g3_cm16_o48_n0a2r0u0s2o0_w2r4  gconv_cm16.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=2 WR=4
+g3_cm16_o48_n0a2r1u0s1o0_w8r2  gconv_cm16.comp  COUTP=48 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o48_n0a2r1u0s1o0_w4r4  gconv_cm16.comp  COUTP=48 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n0a0r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n0a0r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n0a0r0u0s1o5_w8r2  gconv_cm16.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n0a0r0u0s1o5_w4r4  gconv_cm16.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n0a0r1u0s1o0_w8r2  gconv_cm16.comp  COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n0a0r1u0s1o0_w4r4  gconv_cm16.comp  COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n0a0r2u0s1o0_w8r2  gconv_cm16.comp  COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n0a0r2u0s1o0_w4r4  gconv_cm16.comp  COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n0a2r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n0a2r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n0a2r0u0s2o0_w4r2  gconv_cm16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=4 WR=2
+g3_cm16_o64_n0a2r0u0s2o0_w2r4  gconv_cm16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=32 WARPS=2 WR=4
+g3_cm16_o64_n0a2r0u1s1o0_w8r2  gconv_cm16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n0a2r0u1s1o0_w4r4  gconv_cm16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n0a2r1u0s1o0_w8r2  gconv_cm16.comp  COUTP=64 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n0a2r1u0s1o0_w4r4  gconv_cm16.comp  COUTP=64 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n1a0r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n1a0r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_cm16_o64_n2a0r0u0s1o0_w8r2  gconv_cm16.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=8 WR=2
+g3_cm16_o64_n2a0r0u0s1o0_w4r4  gconv_cm16.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 WARPS=4 WR=4
+g3_sg16_o16_n0a0r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o16_n0a0r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o16_n0a0r0u0s1o3_t8r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=3 KMAX=64 TH=8 RPS=1
+g3_sg16_o16_n0a0r0u0s1o3_t4r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=3 KMAX=64 TH=4 RPS=1
+g3_sg16_o16_n0a0r0u0s1o4_t8r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 TH=8 RPS=1
+g3_sg16_o16_n0a0r0u0s1o4_t4r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 TH=4 RPS=1
+g3_sg16_o16_n0a0r1u0s1o0_t8r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o16_n0a0r1u0s1o0_t4r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o16_n0a2r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o16_n0a2r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o16_n0a2r0u0s2o0_t8r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_sg16_o16_n0a2r0u0s2o0_t4r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_sg16_o16_n0a2r1u0s1o0_t8r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o16_n0a2r1u0s1o0_t4r1  gconv_sg16.comp  COUTP=16 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o16_n1a0r0u0s2o0_t8r1  gconv_sg16.comp  COUTP=16 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_sg16_o16_n1a0r0u0s2o0_t4r1  gconv_sg16.comp  COUTP=16 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_sg16_o16_n1a2r0u0s2o0_t8r1  gconv_sg16.comp  COUTP=16 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_sg16_o16_n1a2r0u0s2o0_t4r1  gconv_sg16.comp  COUTP=16 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_sg16_o32_n0a0r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o32_n0a0r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o32_n0a0r0u0s1o4_t8r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 TH=8 RPS=1
+g3_sg16_o32_n0a0r0u0s1o4_t4r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 TH=4 RPS=1
+g3_sg16_o32_n0a0r0u0s1o5_t8r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 TH=8 RPS=1
+g3_sg16_o32_n0a0r0u0s1o5_t4r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 TH=4 RPS=1
+g3_sg16_o32_n0a0r1u0s1o0_t8r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o32_n0a0r1u0s1o0_t4r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o32_n0a2r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o32_n0a2r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o32_n0a2r0u0s2o0_t8r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_sg16_o32_n0a2r0u0s2o0_t4r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_sg16_o32_n0a2r1u0s1o0_t8r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o32_n0a2r1u0s1o0_t4r1  gconv_sg16.comp  COUTP=32 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o32_n1a0r0u0s2o0_t8r1  gconv_sg16.comp  COUTP=32 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_sg16_o32_n1a0r0u0s2o0_t4r1  gconv_sg16.comp  COUTP=32 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_sg16_o32_n1a2r0u0s2o0_t8r1  gconv_sg16.comp  COUTP=32 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_sg16_o32_n1a2r0u0s2o0_t4r1  gconv_sg16.comp  COUTP=32 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_sg16_o48_n0a0r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o48_n0a0r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o48_n0a0r1u0s1o0_t8r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o48_n0a0r1u0s1o0_t4r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o48_n0a2r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o48_n0a2r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o48_n0a2r0u0s2o0_t8r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_sg16_o48_n0a2r0u0s2o0_t4r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_sg16_o48_n0a2r1u0s1o0_t8r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o48_n0a2r1u0s1o0_t4r1  gconv_sg16.comp  COUTP=48 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n0a0r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n0a0r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n0a0r0u0s1o5_t8r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n0a0r0u0s1o5_t4r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n0a0r1u0s1o0_t8r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n0a0r1u0s1o0_t4r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n0a0r2u0s1o0_t8r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n0a0r2u0s1o0_t4r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n0a2r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n0a2r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n0a2r0u0s2o0_t8r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_sg16_o64_n0a2r0u0s2o0_t4r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_sg16_o64_n0a2r0u1s1o0_t8r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n0a2r0u1s1o0_t4r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n0a2r1u0s1o0_t8r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n0a2r1u0s1o0_t4r1  gconv_sg16.comp  COUTP=64 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n1a0r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n1a0r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_sg16_o64_n2a0r0u0s1o0_t8r1  gconv_sg16.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_sg16_o64_n2a0r0u0s1o0_t4r1  gconv_sg16.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o16_n0a0r0u0s1o0_t8r1  gconv_plain.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o16_n0a0r0u0s1o0_t4r1  gconv_plain.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o16_n0a0r0u0s1o3_t8r1  gconv_plain.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=3 KMAX=64 TH=8 RPS=1
+g3_plain_o16_n0a0r0u0s1o3_t4r1  gconv_plain.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=3 KMAX=64 TH=4 RPS=1
+g3_plain_o16_n0a0r0u0s1o4_t8r1  gconv_plain.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 TH=8 RPS=1
+g3_plain_o16_n0a0r0u0s1o4_t4r1  gconv_plain.comp  COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 TH=4 RPS=1
+g3_plain_o16_n0a0r1u0s1o0_t8r1  gconv_plain.comp  COUTP=16 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o16_n0a0r1u0s1o0_t4r1  gconv_plain.comp  COUTP=16 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o16_n0a2r0u0s1o0_t8r1  gconv_plain.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o16_n0a2r0u0s1o0_t4r1  gconv_plain.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o16_n0a2r0u0s2o0_t8r1  gconv_plain.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_plain_o16_n0a2r0u0s2o0_t4r1  gconv_plain.comp  COUTP=16 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_plain_o16_n0a2r1u0s1o0_t8r1  gconv_plain.comp  COUTP=16 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o16_n0a2r1u0s1o0_t4r1  gconv_plain.comp  COUTP=16 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o16_n1a0r0u0s2o0_t8r1  gconv_plain.comp  COUTP=16 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_plain_o16_n1a0r0u0s2o0_t4r1  gconv_plain.comp  COUTP=16 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_plain_o16_n1a2r0u0s2o0_t8r1  gconv_plain.comp  COUTP=16 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_plain_o16_n1a2r0u0s2o0_t4r1  gconv_plain.comp  COUTP=16 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_plain_o32_n0a0r0u0s1o0_t8r1  gconv_plain.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o32_n0a0r0u0s1o0_t4r1  gconv_plain.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o32_n0a0r0u0s1o4_t8r1  gconv_plain.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 TH=8 RPS=1
+g3_plain_o32_n0a0r0u0s1o4_t4r1  gconv_plain.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=4 KMAX=64 TH=4 RPS=1
+g3_plain_o32_n0a0r0u0s1o5_t8r1  gconv_plain.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 TH=8 RPS=1
+g3_plain_o32_n0a0r0u0s1o5_t4r1  gconv_plain.comp  COUTP=32 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 TH=4 RPS=1
+g3_plain_o32_n0a0r1u0s1o0_t8r1  gconv_plain.comp  COUTP=32 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o32_n0a0r1u0s1o0_t4r1  gconv_plain.comp  COUTP=32 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o32_n0a2r0u0s1o0_t8r1  gconv_plain.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o32_n0a2r0u0s1o0_t4r1  gconv_plain.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o32_n0a2r0u0s2o0_t8r1  gconv_plain.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_plain_o32_n0a2r0u0s2o0_t4r1  gconv_plain.comp  COUTP=32 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_plain_o32_n0a2r1u0s1o0_t8r1  gconv_plain.comp  COUTP=32 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o32_n0a2r1u0s1o0_t4r1  gconv_plain.comp  COUTP=32 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o32_n1a0r0u0s2o0_t8r1  gconv_plain.comp  COUTP=32 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_plain_o32_n1a0r0u0s2o0_t4r1  gconv_plain.comp  COUTP=32 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_plain_o32_n1a2r0u0s2o0_t8r1  gconv_plain.comp  COUTP=32 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_plain_o32_n1a2r0u0s2o0_t4r1  gconv_plain.comp  COUTP=32 IN=1 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_plain_o48_n0a0r0u0s1o0_t8r1  gconv_plain.comp  COUTP=48 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o48_n0a0r0u0s1o0_t4r1  gconv_plain.comp  COUTP=48 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o48_n0a0r1u0s1o0_t8r1  gconv_plain.comp  COUTP=48 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o48_n0a0r1u0s1o0_t4r1  gconv_plain.comp  COUTP=48 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o48_n0a2r0u0s1o0_t8r1  gconv_plain.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o48_n0a2r0u0s1o0_t4r1  gconv_plain.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o48_n0a2r0u0s2o0_t8r1  gconv_plain.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_plain_o48_n0a2r0u0s2o0_t4r1  gconv_plain.comp  COUTP=48 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_plain_o48_n0a2r1u0s1o0_t8r1  gconv_plain.comp  COUTP=48 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o48_n0a2r1u0s1o0_t4r1  gconv_plain.comp  COUTP=48 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n0a0r0u0s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n0a0r0u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n0a0r0u0s1o5_t8r1  gconv_plain.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n0a0r0u0s1o5_t4r1  gconv_plain.comp  COUTP=64 IN=0 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=5 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n0a0r1u0s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n0a0r1u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=0 ACT=0 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n0a0r2u0s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n0a0r2u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=0 ACT=0 NRES=2 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n0a2r0u0s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n0a2r0u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n0a2r0u0s2o0_t8r1  gconv_plain.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=8 RPS=1
+g3_plain_o64_n0a2r0u0s2o0_t4r1  gconv_plain.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 STRIDE=2 OUT=0 KMAX=16 TH=4 RPS=1
+g3_plain_o64_n0a2r0u1s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n0a2r0u1s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=0 ACT=2 NRES=0 UP2=1 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n0a2r1u0s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n0a2r1u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=0 ACT=2 NRES=1 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n1a0r0u0s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n1a0r0u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=1 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1
+g3_plain_o64_n2a0r0u0s1o0_t8r1  gconv_plain.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=8 RPS=1
+g3_plain_o64_n2a0r0u0s1o0_t4r1  gconv_plain.comp  COUTP=64 IN=2 ACT=0 NRES=0 UP2=0 STRIDE=1 OUT=0 KMAX=64 TH=4 RPS=1

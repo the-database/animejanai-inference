@@ -13,6 +13,7 @@
 #include "native/pack.h"
 #include "native/onnx_read.h"
 #include "native/rife_kernels.h"
+#include "native/rife_plan.h"
 
 namespace ajinative {
 
@@ -83,37 +84,11 @@ struct Rife::Impl {
 
 std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_t s, std::string *why)
 {
-    if (W % 64 || H % 64 || W < 64 || H < 64) return refuse(why, "size must be a multiple of 64"), nullptr;
-    Reader rd(g);
-    // input layout: Split(input, [6, 1, 2, 2])
-    const OnnxNode *sp = rd.node("/Split");
-    std::vector<int64_t> parts;
-    if (sp && sp->in.size() > 1 && rd.tensor(sp->in[1])) rd.tensor(sp->in[1])->ints(&parts);
-    if (sp && parts.empty() && sp->attr("split")) parts = sp->attr("split")->ints;
-    if (!sp || g.inputs.size() != 1 || sp->in[0] != g.inputs[0])
-        return refuse(why, "not the vs-mlrt RIFE input layout"), nullptr;
-    const bool ens = parts == std::vector<int64_t>{3, 3, 1, 2, 2};
-    if (!ens && parts != std::vector<int64_t>{6, 1, 2, 2}) return refuse(why, "not the vs-mlrt RIFE input layout"), nullptr;
-
-    // encoder: the /encode/ convs in file order
-    std::vector<Conv> enc;
-    for (const OnnxNode &n : g.nodes)
-        if (n.name.rfind("/encode/", 0) == 0 && (n.op == "Conv" || n.op == "ConvTranspose")) {
-            Conv c;
-            if (!rd.conv(n.name, &c, why)) return nullptr;
-            enc.push_back(c);
-        }
-    int F = 0;
-    if (!enc.empty()) {
-        if (enc.front().transposed || enc.front().stride != 2 || enc.front().cin != 3 || !enc.back().transposed)
-            return refuse(why, "unexpected encoder"), nullptr;
-        for (size_t i = 1; i + 1 < enc.size(); i++)
-            if (enc[i].transposed || enc[i].stride != 1) return refuse(why, "unexpected encoder"), nullptr;
-        for (size_t i = 1; i < enc.size(); i++)
-            if (enc[i].cin != enc[i - 1].cout) return refuse(why, "encoder channels"), nullptr;
-        F = enc.back().cout;
-        if (F > 16 || enc.back().lrelu) return refuse(why, "encoder output"), nullptr;
-    }
+    RifePlan plan;
+    if (!rife_plan(g, W, H, &plan, why)) return nullptr;
+    const bool ens = plan.ens;
+    const std::vector<Conv> &enc = plan.enc;
+    const int F = plan.F;
 
     std::unique_ptr<Rife> r(new Rife);
     r->d.reset(new Impl);
@@ -126,29 +101,14 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     if (!d.dt) return refuse(why, "out of GPU memory"), nullptr;
     const size_t plane = (size_t)W * H;
 
-    // ---- blocks: first pass for the shared scratch sizes (a block's input and conv buffers are
-    // only used inside it; the block outputs and the frame features persist)
+    // ---- blocks: the shared scratch sizes (a block's input and conv buffers are only used inside
+    // it; the block outputs and the frame features persist)
     size_t needX = 0, needT1 = 0, needA = 0;
-    {
-        int nbs = 0;
-        while (rd.node("/block" + std::to_string(nbs) + "/conv0/conv0.0/conv0.0.0/Conv")) nbs++;
-        for (int b = 0; b < nbs && b < kRifeMaxBlocks; b++) {
-            const std::string pre = "/block" + std::to_string(b) + "/";
-            Conv c0a, c0b;
-            std::string w2;
-            if (!rd.conv(pre + "conv0/conv0.0/conv0.0.0/Conv", &c0a, &w2) || !rd.conv(pre + "conv0/conv0.1/conv0.1.0/Conv", &c0b, &w2))
-                break;
-            int s = 1;
-            if (const OnnxNode *rz = rd.node(pre + "Resize")) {
-                std::vector<float> sc;
-                if (rz->in.size() >= 3 && rd.floats(rz->in[2], &sc) && sc.size() == 4 && sc[2] > 0) s = (int)std::lround(1.0 / sc[2]);
-            }
-            if (s < 1) s = 1;
-            const size_t px = (size_t)(W / s) * (H / s);
-            needX = std::max(needX, px * pad16(c0a.cin));
-            needT1 = std::max(needT1, px / 4 * pad16(c0a.cout));
-            needA = std::max(needA, px / 16 * pad16(c0b.cout));
-        }
+    for (const RifeBlockPlan &bp : plan.blocks) {
+        const size_t px = (size_t)(W / bp.s) * (H / bp.s);
+        needX = std::max(needX, px * pad16(bp.c0a.cin));
+        needT1 = std::max(needT1, px / 4 * pad16(bp.c0a.cout));
+        needA = std::max(needA, px / 16 * pad16(bp.c0b.cout));
     }
     void *sX = d.alloc(needX), *sT1 = d.alloc(needT1), *sA = d.alloc(needA), *sB = d.alloc(needA);
     if (!sX || !sT1 || !sA || !sB) return refuse(why, "out of GPU memory"), nullptr;
@@ -244,68 +204,20 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     d.frame.F = F;
     d.frame.fstride = d.FP;
 
-    int nb = 0;
-    while (rd.node("/block" + std::to_string(nb) + "/conv0/conv0.0/conv0.0.0/Conv")) nb++;
-    if (nb < 1 || nb > kRifeMaxBlocks) return refuse(why, "unexpected number of blocks"), nullptr;
+    const int nb = (int)plan.blocks.size();
     int prevK = 0;
     for (int b = 0; b < nb; b++) {
+        const RifeBlockPlan &bp = plan.blocks[b];
         const std::string pre = "/block" + std::to_string(b) + "/";
-        Conv c0a, c0b, last;
-        if (!rd.conv(pre + "conv0/conv0.0/conv0.0.0/Conv", &c0a, why) || !rd.conv(pre + "conv0/conv0.1/conv0.1.0/Conv", &c0b, why) ||
-            !rd.conv(pre + "lastconv/lastconv.0/ConvTranspose", &last, why))
-            return nullptr;
-        if (c0a.stride != 2 || c0b.stride != 2 || !c0a.lrelu || !c0b.lrelu || c0b.cin != c0a.cout || last.lrelu)
-            return refuse(why, pre + "conv0"), nullptr;
-        const int c = c0b.cout;
-        std::vector<Conv> res;
-        std::vector<std::vector<float>> beta;
-        for (int k = 0;; k++) {
-            const std::string rp = pre + "convblock/convblock." + std::to_string(k) + "/";
-            if (!rd.node(rp + "conv/Conv")) break;
-            Conv rc;
-            if (!rd.conv(rp + "conv/Conv", &rc, why)) return nullptr;
-            const OnnxNode *mul = rd.node(rp + "Mul"), *add = rd.node(rp + "Add"), *act = rd.node(rp + "relu/LeakyRelu");
-            std::vector<float> bt;
-            if (!mul || !add || !act || mul->in.size() != 2 || !rd.floats(mul->in[1], &bt) || (int)bt.size() != c || rc.cin != c ||
-                rc.cout != c || rc.stride != 1 || rc.lrelu)
-                return refuse(why, rp + ": not conv * beta + x, LeakyReLU"), nullptr;
-            res.push_back(rc);
-            beta.push_back(bt);
-        }
-        if (last.cin != c || last.cout % 4 || last.cout / 4 < 5) return refuse(why, pre + "lastconv"), nullptr;
-        const OnnxNode *d2s = rd.node(pre + "lastconv/lastconv.1/DepthToSpace");
-        if (!d2s || d2s->attr_i("blocksize", 0) != 2 || d2s->attr_s("mode", "DCR") != "CRD")
-            return refuse(why, pre + "lastconv depth-to-space"), nullptr;
-        const int K = last.cout / 4;
-        // scale from the block's input Resize (absent: 1)
-        int s = 1;
-        if (const OnnxNode *rz = rd.node(pre + "Resize")) {
-            std::vector<float> sc;
-            if (rz->in.size() < 3 || !rd.floats(rz->in[2], &sc) || sc.size() != 4 || sc[2] != sc[3] || sc[2] <= 0)
-                return refuse(why, pre + "Resize scales"), nullptr;
-            if (rz->attr_s("mode", "") != "linear" || rz->attr_s("coordinate_transformation_mode", "") != "half_pixel")
-                return refuse(why, pre + "Resize mode"), nullptr;
-            s = (int)std::lround(1.0 / sc[2]);
-            if (s < 2 || s > 64 || (s & (s - 1)) || std::fabs(sc[2] * s - 1.f) > 1e-6f) return refuse(why, pre + "scale"), nullptr;
-        }
-        if (W % (4 * s) || H % (4 * s)) return refuse(why, "size not divisible by a block scale"), nullptr;
-        // input channels and whether the previous block's features are fed in
-        const int base0 = 6 + 2 * F + 1, base = base0 + 1 + 4;
-        bool feeds = false;
-        if (b == 0) {
-            if (c0a.cin != base0) return refuse(why, "block 0 input channels"), nullptr;
-        } else if (c0a.cin == base + prevK - 5 && prevK > 5) {
-            feeds = true;
-        } else if (c0a.cin != base) {
-            return refuse(why, pre + "input channels"), nullptr;
-        }
-        if (!d.scales.empty() && s > d.scales.back()) return refuse(why, "block scales must not increase"), nullptr;
-        if (ens && (feeds || K > 8)) return refuse(why, "ensemble with fed block features"), nullptr;
+        const Conv &c0a = bp.c0a, &c0b = bp.c0b, &last = bp.last;
+        const std::vector<Conv> &res = bp.res;
+        const std::vector<std::vector<float>> &beta = bp.beta;
+        const int c = c0b.cout, K = bp.K, s = bp.s;
+        const bool feeds = bp.feeds;
         d.scales.push_back(s);
 
         // buffers
         const int bw = W / s, bh = H / s, cinp = pad16(c0a.cin), KP = K <= 8 ? 8 : 16;
-        if (K > 16) return refuse(why, pre + "too many output channels"), nullptr;
         if ((size_t)bw * bh * cinp > needX || (size_t)bw * bh / 4 * pad16(c0a.cout) > needT1 || (size_t)bw * bh / 16 * pad16(c) > needA)
             return refuse(why, "scratch sizing"), nullptr;
         void *X = sX, *T1 = sT1, *A = sA, *B = sB;
@@ -426,7 +338,6 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
         prevK = K;
     }
     d.nb = nb;
-    if (d.scales.back() != 1) return refuse(why, "the last block must run at full resolution"), nullptr;
     d.steps.push_back(Step{Step::FINAL});
 
     // check every conv and pick its tile variant on scratch data (the input pointer of the first

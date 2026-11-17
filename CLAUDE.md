@@ -168,7 +168,7 @@ off; any other value, or no key, is on. Image path: `AJI_NATIVE=off` (or `0`, `n
 | SPAN, SPANF3, span_s, Compact (SRVGG) | `native/lower` + `native/executor` at the chain's size | the same plan and executor behind `ImgNet` (`build_lowered`, `native/framenet.cpp`), per tile |
 | ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory | the `native/imgnet` builders, per tile |
 | TFDAT, TemporalFix | `native/vidnet` in the temporal stage | — |
-| RIFE | `native/rife` | — |
+| RIFE | `native/rife` (the graph read by `native/rife_plan`, which Vulkan's `vk/rife` shares) | — |
 
 Video, single-frame models: in `aji_configure` (`try_native` in `aji_trt.cpp`) the model's ONNX
 is parsed (`native/onnx_graph`, no onnx dependency) and lowered (`native/lower`); a lowered model
@@ -289,12 +289,31 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
     Vulkan reads wrong chroma on NVIDIA, and Intel allows no arrays.
 - **`vk/gconv`, `vk/esrgan.cpp`, `vk/imgnet.h`:** the general 3x3 conv (`gconv_*.comp`, the
   counterpart of CUDA's gconv): a channel prefix of a wider NHWC buffer in, a channel slice out, at
-  strides and offsets per dispatch (a parameter buffer); the input tile in shared memory up to 64
-  channels at a time; bias, two scaled residuals and LeakyReLU per element in fp32 in the writer;
-  nearest 2x upsampling of the input on the fly; NCHW in (or its unshuffle) and NCHW out. ESRGAN
-  (RRDBNet 64/32, 2x unshuffle and 4x) follows `native/esrgan.cpp`'s plan on it, with its
+  strides and offsets per dispatch (a parameter buffer); the input channels and the halo chunk
+  (16 / 32 / 64 channels in shared memory at a time) per dispatch too; bias, two scaled residuals
+  and LeakyReLU per element in fp32 in the writer; nearest 2x upsampling of the input on the fly;
+  stride 2; NCHW in (three planes at an offset, or their unshuffle) and NCHW out; phase-scattered
+  outputs (a transposed conv, or one followed by depth-to-space, as 2 or 4 row-phase convs,
+  `phase_weights`). A dispatch's z index is an output slice, so a conv wider than 64 channels is
+  one dispatch, and narrow slices give small low-resolution convs enough workgroups. The shapes
+  built are in `shaders.txt` (`g3_...`). `GConvOp` + `gconv_prepare` / `gconv_record` /
+  `gconv_choose` are what a network builder records with (variants timed once per module, size
+  and slice count). `aji_vk_gconv_test` (`ctest -L gpu`) checks each mode against a CPU reference.
+  ESRGAN (RRDBNet 64/32, 2x unshuffle and 4x) follows `native/esrgan.cpp`'s plan on it, with its
   intermediates in one arena by lifetime; a tile whose buffers exceed `maxStorageBufferRange` is
   refused. `ImgNet::create` tries ESRGAN, then the lowering.
+- **`vk/rife`: RIFE v4 on Vulkan,** from the graph `native/rife_plan` reads (shared with CUDA's
+  `native/rife`): the encoder, each block's convs on gconv, and the resampling (block inputs
+  with their warps, the ensemble merge, the output blend) in `rife.comp`, ports of
+  `native/rife_kernels.cu` with the same fp16 roundings, the gather specialized like CUDA's
+  template (`rife_gather_f<F>_m<NM>_k<KV>_t<NT>_b<B0>_r<REV>`). The timestep comes from the input's
+  plane 6. In `aji_vk`, `setup_rife` opens it unless `native=off` (log: `Native kernels:
+  rife_v4.14 (...; Vulkan cm16)`; else DirectML, with the reason); the 11-channel input and the
+  output tensors are shared D3D12 buffers, and the step goes through the same fence hand-off
+  (`vk_submit`). 1080p on an RTX 5090: 4.1 ms of GPU time (CUDA native 2.6-2.9); 7.2 ms per
+  interpolated frame through `aji_infer_rife` (DirectML 10.6). Output vs CUDA native: 74.6 dB,
+  max 5 levels over 47 frames (DirectML is 49.6 dB from CUDA). `aji_vk_model_test rife <onnx> W
+  H` times it and compares with CUDA native RIFE (`AJI_VK_PROFILE=1`: time per kind of step).
 - **`vk/frame`: a 4:2:0 frame on Vulkan alone, no D3D** (for Linux and Android): raw NV12 / P010
   planes in buffers, pre (`frame_pre.comp`), the executor, post (`frame_post.comp`) in one
   command buffer. The kernels are GLSL ports of `dml_shaders.h`'s pre/post with the same
@@ -405,7 +424,8 @@ Linux: `<root>/lib`). The import-library names carry the SDK's major/minor on Wi
 | `aji_vk_spirv_test` | EXE | — | **`AJI_VULKAN` only**: CPU check that each embedded module is well-formed SPIR-V with its family's capabilities |
 | `aji_vk_core` | OBJECT | — (Vulkan loaded at run time) | **`AJI_VULKAN` only**: `src/vk` device, kernels, executor |
 | `aji_vk` | SHARED | `d3d12 d3d11 dxgi d3dcompiler` | **`AJI_VULKAN` + WIN32 only**: `aji_dml.cpp` with `AJI_VULKAN`, model steps on the Vulkan executor |
-| `aji_vk_model_test` | EXE | — | **`AJI_VULKAN` only**, by hand: one model on the Vulkan executor against the fp32 CPU reference (and the CUDA executor with `AJI_CUDA`) |
+| `aji_vk_model_test` | EXE | — | **`AJI_VULKAN` only**, by hand: one model on the Vulkan executor against the fp32 CPU reference (and the CUDA executor with `AJI_CUDA`); `rife <onnx> W H`: Vulkan RIFE, timed, against CUDA native RIFE |
+| `aji_vk_gconv_test` | EXE | — | **`AJI_VULKAN` only** (`ctest -L gpu`): the general conv's modes against a CPU reference, each tile variant |
 | `aji_native_conv_test` | EXE | `aji_native`, `CUDA::cudart` | every native kernel against a CPU reference (sm_80+, skips below) |
 | `aji_native_bench` | EXE | `aji_native`, `CUDA::cudart` | **EXCLUDE_FROM_ALL**; whole-model native timing on `experimental/native-span` data |
 
