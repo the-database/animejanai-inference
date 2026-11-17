@@ -1,0 +1,56 @@
+#version 450
+// RIFE's scene detection (HLSL cs_scd_partial, cs_scd_final: misc.SCDetect's metric), by PASS:
+//   1 partial: per 32x8 group, the sum of |Ya - Yb| * norm over raw luma (T16: u16 / P010, else u8).
+//     di = {w, h, groups_x}, dj = {pitch_a, pitch_b} (bytes), kr = norm. d0 plane a, d1 plane b,
+//     d2 partials (a float per group).
+//   2 final: one group sums the partials. di.x = partial count, dj.x = the result's float index.
+//     d0 partials, d1 result.
+//   3 consts: RIFE's constant input channels 7..10 (the mesh and its multipliers, HLSL
+//     cs_rife_consts), fp16, two pixels per invocation. di = {w, h}, dj.x = channel 7's element
+//     offset (even). d0 the model input.
+#extension GL_GOOGLE_include_directive : require
+#include "frame_common.glsl"
+
+shared float gs[256];
+
+void main()
+{
+    const ivec4 di = DI(), dj = DJ();
+    const uint gi = gl_LocalInvocationIndex;
+#if PASS == 1
+    const uvec3 id = gl_GlobalInvocationID;
+    float d = 0.0;
+    if (id.x < uint(di.x) && id.y < uint(di.y)) {
+        const float a = RAWLOAD(d0, id.y * uint(dj.x) + id.x * RAWSIZE);
+        const float b = RAWLOAD(d1, id.y * uint(dj.y) + id.x * RAWSIZE);
+        d = abs(a - b) * kr();
+    }
+    gs[gi] = d;
+    barrier();
+    for (uint n = 128u; n > 0u; n >>= 1) {
+        if (gi < n) gs[gi] += gs[gi + n];
+        barrier();
+    }
+    if (gi == 0u) d2[gl_WorkGroupID.y * uint(di.z) + gl_WorkGroupID.x] = floatBitsToUint(gs[0]);
+#elif PASS == 2
+    float a = 0.0;
+    for (uint i = gi; i < uint(di.x); i += 256u) a += uintBitsToFloat(d0[i]);
+    gs[gi] = a;
+    barrier();
+    for (uint n = 128u; n > 0u; n >>= 1) {
+        if (gi < n) gs[gi] += gs[gi + n];
+        barrier();
+    }
+    if (gi == 0u) d1[uint(dj.x)] = floatBitsToUint(gs[0]);
+#elif PASS == 3
+    const int w = di.x, h = di.y, x0 = int(gl_GlobalInvocationID.x) * 2, y = int(gl_GlobalInvocationID.y);
+    if (x0 >= w || y >= h) return;
+    const uint plane = uint(w) * uint(h), base = uint(dj.x) + uint(y) * uint(w) + uint(x0);
+    const float vx0 = 2.0 * float(x0) / float(w - 1) - 1.0, vx1 = 2.0 * float(x0 + 1) / float(w - 1) - 1.0;
+    const float vy = 2.0 * float(y) / float(h - 1) - 1.0;
+    d0[base >> 1] = packHalf2x16(vec2(vx0, vx1));
+    d0[(plane + base) >> 1] = packHalf2x16(vec2(vy));
+    d0[(2u * plane + base) >> 1] = packHalf2x16(vec2(2.0 / float(w - 1)));
+    d0[(3u * plane + base) >> 1] = packHalf2x16(vec2(2.0 / float(h - 1)));
+#endif
+}

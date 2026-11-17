@@ -91,26 +91,25 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 
 extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 {
-    (void)c, (void)num, (void)den;
-    return 0;
+    AJI_VKV(0)
+    return c->v->rife_factor(num, den);
 }
 
 extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
 {
-    (void)c;
-    return 0;
+    AJI_VKV(0)
+    return c->v->rife_before_upscale();
 }
 
 extern "C" AJI_EXPORT int aji_rife_enhanced_scene(aji_ctx *c)
 {
-    (void)c;
-    return 0;
+    AJI_VKV(0)
+    return c->v->rife_enhanced_scene();
 }
 
 extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
 {
-    (void)c;
-    return 0;
+    return c && c->v ? 1 : 0;
 }
 
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
@@ -133,15 +132,17 @@ extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
 
 extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a, const aji_frame *b, double t, const aji_frame *out, void *cu_stream)
 {
-    (void)c, (void)a, (void)b, (void)t, (void)out, (void)cu_stream;
-    return AJI_ERR;
+    (void)cu_stream;
+    AJI_VKV(AJI_ERR)
+    return c->v->infer_rife(a, b, t, out, -1);
 }
 
 extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a, const aji_frame *b, double t, const aji_frame *out,
                                                     void *cu_stream, int scene)
 {
-    (void)c, (void)a, (void)b, (void)t, (void)out, (void)cu_stream, (void)scene;
-    return AJI_ERR;
+    (void)cu_stream;
+    AJI_VKV(AJI_ERR)
+    return c->v->infer_rife(a, b, t, out, scene);
 }
 
 extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)

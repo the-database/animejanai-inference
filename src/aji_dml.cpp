@@ -3576,7 +3576,7 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return 0;
+    if (c && c->vkv) return c->vkv->rife_factor(num, den);
 #endif
     if (!c || !c->rife.enabled)
         return 0;
@@ -3590,7 +3590,7 @@ extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return 0;
+    if (c && c->vkv) return c->vkv->rife_before_upscale();
 #endif
     return (c && c->rife.enabled && c->rife.before_upscale) ? 1 : 0;
 }
@@ -3598,7 +3598,7 @@ extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
 extern "C" AJI_EXPORT int aji_rife_enhanced_scene(aji_ctx *c)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return 0;
+    if (c && c->vkv) return c->vkv->rife_enhanced_scene();
 #endif
     return c && c->rife.enabled && c->rife.scene_detect_enhanced;
 }
@@ -3661,7 +3661,7 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *out, void *cu_stream)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return AJI_ERR;
+    if (c && c->vkv) return c->vkv->infer_rife(a, b, t, out, -1);
 #endif
     return aji_infer_rife_with_scene(c, a, b, t, out, cu_stream, -1);
 }
@@ -3669,7 +3669,7 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
 extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return 0;
+    if (c && c->vkv) return 1;
 #endif
     return c != nullptr;
 }
@@ -3680,7 +3680,7 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
                                          int scene)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return AJI_ERR;
+    if (c && c->vkv) return c->vkv->infer_rife(a, b, t, out, scene);
 #endif
     (void)cu_stream;
     if (!c || !a || !b || !out || scene < -1 || scene > 1)

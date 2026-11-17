@@ -101,6 +101,7 @@ std::unique_ptr<VkVideo> VkVideo::create(const aji_create_params *p, const aji_v
     v->log_opaque_ = p->log_opaque;
     v->conf_path_ = p->conf_path;
     v->model_dir_ = p->model_dir ? p->model_dir : "";
+    v->rife_dir_ = p->rife_model_dir ? p->rife_model_dir : "";
     v->slot_ = p->slot;
     v->dev_ = Device::create_external(e, why);
     if (!v->dev_) return nullptr;
@@ -122,9 +123,342 @@ VkVideo::~VkVideo()
     dev_->save_caches();
 }
 
+void VkVideo::rife_teardown()
+{
+    RifeState &R = rife_;
+    R.io[0].reset();
+    R.io[1].reset();
+    R.net.reset();
+    if (R.pool) vkDestroyDescriptorPool(dev_->device(), R.pool, nullptr);
+    for (Buffer *b : {&R.part, &R.sum, &R.read, &R.params}) dev_->destroy(*b);
+    R = RifeState{};
+}
+
+// "414" -> rife_v4.14, a trailing 1 on four digits -> _lite (aji_dml.cpp's rife_model_name)
+static std::string rife_name(int code, bool ensemble)
+{
+    std::string s = std::to_string(code);
+    if (s.size() < 2) return "";
+    const std::string dec = s.size() == 2 ? s.substr(1, 1) : s.substr(1, 2);
+    std::string name = "rife_v" + s.substr(0, 1) + "." + dec;
+    if (s.size() == 4 && s.back() == '1') name += "_lite";
+    if (ensemble) name += "_ensemble";
+    return name;
+}
+
+bool VkVideo::rife_setup(const AjiChainConf &chain, int w, int h, double fps)
+{
+    RifeState &R = rife_;
+    R.w = w;
+    R.h = h;
+    R.pw = (w + 63) / 64 * 64;
+    R.ph = (h + 63) / 64 * 64;
+    // centred like animejanai_core's AddBorders split, rounded down to even (4:2:0 chroma)
+    R.pad_l = ((R.pw - w) / 2) & ~1;
+    R.pad_t = ((R.ph - h) / 2) & ~1;
+    R.num = chain.rife_factor_num;
+    R.den = chain.rife_factor_den;
+    R.threshold = chain.rife_scd_threshold;
+    R.enhanced = chain.rife_scene_detect_enhanced;
+    const std::string model = rife_name(chain.rife_model, chain.rife_ensemble);
+    std::string why;
+    std::vector<char> bytes;
+    ajinative::OnnxGraph g;
+    if (model.empty()) why = "invalid rife model code " + std::to_string(chain.rife_model);
+    else if (!ajicore::read_file_bytes(rife_dir_ + "/" + model + ".onnx", &bytes)) why = model + ".onnx can't be read";
+    else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) R.net = Rife::create(*dev_, g, R.pw, R.ph, &why);
+    if (!R.net) {
+        log_steps_.push_back("RIFE not used: " + why + " (no DirectML on Vulkan frames)");
+        rife_teardown();
+        return false;
+    }
+    // the scene detection: partials over the padded luma, their sum, a readback
+    R.groups_x = (uint32_t)(R.pw + 31) / 32;
+    R.groups_y = (uint32_t)(R.ph + 7) / 8;
+    if (!dev_->make_buffer(&R.part, (VkDeviceSize)R.groups_x * R.groups_y * 4, false, &why) || !dev_->make_buffer(&R.sum, 4, false, &why) ||
+        !dev_->make_buffer(&R.read, 4, true, &why)) {
+        log_steps_.push_back("RIFE not used: " + why);
+        rife_teardown();
+        return false;
+    }
+    char buf[256];
+    const double factor = (double)R.num / R.den;
+    if (R.pw != w || R.ph != h)
+        std::snprintf(buf, sizeof buf, "Padded to %dx%d, applied RIFE v%d Interpolation %.3fx, cropped back to %dx%d;    New Video FPS: %.3f",
+                      R.pw, R.ph, chain.rife_model, factor, w, h, fps * factor);
+    else
+        std::snprintf(buf, sizeof buf, "Applied RIFE v%d Interpolation %.3fx;    New Video FPS: %.3f", chain.rife_model, factor, fps * factor);
+    const std::string kernels = "Native kernels: " + model + " (" + R.net->describe() + ")";
+    if (R.before) log_steps_.insert(log_steps_.begin(), {buf, kernels});
+    else log_steps_.insert(log_steps_.end(), {buf, kernels});
+    R.on = true;
+    return true;
+}
+
+// The pre / post of both frames and the scene detection's sets, for a frame format and range.
+bool VkVideo::rife_formats(int fmt, int range, std::string *why)
+{
+    RifeState &R = rife_;
+    if (R.io[0] && R.fmt == fmt && R.range == range) return true;
+    if (ticket_) wait(ticket_);
+    R.io[0].reset();
+    R.io[1].reset();
+    if (R.pool) vkDestroyDescriptorPool(dev_->device(), R.pool, nullptr);
+    R.pool = VK_NULL_HANDLE;
+    dev_->destroy(R.params);
+    const FrameFormat f{fmt, AJI_MATRIX_BT709, range, AJI_SITING_LEFT};  // BT.709, as rife_cuda.py
+    const uint32_t plane = (uint32_t)R.pw * R.ph;
+    for (int i = 0; i < 2; i++) {
+        R.io[i] = FrameIO::create(*dev_, R.pw, R.ph, R.pw, R.ph, f, f, R.net->input().buf, R.net->output().buf, why, 1 /* AJI_FILTER_BILINEAR */,
+                                  i * 3 * plane);
+        if (!R.io[i]) return false;
+    }
+    const bool t16 = fmt == AJI_FMT_P010;
+    // descriptor sets: the scene detection's partial (a, b luma -> part) and final (part -> sum),
+    // the constant channels 7..10 of the model input
+    struct KA {
+        int32_t di[4], dj[4];
+        float kr, kb, yoff, yscale, coff, cscale, qdiv, qmax;
+    } ka[3] = {};
+    ka[0].di[0] = R.pw;
+    ka[0].di[1] = R.ph;
+    ka[0].di[2] = (int32_t)R.groups_x;
+    ka[0].dj[0] = ka[0].dj[1] = (int32_t)R.io[0]->in_pitch();
+    ka[0].kr = t16 ? 1.0f / 65472.0f : 1.0f / 255.0f;
+    ka[1].di[0] = (int32_t)(R.groups_x * R.groups_y);
+    ka[2].di[0] = R.pw;
+    ka[2].di[1] = R.ph;
+    ka[2].dj[0] = (int32_t)(plane * 7);
+    if (!dev_->make_buffer(&R.params, sizeof ka, false, why) || !dev_->upload(R.params, ka, sizeof ka, why)) return false;
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * Device::kBindings};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 3;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(dev_->device(), &pi, nullptr, &R.pool) != VK_SUCCESS) return *why = "descriptor pool", false;
+    const VkBuffer d[3][3] = {{R.io[0]->in_y().buf, R.io[1]->in_y().buf, R.part.buf},
+                              {R.part.buf, R.sum.buf, VK_NULL_HANDLE},
+                              {R.net->input().buf, VK_NULL_HANDLE, VK_NULL_HANDLE}};
+    const char *mods[3] = {t16 ? "fr_scd1_u16" : "fr_scd1_u8", "fr_scd2", "fr_rife_consts"};
+    for (int k = 0; k < 3; k++) {
+        R.pipes[k] = dev_->pipeline(mods[k], 0, 0, why);
+        if (!R.pipes[k]) return false;
+        VkDescriptorSetLayout l = dev_->set_layout();
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = R.pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &l;
+        if (vkAllocateDescriptorSets(dev_->device(), &ai, &R.sets[k]) != VK_SUCCESS) return *why = "descriptor set", false;
+        VkDescriptorBufferInfo bi[Device::kBindings];
+        for (auto &b : bi) b = {dev_->dummy(), 0, VK_WHOLE_SIZE};
+        for (int j = 0; j < 3; j++)
+            if (d[k][j]) bi[2 + j] = {d[k][j], 0, VK_WHOLE_SIZE};
+        bi[7] = {R.params.buf, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet wr[Device::kBindings];
+        for (int j = 0; j < Device::kBindings; j++) {
+            wr[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr[j].dstSet = R.sets[k];
+            wr[j].dstBinding = (uint32_t)j;
+            wr[j].descriptorCount = 1;
+            wr[j].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wr[j].pBufferInfo = &bi[j];
+        }
+        vkUpdateDescriptorSets(dev_->device(), Device::kBindings, wr, 0, nullptr);
+    }
+    // once: the padding in studio black (the frames overwrite their window every call), the
+    // constant channels (the mesh and its multipliers, as the other backends fill them)
+    VkCommandBuffer cb = dev_->begin();
+    for (int i = 0; i < 2; i++) {
+        vkCmdFillBuffer(cb, R.io[i]->in_y().buf, 0, VK_WHOLE_SIZE, t16 ? 0x10001000u : 0x10101010u);
+        vkCmdFillBuffer(cb, R.io[i]->in_uv().buf, 0, VK_WHOLE_SIZE, t16 ? 0x80008000u : 0x80808080u);
+    }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipes[2]);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev_->pipeline_layout(), 0, 1, &R.sets[2], 0, nullptr);
+    const int32_t pc[4] = {2, 0, 0, 0};
+    vkCmdPushConstants(cb, dev_->pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, (uint32_t)(R.pw / 2 + 31) / 32, (uint32_t)(R.ph + 7) / 8, 1);
+    if (!dev_->submit_wait(cb, why)) return false;
+    R.fmt = fmt;
+    R.range = range;
+    return true;
+}
+
+int VkVideo::rife_factor(int *num, int *den) const
+{
+    if (!rife_.on) return 0;
+    if (num) *num = rife_.num;
+    if (den) *den = rife_.den;
+    return 1;
+}
+
+int VkVideo::infer_rife(const aji_frame *a, const aji_frame *b, double t, const aji_frame *out, int scene)
+{
+    RifeState &R = rife_;
+    if (!R.on) {
+        fail("aji_infer_rife without an active RIFE configuration");
+        return AJI_ERR;
+    }
+    if (!a || !b || !out || !a->plane[0] || !b->plane[0] || !out->plane[0] || scene < -1 || scene > 1) return AJI_ERR;
+    if (a->format != b->format || a->format != out->format || (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010)) {
+        fail("rife frame formats must match (nv12/p010)");
+        return AJI_ERR_FORMAT;
+    }
+    if (a->width != R.w || a->height != R.h || b->width != R.w || b->height != R.h || out->width != R.w || out->height != R.h) {
+        fail("rife frame dims do not match configured %dx%d", R.w, R.h);
+        return AJI_ERR_SHAPE;
+    }
+    if (scene == 1) return AJI_SCENE;
+    std::string why;
+    if (!rife_formats(a->format, a->range, &why)) {
+        fail("aji_infer_rife: %s", why.c_str());
+        return AJI_ERR;
+    }
+    auto *ia = static_cast<aji_vk_image *>(a->plane[0]);
+    auto *ib = static_cast<aji_vk_image *>(b->plane[0]);
+    auto *io = static_cast<aji_vk_image *>(out->plane[0]);
+    const uint32_t bps = a->format == AJI_FMT_P010 ? 2 : 1, pitch = R.io[0]->in_pitch(), plane = (uint32_t)R.pw * R.ph;
+    const auto copy_region = [&](VkImageAspectFlagBits aspect, int w, int h, VkDeviceSize off, uint32_t texel) {
+        VkBufferImageCopy r{};
+        r.bufferOffset = off;
+        r.bufferRowLength = pitch / texel;
+        r.imageSubresource = {(VkImageAspectFlags)aspect, 0, 0, 1};
+        r.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
+        return r;
+    };
+    const VkDeviceSize off_y = (VkDeviceSize)R.pad_t * pitch + (VkDeviceSize)R.pad_l * bps;
+    const VkDeviceSize off_uv = (VkDeviceSize)(R.pad_t / 2) * pitch + (VkDeviceSize)R.pad_l * bps;
+    const VkBufferImageCopy ry = copy_region(VK_IMAGE_ASPECT_PLANE_0_BIT, R.w, R.h, off_y, bps);
+    const VkBufferImageCopy ruv = copy_region(VK_IMAGE_ASPECT_PLANE_1_BIT, R.w / 2, R.h / 2, off_uv, 2 * bps);
+    const auto barrier_image = [&](VkCommandBuffer cb, aji_vk_image *im, VkImageLayout to, VkAccessFlags acc, bool discard) {
+        VkImageMemoryBarrier ib2{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        ib2.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        ib2.dstAccessMask = acc;
+        ib2.oldLayout = discard ? VK_IMAGE_LAYOUT_UNDEFINED : static_cast<VkImageLayout>(im->layout);
+        ib2.newLayout = to;
+        ib2.srcQueueFamilyIndex = ib2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib2.image = static_cast<VkImage>(im->image);
+        ib2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib2);
+    };
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    const auto mem_barrier = [&](VkCommandBuffer cb, VkPipelineStageFlags src, VkAccessFlags sa, VkPipelineStageFlags dst, VkAccessFlags da) {
+        mb.srcAccessMask = sa;
+        mb.dstAccessMask = da;
+        vkCmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    // 1: both frames into the padded inputs (and, when asked, the scene detection's sum to the host)
+    int slot = 0;
+    VkCommandBuffer cb = dev_->frame_begin(&slot);
+    if (!cb) {
+        fail("aji_infer_rife: an earlier Vulkan submit has not finished after 10 s");
+        return AJI_ERR;
+    }
+    aji_vk_image *in2[2] = {ia, ib};
+    for (int i = 0; i < 2; i++) {
+        barrier_image(cb, in2[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, false);
+        vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(in2[i]->image), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.io[i]->in_y().buf, 1, &ry);
+        vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(in2[i]->image), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.io[i]->in_uv().buf, 1, &ruv);
+    }
+    mem_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    if (scene < 0) {
+        for (int k = 0; k < 2; k++) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, R.pipes[k]);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev_->pipeline_layout(), 0, 1, &R.sets[k], 0, nullptr);
+            const int32_t pc[4] = {k, 0, 0, 0};
+            vkCmdPushConstants(cb, dev_->pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+            if (k == 0) vkCmdDispatch(cb, R.groups_x, R.groups_y, 1);
+            else vkCmdDispatch(cb, 1, 1, 1);
+            mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        }
+        const VkBufferCopy c4{0, 0, 4};
+        vkCmdCopyBuffer(cb, R.sum.buf, R.read.buf, 1, &c4);
+        mem_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    }
+    {
+        const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ia->semaphore), ia->value}, {static_cast<VkSemaphore>(ib->semaphore), ib->value}};
+        const uint64_t tk = ticket_ + 1;
+        const Device::SemValue sig[3] = {
+            {tl_, tk}, {static_cast<VkSemaphore>(ia->semaphore), ia->value + 1}, {static_cast<VkSemaphore>(ib->semaphore), ib->value + 1}};
+        if (!dev_->frame_submit(slot, waits, 2, sig, 3, &why)) {
+            fail("aji_infer_rife: %s", why.c_str());
+            return AJI_ERR;
+        }
+        ticket_ = tk;
+        for (aji_vk_image *im : in2) {
+            im->value += 1;
+            im->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            im->access = VK_ACCESS_2_TRANSFER_READ_BIT;
+            im->queue_family = dev_->queue_family();
+        }
+    }
+    if (scene < 0) {
+        if (wait(ticket_) != AJI_OK) return AJI_ERR;
+        float sum = 0.0f;
+        std::memcpy(&sum, R.read.map, 4);
+        // the reference runs SCDetect on the padded clip: the borders add nothing, the mean divides by the padded area
+        if (sum / ((double)R.pw * R.ph) > R.threshold) return AJI_SCENE;
+    }
+    // 2: pre of both, the timestep plane, the model, post, the window into the output frame
+    cb = dev_->frame_begin(&slot);
+    if (!cb) {
+        fail("aji_infer_rife: an earlier Vulkan submit has not finished after 10 s");
+        return AJI_ERR;
+    }
+    mem_barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    R.io[0]->record_pre(cb);
+    R.io[1]->record_pre(cb);
+    {
+        // channel 6, the timestep: fp16 by truncation, as the other backends fill it
+        uint32_t x;
+        const float ft = (float)t;
+        std::memcpy(&x, &ft, 4);
+        const uint32_t sign = (x >> 16) & 0x8000u;
+        const int32_t e = (int32_t)((x >> 23) & 0xff) - 127 + 15;
+        const uint32_t half = e <= 0 ? sign : e >= 31 ? (sign | 0x7c00u) : (sign | ((uint32_t)e << 10) | ((x & 0x7fffffu) >> 13));
+        vkCmdFillBuffer(cb, R.net->input().buf, (VkDeviceSize)plane * 6 * 2, (VkDeviceSize)plane * 2, half | (half << 16));
+        mem_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+    R.net->record(cb);
+    mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    R.io[0]->record_post(cb);
+    mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    barrier_image(cb, io, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, true);
+    const uint32_t opitch = R.io[0]->out_pitch();
+    VkBufferImageCopy oy = copy_region(VK_IMAGE_ASPECT_PLANE_0_BIT, R.w, R.h, (VkDeviceSize)R.pad_t * opitch + (VkDeviceSize)R.pad_l * bps, bps);
+    VkBufferImageCopy ouv = copy_region(VK_IMAGE_ASPECT_PLANE_1_BIT, R.w / 2, R.h / 2,
+                                        (VkDeviceSize)(R.pad_t / 2) * opitch + (VkDeviceSize)R.pad_l * bps, 2 * bps);
+    oy.bufferRowLength = opitch / bps;
+    ouv.bufferRowLength = opitch / (2 * bps);
+    vkCmdCopyBufferToImage(cb, R.io[0]->out_y().buf, static_cast<VkImage>(io->image), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &oy);
+    vkCmdCopyBufferToImage(cb, R.io[0]->out_uv().buf, static_cast<VkImage>(io->image), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ouv);
+    {
+        const Device::SemValue w1{static_cast<VkSemaphore>(io->semaphore), io->value};
+        const uint64_t tk = ticket_ + 1;
+        const Device::SemValue sig[2] = {{tl_, tk}, {static_cast<VkSemaphore>(io->semaphore), io->value + 1}};
+        if (!dev_->frame_submit(slot, &w1, 1, sig, 2, &why)) {
+            fail("aji_infer_rife: %s", why.c_str());
+            return AJI_ERR;
+        }
+        ticket_ = tk;
+        io->value += 1;
+        io->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        io->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        io->queue_family = dev_->queue_family();
+    }
+    // synchronous like the other backends' aji_infer_rife: the interpolated frame is complete on return
+    return wait(ticket_);
+}
+
 void VkVideo::teardown()
 {
     if (dev_ && ticket_) wait(ticket_);
+    rife_teardown();
     io_.reset();
     steps_.clear();
     for (Buffer &b : chain_) dev_->destroy(b);
@@ -242,9 +576,29 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
         log_steps_.push_back(buf);
         steps_.push_back(std::move(s));
     }
-    if (steps_.empty()) return passthrough("");
+    if (steps_.empty()) {
+        if (!chain->rife) return passthrough("");
+        if (rife_dir_.empty()) return passthrough("RIFE requested by the chain but no rife model dir is configured; interpolation disabled");
+        // RIFE alone: no upscale (0, as the D3D12 path), the interpolation at the source size
+        teardown();
+        rife_.before = chain->rife_before_upscale;
+        rife_setup(*chain, w, h, fps);
+        finalize_log();
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        return 0;
+    }
     if ((cw & 1) || (ch & 1)) return passthrough("the chain's output size is odd: passthrough");
-    if (chain->rife) log_steps_.push_back("RIFE is not on Vulkan frames yet: left out");
+    if (chain->rife) {
+        if (rife_dir_.empty()) {
+            log_steps_.push_back("RIFE requested by the chain but no rife model dir is configured; interpolation disabled");
+        } else {
+            // RIFE-first interpolates at the source size (the D3D12 path hoists the first model's resize
+            // ahead of it; here that resize stays in the chain)
+            rife_.before = chain->rife_before_upscale;
+            rife_setup(*chain, rife_.before ? w : cw, rife_.before ? h : ch, fps);
+        }
+    }
     // the chain buffers: every step reads one and writes the other
     VkDeviceSize most = 0;
     for (const Step &s : steps_) most = std::max({most, (VkDeviceSize)3 * s.in_w * s.in_h * 2, (VkDeviceSize)3 * s.out_w * s.out_h * 2});
