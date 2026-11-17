@@ -386,7 +386,7 @@ and prints each one's entry list and size:
 
 | Asset | Contents | Size |
 |---|---|---|
-| `aji-windows-x64.zip` | `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_encode.exe`, `aji_harness.exe`, `aji_harness_dml.exe`, `aji_kernel_test.exe` | ~0.8 MB |
+| `aji-windows-x64.zip` | `aji.dll`, `aji_dml.dll`, `aji_trt.dll`, `aji_vk.dll`, `aji_encode.exe`, `aji_harness.exe`, `aji_harness_dml.exe`, `aji_kernel_test.exe` | ~30 MB (`aji_vk.dll` embeds its shaders) |
 | `aji-trtrtx-backend-windows-x64.zip` | `aji_trtrtx.dll` alone, for apps whose TensorRT-RTX runtime comes from a shared `trtrtx-runtime` pack (`aji-runtime.json`, see `CLAUDE.md`) | ~0.2 MB |
 | `aji-trtrtx-windows-x64.zip` | `aji_trtrtx.dll` plus the TensorRT-RTX runtime from `-TrtRtxRoot` (default `%AJI_TRTRTX_ROOT%`, else `%AJI_WIN%\trtrtx171`): exactly one `tensorrt_rtx_*.dll` and one `tensorrt_onnxparser_rtx_*.dll`, or it throws; plus `TensorRT-RTX-NOTICE.txt` and `TensorRT-RTX-Acknowledgements.txt` (the SDK's `doc\Acknowledgements.txt`; throws if absent) | ~91 MB |
 

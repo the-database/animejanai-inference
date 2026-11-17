@@ -68,11 +68,31 @@ struct Buffer {
     VkDeviceSize alloc = 0;  // device-local bytes this Device allocated for it (Device::allocated)
 };
 
+// A caller's device to run on (aji_create_vk: mpv's libplacebo device, FFmpeg's Vulkan
+// hwcontext): its handles, the queue to submit to and its lock, and what the device was created
+// with, which decides the kernel family (a family needs its features enabled, not just supported).
+struct ExternalDevice {
+    VkPhysicalDevice phys = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t family = 0, index = 0;
+    void (*lock)(void *opaque, uint32_t family, uint32_t index) = nullptr;  // around each submit; may be null
+    void (*unlock)(void *opaque, uint32_t family, uint32_t index) = nullptr;
+    void *opaque = nullptr;
+    std::vector<std::string> extensions;  // enabled device extensions
+    const void *features = nullptr;       // the VkPhysicalDeviceFeatures2 chain it was created with
+};
+
 class Device {
 public:
     // index >= 0 picks that device; otherwise luid (8 bytes) picks the matching one; otherwise
     // the first discrete GPU, else device 0.
     static std::unique_ptr<Device> create(int index, const uint8_t *luid, std::string *why);
+    // On a caller's device (it outlives this Device, which never destroys it).
+    static std::unique_ptr<Device> create_external(const ExternalDevice &e, std::string *why);
+    bool external() const { return ext_.device != VK_NULL_HANDLE; }
+    // vkQueueSubmit on the queue, inside the caller's queue lock for an external device.
+    VkResult queue_submit(const VkSubmitInfo *si, VkFence fence);
     ~Device();
     Device(const Device &) = delete;
     Device &operator=(const Device &) = delete;
@@ -80,6 +100,7 @@ public:
     const DeviceInfo &info() const { return info_; }
     Family family() const { return info_.family; }
     VkDevice device() const { return dev_; }
+    VkPhysicalDevice physical() const { return phys_; }
     VkQueue queue() const { return queue_; }
     uint32_t queue_family() const { return qfam_; }
 
@@ -136,6 +157,13 @@ public:
     // timeline value wait_value of sem and signaling signal_value (0: none).
     VkCommandBuffer frame_begin(int *slot);
     bool frame_submit(int slot, VkSemaphore sem, uint64_t wait_value, uint64_t signal_value, std::string *why);
+    // The same with any timeline waits and signals (value 0: skipped); the slot's buffer is free
+    // again once signals[0] is reached.
+    struct SemValue {
+        VkSemaphore sem = VK_NULL_HANDLE;
+        uint64_t value = 0;
+    };
+    bool frame_submit(int slot, const SemValue *waits, uint32_t nwait, const SemValue *signals, uint32_t nsignal, std::string *why);
 
 #ifdef _WIN32
     // D3D12 interop (aji_vk on Windows runs inside aji_dml's D3D12 frame pipeline): import a
@@ -149,6 +177,8 @@ public:
 
 private:
     Device() = default;
+    bool init_common(std::string *why);  // pools, layouts, caches, the dummy buffer
+    ExternalDevice ext_;
     VkCommandBuffer begin_locked();
     bool submit_locked(VkCommandBuffer cb, std::string *why);
     bool copy_staged(const Buffer &buf, void *data, size_t bytes, bool up, std::string *why);

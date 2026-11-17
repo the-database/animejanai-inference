@@ -1,6 +1,7 @@
 // vk/device.cpp — see device.h.
 #include "vk/device.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -407,26 +408,35 @@ std::unique_ptr<Device> Device::create(int index, const uint8_t *luid, std::stri
     VkResult r = vkCreateDevice(d->phys_, &dci, nullptr, &d->dev_);
     if (r != VK_SUCCESS) return fail(err("vkCreateDevice", r));
     vkGetDeviceQueue(d->dev_, d->qfam_, 0, &d->queue_);
+    if (!d->init_common(&reason)) return fail(reason);
+    return d;
+}
 
+bool Device::init_common(std::string *why)
+{
+    const auto fail = [&](const std::string &m) {
+        if (why) *why = m;
+        return false;
+    };
+    VkResult r;
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    cpi.queueFamilyIndex = d->qfam_;
+    cpi.queueFamilyIndex = qfam_;
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    if ((r = vkCreateCommandPool(d->dev_, &cpi, nullptr, &d->pool_)) != VK_SUCCESS) return fail(err("vkCreateCommandPool", r));
+    if ((r = vkCreateCommandPool(dev_, &cpi, nullptr, &pool_)) != VK_SUCCESS) return fail(err("vkCreateCommandPool", r));
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = d->pool_;
+    cai.commandPool = pool_;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = 1;
-    if ((r = vkAllocateCommandBuffers(d->dev_, &cai, &d->cb_)) != VK_SUCCESS) return fail(err("vkAllocateCommandBuffers", r));
+    if ((r = vkAllocateCommandBuffers(dev_, &cai, &cb_)) != VK_SUCCESS) return fail(err("vkAllocateCommandBuffers", r));
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if ((r = vkCreateFence(d->dev_, &fci, nullptr, &d->fence_)) != VK_SUCCESS) return fail(err("vkCreateFence", r));
+    if ((r = vkCreateFence(dev_, &fci, nullptr, &fence_)) != VK_SUCCESS) return fail(err("vkCreateFence", r));
     // frame command buffers: their own pool (frame_mu_), so frames and one-shot work can come
     // from different threads
-    if ((r = vkCreateCommandPool(d->dev_, &cpi, nullptr, &d->frame_pool_)) != VK_SUCCESS)
-        return fail(err("vkCreateCommandPool", r));
-    cai.commandPool = d->frame_pool_;
-    for (FrameSlot &fs : d->frames_) {
-        if ((r = vkAllocateCommandBuffers(d->dev_, &cai, &fs.cb)) != VK_SUCCESS) return fail(err("vkAllocateCommandBuffers", r));
-        if ((r = vkCreateFence(d->dev_, &fci, nullptr, &fs.fence)) != VK_SUCCESS) return fail(err("vkCreateFence", r));
+    if ((r = vkCreateCommandPool(dev_, &cpi, nullptr, &frame_pool_)) != VK_SUCCESS) return fail(err("vkCreateCommandPool", r));
+    cai.commandPool = frame_pool_;
+    for (FrameSlot &fs : frames_) {
+        if ((r = vkAllocateCommandBuffers(dev_, &cai, &fs.cb)) != VK_SUCCESS) return fail(err("vkAllocateCommandBuffers", r));
+        if ((r = vkCreateFence(dev_, &fci, nullptr, &fs.fence)) != VK_SUCCESS) return fail(err("vkCreateFence", r));
     }
 
     VkDescriptorSetLayoutBinding lb[kBindings];
@@ -434,30 +444,171 @@ std::unique_ptr<Device> Device::create(int index, const uint8_t *luid, std::stri
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dl.bindingCount = kBindings;
     dl.pBindings = lb;
-    if ((r = vkCreateDescriptorSetLayout(d->dev_, &dl, nullptr, &d->set_layout_)) != VK_SUCCESS)
+    if ((r = vkCreateDescriptorSetLayout(dev_, &dl, nullptr, &set_layout_)) != VK_SUCCESS)
         return fail(err("vkCreateDescriptorSetLayout", r));
     VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, kPushBytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
-    pli.pSetLayouts = &d->set_layout_;
+    pli.pSetLayouts = &set_layout_;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pcr;
-    if ((r = vkCreatePipelineLayout(d->dev_, &pli, nullptr, &d->pipe_layout_)) != VK_SUCCESS)
-        return fail(err("vkCreatePipelineLayout", r));
+    if ((r = vkCreatePipelineLayout(dev_, &pli, nullptr, &pipe_layout_)) != VK_SUCCESS) return fail(err("vkCreatePipelineLayout", r));
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    if ((r = vkCreatePipelineCache(d->dev_, &pci, nullptr, &d->cache_)) != VK_SUCCESS) return fail(err("vkCreatePipelineCache", r));
+    if ((r = vkCreatePipelineCache(dev_, &pci, nullptr, &cache_)) != VK_SUCCESS) return fail(err("vkCreatePipelineCache", r));
 
-    if (!d->make_buffer(&d->dummy_, kBindings * 16, false, &reason)) return fail(reason);
-    VkCommandBuffer cb = d->begin();
-    vkCmdFillBuffer(cb, d->dummy_.buf, 0, VK_WHOLE_SIZE, 0);
-    if (!d->submit_wait(cb, &reason)) return fail(reason);
+    std::string reason;
+    if (!make_buffer(&dummy_, kBindings * 16, false, &reason)) return fail(reason);
+    VkCommandBuffer cb = begin();
+    vkCmdFillBuffer(cb, dummy_.buf, 0, VK_WHOLE_SIZE, 0);
+    if (!submit_wait(cb, &reason)) return fail(reason);
+    return true;
+}
+
+namespace {
+
+// What a device was created with: the VkPhysicalDeviceFeatures2 chain, the 1.1 / 1.2 / 1.3
+// structs or their extension forms (callers use either).
+struct Enabled {
+    bool fp16 = false, storage16 = false, sync2 = false, timeline = false, size_control = false, full_subgroups = false,
+         memory_model = false, memory_model_device = false, coopmat = false;
+};
+Enabled enabled_features(const void *chain)
+{
+    Enabled e;
+    for (auto *s = static_cast<const VkBaseInStructure *>(chain); s; s = s->pNext) {
+        switch (s->sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+            e.storage16 |= reinterpret_cast<const VkPhysicalDeviceVulkan11Features *>(s)->storageBuffer16BitAccess != 0;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES:
+            e.storage16 |= reinterpret_cast<const VkPhysicalDevice16BitStorageFeatures *>(s)->storageBuffer16BitAccess != 0;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
+            auto *f = reinterpret_cast<const VkPhysicalDeviceVulkan12Features *>(s);
+            e.fp16 |= f->shaderFloat16 != 0;
+            e.timeline |= f->timelineSemaphore != 0;
+            e.memory_model |= f->vulkanMemoryModel != 0;
+            e.memory_model_device |= f->vulkanMemoryModelDeviceScope != 0;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES:
+            e.fp16 |= reinterpret_cast<const VkPhysicalDeviceShaderFloat16Int8Features *>(s)->shaderFloat16 != 0;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
+            e.timeline |= reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures *>(s)->timelineSemaphore != 0;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES: {
+            auto *f = reinterpret_cast<const VkPhysicalDeviceVulkanMemoryModelFeatures *>(s);
+            e.memory_model |= f->vulkanMemoryModel != 0;
+            e.memory_model_device |= f->vulkanMemoryModelDeviceScope != 0;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
+            auto *f = reinterpret_cast<const VkPhysicalDeviceVulkan13Features *>(s);
+            e.sync2 |= f->synchronization2 != 0;
+            e.size_control |= f->subgroupSizeControl != 0;
+            e.full_subgroups |= f->computeFullSubgroups != 0;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES:
+            e.sync2 |= reinterpret_cast<const VkPhysicalDeviceSynchronization2Features *>(s)->synchronization2 != 0;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: {
+            auto *f = reinterpret_cast<const VkPhysicalDeviceSubgroupSizeControlFeatures *>(s);
+            e.size_control |= f->subgroupSizeControl != 0;
+            e.full_subgroups |= f->computeFullSubgroups != 0;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR:
+            e.coopmat |= reinterpret_cast<const VkPhysicalDeviceCooperativeMatrixFeaturesKHR *>(s)->cooperativeMatrix != 0;
+            break;
+        default:
+            break;
+        }
+    }
+    return e;
+}
+
+}  // namespace
+
+std::unique_ptr<Device> Device::create_external(const ExternalDevice &e, std::string *why)
+{
+    auto fail = [&](const std::string &m) -> std::unique_ptr<Device> {
+        if (why) *why = m;
+        return nullptr;
+    };
+    std::string reason;
+    if (!instance(&reason)) return fail(reason);  // the loader's entry points
+    if (!e.phys || !e.device || !e.queue) return fail("the caller's Vulkan device is incomplete");
+    std::unique_ptr<Device> d(new Device());
+    d->ext_ = e;
+    d->phys_ = e.phys;
+    d->dev_ = e.device;
+    d->queue_ = e.queue;
+    d->qfam_ = e.family;
+    d->info_ = probe(d->phys_, 0);
+    DeviceInfo &in = d->info_;
+    // the families the device can run as created: each family's features enabled, not just supported
+    const Enabled en = enabled_features(e.features);
+    const auto has = [&](const char *x) { return std::find(e.extensions.begin(), e.extensions.end(), x) != e.extensions.end(); };
+    std::string missing;
+    if (!en.fp16) missing += " shaderFloat16";
+    if (!en.storage16) missing += " storageBuffer16BitAccess";
+    if (!en.sync2) missing += " synchronization2";
+    if (!en.timeline) missing += " timelineSemaphore";
+    if (!missing.empty()) {
+        in.plain = in.sg16 = in.cm16 = false;
+        in.plain_why = in.sg16_why = in.cm16_why = "not enabled on the caller's device:" + missing;
+    }
+    if (in.sg16 && !(en.size_control && en.full_subgroups)) {
+        in.sg16 = false;
+        in.sg16_why = "subgroup size control not enabled on the caller's device";
+    }
+    if (in.cm16 && !(en.size_control && en.full_subgroups && en.coopmat && en.memory_model && en.memory_model_device &&
+                     has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))) {
+        in.cm16 = false;
+        in.cm16_acc32 = false;
+        in.cm16_why = "cooperative matrices (with subgroup size control and the memory model) not enabled on the caller's device";
+    }
+    if (in.family == Family::CM16 && !in.cm16) in.family = in.sg16 ? Family::SG16 : in.plain ? Family::PLAIN : Family::None;
+    if (in.family == Family::SG16 && !in.sg16) in.family = in.plain ? Family::PLAIN : Family::None;
+    if (in.family == Family::PLAIN && !in.plain) in.family = Family::None;
+    if (in.family == Family::None)
+        return fail(in.name + ": no aji_vk kernel family runs on the caller's device (cm16: " + in.cm16_why + "; sg16: " + in.sg16_why +
+                    "; plain: " + in.plain_why + ")");
+    vkGetPhysicalDeviceMemoryProperties(d->phys_, &d->mem_);
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(d->phys_, &nq, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(nq);
+    vkGetPhysicalDeviceQueueFamilyProperties(d->phys_, &nq, qf.data());
+    if (e.family >= nq || !(qf[e.family].queueFlags & VK_QUEUE_COMPUTE_BIT)) return fail("the caller's queue can't run compute work");
+    if (!qf[e.family].timestampValidBits) in.timestamp_ns = 0.0;
+    if (!d->init_common(&reason)) {
+        d->dev_ = VK_NULL_HANDLE;  // not ours to destroy (init_common's partial objects leak with the failure)
+        return fail(reason);
+    }
     return d;
+}
+
+VkResult Device::queue_submit(const VkSubmitInfo *si, VkFence fence)
+{
+    if (ext_.lock) ext_.lock(ext_.opaque, ext_.family, ext_.index);
+    const VkResult r = vkQueueSubmit(queue_, 1, si, fence);
+    if (ext_.unlock) ext_.unlock(ext_.opaque, ext_.family, ext_.index);
+    return r;
 }
 
 Device::~Device()
 {
     if (!dev_) return;
-    vkDeviceWaitIdle(dev_);
+    if (external()) {
+        // only this Device's work: the caller's device keeps running
+        if (ext_.lock) ext_.lock(ext_.opaque, ext_.family, ext_.index);
+        vkQueueWaitIdle(queue_);
+        if (ext_.unlock) ext_.unlock(ext_.opaque, ext_.family, ext_.index);
+    } else {
+        vkDeviceWaitIdle(dev_);
+    }
     save_caches();
     for (auto &p : pipelines_) vkDestroyPipeline(dev_, p.second, nullptr);
     destroy(dummy_);
@@ -470,7 +621,7 @@ Device::~Device()
         if (fs.fence) vkDestroyFence(dev_, fs.fence, nullptr);
     if (frame_pool_) vkDestroyCommandPool(dev_, frame_pool_, nullptr);
     if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
-    vkDestroyDevice(dev_, nullptr);
+    if (!external()) vkDestroyDevice(dev_, nullptr);
 }
 
 VkCommandBuffer Device::frame_begin(int *slot)
@@ -509,6 +660,51 @@ VkCommandBuffer Device::frame_begin(int *slot)
     return fs.cb;
 }
 
+bool Device::frame_submit(int slot, const SemValue *waits, uint32_t nwait, const SemValue *signals, uint32_t nsignal, std::string *why)
+{
+    FrameSlot &fs = frames_[slot];
+    VkResult r = vkEndCommandBuffer(fs.cb);
+    if (r == VK_SUCCESS) {
+        std::vector<VkSemaphore> ws, ss;
+        std::vector<uint64_t> wv, sv;
+        std::vector<VkPipelineStageFlags> stages;
+        for (uint32_t i = 0; i < nwait; i++)
+            if (waits[i].sem && waits[i].value) {
+                ws.push_back(waits[i].sem);
+                wv.push_back(waits[i].value);
+                stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            }
+        for (uint32_t i = 0; i < nsignal; i++)
+            if (signals[i].sem && signals[i].value) {
+                ss.push_back(signals[i].sem);
+                sv.push_back(signals[i].value);
+            }
+        VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        ts.waitSemaphoreValueCount = (uint32_t)wv.size();
+        ts.pWaitSemaphoreValues = wv.data();
+        ts.signalSemaphoreValueCount = (uint32_t)sv.size();
+        ts.pSignalSemaphoreValues = sv.data();
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts};
+        si.waitSemaphoreCount = (uint32_t)ws.size();
+        si.pWaitSemaphores = ws.data();
+        si.pWaitDstStageMask = stages.data();
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &fs.cb;
+        si.signalSemaphoreCount = (uint32_t)ss.size();
+        si.pSignalSemaphores = ss.data();
+        const bool fenced = ss.empty() || !(nsignal && signals[0].sem && signals[0].value);
+        r = queue_submit(&si, fenced ? fs.fence : VK_NULL_HANDLE);
+        if (r == VK_SUCCESS) {
+            fs.fenced = fenced;
+            fs.sem = fenced ? VK_NULL_HANDLE : signals[0].sem;
+            fs.value = fenced ? 0 : signals[0].value;
+        }
+    }
+    frame_mu_.unlock();
+    if (r != VK_SUCCESS && why) *why = err("frame submit", r);
+    return r == VK_SUCCESS;
+}
+
 bool Device::frame_submit(int slot, VkSemaphore sem, uint64_t wait_value, uint64_t signal_value, std::string *why)
 {
     FrameSlot &fs = frames_[slot];
@@ -529,7 +725,7 @@ bool Device::frame_submit(int slot, VkSemaphore sem, uint64_t wait_value, uint64
         si.signalSemaphoreCount = sem && signal_value ? 1 : 0;
         si.pSignalSemaphores = &sem;
         const bool fenced = !(sem && signal_value);
-        r = vkQueueSubmit(queue_, 1, &si, fenced ? fs.fence : VK_NULL_HANDLE);
+        r = queue_submit(&si, fenced ? fs.fence : VK_NULL_HANDLE);
         if (r == VK_SUCCESS) {
             fs.fenced = fenced;
             fs.sem = fenced ? VK_NULL_HANDLE : sem;
@@ -735,7 +931,7 @@ bool Device::submit_locked(VkCommandBuffer cb, std::string *why)
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cb;
-        r = vkQueueSubmit(queue_, 1, &si, fence_);
+        r = queue_submit(&si, fence_);
         if (r == VK_SUCCESS) r = vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX);
         vkResetFences(dev_, 1, &fence_);
     }

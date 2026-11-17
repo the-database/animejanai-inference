@@ -381,6 +381,34 @@ static bool fall_back_to_trt(aji_ctx *c, const char *what)
     return true;
 }
 
+/* A context on the caller's Vulkan device (aji.h): always aji_vk, whatever the
+ * conf's backend says, since only it takes Vulkan frames. No fallback: DirectML
+ * and TensorRT can't take these frames. */
+extern "C" AJI_EXPORT aji_ctx *aji_create_vk(const aji_create_params *params, const aji_vk_device *device)
+{
+    if (!params)
+        return nullptr;
+    aji_backend be = {};
+    std::string err;
+    if (!load_backend("aji_vk", &be, &err)) {
+        logf_to(params->log, params->log_opaque, 0, "Vulkan frames (aji_vk): %s", err.c_str());
+        return nullptr;
+    }
+    auto create_vk = (aji_ctx * (*)(const aji_create_params *, const aji_vk_device *)) lib_sym(be.lib, "aji_create_vk");
+    if (!create_vk) {
+        logf_to(params->log, params->log_opaque, 0, "Vulkan frames: this aji_vk has no aji_create_vk");
+        lib_close(be.lib);
+        return nullptr;
+    }
+    aji_ctx *inner = create_vk(params, device);
+    if (!inner) {
+        lib_close(be.lib);
+        return nullptr;
+    }
+    logf_to(params->log, params->log_opaque, 3, "backend: Vulkan frames (aji_vk)");
+    return new aji_ctx{be, inner, false, nullptr, params->slot};
+}
+
 extern "C" AJI_EXPORT int aji_set_slot(aji_ctx *c, int slot)
 {
     int r = c->be.set_slot(c->inner, slot);
