@@ -268,8 +268,9 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     std::string err;
     aji_ctx *inner = nullptr;
     std::string packs;
+    const bool vk = !strcmp(stem, "aji_vk");
     if (!load_backend(stem, &be, &err, &packs)) {
-        logf_to(params->log, params->log_opaque, rtx ? 2 : 0,
+        logf_to(params->log, params->log_opaque, rtx || vk ? 2 : 0,
                 "backend %s (%s): %s", backend.c_str(), stem, err.c_str());
     } else {
         if (!packs.empty())
@@ -294,6 +295,25 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     // An addon streaming request must not build or switch inference backends.
     if (!inner && params->async_build == 2)
         return nullptr;
+#ifdef _WIN32
+    if (!inner && vk) {
+        // aji_vk missing or failing to start (its error is logged above): keep
+        // playing on DirectML. (Models without Vulkan kernels already fall back
+        // inside aji_vk, one at a time.)
+        logf_to(params->log, params->log_opaque, 1, "Vulkan failed to start; using DirectML instead");
+        be = {};
+        if (!load_backend("aji_dml", &be, &err)) {
+            logf_to(params->log, params->log_opaque, 0, "backend DirectML (aji_dml): %s", err.c_str());
+            return nullptr;
+        }
+        inner = be.create(params);
+        if (!inner) {
+            lib_close(be.lib);
+            return nullptr;
+        }
+        return new aji_ctx{be, inner, false, nullptr, params->slot};
+    }
+#endif
     if (!inner && rtx) {
         // TensorRT-RTX missing or failing (its error is logged above):
         // keep playing on TensorRT

@@ -1,6 +1,6 @@
 # Stage the release artifacts of build-aji-release.bat and zip them flat into
 # three assets under <OutDir>\<tag>\ (see docs\BUILD-WINDOWS.md):
-#   aji-windows-x64.zip         the engine: dispatcher, aji_trt, aji_dml, tools
+#   aji-windows-x64.zip         the engine: dispatcher, aji_trt, aji_dml, aji_vk, tools
 #   aji-trtrtx-windows-x64.zip  the opt-in TensorRT for RTX backend: aji_trtrtx.dll
 #                               and the two runtime DLLs it needs (never
 #                               tensorrt_rtx.exe, which the SDK licence keeps
@@ -30,7 +30,7 @@ function Get-Artifact([string]$name) {
     $p
 }
 
-$engine = foreach ($f in 'aji.dll', 'aji_dml.dll', 'aji_trt.dll', 'aji_encode.exe',
+$engine = foreach ($f in 'aji.dll', 'aji_dml.dll', 'aji_trt.dll', 'aji_vk.dll', 'aji_encode.exe',
                          'aji_harness.exe', 'aji_harness_dml.exe', 'aji_kernel_test.exe') {
     Get-Artifact $f
 }

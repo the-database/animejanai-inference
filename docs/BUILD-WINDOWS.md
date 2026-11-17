@@ -10,7 +10,7 @@ in [`ci/windows/`](../ci/windows/):
 | Script | Does |
 |---|---|
 | `ci\windows\build-aji-release.bat` | the release build of this checkout (all architectures, clean) |
-| `ci\windows\package-aji-release.ps1` | zips the seven engine artifacts into `aji-windows-x64.zip`, and `aji_trtrtx.dll` with the TensorRT-RTX runtime into `aji-trtrtx-windows-x64.zip` |
+| `ci\windows\package-aji-release.ps1` | zips the eight engine artifacts into `aji-windows-x64.zip`, and `aji_trtrtx.dll` with the TensorRT-RTX runtime into `aji-trtrtx-windows-x64.zip` |
 
 The SDKs they build against live **outside** the repo, in a working area. Linux build:
 [`BUILD-LINUX.md`](BUILD-LINUX.md). Engine overview: [`../CLAUDE.md`](../CLAUDE.md).
@@ -47,6 +47,7 @@ part of the contract:
 │   ├── ort-dml-1.24.4.nupkg       +  Microsoft.ML.OnnxRuntime.DirectML\   (extracted)
 │   └── directml-1.15.4.nupkg      +  Microsoft.AI.DirectML\               (extracted)
 ├── ffmpeg-shared\ffmpeg-9.0.2-full_build-shared\{include,lib,bin}
+├── vulkan-headers\{vulkan,vk_video}\   the Vulkan headers for aji_vk (see 2c.)
 └── dist\<tag>\aji-windows-x64.zip      packaging output
              aji-trtrtx-windows-x64.zip
 %REPO%\build-win-release\               release build directory  [created by the build]
@@ -69,6 +70,7 @@ locally: add `build-win-*/` to `.git/info/exclude`.
 | Ninja | 1.13.2, bundled with VS | `.../CommonExtensions/Microsoft/CMake/Ninja/ninja.exe` |
 | CUDA | 13.4 (nvcc 13.4.59) | `%AJI_WIN%\cuda134` — not a system install (see 1.) |
 | PowerShell 7 (`pwsh`) | — | only needed for `package-aji-release.ps1`; must be on `PATH` |
+| glslc | shaderc 2026.2 | MSYS2's `C:\msys64\ucrt64\bin\glslc.exe` (see 2c.) — a build tool only: the shaders are embedded in `aji_vk.dll` |
 
 Install Visual Studio with:
 
@@ -214,6 +216,28 @@ What differs from TensorRT:
   `ci\windows\`: what the DLLs are, NVIDIA's copyright, the SLA link, use with this application
   only) and the SDK's `doc\Acknowledgements.txt` unmodified as
   `TensorRT-RTX-Acknowledgements.txt` (the third-party licences inside the DLLs).
+
+### 2c. glslc and the Vulkan headers — for `aji_vk`
+
+`aji_vk.dll` (the Vulkan native kernels, `backend=Vulkan`) embeds its compute shaders as SPIR-V,
+compiled at build time by glslc, and includes the Vulkan headers. Nothing Vulkan is linked or
+shipped: the DLL opens the driver's `vulkan-1.dll` at run time. Both come from MSYS2:
+
+```
+pacman -S mingw-w64-ucrt-x86_64-shaderc mingw-w64-ucrt-x86_64-vulkan-headers
+```
+
+Copy the headers out (MSVC must not see the rest of MSYS2's include directory):
+
+```
+robocopy C:\msys64\ucrt64\include\vulkan   %AJI_WIN%\vulkan-headers\vulkan   /E
+robocopy C:\msys64\ucrt64\include\vk_video %AJI_WIN%\vulkan-headers\vk_video /E
+```
+
+`build-aji-release.bat` reads `AJI_GLSLC` (default `C:\msys64\ucrt64\bin\glslc.exe`) and
+`AJI_VK_HEADERS` (default `%AJI_WIN%\vulkan-headers`) and stops when either is missing. The LunarG
+Vulkan SDK's glslc and `Include\` work too. An old glslc (Ubuntu 24.04's shaderc 2023.8) crashes on
+the cooperative-matrix kernels.
 
 ### 3. `trtexec.exe` — NVIDIA's, not a patched fork
 
