@@ -67,7 +67,7 @@
 #include "native/lower.h"
 #include "native/onnx_graph.h"
 #include "vk/device.h"
-#include "vk/executor.h"
+#include "vk/imgnet.h"
 #include "vk/rife.h"
 #endif
 
@@ -147,7 +147,7 @@ struct DmlModel {
     OrtIoBinding *binding = nullptr;
     OrtValue *in_val = nullptr, *out_val = nullptr;
 #ifdef AJI_VULKAN
-    std::shared_ptr<ajivk::Executor> vk;  // the native kernels run this model (no session)
+    std::shared_ptr<ajivk::ImgNet> vk;    // the native kernels run this model (no session)
     std::string vk_onnx, vk_name;         // to reopen it on DirectML
 #endif
 };
@@ -1454,9 +1454,10 @@ bool model_open(aji_ctx *c, DmlModel *m, const std::string &onnx_path,
 }
 
 #ifdef AJI_VULKAN
-// The model on the Vulkan native kernels at w x h, when it lowers (unless
-// native=off) and the device runs every step; logs either way. False: open it
-// on DirectML.
+// The model on the Vulkan native kernels at w x h (unless native=off): a conv
+// net the lowering takes on the executor, else an image model (ESRGAN) on the
+// whole frame when it fits in memory; logs either way. False: open it on
+// DirectML.
 bool vk_model_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const std::string &name, int w, int h)
 {
     if (!c->conf.native)
@@ -1470,8 +1471,16 @@ bool vk_model_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const std::
         ajinative::Plan plan;
         if (!ajicore::read_file_bytes(onnx, &bytes)) {
             why = "the model file can't be read";
-        } else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why) && ajinative::lower(g, &plan, &why)) {
-            std::unique_ptr<ajivk::Executor> ex = ajivk::Executor::create(*c->vk, plan, w, h, &why);
+        } else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) {
+            std::unique_ptr<ajivk::ImgNet> ex;
+            if (ajinative::lower(g, &plan, &why)) {
+                ex = ajivk::ImgNet::lowered(*c->vk, plan, w, h, &why);
+            } else {
+                const std::string wl = why;
+                ex = ajivk::ImgNet::frame(*c->vk, g, w, h, &why);
+                if (!ex && why.rfind("not an ESRGAN", 0) == 0)
+                    why = wl;  // neither: the lowering's reason
+            }
             if (ex) {
                 m->fp16 = true;
                 m->in_w = w;
@@ -1482,8 +1491,7 @@ bool vk_model_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const std::
                 m->vk_onnx = onnx;
                 m->vk_name = name;
                 c->vk->save_caches();
-                c->log_steps.push_back("Native kernels: " + name + " (" + ajinative::describe(plan) + "; Vulkan " +
-                                       ajivk::family_name(c->vk->family()) + ")");
+                c->log_steps.push_back("Native kernels: " + name + " (" + m->vk->describe() + ")");
                 return true;
             }
         }

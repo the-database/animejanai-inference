@@ -13,6 +13,7 @@
 #define AJI_VK_GCONV_H
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,12 @@ std::vector<uint16_t> gconv_pack(Family f, const uint16_t *w, int cin, int cinp,
 // after another.
 std::vector<uint16_t> gconv_pack_slices(Family f, const uint16_t *w, int cin, int cinp, int cout, int coutp, int nz);
 std::vector<uint16_t> gconv_bias_slices(const float *b, int cout, int coutp, int nz);
+
+// The output slice width for a conv of cout channels at W x H (stride: its tile rows): the widest
+// of widths (descending, the shapes built) dividing pad16(cout) whose dispatch still has enough
+// workgroups to fill a GPU (AJI_VK_SLICE_TARGET, default below), else the narrowest dividing one.
+// Small low-resolution convs (RIFE's first blocks, ESRGAN on small frames) then fill the GPU.
+int gconv_slice_width(int cout, int W, int H, int stride, std::initializer_list<int> widths);
 
 // A conv dispatch as a network records it: shape, parameter entry, descriptor set (the caller's)
 // and tile variants.
