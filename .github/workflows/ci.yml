@@ -123,7 +123,7 @@ jobs:
           SDK="$PWD/vulkansdk/1.4.309.0/x86_64"
           "$SDK/bin/glslc" --version | head -1
           cmake -S . -B build-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_CUDA=OFF -DAJI_VULKAN=ON \
-            -DAJI_GLSLC="$SDK/bin/glslc" -DAJI_VK_INCLUDE="$SDK/include" -DAJI_GLSLC_JOBS=2
+            -DAJI_GLSLC="$SDK/bin/glslc" -DAJI_VK_INCLUDE="$SDK/include" -DAJI_GLSLC_JOBS=4
           # the first errors also as annotations, readable without the log; a compiler that runs
           # away fails on its own (6 GB each) instead of taking the runner down
           set -o pipefail

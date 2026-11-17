@@ -83,8 +83,11 @@ void main()
     const int g = sg % NG, blk = sg / NG, ch = g * 16 + lane;
     float tot[16];
     [[unroll]] for (int m = 0; m < 16; m++) tot[m] = 0.0;
-    [[unroll]] for (int kc = 0; kc < KC; kc++) {
-        const int s = kc / (C / 16), kk = kc % (C / 16);
+    // the sources in a loop, each one's C/16 chunks unrolled (all unrolled, a 64-channel
+    // 4-source concat takes glslc 7 GB)
+    [[dont_unroll]] for (int s = 0; s < NSRC; s++)
+    [[unroll]] for (int kk = 0; kk < C / 16; kk++) {
+        const int kc = s * (C / 16) + kk;
         const int wi = ((kc * NG + g) * 16 + lane) * 2;
         float16_t w[16];
         unpack16(wp[wi], wp[wi + 1], w);
