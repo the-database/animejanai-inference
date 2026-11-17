@@ -3321,7 +3321,7 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return 0;
+    if (c && c->vkv) return c->vkv->pre_resize(work_w, work_h);
 #endif
     if (!c || !c->has_pre_resize)
         return 0;
@@ -3340,7 +3340,7 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
                                      const aji_frame *out, void *cu_stream)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return AJI_ERR;
+    if (c && c->vkv) return c->vkv->resize(in, out);
 #endif
     (void)cu_stream;
     if (!c || !in || !out)

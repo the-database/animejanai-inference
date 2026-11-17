@@ -10,9 +10,9 @@
  * whose values are aji_flush's tickets.
  *
  * RIFE as the other backends run it (padded to 64, centred, bilinear BT.709 pre / post, the scene
- * detection's readback). Not yet here (the chain is passed through, or the step left out, with the
- * reason logged): the pre-RIFE resize hoist (RIFE-first interpolates at the source size), models
- * without Vulkan kernels (there is no DirectML to fall back to on this path). aji_frame_diff (and
+ * detection's readback, RIFE-first's pre-RIFE resize). Not yet here (the chain is passed through,
+ * with the reason logged): models without Vulkan kernels (there is no DirectML to fall back to on
+ * this path). aji_frame_diff (and
  * so the held-frame engine) on Vulkan frames.
  * Temporal models as the other backends run them (aji_ingest + aji_infer_seq).
  */
@@ -62,6 +62,10 @@ public:
     // aji_frame_diff on two Vulkan frames (NV12 / P010, same dims): synchronous, its own scratch,
     // configured or not.
     int frame_diff(const aji_frame *a, const aji_frame *b, aji_frame_diff_result *out);
+    // RIFE-first's pre-RIFE resize (aji.h's aji_pre_resize, aji_resize): the first model's explicit
+    // resize hoisted ahead of RIFE, as aji_dml.cpp's; the chain then starts at the work size.
+    int pre_resize(int *work_w, int *work_h) const;
+    int resize(const aji_frame *in, const aji_frame *out);
 
 private:
     VkVideo() = default;
@@ -142,6 +146,14 @@ private:
         VkPipeline pipe = VK_NULL_HANDLE;
     } diff_;
     bool diff_setup(int w, int h, int fmt, std::string *why);
+    // the hoisted pre-RIFE resize: source frames -> work frames (pre, RgbResize, post)
+    struct PreResize {
+        bool on = false;
+        int sw = 0, sh = 0, ww = 0, wh = 0;
+        Buffer a, b;
+        std::unique_ptr<RgbResize> rs;
+        std::unique_ptr<FrameIO> io;
+    } pre_;
     void diff_teardown();
     bool rife_setup(const AjiChainConf &chain, int w, int h, double fps);
     bool rife_formats(int fmt, int range, std::string *why);

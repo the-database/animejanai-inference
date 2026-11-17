@@ -114,14 +114,15 @@ extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
 
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
 {
-    (void)c, (void)work_w, (void)work_h;
-    return 0;
+    AJI_VKV(0)
+    return c->v->pre_resize(work_w, work_h);
 }
 
 extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in, const aji_frame *out, void *cu_stream)
 {
-    (void)c, (void)in, (void)out, (void)cu_stream;
-    return AJI_ERR;
+    (void)cu_stream;
+    AJI_VKV(AJI_ERR)
+    return c->v->resize(in, out);
 }
 
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)

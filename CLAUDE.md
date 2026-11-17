@@ -399,7 +399,10 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   (`frame_scd.comp`, SCDetect's metric over the padded luma, divided by the padded area) read back
   between two submits, post and a cropped copy into the output image; synchronous like the
   other backends'. A RIFE-only chain configures to 0 with RIFE active, as the D3D12 path.
-  RIFE-first interpolates at the source size (no pre-RIFE resize hoist). Temporal models
+  RIFE-first hoists the first model's explicit resize ahead of RIFE, as aji_dml.cpp:
+  `aji_pre_resize` reports the work size, `aji_resize` runs pre, `RgbResize` and post on a
+  source frame, and the chain then starts at the work size. With a temporal model, RIFE runs
+  after the upscale, as on D3D12. Temporal models
   (`TemporalNet`: TFDAT, TemporalFix) as aji_dml.cpp's: one ring per temporal step at its input
   size, the cut metric per stored frame (`frame_temporal.comp` PASS 1, then `fr_scd2`), the
   window gathered padded to 32 (PASS 2) with the same clamping and cut rules, the model's frame
