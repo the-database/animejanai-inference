@@ -555,6 +555,14 @@ typedef struct aji_vk_image {
  * as created: the log says why). */
 AJI_EXPORT aji_ctx *aji_create_vk(const aji_create_params *params, const aji_vk_device *device);
 
+/* An exact copy of frame `in` into `out` (same format and dims, every plane),
+ * for a caller keeping a frame past its decoder's pool: a held-frame anchor,
+ * RIFE's frames without an upscale. Vulkan frames only (a context from
+ * aji_create_vk; the images' semaphores as for aji_infer), enqueued like
+ * aji_infer (aji_flush's ticket covers it). Other backends, and libaji before
+ * this call, return AJI_ERR. Additive, no API_VERSION bump. */
+AJI_EXPORT int aji_copy_frame(aji_ctx *c, const aji_frame *in, const aji_frame *out);
+
 #ifdef __cplusplus
 }
 #endif

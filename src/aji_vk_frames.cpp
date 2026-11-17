@@ -171,6 +171,12 @@ extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
     if (c && c->v) c->v->temporal_reset();
 }
 
+extern "C" AJI_EXPORT int aji_copy_frame(aji_ctx *c, const aji_frame *in, const aji_frame *out)
+{
+    AJI_VKV(AJI_ERR)
+    return c->v->copy_frame(in, out);
+}
+
 extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a, const aji_frame *b, aji_frame_diff_result *out, void *cu_stream)
 {
     (void)cu_stream;

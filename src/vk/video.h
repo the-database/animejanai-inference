@@ -66,6 +66,8 @@ public:
     // resize hoisted ahead of RIFE, as aji_dml.cpp's; the chain then starts at the work size.
     int pre_resize(int *work_w, int *work_h) const;
     int resize(const aji_frame *in, const aji_frame *out);
+    // aji_copy_frame: an exact image-to-image copy of every plane, enqueued (a ticket)
+    int copy_frame(const aji_frame *in, const aji_frame *out);
 
 private:
     VkVideo() = default;

@@ -410,7 +410,9 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   each, their per-dispatch parameters written in the command buffer (`vkCmdUpdateBuffer`).
   `aji_frame_diff` (so the dispatcher's held-frame engine) on two Vulkan frames:
   `frame_diff.comp`, the HLSL cs_frame_diff with the same weights table and atomics, synchronous,
-  its own scratch. Not yet there, passed through or left out with the reason in the log: models
+  its own scratch. `aji_copy_frame` (additive, Vulkan frames only): an exact `vkCmdCopyImage` of
+  both planes, enqueued, for the caller's held-frame anchors and RIFE-alone passthrough frames
+  (the mpv fork's traces of held decisions are byte-identical to its D3D11 path). Not yet there, passed through or left out with the reason in the log: models
   without Vulkan kernels (no DirectML on this path). On
   Windows `aji_vk.dll`'s exports (aji_dml.cpp) forward a Vulkan-frames context (`c->vkv`); on Linux
   `aji_vk_frames.cpp` is the video ABI. The dispatcher's `aji_create_vk` always loads aji_vk.

@@ -4242,6 +4242,16 @@ static int frame_diff(aji_ctx *c, const aji_frame *a, const aji_frame *b,
     return AJI_OK;
 }
 
+// aji_copy_frame: Vulkan frames only
+extern "C" AJI_EXPORT int aji_copy_frame(aji_ctx *c, const aji_frame *in, const aji_frame *out)
+{
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->copy_frame(in, out);
+#endif
+    if (c) c->set_error("aji_copy_frame: Vulkan frames only");
+    return AJI_ERR;
+}
+
 extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *b,
                                          aji_frame_diff_result *out,

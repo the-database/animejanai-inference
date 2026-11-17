@@ -1549,6 +1549,70 @@ int VkVideo::resize(const aji_frame *in, const aji_frame *out)
     return AJI_OK;
 }
 
+int VkVideo::copy_frame(const aji_frame *in, const aji_frame *out)
+{
+    if (!in || !out || !in->plane[0] || !out->plane[0]) return AJI_ERR;
+    if (in->format != out->format || (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010)) {
+        fail("aji_copy_frame: the frames must be NV12 or P010, the same format");
+        return AJI_ERR_FORMAT;
+    }
+    if (in->width != out->width || in->height != out->height || (in->width & 1) || (in->height & 1)) {
+        fail("aji_copy_frame dims %dx%d vs %dx%d", in->width, in->height, out->width, out->height);
+        return AJI_ERR_SHAPE;
+    }
+    auto *ii = static_cast<aji_vk_image *>(in->plane[0]);
+    auto *oi = static_cast<aji_vk_image *>(out->plane[0]);
+    if (ii == oi) return AJI_OK;
+    int slot = 0;
+    VkCommandBuffer cb = dev_->frame_begin(&slot);
+    if (!cb) {
+        fail("aji_copy_frame: an earlier Vulkan submit has not finished after 10 s");
+        return AJI_ERR;
+    }
+    VkImageMemoryBarrier ib[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
+    ib[0].srcAccessMask = ib[1].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    ib[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    ib[0].oldLayout = static_cast<VkImageLayout>(ii->layout);
+    ib[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ib[0].image = static_cast<VkImage>(ii->image);
+    ib[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ib[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // replaced
+    ib[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    ib[1].image = static_cast<VkImage>(oi->image);
+    for (auto &b : ib) {
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, ib);
+    VkImageCopy r[2] = {};
+    for (int p = 0; p < 2; p++) {
+        const VkImageAspectFlags a = p ? VK_IMAGE_ASPECT_PLANE_1_BIT : VK_IMAGE_ASPECT_PLANE_0_BIT;
+        r[p].srcSubresource = r[p].dstSubresource = {a, 0, 0, 1};
+        r[p].extent = {(uint32_t)(p ? in->width / 2 : in->width), (uint32_t)(p ? in->height / 2 : in->height), 1};
+    }
+    vkCmdCopyImage(cb, ib[0].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ib[1].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, r);
+    const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ii->semaphore), ii->value},
+                                       {static_cast<VkSemaphore>(oi->semaphore), oi->value}};
+    const uint64_t t = ticket_ + 1;
+    const Device::SemValue sig[3] = {
+        {tl_, t}, {static_cast<VkSemaphore>(ii->semaphore), ii->value + 1}, {static_cast<VkSemaphore>(oi->semaphore), oi->value + 1}};
+    std::string why;
+    if (!dev_->frame_submit(slot, waits, 2, sig, 3, &why)) {
+        fail("aji_copy_frame: %s", why.c_str());
+        return AJI_ERR;
+    }
+    ticket_ = t;
+    ii->value += 1;
+    ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
+    ii->queue_family = dev_->queue_family();
+    oi->value += 1;
+    oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    oi->queue_family = dev_->queue_family();
+    return AJI_OK;
+}
+
 int VkVideo::done(uint64_t t)
 {
     if (t == 0) return 1;

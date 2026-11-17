@@ -107,6 +107,7 @@
     X(vkBindImageMemory)                \
     X(vkCmdCopyImageToBuffer)           \
     X(vkCmdCopyBufferToImage)           \
+    X(vkCmdCopyImage)                   \
     X(vkCreateSemaphore)                \
     X(vkDestroySemaphore)               \
     X(vkWaitSemaphores)                 \
