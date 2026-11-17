@@ -399,15 +399,22 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   (`frame_scd.comp`, SCDetect's metric over the padded luma, divided by the padded area) read back
   between two submits, post and a cropped copy into the output image; synchronous like the
   other backends'. A RIFE-only chain configures to 0 with RIFE active, as the D3D12 path.
-  RIFE-first interpolates at the source size (no pre-RIFE resize hoist). Not yet there, passed
-  through or left out with the reason in the log: temporal models, frame diff, and models
+  RIFE-first interpolates at the source size (no pre-RIFE resize hoist). Temporal models
+  (`TemporalNet`: TFDAT, TemporalFix) as aji_dml.cpp's: one ring per temporal step at its input
+  size, the cut metric per stored frame (`frame_temporal.comp` PASS 1, then `fr_scd2`), the
+  window gathered padded to 32 (PASS 2) with the same clamping and cut rules, the model's frame
+  cache, stacked stages through `rec_ensure`; `aji_ingest` and `aji_infer_seq` are one submit
+  each, their per-dispatch parameters written in the command buffer (`vkCmdUpdateBuffer`).
+  Not yet there, passed through or left out with the reason in the log: frame diff, and models
   without Vulkan kernels (no DirectML on this path). On
   Windows `aji_vk.dll`'s exports (aji_dml.cpp) forward a Vulkan-frames context (`c->vkv`); on Linux
   `aji_vk_frames.cpp` is the video ABI. The dispatcher's `aji_create_vk` always loads aji_vk.
   `aji_vk_frames_test` plays the player (a device of its own, NV12 / P010 images, `--no-coopmat`
   reports a device without cooperative matrices): SPANF3 720x480 0.64 ms a frame on the 5090,
   within 1 level of the D3D12 path. `--rife --rife-model-dir` is aji_harness_dml `--rife`'s loop:
-  rife_v4.14 1080p 4.3 ms, 74.6 dB against the D3D12 path; same scene skips on cut clips.
+  rife_v4.14 1080p 4.3 ms, 74.6 dB against the D3D12 path; same scene skips on cut clips. A
+  temporal chain runs aji_harness_dml's ingest loop (`--reset-at K`): TFDAT 2x 720x480 within 2
+  levels of the D3D12 path, TemporalFix 62.9 dB (5.4 ms a frame).
 - **`aji_img_vk.cpp`: the image ABI on Vulkan (`AJI_IMG_VULKAN`, `aji_image --backend vulkan`).**
   A `core/tiling` `TileModel` over the executor at the model's tile: the same cover, reflect pad
   and blend as the other backends. Every model must lower; one that doesn't is refused with the

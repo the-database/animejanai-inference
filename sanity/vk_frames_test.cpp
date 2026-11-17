@@ -14,6 +14,9 @@
  * player that didn't enable them gets. Raw files as aji_harness_dml's: per frame the Y plane, then
  * the interleaved CbCr plane; 16-bit little-endian MSB-aligned for P010.
  *
+ * A temporal chain (aji_temporal_radius > 0) runs as aji_harness_dml's: frames ingested in order,
+ * r ahead of the one upscaled (aji_ingest, aji_infer_seq), --reset-at K resetting before frame K.
+ *
  * --rife: aji_harness_dml --rife's interpolation-only loop (a scale-free 2/1 RIFE chain): writes
  * f0, i01, f1, i12, ..., the left frame in place of an interpolated one on a scene change.
  */
@@ -199,12 +202,76 @@ bool run_rife(Device &dev, aji_ctx *c, const char *input, const char *output, in
     return true;
 }
 
+// aji_harness_dml's temporal loop on Vulkan frames
+bool run_temporal(Device &dev, aji_ctx *c, Image &in, Image &out, Buffer &sin, Buffer &sout, const char *input, const char *output,
+                  int w, int h, int ow, int oh, int frames, bool p010, bool out_p010, int reset_at)
+{
+    const int r = aji_temporal_radius(c), ibps = p010 ? 2 : 1, obps = out_p010 ? 2 : 1;
+    const size_t in_bytes = (size_t)w * h * 3 / 2 * ibps, out_bytes = (size_t)ow * oh * 3 / 2 * obps;
+    std::printf("temporal: %d-frame window, reset at %d\n", 2 * r + 1, reset_at);
+    std::ifstream fi(input, std::ios::binary);
+    std::vector<char> all;
+    std::vector<char> buf(in_bytes);
+    size_t nfr = 0;
+    while ((int)nfr < frames && fi.read(buf.data(), (std::streamsize)in_bytes)) {
+        all.insert(all.end(), buf.begin(), buf.end());
+        nfr++;
+    }
+    std::ofstream fo;
+    if (output) fo.open(output, std::ios::binary);
+    aji_frame fin{}, fout{};
+    fin.width = w;
+    fin.height = h;
+    fin.format = p010 ? AJI_FMT_P010 : AJI_FMT_NV12;
+    fin.matrix = AJI_MATRIX_BT709;
+    fin.range = AJI_RANGE_LIMITED;
+    fin.siting = AJI_SITING_LEFT;
+    fin.plane[0] = &in.d;
+    fout = fin;
+    fout.width = ow;
+    fout.height = oh;
+    fout.format = out_p010 ? AJI_FMT_P010 : AJI_FMT_NV12;
+    fout.plane[0] = &out.d;
+    std::string why;
+    size_t base = 0, next = 0;
+    int n = 0;
+    double total = 0;
+    for (size_t k = 0; k < nfr; k++) {
+        if ((int)k == reset_at) {
+            aji_temporal_reset(c);
+            base = next = k;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        while (next < nfr && next <= k + r) {
+            std::memcpy(sin.map, all.data() + next * in_bytes, in_bytes);
+            if (!transfer(dev, in, sin, w, h, ibps, true, &why)) return false;
+            if (aji_ingest(c, &fin, (uint64_t)(next - base), nullptr) != AJI_OK || aji_wait(c, aji_flush(c, nullptr)) != AJI_OK) {
+                std::fprintf(stderr, "aji_ingest: %s\n", aji_last_error(c));
+                return false;
+            }
+            next++;
+        }
+        if (aji_infer_seq(c, (uint64_t)(k - base), &fout, nullptr) != AJI_OK || aji_wait(c, aji_flush(c, nullptr)) != AJI_OK) {
+            std::fprintf(stderr, "aji_infer_seq: %s\n", aji_last_error(c));
+            return false;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (k >= 2) total += ms;
+        if (!transfer(dev, out, sout, ow, oh, obps, false, &why)) return false;
+        if (fo) fo.write(static_cast<const char *>(sout.map), (std::streamsize)out_bytes);
+        n++;
+    }
+    std::printf("frames: %d, %dx%d -> %dx%d, %.3f ms a frame (ingest + infer_seq to the ticket, after the first two)\n", n, w, h, ow,
+                oh, n > 2 ? total / (n - 2) : 0.0);
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
 {
     const char *conf = nullptr, *model_dir = nullptr, *input = nullptr, *output = nullptr, *rife_dir = nullptr;
-    int w = 0, h = 0, frames = 1 << 30, slot = 1;
+    int w = 0, h = 0, frames = 1 << 30, slot = 1, reset_at = -1;
     bool p010 = false, out_p010 = false, no_cm = false, rife = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
@@ -226,6 +293,7 @@ int main(int argc, char **argv)
         else if (!std::strcmp(a, "--height")) h = std::atoi(v);
         else if (!std::strcmp(a, "--frames")) frames = std::atoi(v);
         else if (!std::strcmp(a, "--slot")) slot = std::atoi(v);
+        else if (!std::strcmp(a, "--reset-at")) reset_at = std::atoi(v);
         else if (!std::strcmp(a, "--format")) p010 = !std::strcmp(v, "p010");
         else if (!std::strcmp(a, "--out-format")) out_p010 = !std::strcmp(v, "p010");
     }
@@ -298,6 +366,11 @@ int main(int argc, char **argv)
         !dev->make_buffer(&sin, in_bytes, true, &why) || !dev->make_buffer(&sout, out_bytes, true, &why)) {
         std::fprintf(stderr, "caller resources: %s\n", why.c_str());
         return 1;
+    }
+    if (aji_temporal_radius(c) > 0) {
+        const bool ok = run_temporal(*dev, c, in, out, sin, sout, input, output, w, h, ow, oh, frames, p010, out_p010, reset_at);
+        aji_destroy(&c);
+        return ok ? 0 : 1;
     }
     std::ifstream fi(input, std::ios::binary);
     std::ofstream fo;

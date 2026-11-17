@@ -2946,7 +2946,7 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
 extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return 0;
+    if (c && c->vkv) return c->vkv->temporal_radius();
 #endif
     return (c && c->active && c->temporal.enabled) ? c->temporal.r : 0;
 }
@@ -2954,7 +2954,7 @@ extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
 extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return;
+    if (c && c->vkv) return c->vkv->temporal_reset();
 #endif
     if (c && c->temporal.enabled)
         for (auto &T : c->temporal.st)
@@ -3028,7 +3028,7 @@ extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
                                      uint64_t seq, void *cu_stream)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return AJI_ERR;
+    if (c && c->vkv) return c->vkv->ingest(in, seq);
 #endif
     (void)cu_stream;
     if (!c || !in)
@@ -3266,7 +3266,7 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
                                         const aji_frame *out, void *cu_stream)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return AJI_ERR;
+    if (c && c->vkv) return c->vkv->infer_seq(seq, out);
 #endif
     (void)cu_stream;
     if (!c || !out)
