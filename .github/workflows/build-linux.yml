@@ -1,6 +1,7 @@
 name: Build Linux (aji)
 
-# The Linux release leg: builds libaji.so + libaji_trt.so (TensorRT/CUDA backend) on the
+# The Linux release leg: builds libaji.so + libaji_trt.so (TensorRT/CUDA backend) + libaji_vk.so
+# (the Vulkan backend: Vulkan frames, the image ABI; for AMD and Intel GPUs too) on the
 # Ubuntu 22.04 baseline image and publishes aji-linux-x64.tar.zst on the release tag. The
 # mpv-upscale-2x_animejanai assembler downloads this (InstallAji). Dispatched by hand from main
 # with the tag; this run creates the release, the Windows zips are uploaded to it afterwards:
@@ -72,7 +73,7 @@ jobs:
     - name: Stage + tar (flat, extracts into animejanai/inference)
       run: |
         mkdir -p stage
-        cp build/libaji.so build/libaji_trt.so build/aji_harness build/aji_kernel_test stage/
+        cp build/libaji.so build/libaji_trt.so build/libaji_vk.so build/aji_harness build/aji_kernel_test stage/
         chmod +x stage/*
         tar --zstd -C stage -cf aji-linux-x64.tar.zst .
 
