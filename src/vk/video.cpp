@@ -23,6 +23,24 @@ std::string fmt_num(double v)
     return buf;
 }
 
+int round_even(double v)
+{
+    const int i = (int)(v + 0.5);
+    return i & ~1;
+}
+
+// fit into (box_w, box_h) preserving the aspect (aji_dml.cpp's fit_box)
+void fit_box(int w, int h, double box_w, double box_h, int *ow, int *oh)
+{
+    if ((double)w / h > 16.0 / 9.0) {
+        *ow = round_even(box_w);
+        *oh = round_even(box_w * h / w);
+    } else {
+        *ow = round_even(box_h * w / h);
+        *oh = round_even(box_h);
+    }
+}
+
 constexpr uint64_t kWaitNs = 10ull * 1000 * 1000 * 1000;  // a ticket wait or a slot reuse: a lost device after this
 
 }  // namespace
@@ -170,8 +188,31 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
         int t = aji_onnx_input(bytes.data(), bytes.size(), &oin) ? aji_onnx_temporal_frames(oin) : 1;
         if (m.frames > 0) t = m.frames;
         if (t > 1) return passthrough(m.name + ": temporal models are not on Vulkan frames yet: passthrough");
-        if (m.resize_height_before_upscale > 0 || m.resize_factor_before_upscale != 100.0)
-            return passthrough(m.name + ": resizes before upscale are not on Vulkan frames yet: passthrough");
+        // resizes before upscale: the factor, then the height (fitted to 16:9), as aji_dml.cpp's
+        const auto resize_to = [&](int nw, int nh, const char *what) {
+            Step r;
+            r.in_w = cw;
+            r.in_h = ch;
+            r.out_w = nw;
+            r.out_h = nh;
+            steps_.push_back(std::move(r));
+            cw = nw;
+            ch = nh;
+            char buf[200];
+            std::snprintf(buf, sizeof buf, what, m.resize_height_before_upscale > 0 ? m.resize_height_before_upscale : m.resize_factor_before_upscale,
+                          cw, ch);
+            log_steps_.push_back(buf);
+        };
+        if (m.resize_height_before_upscale == 0 && m.resize_factor_before_upscale != 100.0) {
+            const int nw = round_even(cw * m.resize_factor_before_upscale / 100.0), nh = round_even(ch * m.resize_factor_before_upscale / 100.0);
+            if (nw >= 2 && nh >= 2 && (nw != cw || nh != ch))
+                resize_to(nw, nh, "Applied Resize Factor Before Upscale: %g%%;    New Video Resolution: %dx%d");
+        }
+        if (m.resize_height_before_upscale != 0 && (int)m.resize_height_before_upscale != ch) {
+            int nw, nh;
+            fit_box(cw, ch, m.resize_height_before_upscale * 16.0 / 9.0, m.resize_height_before_upscale, &nw, &nh);
+            resize_to(nw, nh, "Applied Resize Height Before Upscale: %gpx;    New Video Resolution: %dx%d");
+        }
         std::string why;
         ajinative::OnnxGraph g;
         std::unique_ptr<ImgNet> net;
@@ -213,7 +254,16 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
         teardown();
         return AJI_ERR;
     }
-    for (size_t k = 0; k < steps_.size(); k++) steps_[k].net->bind_io(chain_[k % 2].buf, chain_[(k + 1) % 2].buf);
+    for (size_t k = 0; k < steps_.size(); k++) {
+        Step &s = steps_[k];
+        if (s.net) {
+            s.net->bind_io(chain_[k % 2].buf, chain_[(k + 1) % 2].buf);
+        } else if (!(s.rs = RgbResize::create(*dev_, s.in_w, s.in_h, s.out_w, s.out_h, chain_[k % 2].buf, chain_[(k + 1) % 2].buf, &why))) {
+            fail("resize %dx%d -> %dx%d: %s", s.in_w, s.in_h, s.out_w, s.out_h, why.c_str());
+            teardown();
+            return AJI_ERR;
+        }
+    }
     dev_->save_caches();
     active_ = true;
     out_w_ = cw;
@@ -300,6 +350,10 @@ int VkVideo::infer(const aji_frame *in, const aji_frame *out)
     io_->record_pre(cb);
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     for (const Step &s : steps_) {
+        if (s.rs) {
+            s.rs->record(cb);  // ends with its barrier
+            continue;
+        }
         (void)s.net->record(cb, s.in_w, s.in_h);  // the sizes it was created for: it records
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }

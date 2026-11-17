@@ -1,0 +1,45 @@
+#version 450
+// A resize of the fp16 NCHW RGB tensor between chain steps (HLSL cs_rs_h, cs_rs_v), by PASS:
+//   1 rs_h: horizontal, tensor -> planar fp32. di = {src w, dst w, taps, rows}. d0 tensor, d1 f32
+//     out (3 planes of dst w x rows, z = plane).
+//   2 rs_v: vertical, planar fp32 -> tensor, 2 px per invocation (x covers w/2; w is even).
+//     di = {w, src rows, taps, dst rows}. d0 f32 in, d1 tensor out.
+#extension GL_GOOGLE_include_directive : require
+#include "frame_common.glsl"
+
+// element i of the fp16 tensor in d0
+float tload0(uint i)
+{
+    const uint w = d0[i >> 1];
+    return f16_to_f32((i & 1u) != 0u ? (w >> 16) : (w & 0xffffu));
+}
+
+void main()
+{
+    const ivec4 di = DI();
+#if PASS == 1
+    const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= di.y || y >= di.w) return;
+    const uint z = gl_GlobalInvocationID.z;
+    const uint sp = z * uint(di.x) * uint(di.w) + uint(y) * uint(di.x);
+    const uint dp = z * uint(di.y) * uint(di.w);
+    const int s0 = starts[x];
+    float a = 0.0;
+    for (int j = 0; j < di.z; j++) a += weights[x * di.z + j] * tload0(sp + uint(mirr(s0 + j, di.x)));
+    d1[dp + uint(y) * uint(di.y) + uint(x)] = floatBitsToUint(a);
+#elif PASS == 2
+    const int w = di.x, x0 = int(gl_GlobalInvocationID.x) * 2, y = int(gl_GlobalInvocationID.y);
+    if (x0 >= w || y >= di.w) return;
+    const uint z = gl_GlobalInvocationID.z;
+    const uint sp = z * uint(w) * uint(di.y), dp = z * uint(w) * uint(di.w);
+    const int s0 = starts[y];
+    float a[2];
+    for (int k = 0; k < 2; k++) {
+        a[k] = 0.0;
+        for (int j = 0; j < di.z; j++)
+            a[k] += weights[y * di.z + j] * uintBitsToFloat(d0[sp + uint(mirr(s0 + j, di.y)) * uint(w) + uint(x0 + k)]);
+    }
+    const uint e = dp + uint(y) * uint(w) + uint(x0);
+    d1[e >> 1] = f32_to_f16(a[0]) | (f32_to_f16(a[1]) << 16);
+#endif
+}

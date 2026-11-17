@@ -10,8 +10,8 @@
  * whose values are aji_flush's tickets.
  *
  * Not yet here (the chain is passed through, or the step left out, with the reason logged):
- * resizes before upscale, RIFE, temporal models, frame differences, models without Vulkan
- * kernels (there is no DirectML to fall back to on this path).
+ * RIFE, temporal models, frame differences, models without Vulkan kernels (there is no DirectML
+ * to fall back to on this path).
  */
 #ifndef AJI_VK_VIDEO_H
 #define AJI_VK_VIDEO_H
@@ -50,7 +50,8 @@ private:
     void teardown();
 
     struct Step {
-        std::unique_ptr<ImgNet> net;
+        std::unique_ptr<ImgNet> net;      // a model, or
+        std::unique_ptr<RgbResize> rs;    // a resize before upscale (made once the chain buffers are)
         int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
     };
 

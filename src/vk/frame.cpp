@@ -212,6 +212,96 @@ void FrameIO::record_post(VkCommandBuffer cb) const
     run(cb, 4);
 }
 
+RgbResize::~RgbResize()
+{
+    if (pool_) vkDestroyDescriptorPool(dev_.device(), pool_, nullptr);
+    for (Buffer *b : {&tmp_, &tables_, &params_}) dev_.destroy(*b);
+}
+
+std::unique_ptr<RgbResize> RgbResize::create(Device &dev, int sw, int sh, int dw, int dh, VkBuffer src, VkBuffer dst, std::string *why)
+{
+    if (sw < 1 || sh < 1 || dw < 2 || dh < 1 || (dw & 1)) return fail(why, "resize sizes"), nullptr;
+    std::unique_ptr<RgbResize> p(new RgbResize(dev));
+    const aji_resample::weights tbl[2] = {aji_resample::compute(sw, dw, 0.0, AJI_FILTER_SPLINE36),
+                                          aji_resample::compute(sh, dh, 0.0, AJI_FILTER_SPLINE36)};
+    std::vector<uint8_t> tables;
+    VkDeviceSize toff[2][2] = {}, tsize[2][2] = {};
+    const VkDeviceSize align = std::max<VkDeviceSize>(dev.info().storage_align, 16);
+    const auto put = [&](const void *s, size_t bytes, VkDeviceSize *off, VkDeviceSize *size) {
+        tables.resize((tables.size() + align - 1) / align * align);
+        *off = tables.size();
+        *size = std::max<size_t>(bytes, 4);
+        tables.resize(tables.size() + *size, 0);
+        std::memcpy(tables.data() + *off, s, bytes);
+    };
+    for (int i = 0; i < 2; i++) {
+        put(tbl[i].start.data(), tbl[i].start.size() * 4, &toff[i][0], &tsize[i][0]);
+        put(tbl[i].wt.data(), tbl[i].wt.size() * 4, &toff[i][1], &tsize[i][1]);
+    }
+    KArgs a[2];
+    a[0].di[0] = sw; a[0].di[1] = dw; a[0].di[2] = tbl[0].taps; a[0].di[3] = sh;
+    a[1].di[0] = dw; a[1].di[1] = sh; a[1].di[2] = tbl[1].taps; a[1].di[3] = dh;
+    if (!dev.make_buffer(&p->tmp_, (VkDeviceSize)3 * dw * sh * 4, false, why) || !dev.make_buffer(&p->tables_, tables.size(), false, why) ||
+        !dev.make_buffer(&p->params_, sizeof a, false, why) || !dev.upload(p->tables_, tables.data(), tables.size(), why) ||
+        !dev.upload(p->params_, a, sizeof a, why))
+        return nullptr;
+    {
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * Device::kBindings};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pi.maxSets = 2;
+        pi.poolSizeCount = 1;
+        pi.pPoolSizes = &ps;
+        if (vkCreateDescriptorPool(dev.device(), &pi, nullptr, &p->pool_) != VK_SUCCESS) return fail(why, "descriptor pool"), nullptr;
+    }
+    const char *mod[2] = {"fr_rs_h", "fr_rs_v"};
+    const VkBuffer d0[2] = {src, p->tmp_.buf}, d1[2] = {p->tmp_.buf, dst};
+    for (int k = 0; k < 2; k++) {
+        p->pipe_[k] = dev.pipeline(mod[k], 0, 0, why);
+        if (!p->pipe_[k]) return nullptr;
+        VkDescriptorSetLayout l = dev.set_layout();
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = p->pool_;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &l;
+        if (vkAllocateDescriptorSets(dev.device(), &ai, &p->set_[k]) != VK_SUCCESS) return fail(why, "descriptor set"), nullptr;
+        VkDescriptorBufferInfo bi[Device::kBindings];
+        for (auto &b : bi) b = {dev.dummy(), 0, VK_WHOLE_SIZE};
+        bi[0] = {p->tables_.buf, toff[k][0], tsize[k][0]};
+        bi[1] = {p->tables_.buf, toff[k][1], tsize[k][1]};
+        bi[2] = {d0[k], 0, VK_WHOLE_SIZE};
+        bi[3] = {d1[k], 0, VK_WHOLE_SIZE};
+        bi[7] = {p->params_.buf, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet wr[Device::kBindings];
+        for (int j = 0; j < Device::kBindings; j++) {
+            wr[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr[j].dstSet = p->set_[k];
+            wr[j].dstBinding = (uint32_t)j;
+            wr[j].descriptorCount = 1;
+            wr[j].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wr[j].pBufferInfo = &bi[j];
+        }
+        vkUpdateDescriptorSets(dev.device(), Device::kBindings, wr, 0, nullptr);
+    }
+    const uint32_t g[2][3] = {{groups(dw, 32), groups(sh, 8), 3}, {groups(dw / 2, 32), groups(dh, 8), 3}};
+    std::memcpy(p->groups_, g, sizeof g);
+    return p;
+}
+
+void RgbResize::record(VkCommandBuffer cb) const
+{
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    for (int k = 0; k < 2; k++) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_[k]);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev_.pipeline_layout(), 0, 1, &set_[k], 0, nullptr);
+        const int32_t pc[4] = {k, 0, 0, 0};
+        vkCmdPushConstants(cb, dev_.pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cb, groups_[k][0], groups_[k][1], groups_[k][2]);
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+}
+
 std::unique_ptr<FramePipeline> FramePipeline::create(Device &dev, const ajinative::Plan &plan, int w, int h, const FrameFormat &f,
                                                      std::string *why)
 {
