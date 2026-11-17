@@ -10,6 +10,8 @@
 namespace ajivk {
 namespace {
 
+constexpr int kSliceTarget = 256;  // workgroups a dispatch should have
+
 bool fail(std::string *why, const std::string &m)
 {
     if (why) *why = m;
@@ -87,6 +89,24 @@ std::vector<uint16_t> gconv_pack(Family f, const uint16_t *w, int cin, int cinp,
         for (int i = 0; i < cin; i++)
             for (int o = 0; o < n; o++) sub[((size_t)t * cin + i) * n + o] = w[((size_t)t * cin + i) * cout + co0 + o];
     return pack_weights(f, sub.data(), 9, cin, cinp, n, coutp);
+}
+
+int gconv_slice_width(int cout, int W, int H, int stride, std::initializer_list<int> widths)
+{
+    static const int target = [] {
+        const char *e = std::getenv("AJI_VK_SLICE_TARGET");
+        const int v = e ? std::atoi(e) : 0;
+        return v > 0 ? v : kSliceTarget;
+    }();
+    const int CP = (cout + 15) / 16 * 16, th = stride == 2 ? 8 : 16;
+    const int tiles = ((W + 15) / 16) * ((H + th - 1) / th);
+    int narrow = 0;
+    for (int w : widths) {
+        if (CP % w) continue;
+        if (tiles * (CP / w) >= target) return w;
+        narrow = w;
+    }
+    return narrow ? narrow : 16;
 }
 
 std::vector<uint16_t> gconv_pack_slices(Family f, const uint16_t *w, int cin, int cinp, int cout, int coutp, int nz)

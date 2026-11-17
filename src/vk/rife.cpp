@@ -360,14 +360,9 @@ std::unique_ptr<Rife> VkRife::build(Device &dev, const ajinative::OnnxGraph &g, 
                           std::vector<int> *wslices) {
         // the slice width: the widest built (shaders.txt) that still gives the dispatch ~256
         // workgroups, so the small low-resolution convs of the first blocks fill the GPU
-        const int CP = pad16(cout), th = io.stride == 2 ? 8 : 16;
-        const int tiles = ((io.W + 15) / 16) * ((io.H + th - 1) / th);
-        int coutp = 16;
-        for (int w : {64, 48, 32, 16})
-            if (CP % w == 0 && (io.in == 0 || w <= 32) && tiles * (CP / w) >= 256) {
-                coutp = w;
-                break;
-            }
+        const int CP = pad16(cout);
+        const int coutp = io.in == 0 ? gconv_slice_width(cout, io.W, io.H, io.stride, {64, 48, 32, 16})
+                                     : gconv_slice_width(cout, io.W, io.H, io.stride, {32, 16});
         const int nz = CP / coutp;
         if (wslices->empty()) wslices->push_back(add_w(taps, bias, cin, io.cinp, cout, coutp, nz));
         {

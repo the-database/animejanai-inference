@@ -279,7 +279,9 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   the model input and output at caller-owned buffers.
 - **`aji_vk` (Windows) is `aji_dml.cpp` built with `AJI_VULKAN`,** as `aji_trtrtx` is `aji_trt`'s
   sources with a define. The D3D12 frame pipeline is DirectML's: plane copies, pre/post, resizes,
-  the ticket API. Each model step that lowers runs on the Vulkan executor; the others run on
+  the ticket API. Each model step that lowers runs on the Vulkan executor, and an ESRGAN step on
+  the whole frame (`ImgNet::frame`, the memory rule of CUDA's `FrameNet::image`: refused unless
+  weights plus buffers fit in free memory less 1 GiB + 10% of the device); the others run on
   DirectML, so the fallback is per model. The log line is `Native kernels: <model> (...; Vulkan
   cm16)`, or `Native kernels not used for <model>: <why>; using DirectML`.
   - The chain buffers are shared D3D12 buffers imported into Vulkan (`import_d3d12_buffer`).

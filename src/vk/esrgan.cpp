@@ -87,13 +87,19 @@ public:
     ~Esrgan() override
     {
         if (pool_) vkDestroyDescriptorPool(dev_.device(), pool_, nullptr);
-        for (Buffer *b : {&in_, &out_, &arena_, &wts_, &bias_, &params_}) dev_.destroy(*b);
+        if (!io_external_) {
+            dev_.destroy(in_);
+            dev_.destroy(out_);
+        }
+        for (Buffer *b : {&arena_, &wts_, &bias_, &params_}) dev_.destroy(*b);
     }
     static std::unique_ptr<ImgNet> build(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why);
 
     const Buffer &input() const override { return in_; }
     const Buffer &output() const override { return out_; }
+    void bind_io(VkBuffer in, VkBuffer out) override;
     bool record(VkCommandBuffer cb, int w, int h) const override;
+    void suffix(const std::string &s) { what_ += s; }
     int out_w() const override { return w_ * scale_; }
     int out_h() const override { return h_ * scale_; }
     size_t device_bytes() const override { return bytes_; }
@@ -103,7 +109,7 @@ public:
 private:
     struct Conv1 {
         GConvShape s;
-        int cinp = 16;
+        int cinp = 16, nz = 1;
         VkDeviceSize woff = 0, wsize = 0, boff = 0, bsize = 0;
     };
     struct Op : GConvOp {
@@ -116,12 +122,49 @@ private:
     bool unshuffle_ = false;
     float rrdb_scale_ = 0.2f;
     Buffer in_, out_, arena_, wts_, bias_, params_;
+    bool io_external_ = false;  // in_ / out_ are the caller's (bind_io): handles only
     std::vector<Conv1> convs_;
     std::vector<Op> ops_;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     size_t bytes_ = 0, wbytes_ = 0;
     std::string what_;
 };
+
+void Esrgan::bind_io(VkBuffer in, VkBuffer out)
+{
+    // the first conv reads the input (binding 0), the last writes the output (binding 2)
+    std::vector<VkDescriptorBufferInfo> bi;
+    std::vector<VkWriteDescriptorSet> wr;
+    bi.reserve(2 * ops_.size());
+    for (const Op &o : ops_)
+        for (int k = 0; k < 2; k++) {
+            const bool hit = k == 0 ? o.src.buf == in_.buf : o.dst.buf == out_.buf;
+            if (!hit) continue;
+            bi.push_back({k == 0 ? in : out, 0, VK_WHOLE_SIZE});
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = o.set;
+            w.dstBinding = k == 0 ? 0u : 2u;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w.pBufferInfo = &bi.back();
+            wr.push_back(w);
+        }
+    vkUpdateDescriptorSets(dev_.device(), (uint32_t)wr.size(), wr.data(), 0, nullptr);
+    for (Op &o : ops_) {
+        if (o.src.buf == in_.buf) o.src = Ref{in, 0, VK_WHOLE_SIZE};
+        if (o.dst.buf == out_.buf) o.dst = Ref{out, 0, VK_WHOLE_SIZE};
+    }
+    if (!io_external_) {
+        bytes_ -= in_.size + out_.size;
+        dev_.destroy(in_);
+        dev_.destroy(out_);
+    }
+    io_external_ = true;
+    in_ = Buffer{};
+    out_ = Buffer{};
+    in_.buf = in;
+    out_.buf = out;
+}
 
 bool Esrgan::record(VkCommandBuffer cb, int w, int h) const
 {
@@ -177,16 +220,19 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
     // weights, packed for the family, into one buffer (each conv's at an aligned offset)
     std::vector<uint16_t> wall, ball;
     const VkDeviceSize align = std::max<VkDeviceSize>(dev.info().storage_align, 16);
+    // (output slices don't pay here: on a 360x240 trunk they made ESRGAN 2x a third slower)
     const auto add_conv = [&](const Conv &c, float scale, int cinp, const GConvShape &s) -> int {
+        const int nz = 1;
         std::vector<float> sc(c.cout, scale);
         const std::vector<uint16_t> taps = conv_taps(c, scale == 1.f ? nullptr : &sc);
-        const std::vector<uint16_t> pw = gconv_pack(fam, taps.data(), c.cin, cinp, c.cout, 0, s.coutp);
+        const std::vector<uint16_t> pw = gconv_pack_slices(fam, taps.data(), c.cin, cinp, c.cout, s.coutp, nz);
         std::vector<float> b(c.cout);
         for (int o = 0; o < c.cout; o++) b[o] = c.b[o] * scale;
-        const std::vector<uint16_t> pb = pack_vector(b.data(), c.cout, s.coutp);
+        const std::vector<uint16_t> pb = gconv_bias_slices(b.data(), c.cout, s.coutp, nz);
         Conv1 cv;
         cv.s = s;
         cv.cinp = cinp;
+        cv.nz = nz;
         const size_t aw = align / 2;
         wall.resize((wall.size() + aw - 1) / aw * aw);
         cv.woff = wall.size() * 2;
@@ -275,6 +321,7 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
         Op o;
         o.conv = conv;
         o.s = e->convs_[conv].s;
+        o.nz = e->convs_[conv].nz;
         o.entry = (int)e->ops_.size();
         o.src = src;
         o.dst = dst;
@@ -383,6 +430,7 @@ public:
     explicit Lowered(std::unique_ptr<Executor> e) : ex_(std::move(e)) {}
     const Buffer &input() const override { return ex_->input(); }
     const Buffer &output() const override { return ex_->output(); }
+    void bind_io(VkBuffer in, VkBuffer out) override { ex_->bind_io(in, out); }
     bool record(VkCommandBuffer cb, int w, int h) const override { return ex_->record(cb, w, h); }
     int out_w() const override { return ex_->out_w(); }
     int out_h() const override { return ex_->out_h(); }
@@ -409,6 +457,44 @@ bool ImgNet::run(Device &dev, int w, int h, std::string *why) const
 std::unique_ptr<ImgNet> build_esrgan(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why)
 {
     return Esrgan::build(dev, g, w, h, why);
+}
+
+std::unique_ptr<ImgNet> ImgNet::lowered(Device &dev, const ajinative::Plan &plan, int w, int h, std::string *why)
+{
+    std::unique_ptr<Executor> ex = Executor::create(dev, plan, w, h, why);
+    if (!ex) return nullptr;
+    auto n = std::make_unique<Lowered>(std::move(ex));
+    n->desc_ = ajinative::describe(plan) + "; Vulkan " + family_name(dev.family());
+    return n;
+}
+
+std::unique_ptr<ImgNet> ImgNet::frame(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why)
+{
+    if (w < 1 || h < 1) return refuse_(why, "bad frame size"), nullptr;
+    // the probe: buffers per input pixel (they scale with the area; what does not makes the
+    // estimate high, not low)
+    constexpr int P = 128;
+    std::unique_ptr<ImgNet> probe = Esrgan::build(dev, g, P, P, why);
+    if (!probe) return nullptr;
+    const double per_px = (double)(probe->device_bytes() - probe->weight_bytes()) / ((double)P * P);
+    const double need = (double)probe->weight_bytes() + per_px * w * h;
+    probe.reset();
+    uint64_t free_b = 0, total_b = 0;
+    dev.memory(&free_b, &total_b);
+    const double keep = (double)(1ull << 30) + total_b / 10.0;
+    const auto gb = [](double b) {
+        char t[32];
+        std::snprintf(t, sizeof t, "%.1f GB", b / (1u << 30));
+        return std::string(t);
+    };
+    if (need + keep > (double)free_b)
+        return refuse_(why, "a whole " + std::to_string(w) + "x" + std::to_string(h) + " frame needs ~" + gb(need) + ", " +
+                                gb((double)free_b) + " free (keeping " + gb(keep) + ")"),
+               nullptr;
+    std::unique_ptr<ImgNet> n = Esrgan::build(dev, g, w, h, why);
+    if (!n) return nullptr;
+    static_cast<Esrgan *>(n.get())->suffix(", whole frame");
+    return n;
 }
 
 std::unique_ptr<ImgNet> ImgNet::create(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why)
