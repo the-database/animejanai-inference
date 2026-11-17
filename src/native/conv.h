@@ -58,6 +58,9 @@ struct Conv3x3 {
     int cin = 0, cout = 0;
     const Weights *w = nullptr;
     const Weights *att = nullptr;  // Gate::Tanh1x1: the 1x1 attention conv (taps 1)
+    // NCHW inputs: the model input normalized as it is loaded, (x - in_mean[c]) * in_scale[c]
+    bool in_norm = false;
+    float in_mean[3] = {0.f, 0.f, 0.f}, in_scale[3] = {1.f, 1.f, 1.f};
 };
 
 // H, W: the conv's resolution (an unshuffled input is 2H x 2W). src: NHWC [H][W][cin] or NCHW

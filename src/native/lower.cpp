@@ -39,6 +39,7 @@ struct Lowerer {
     std::string X, Y;                          // canonical model input / output
     std::map<std::string, int> feat;           // canonical tensor -> feature id
     std::map<std::string, int> unshuffled;     // canonical tensor -> 0 CRD, 1 DCR (factor 2)
+    float norm_mean[3] = {0.f, 0.f, 0.f}, norm_scale[3] = {1.f, 1.f, 1.f};  // input_norm()
 
     Lowerer(const OnnxGraph &g_, Plan &p) : g(g_), plan(p), used(g_.nodes.size(), false) {}
 
@@ -125,6 +126,7 @@ struct Lowerer {
         for (size_t i = 0; i < g.nodes.size(); i++)
             for (const std::string &o : g.nodes[i].out) prod[o] = (int)i;
         X = g.inputs[0];
+        if (!input_norm()) return false;
         data.insert(X);
         for (size_t i = 0; i < g.nodes.size(); i++) {
             const OnnxNode &n = g.nodes[i];
@@ -148,6 +150,73 @@ struct Lowerer {
                 if (!n.in[k].empty() && data.count(canon(n.in[k]))) cons[canon(n.in[k])].push_back((int)i);
         }
         Y = canon(g.outputs[0]);
+        return true;
+    }
+
+    // A per-channel constant of an elementwise op on the input: a scalar or 3 values over the
+    // channel axis ([3], [3,1,1], [1,3,1,1]).
+    bool channel_const(const std::string &name, float v[3])
+    {
+        const OnnxTensor *t = constant(name);
+        std::vector<float> f;
+        if (!t || !t->floats(&f)) return false;
+        if (f.size() == 1) {
+            v[0] = v[1] = v[2] = f[0];
+            return true;
+        }
+        if (f.size() != 3) return false;
+        int big = 0;
+        for (int64_t d : t->dims)
+            if (d != 1) big++;
+        if (big != 1 || t->dims.empty()) return false;
+        const size_t nd = t->dims.size();
+        if (!(nd == 1 || (nd >= 3 && t->dims[nd - 3] == 3))) return false;  // the channel axis
+        for (int c = 0; c < 3; c++) v[c] = f[c];
+        return true;
+    }
+
+    // The input normalization: a chain of Sub / Add / Mul / Div by per-channel constants on the
+    // model input, as SPAN's (x - mean) * img_range, taken off the graph into the plan
+    // (y = a x + b, kept as (x - mean) * scale); X becomes its result.
+    bool input_norm()
+    {
+        float a[3] = {1.f, 1.f, 1.f}, b[3] = {0.f, 0.f, 0.f};
+        bool any = false;
+        for (;;) {
+            int user = -1, nusers = 0;
+            for (size_t i = 0; i < g.nodes.size(); i++)
+                for (const std::string &in : g.nodes[i].in)
+                    if (!in.empty() && in == X) {
+                        nusers++;
+                        user = (int)i;
+                        break;
+                    }
+            if (nusers != 1) break;
+            const OnnxNode &n = node(user);
+            const bool sub = n.op == "Sub", add = n.op == "Add", mul = n.op == "Mul", div = n.op == "Div";
+            if (!(sub || add || mul || div) || n.in.size() != 2 || n.out.empty()) break;
+            const bool first = n.in[0] == X;
+            if (!first && (sub || div)) break;  // c - x, c / x: not affine in x
+            float c[3];
+            if (!channel_const(first ? n.in[1] : n.in[0], c)) break;
+            for (int k = 0; k < 3; k++) {
+                if (sub) b[k] -= c[k];
+                else if (add) b[k] += c[k];
+                else if (mul) a[k] *= c[k], b[k] *= c[k];
+                else if (c[k] == 0.f) return fail("input normalization divides by zero");
+                else a[k] /= c[k], b[k] /= c[k];
+            }
+            used[user] = true;
+            X = n.out[0];
+            any = true;
+        }
+        if (!any) return true;
+        for (int k = 0; k < 3; k++) {
+            if (a[k] == 0.f) return fail("input normalization scales by zero");
+            norm_scale[k] = a[k];
+            norm_mean[k] = -b[k] / a[k];
+        }
+        plan.in_norm = true;
         return true;
     }
 
@@ -309,6 +378,15 @@ struct Lowerer {
         return true;
     }
 
+    void set_norm(PlanStep *st) const
+    {
+        st->in_norm = plan.in_norm;
+        for (int k = 0; k < 3; k++) {
+            st->in_mean[k] = norm_mean[k];
+            st->in_scale[k] = norm_scale[k];
+        }
+    }
+
     bool conv(int i)
     {
         const OnnxNode &n = node(i);
@@ -325,9 +403,11 @@ struct Lowerer {
         if (s == X) {
             st.in = (int)Input::NCHW3;
             st.src = kModelInput;
+            set_norm(&st);
         } else if (unshuffled.count(s)) {
             st.in = (int)Input::NCHW3Unshuffle2;
             st.src = kModelInput;
+            set_norm(&st);
             plan.unshuffle = 2;
             if (unshuffled[s] == 1) {  // SpaceToDepth (DCR): ONNX channel (ry*2+rx)*3 + c
                 for (int u = 0; u < 12; u++) cin_from.push_back(((u % 4) / 2 * 2 + u % 2) * 3 + u / 4);
@@ -374,6 +454,7 @@ struct Lowerer {
                 if (canon(rz.in[0]) != X || rz.attr_s("mode", "nearest") != "nearest" ||
                     (ct != "asymmetric" && ct != "half_pixel"))
                     return fail("the output adds an input upsampled other than nearest");
+                if (plan.in_norm) return fail("the output adds the input, which the model normalizes");
                 used[a] = used[pz->second] = true;
                 st.resid = kModelInput;
             }
@@ -562,8 +643,8 @@ std::string describe(const Plan &p)
     std::string ch;
     for (int c : cs) ch += (ch.empty() ? "" : "/") + std::to_string(c);
     char buf[200];
-    std::snprintf(buf, sizeof(buf), "%zu kernels, %s ch%s, depth-to-space %d%s", p.steps.size(), ch.c_str(),
-                  p.unshuffle > 1 ? ", pixel-unshuffle 2" : "", p.depth_to_space,
+    std::snprintf(buf, sizeof(buf), "%zu kernels, %s ch%s%s, depth-to-space %d%s", p.steps.size(), ch.c_str(),
+                  p.in_norm ? ", input normalized" : "", p.unshuffle > 1 ? ", pixel-unshuffle 2" : "", p.depth_to_space,
                   p.fp32_weights ? ", fp32 model computed in fp16" : "");
     return buf;
 }

@@ -209,7 +209,11 @@ through the same `ImgNet` interface (`weight_bytes`, `device_bytes`).
 The lowering works op by op on the graph's data path and folds into each Conv what follows it (activation,
 SPAN gate with the residual, depth-to-space and SRVGG's upsampled-input add); `Concat` + 1x1 `Conv`
 is the concat kernel; pixel-unshuffle (reshape/transpose or `SpaceToDepth`) and `DepthToSpace`
-(CRD or DCR, by reordering weights) fold into the first and last convs. Shape-only plumbing,
+(CRD or DCR, by reordering weights) fold into the first and last convs. A constant per-channel
+Sub / Add / Mul / Div chain on the input (SPAN's `(x - mean) * 255`) comes off the graph as the
+plan's input normalization, applied where the first conv loads the input (CUDA `ConvParams`;
+Vulkan: mean and scale after the bias, push constant 3 the flag), so its zero padding stays zero
+in normalized space; folding it into the weights would not be exact at the borders. Shape-only plumbing,
 casts, and pads/slices that align to the unshuffle factor are ignored; any other op refuses the
 model with its reason. `aji_native_lower_test` (cpu) checks the plans for SPANF3-, Compact- and
 span_s-shaped graphs written in memory, and the refusals.

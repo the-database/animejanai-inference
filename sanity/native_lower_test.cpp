@@ -2,6 +2,7 @@
 // the supported families export (SPANF3, SRVGG Compact, span_s), lowered to native steps;
 // plus graphs that must be refused. Checks the plan's structure, not numbers. CPU only.
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -168,13 +169,20 @@ std::string compact(int c, int body, bool leaky)
     return g.bytes("input", "output");
 }
 
-// span_s 4x: SiLU (x * sigmoid(x)), sigmoid(o) - 0.5 gates, conv_2, DCR depth-to-space
-std::string span_s(int c, int blocks)
+// span_s 4x: SiLU (x * sigmoid(x)), sigmoid(o) - 0.5 gates, conv_2, DCR depth-to-space; norm:
+// SPAN's input normalization in front, (input - mean) * 255
+std::string span_s(int c, int blocks, bool norm = false)
 {
     G g;
     auto silu = [&](const std::string &x) { return g.op2("Mul", x, g.op1("Sigmoid", x)); };
     g.init(tensor("half", {}, 1, 0.5f));
-    const std::string feat = g.conv("input", 3, c, 3);
+    std::string in = "input";
+    if (norm) {
+        g.init(tensor("mean", {1, 3, 1, 1}, 1, 0.45f));
+        g.init(tensor("range", {}, 1, 255.f));
+        in = g.op2("Mul", g.op2("Sub", in, "mean"), "range");
+    }
+    const std::string feat = g.conv(in, 3, c, 3);
     std::string x = feat, out_b1, mid;
     for (int i = 0; i < blocks; i++) {
         const std::string o1 = g.conv(x, c, c, 3), a1 = silu(o1);
@@ -234,6 +242,12 @@ int main()
     CHECK(p.steps.size() == 1 + 6 * 3 + 1 + 1 + 1 + 1);
     CHECK(count(p, 3, 0) == 6 && count(p, 0, 3) == 12);
     CHECK(p.depth_to_space == 4 && p.steps.back().out == 2);
+    CHECK(!p.in_norm && !p.steps[0].in_norm);
+    // the input normalization: off the graph, onto the step reading the input
+    CHECK(lower_bytes(span_s(48, 6, true), &p, &why));
+    CHECK(p.in_norm && p.steps[0].in_norm && p.steps[0].src == kModelInput);
+    CHECK(std::fabs(p.steps[0].in_mean[1] - 0.45f) < 1e-6f && p.steps[0].in_scale[2] == 255.f);
+    CHECK(!p.steps[1].in_norm);
     const std::string span_desc = describe(p);
 
     // refusals, with a reason

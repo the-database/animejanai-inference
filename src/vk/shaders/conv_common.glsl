@@ -15,8 +15,10 @@ const int TW = 16, CP = CINP + 8, SP = COUTP + 8, HP = (TH + 2) * (TW + 2);
 const int SM_HALO = HP * CP / 8, SM_STAGE = TH * TW * SP / 8;
 const int SM_TOTAL = SM_HALO > SM_STAGE + SM_EXTRA ? SM_HALO : SM_STAGE + SM_EXTRA;
 
-// H, W: the conv resolution. has_resid: a depth-to-space output adds the model input.
-layout(push_constant) uniform PC { int H; int W; int has_resid; int unused; } pc;
+// H, W: the conv resolution. has_resid: a depth-to-space output adds the model input. in_norm:
+// an NCHW input is normalized as it is loaded, (x - mean[c]) * scale[c], the six fp16 values after
+// the bias (bias_h[COUTP + c], bias_h[COUTP + 3 + c]).
+layout(push_constant) uniform PC { int H; int W; int has_resid; int in_norm; } pc;
 
 #if IN == 0
 layout(std430, binding = 0) readonly buffer Src { uvec4 src_v[]; };      // NHWC [H][W][CINP]
@@ -67,8 +69,11 @@ void fill_halo(int tid, int nth, int tx0, int ty0, int H, int W)
         uvec4 a = uvec4(0);
         if (yy >= 0 && yy < H && xx >= 0 && xx < W) {
             const int o = yy * W + xx, plane = H * W;
-            a.x = packFloat2x16(f16vec2(src_h[o], src_h[plane + o]));
-            a.y = packFloat2x16(f16vec2(src_h[2 * plane + o], float16_t(0.0)));
+            vec3 v = vec3(float(src_h[o]), float(src_h[plane + o]), float(src_h[2 * plane + o]));
+            if (pc.in_norm != 0)
+                for (int c = 0; c < 3; c++) v[c] = (v[c] - float(bias_h[COUTP + c])) * float(bias_h[COUTP + 3 + c]);
+            a.x = packFloat2x16(f16vec2(v.x, v.y));
+            a.y = packFloat2x16(f16vec2(v.z, 0.0));
         }
         sm[px * (CP / 8)] = a;
         sm[px * (CP / 8) + 1] = uvec4(0);
@@ -86,6 +91,17 @@ void fill_halo(int tid, int nth, int tx0, int ty0, int H, int W)
             a.w = src_u[((1 * H2 + y2 + 1) * W2 + x2) >> 1];
             b.x = src_u[((2 * H2 + y2) * W2 + x2) >> 1];
             b.y = src_u[((2 * H2 + y2 + 1) * W2 + x2) >> 1];
+            if (pc.in_norm != 0) {
+                // pairs (a.x, a.y): channel 0, (a.z, a.w): 1, (b.x, b.y): 2
+                const float m0 = float(bias_h[COUTP]), m1 = float(bias_h[COUTP + 1]), m2 = float(bias_h[COUTP + 2]);
+                const float s0 = float(bias_h[COUTP + 3]), s1 = float(bias_h[COUTP + 4]), s2 = float(bias_h[COUTP + 5]);
+                a.x = packFloat2x16(f16vec2((unpackFloat2x16(a.x) - m0) * s0));
+                a.y = packFloat2x16(f16vec2((unpackFloat2x16(a.y) - m0) * s0));
+                a.z = packFloat2x16(f16vec2((unpackFloat2x16(a.z) - m1) * s1));
+                a.w = packFloat2x16(f16vec2((unpackFloat2x16(a.w) - m1) * s1));
+                b.x = packFloat2x16(f16vec2((unpackFloat2x16(b.x) - m2) * s2));
+                b.y = packFloat2x16(f16vec2((unpackFloat2x16(b.y) - m2) * s2));
+            }
         }
         sm[px * (CP / 8)] = a;
         sm[px * (CP / 8) + 1] = b;

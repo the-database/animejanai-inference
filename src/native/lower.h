@@ -10,8 +10,10 @@
  *       Mul(Add(o, x), Sub(Sigmoid(o), 0.5))        -> Gate::SigmoidHalf (SPAN)
  *       Add(x, o)                                   -> Gate::Residual;
  *   - Conv1x1(Concat(f1..fn)), n = 2..4             -> the concat kernel;
- *   - the model input, optionally pixel-unshuffled (Reshape/Transpose/Reshape or SpaceToDepth)
- *     into the first conv; DepthToSpace (CRD or DCR) after the last conv, optionally plus the
+ *   - the model input, optionally normalized per channel by constants (Sub / Add / Mul / Div,
+ *     as SPAN's (x - mean) * 255) and pixel-unshuffled (Reshape/Transpose/Reshape or
+ *     SpaceToDepth), into the first conv: the normalization is applied where that conv loads
+ *     the input, so its zero padding stays zero in normalized space; DepthToSpace (CRD or DCR) after the last conv, optionally plus the
  *     nearest-upsampled model input (SRVGG's skip), into the output.
  * Cast / Identity / Dropout, and Pad / Slice used to align the input to the unshuffle factor
  * and crop the output back, pass through (the executor then requires aligned sizes). Any other
@@ -48,6 +50,9 @@ struct PlanStep {
     int cin = 0, cout = 0;
     PlanWeights w, att;
     int src = -1, resid = -1, dst = -1;
+    // CONV reading the model input: it is (x - in_mean[c]) * in_scale[c] (Plan's normalization)
+    bool in_norm = false;
+    float in_mean[3] = {0.f, 0.f, 0.f}, in_scale[3] = {1.f, 1.f, 1.f};
     // CONCAT: 1x1 over the concat of nsrc feature maps of c channels each
     int c = 0, nsrc = 0;
     int srcs[4] = {-1, -1, -1, -1};
@@ -60,6 +65,7 @@ struct Plan {
     int depth_to_space = 1;      // the output is depth-to-space'd by this after the last conv
     bool aligned_only = false;   // the graph pads/crops to the unshuffle factor: sizes must be multiples
     bool fp32_weights = false;   // the model was exported in fp32 (the kernels compute in fp16)
+    bool in_norm = false;        // the input is normalized per channel (the steps reading it carry it)
     // output = input * depth_to_space / unshuffle
 };
 

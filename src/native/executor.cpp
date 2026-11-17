@@ -72,6 +72,11 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
             st.op.out = (Output)ps.out;
             st.op.cin = ps.cin;
             st.op.cout = ps.cout;
+            st.op.in_norm = ps.in_norm;
+            for (int c = 0; c < 3; c++) {
+                st.op.in_mean[c] = ps.in_mean[c];
+                st.op.in_scale[c] = ps.in_scale[c];
+            }
             if (!upload_w(ps.w, L.cin_pad[i], L.cout_pad[i], &st.op.w)) return fail(reason);
             if (ps.gate == 2 && !upload_w(ps.att, ps.att.cin, ps.att.cout, &st.op.att)) return fail(reason);
             if (!supported(st.op, &reason)) return fail("conv " + std::to_string(ps.cin) + "->" + std::to_string(ps.cout) + ": " + reason);

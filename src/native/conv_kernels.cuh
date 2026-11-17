@@ -28,6 +28,9 @@ struct ConvParams {
     const uint4 *watt;
     const half2 *batt;
     int H, W;
+    // the model input normalized as it is loaded: (x - in_mean[c]) * in_scale[c] (NCHW inputs)
+    int in_norm;
+    float in_mean[3], in_scale[3];
 };
 
 struct ConcatParams {
@@ -113,6 +116,9 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
             if (yy >= 0 && yy < H && xx >= 0 && xx < W) {
 #pragma unroll
                 for (int c = 0; c < 3; c++) v[c] = p.src[((size_t)c * H + yy) * W + xx];
+                if (p.in_norm)
+#pragma unroll
+                    for (int c = 0; c < 3; c++) v[c] = __float2half((__half2float(v[c]) - p.in_mean[c]) * p.in_scale[c]);
             }
             reinterpret_cast<uint4 *>(sm + px * CP)[0] = reinterpret_cast<uint4 *>(v)[0];
             reinterpret_cast<uint4 *>(sm + px * CP)[1] = reinterpret_cast<uint4 *>(v)[1];
@@ -123,8 +129,13 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
             const int px = i / 6, k = i % 6, c = k >> 1, ry = k & 1;
             const int yy = ty0 - 1 + px / (TW + 2), xx = tx0 - 1 + px % (TW + 2);
             half2 v = __float2half2_rn(0.f);
-            if (yy >= 0 && yy < H && xx >= 0 && xx < W)
+            if (yy >= 0 && yy < H && xx >= 0 && xx < W) {
                 v = __ldg(reinterpret_cast<const half2 *>(p.src + ((size_t)c * (2 * H) + 2 * yy + ry) * (2 * W) + 2 * xx));
+                if (p.in_norm) {
+                    const float2 f = __half22float2(v);
+                    v = __floats2half2_rn((f.x - p.in_mean[c]) * p.in_scale[c], (f.y - p.in_mean[c]) * p.in_scale[c]);
+                }
+            }
             reinterpret_cast<half2 *>(sm + px * CP)[c * 2 + ry] = v;
         }
         for (int px = tid; px < HP; px += WARPS * 32) *reinterpret_cast<uint2 *>(sm + px * CP + 12) = make_uint2(0, 0);
