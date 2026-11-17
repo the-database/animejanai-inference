@@ -71,6 +71,27 @@ private:
     uint32_t groups_[5][3] = {};
 };
 
+// A Spline36 resize of an fp16 NCHW RGB tensor, sw x sh -> dw x dh (dw even): the chain's resize
+// before upscale (HLSL cs_rs_h, cs_rs_v; frame_resize.comp), src and dst the caller's buffers.
+class RgbResize {
+public:
+    static std::unique_ptr<RgbResize> create(Device &dev, int sw, int sh, int dw, int dh, VkBuffer src, VkBuffer dst, std::string *why);
+    ~RgbResize();
+    RgbResize(const RgbResize &) = delete;
+    RgbResize &operator=(const RgbResize &) = delete;
+    // Ends with a compute barrier.
+    void record(VkCommandBuffer cb) const;
+
+private:
+    explicit RgbResize(Device &d) : dev_(d) {}
+    Device &dev_;
+    Buffer tmp_, tables_, params_;
+    VkDescriptorPool pool_ = VK_NULL_HANDLE;
+    VkPipeline pipe_[2] = {};
+    VkDescriptorSet set_[2] = {};
+    uint32_t groups_[2][3] = {};
+};
+
 class FramePipeline {
 public:
     // The model (a lowered plan) for w x h frames (even sizes). Null and *why on failure.

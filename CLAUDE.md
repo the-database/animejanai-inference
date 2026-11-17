@@ -390,9 +390,11 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   device alone. `VkVideo` runs the conf's chain (lowered models and the `ImgNet::frame` ones,
   ping-ponging two chain buffers) between `FrameIO`'s pre and post, one submit a frame: the input
   planes copied out of the image (`vkCmdCopyImageToBuffer`, per plane aspect), the output copied in,
-  the images' semaphores and the context's own timeline (aji_flush's tickets) signalled. Not yet
-  there, passed through or left out with the reason in the log: resizes before upscale, RIFE,
-  temporal models, frame diff, and models without Vulkan kernels (no DirectML on this path). On
+  the images' semaphores and the context's own timeline (aji_flush's tickets) signalled. Resizes
+  before upscale run as `RgbResize` (`frame_resize.comp`, the HLSL cs_rs_h / cs_rs_v; the factor,
+  then the height fitted to 16:9, as aji_dml.cpp's). Not yet there, passed through or left out
+  with the reason in the log: RIFE, temporal models, frame diff, and models without Vulkan
+  kernels (no DirectML on this path). On
   Windows `aji_vk.dll`'s exports (aji_dml.cpp) forward a Vulkan-frames context (`c->vkv`); on Linux
   `aji_vk_frames.cpp` is the video ABI. The dispatcher's `aji_create_vk` always loads aji_vk.
   `aji_vk_frames_test` plays the player (a device of its own, NV12 / P010 images, `--no-coopmat`
