@@ -610,6 +610,7 @@ std::unique_ptr<Rife> VkRife::build(Device &dev, const ajinative::OnnxGraph &g, 
             m = "rife_gather_f" + std::to_string(F) + "_m" + std::to_string(nm) + "_k" + std::to_string(kv) + "_t" +
                 std::to_string(q.v[9] == 1 ? 1 : 2) + "_b" + std::to_string(b0 ? 1 : 0) + "_r" + std::to_string(rev ? 1 : 0);
             if (!spirv_find(m.c_str())) return refuse_(why, "no RIFE gather kernel for this feature layout (" + m + ")"), nullptr;
+            st.label += " " + m.substr(12);
         }
         if (!(st.pipe = dev.pipeline(m.c_str(), 0, 0, why))) return nullptr;
     }
