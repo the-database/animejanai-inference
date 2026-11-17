@@ -5,6 +5,7 @@
 //                     [--seconds S]
 //   aji_vk_model_test rife <rife.onnx> <w> <h> [--t T] [--device N] [--iters N] [--min-db D]
 //                     [--max-levels L]
+//   aji_vk_model_test temporal <temporalfix.onnx> <w> <h> [--device N] [--iters N] [--min-db D]
 // Runs the model at w x h on a synthetic frame and times it (GPU timestamps, model only, and the
 // executor's create time; --cache keeps the variant and pipeline caches in DIR, as aji_vk keeps
 // them in the model directory, so a second run shows a warm configure). Then, per --ref size (default 256x144 and a ragged 202x118), compares
@@ -17,6 +18,8 @@
 // rife: RIFE (vk/rife.h) between a synthetic frame and a shifted copy at timestep T (default 0.5),
 // timed; with AJI_CUDA, compared with CUDA native RIFE (same limits, defaults 40 dB and 16 levels:
 // the warps amplify fp16 differences in the conv sums).
+// temporal: TemporalFix (vk/tfix.h) on 7 frames of a synthetic pan, timed; with AJI_CUDA, compared
+// with CUDA native TemporalFix (--min-db, default 60).
 // Plain C++ with the Vulkan loader opened at run time: it also builds for android-arm64 and runs
 // from an adb shell.
 #include <algorithm>
@@ -26,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -36,11 +40,13 @@
 #include "vk/device.h"
 #include "vk/executor.h"
 #include "vk/rife.h"
+#include "vk/tfix.h"
 
 #ifdef AJI_VK_TEST_CUDA
 #include <cuda_runtime.h>
 #include "native/executor.h"
 #include "native/rife.h"
+#include "native/vidnet.h"
 #endif
 
 using namespace ajinative;
@@ -111,6 +117,165 @@ bool run_vk(ajivk::Device &dev, const Plan &plan, int w, int h, const std::vecto
     if (!dev.download(ex->output(), out->data(), out->size() * 2, why)) return false;
     if (keep) *keep = std::move(ex);
     return true;
+}
+
+int temporal_main(int argc, char **argv)
+{
+    std::string why;
+    const char *model = argv[2];
+    const int w = std::atoi(argv[3]), h = std::atoi(argv[4]);
+    int device = -1, iters = 10;
+    double min_db = 60.0;
+    for (int i = 5; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--device") && i + 1 < argc) device = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--min-db") && i + 1 < argc) min_db = std::atof(argv[++i]);
+    }
+    std::ifstream f(model, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(f)), {});
+    OnnxGraph g;
+    if (bytes.empty() || !parse_onnx(bytes.data(), bytes.size(), &g, &why)) {
+        std::fprintf(stderr, "%s: %s\n", model, why.empty() ? "unreadable" : why.c_str());
+        return 1;
+    }
+    auto dev = ajivk::Device::create(device, nullptr, &why);
+    if (!dev) {
+        std::fprintf(stderr, "device: %s\n", why.c_str());
+        return 1;
+    }
+    std::printf("device %u: %s, family %s\n", dev->info().index, dev->info().name.c_str(), ajivk::family_name(dev->family()));
+    // 7 frames of a pan (3 pixels right, 2 down per frame) with noise that changes per frame
+    const size_t plane = (size_t)w * h;
+    const auto a = synth(w + 32, h + 32);
+    const int aw = w + 32, ah = h + 32;
+    std::vector<float> win(plane * 21);
+    uint32_t sd = 777u;
+    for (int k = 0; k < 7; k++)
+        for (int c = 0; c < 3; c++)
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++) {
+                    sd = sd * 1664525u + 1013904223u;
+                    const float n = (((sd >> 9) & 0xffff) / 65535.f - 0.5f) * 0.04f;
+                    const float v = a[((size_t)c * ah + y + 2 * k) * aw + x + 3 * k] + n;
+                    win[((size_t)(3 * k + c) * h + y) * w + x] = std::fmin(1.f, std::fmax(0.f, v));
+                }
+    const auto hin = to_half(win);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto t = ajivk::TemporalNet::create(*dev, g, w, h, &why);
+    const double cs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!t) {
+        std::fprintf(stderr, "vulkan temporal %dx%d: %s\n", w, h, why.c_str());
+        return 1;
+    }
+    std::printf("%s (create %.2f s, %.0f MB)\n", t->describe().c_str(), cs, t->device_bytes() / 1048576.0);
+    std::vector<uint16_t> out(plane * 3);
+    if (!dev->upload(t->input(), hin.data(), hin.size() * 2, &why) || !t->run(*dev, &why) ||
+        !dev->download(t->output(), out.data(), out.size() * 2, &why)) {
+        std::fprintf(stderr, "vulkan temporal run: %s\n", why.c_str());
+        return 1;
+    }
+    size_t nonfinite = 0;
+    for (uint16_t v : out) nonfinite += !std::isfinite(half_bits_to_float(v));
+    int bad = nonfinite != 0;
+    // the frame cache: the frames encoded into scrambled entries, the window run from them, must
+    // give the whole-window output bit for bit
+    {
+        const int perm[7] = {3, 5, 0, 6, 1, 2, 4}, nocut[7] = {-1, -1, -1, -1, -1, -1, -1};
+        VkCommandBuffer cb = dev->begin();
+        for (int z = 0; z < 7; z++) t->record_encode(cb, perm[z], z);
+        t->record_cached(cb, perm, nocut, 0.f, 1.f);
+        std::vector<uint16_t> o2(out.size());
+        if (!dev->submit_wait(cb, &why) || !dev->download(t->output(), o2.data(), o2.size() * 2, &why)) {
+            std::printf("cached window: %s: FAIL\n", why.c_str());
+            bad++;
+        } else {
+            size_t diff = 0;
+            for (size_t i = 0; i < o2.size(); i++) diff += o2[i] != out[i];
+            std::printf("cached window (scrambled entries) vs whole window: %zu values differ: %s\n", diff, diff ? "FAIL" : "ok");
+            bad += diff != 0;
+        }
+    }
+    const auto timed = [&](const char *what, const std::function<void(VkCommandBuffer)> &rec) {
+        if (dev->info().timestamp_ns <= 0 || iters <= 0) return;
+        VkQueryPool qp = VK_NULL_HANDLE;
+        VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpi.queryCount = 2;
+        vkCreateQueryPool(dev->device(), &qpi, nullptr, &qp);
+        VkCommandBuffer cb = dev->begin();
+        vkCmdResetQueryPool(cb, qp, 0, 2);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        for (int i = 0; i < iters; i++) {
+            if (i)
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            rec(cb);
+        }
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+        if (dev->submit_wait(cb, &why)) {
+            uint64_t ts[2];
+            vkGetQueryPoolResults(dev->device(), qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            std::printf("vulkan temporal %dx%d, %s: %.3f ms (%d iterations)\n", w, h, what,
+                        (double)(ts[1] - ts[0]) * dev->info().timestamp_ns / 1e6 / iters, iters);
+        }
+        vkDestroyQueryPool(dev->device(), qp, nullptr);
+    };
+    timed("whole window", [&](VkCommandBuffer cb) { t->record(cb); });
+    {
+        // steady state: one new frame encoded per window
+        const int ent[7] = {0, 1, 2, 3, 4, 5, 6}, nocut[7] = {-1, -1, -1, -1, -1, -1, -1};
+        int k = 0;
+        timed("one frame encoded + cached window", [&](VkCommandBuffer cb) {
+            t->record_encode(cb, k++ % 7, 6);
+            t->record_cached(cb, ent, nocut, 0.f, 1.f);
+        });
+    }
+    if (std::getenv("AJI_VK_PROFILE")) std::printf("%s", t->profile(*dev).c_str());
+    dev->save_caches();
+    if (nonfinite) std::printf("%zu non-finite outputs: FAIL\n", nonfinite);
+    // against the centre frame: how much the model changed it
+    {
+        std::vector<float> cen(win.begin() + plane * 9, win.begin() + plane * 12);
+        const Cmp c = compare(out, cen);
+        std::printf("output vs the centre frame: %.1f dB (how much it changed)\n", c.db);
+    }
+#ifdef AJI_VK_TEST_CUDA
+    {
+        cudaStream_t s;
+        cudaStreamCreate(&s);
+        auto cn = ajinative::VidNet::create(g, w, h, s, &why);
+        if (!cn) {
+            std::printf("vs CUDA native: not run (%s)\n", why.c_str());
+        } else {
+            void *din = nullptr, *dout = nullptr;
+            cudaMalloc(&din, hin.size() * 2);
+            cudaMalloc(&dout, out.size() * 2);
+            cudaMemcpy(din, hin.data(), hin.size() * 2, cudaMemcpyHostToDevice);
+            cn->run(din, dout, s);
+            cudaStreamSynchronize(s);
+            std::vector<uint16_t> co(out.size());
+            cudaMemcpy(co.data(), dout, co.size() * 2, cudaMemcpyDeviceToHost);
+            size_t same = 0;
+            std::vector<float> cf(co.size());
+            for (size_t i = 0; i < co.size(); i++) {
+                same += co[i] == out[i];
+                cf[i] = half_bits_to_float(co[i]);
+            }
+            const Cmp c = compare(out, cf);
+            const bool ok = c.nan == 0 && c.db >= min_db;
+            std::printf("vs CUDA native TemporalFix at %dx%d: %.1f dB, max %.4f (%.1f levels), %.2f%% bit-identical: %s\n", w, h, c.db,
+                        c.maxd, c.maxd * 255, 100.0 * same / co.size(), ok ? "ok" : "FAIL");
+            bad += !ok;
+            cudaFree(din);
+            cudaFree(dout);
+        }
+        cudaStreamDestroy(s);
+    }
+#endif
+    return bad ? 1 : 0;
 }
 
 int rife_main(int argc, char **argv)
@@ -250,6 +415,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc >= 5 && !std::strcmp(argv[1], "rife")) return rife_main(argc, argv);
+    if (argc >= 5 && !std::strcmp(argv[1], "temporal")) return temporal_main(argc, argv);
     if (argc >= 2 && !std::strcmp(argv[1], "info")) {
         const auto devs = ajivk::list_devices(&why);
         if (devs.empty()) std::printf("no Vulkan devices: %s\n", why.c_str());

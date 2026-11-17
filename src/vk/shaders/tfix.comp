@@ -1,0 +1,441 @@
+#version 450
+// TemporalFix's kernels besides its 3x3 convs (vk/tfix.cpp), ports of native/tfix_kernels.cu and of
+// the depthwise / pointwise convs native/tfix.cpp runs through native/tfm, by PASS:
+//   1 dw: depthwise 3x3 (zero padding) + bias, fp32 sums
+//   2 pw: 1x1 conv, fp32 sums, + bias + a residual, then LeakyReLU 0.2
+//   3 resize: bilinear, half-pixel, clamped (ONNX Resize linear); channels 0, 1 times mx, my
+//   4 down: the model's 5x5 binomial low-pass then the bilinear resize, in one separable pass
+//   5 warp: grid_sample bilinear, zero padding, by an fp32 flow; and the validity (sum of in-image
+//     corner weights)
+//   6 frame: a frame's 8-channel map: rgb, the 4 encoder features upsampled, 0
+//   7 full: a support at full resolution: its flow resized, the frame warped by it, the resized
+//     logit, the validity
+//   8 fill: one channel set to a value
+//   9 conf_in: the confidence head's 32-channel input
+//   10 accum: the confidence-gated accumulation of a support (fp32)
+//   11 final: the output blend, three fp16 planes
+//   12 select: each window position's cache entry, under the temporal gather's scene-cut rule
+//
+// Tensors are maps into one arena (binding 2): element pix*stride + off + c of a buffer at base,
+// fp16 (base and the index in halfs) or fp32 (in floats). A map may name a window position: its
+// buffer is then entry sel[pos] of a stack of same-size buffers fstride elements apart (the frame
+// cache). Binding 0: the window's frames (fp16 NCHW planes), 1: sel, 3: the output planes, 4: fp32
+// weights (dw, pw), 5 (select): the stage's frame-difference sums, 7: Params (64 ints an entry):
+//   0-3, 4-7, 8-11, 12-15, 24-27 maps m0..m4 {base, stride, off, f32}; 16 ih / h, 17 iw / w,
+//   18 oh / H, 19 ow / W, 20 C / K, 21 add / N, 22-23 floats (mx, my; v; dt; thresh, gslope;
+//   minsup, cslope), 28 eps (float), 29 frame plane offset (halfs), 30 weight offset, 31 bias offset
+//   (floats; < 0: none), 32 + 2k, 33 + 2k map k's window position (< 0: none) and fstride;
+//   select: 40-46 the entries, 48-54 the diff slot of each cut (< 0: none), 56 t, 57 thresh,
+//   58 1 / area (floats).
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC { int entry; int u0; int u1; int u2; } pc;
+layout(std430, binding = 7) readonly buffer Params { ivec4 params[]; };
+layout(std430, binding = 0) readonly buffer Frames { float16_t frh[]; };
+#if PASS == 12
+layout(std430, binding = 1) writeonly buffer Sel { int sel[]; };
+layout(std430, binding = 5) readonly buffer Diff { float diff[]; };
+#else
+layout(std430, binding = 1) readonly buffer Sel { int sel[]; };
+#endif
+layout(std430, binding = 2) buffer ArH { float16_t arh[]; };
+layout(std430, binding = 2) buffer ArF { float arf[]; };
+layout(std430, binding = 2) buffer ArV { uvec4 arv[]; };
+layout(std430, binding = 3) writeonly buffer Out { float16_t outh[]; };
+layout(std430, binding = 4) readonly buffer Wt { float wf[]; };
+
+int prm(int k) { return params[pc.entry * 16 + (k >> 2)][k & 3]; }
+float prmf(int k) { return intBitsToFloat(prm(k)); }
+
+struct Map {
+    uint base;
+    int stride, off;
+    bool f32;
+    bool none;
+};
+Map map(int k)
+{
+    const int at = k < 4 ? 4 * k : 24;
+    Map m;
+    m.none = prm(at) < 0;
+    m.base = uint(max(prm(at), 0));
+    m.stride = prm(at + 1);
+    m.off = prm(at + 2);
+    m.f32 = prm(at + 3) != 0;
+#if PASS != 12
+    const int pos = prm(32 + 2 * k);
+    if (pos >= 0) m.base += uint(sel[pos]) * uint(prm(33 + 2 * k));
+#endif
+    return m;
+}
+float ld(Map m, uint pix, int c)
+{
+    const uint i = m.base + pix * uint(m.stride) + uint(m.off + c);
+    return m.f32 ? arf[i] : float(arh[i]);
+}
+// fp16 maps whose pixels start on 8-half boundaries load 8 channels at a time (as CUDA's uint4)
+bool vec8(Map m) { return !m.f32 && (m.stride & 7) == 0 && (m.base & 7u) == 0u; }
+// channels [8v, 8v + 8) of pixel pix, counted from the pixel's first channel (not from off)
+void lv8(Map m, uint pix, int v, out float t[8])
+{
+    const uvec4 q = arv[((m.base + pix * uint(m.stride)) >> 3) + uint(v)];
+    [[unroll]] for (int j = 0; j < 4; j++) {
+        const vec2 h = unpackHalf2x16(q[j]);
+        t[2 * j] = h.x;
+        t[2 * j + 1] = h.y;
+    }
+}
+// The 16 lanes of pixel pix counted from its first channel (lane j: channel j - off), for maps that
+// vec8 takes and off + C <= 16; lanes past the second vector's need are zero.
+bool lanes16(Map m, int C) { return vec8(m) && m.off + C <= 16; }
+void ld16(Map m, uint pix, int C, out float t[16])
+{
+    float a[8];
+    lv8(m, pix, 0, a);
+    [[unroll]] for (int j = 0; j < 8; j++) t[j] = a[j];
+    if (m.off + C > 8) {
+        lv8(m, pix, 1, a);
+        [[unroll]] for (int j = 0; j < 8; j++) t[8 + j] = a[j];
+    } else {
+        [[unroll]] for (int j = 0; j < 8; j++) t[8 + j] = 0.0;
+    }
+}
+// channels [0, C) of a map at channel offset 0 (vectorized when it can be)
+void ldc(Map m, uint pix, int C, out float v[16])
+{
+    if (lanes16(m, C) && m.off == 0) {
+        ld16(m, pix, C, v);
+        return;
+    }
+    for (int c = 0; c < 16; c++) v[c] = c < C ? ld(m, pix, c) : 0.0;
+}
+void st(Map m, uint pix, int c, float v)
+{
+    const uint i = m.base + pix * uint(m.stride) + uint(m.off + c);
+    if (m.f32) arf[i] = v;
+    else arh[i] = float16_t(v);
+}
+
+float sigm(float v) { return 1.0 / (1.0 + exp(-v)); }
+
+// source coordinate for output index o (half-pixel, clamped like ONNX Resize linear)
+void srcc(int o, int n_in, float scale, out int i0, out int i1, out float f)
+{
+    float x = (float(o) + 0.5) / scale - 0.5;
+    x = min(max(x, 0.0), float(n_in - 1));
+    const int a = int(x);
+    i0 = a;
+    i1 = min(a + 1, n_in - 1);
+    f = x - float(a);
+}
+
+// one output pixel of the low-pass + resize: rows i0-2 .. i0+3 with weights (1-f) k[r-i0+2] + f k[r-i0+1]
+void taps6(int o, int n_in, float scale, out int base, out float wt[6])
+{
+    int i0, i1;
+    float f;
+    srcc(o, n_in, scale, i0, i1, f);
+    const float k[5] = float[5](1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0);
+    base = i0 - 2;
+    const float f1 = i1 == i0 ? 0.0 : f, f0 = 1.0 - f1;
+    [[unroll]] for (int t = 0; t < 6; t++) {
+        const int a = t, b = t - 1;
+        wt[t] = (a <= 4 ? f0 * k[a] : 0.0) + (b >= 0 && b <= 4 ? f1 * k[b] : 0.0);
+    }
+}
+
+void main()
+{
+    const int p = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+#if PASS == 1
+    // dw: thread = pixel x 8 channels; taps in the CUDA kernel's order (column, then row)
+    const int H = prm(16), W = prm(17), C = prm(20), G = C / 8;
+    if (p >= H * W * G) return;
+    const int c = (p % G) * 8, t = p / G, y = t / W, x = t % W;
+    const Map mi = map(0), mo = map(1);
+    const int wo = prm(30), bo = prm(31);
+    float a[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    [[unroll]] for (int dx = 0; dx < 3; dx++)
+        [[unroll]] for (int dy = 0; dy < 3; dy++) {
+            const int yy = y + dy - 1, xx = x + dx - 1;
+            if (yy < 0 || yy >= H || xx < 0 || xx >= W) continue;
+            const uint pix = uint(yy * W + xx);
+            [[unroll]] for (int j = 0; j < 8; j++) a[j] += ld(mi, pix, c + j) * wf[wo + (c + j) * 9 + dy * 3 + dx];
+        }
+    [[unroll]] for (int j = 0; j < 8; j++) {
+        if (bo >= 0) a[j] += wf[bo + c + j];
+        st(mo, uint(t), c + j, a[j]);
+    }
+#elif PASS == 2
+    // pw: thread = pixel x 8 output channels; weights [K][N]
+    const int M = prm(16), K = prm(20), N = prm(21), G = N / 8;
+    if (p >= M * G) return;
+    const int n0 = (p % G) * 8, t = p / G;
+    const Map ma = map(0), mo = map(1), m1 = map(2);
+    const int wo = prm(30), bo = prm(31);
+    float a[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (int k = 0; k < K; k++) {
+        const float v = ld(ma, uint(t), k);
+        [[unroll]] for (int j = 0; j < 8; j++) a[j] += v * wf[wo + k * N + n0 + j];
+    }
+    [[unroll]] for (int j = 0; j < 8; j++) {
+        float v = a[j] + (bo >= 0 ? wf[bo + n0 + j] : 0.0);
+        if (!m1.none) v += ld(m1, uint(t), n0 + j);
+        v = v < 0.0 ? v * 0.2 : v;
+        st(mo, uint(t), n0 + j, v);
+    }
+#elif PASS == 3
+    const int ih = prm(16), iw = prm(17), oh = prm(18), ow = prm(19), C = prm(20);
+    if (p >= oh * ow) return;
+    const Map src = map(0), dst = map(1);
+    const bool add = prm(21) != 0;
+    const float mx = prmf(22), my = prmf(23);
+    const int y = p / ow, x = p % ow;
+    int y0, y1, x0, x1;
+    float fy, fx;
+    srcc(y, ih, float(oh) / float(ih), y0, y1, fy);
+    srcc(x, iw, float(ow) / float(iw), x0, x1, fx);
+    const uint a = uint(y0 * iw + x0), b = uint(y0 * iw + x1), c = uint(y1 * iw + x0), d = uint(y1 * iw + x1);
+    if (lanes16(src, C)) {
+        float va[16], vb[16], vc[16], vd[16];
+        ld16(src, a, C, va);
+        ld16(src, b, C, vb);
+        ld16(src, c, C, vc);
+        ld16(src, d, C, vd);
+        [[unroll]] for (int j = 0; j < 16; j++) {
+            const int ch = j - src.off;
+            if (ch < 0 || ch >= C) continue;
+            float v = (va[j] * (1.0 - fx) + vb[j] * fx) * (1.0 - fy) + (vc[j] * (1.0 - fx) + vd[j] * fx) * fy;
+            if (ch == 0) v *= mx;
+            else if (ch == 1) v *= my;
+            if (add) v += ld(dst, uint(p), ch);
+            st(dst, uint(p), ch, v);
+        }
+        return;
+    }
+    for (int ch = 0; ch < C; ch++) {
+        float v = (ld(src, a, ch) * (1.0 - fx) + ld(src, b, ch) * fx) * (1.0 - fy) + (ld(src, c, ch) * (1.0 - fx) + ld(src, d, ch) * fx) * fy;
+        if (ch == 0) v *= mx;
+        else if (ch == 1) v *= my;
+        if (add) v += ld(dst, uint(p), ch);
+        st(dst, uint(p), ch, v);
+    }
+#elif PASS == 4
+    const int ih = prm(16), iw = prm(17), oh = prm(18), ow = prm(19), C = prm(20);
+    if (p >= oh * ow) return;
+    const Map src = map(0), dst = map(1);
+    const float mx = prmf(22), my = prmf(23);
+    const int y = p / ow, x = p % ow;
+    int by, bx;
+    float wy[6], wx[6];
+    taps6(y, ih, float(oh) / float(ih), by, wy);
+    taps6(x, iw, float(ow) / float(iw), bx, wx);
+    float acc[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    const bool v8 = vec8(src) && src.off == 0 && C <= 8;
+    [[unroll]] for (int r = 0; r < 6; r++) {
+        const int yy = by + r;
+        if (yy < 0 || yy >= ih || wy[r] == 0.0) continue;
+        [[unroll]] for (int t = 0; t < 6; t++) {
+            const int xx = bx + t;
+            if (xx < 0 || xx >= iw || wx[t] == 0.0) continue;
+            const float wgt = wy[r] * wx[t];
+            const uint pix = uint(yy * iw + xx);
+            if (v8) {
+                float q[8];
+                lv8(src, pix, 0, q);
+                [[unroll]] for (int c = 0; c < 8; c++) acc[c] += wgt * q[c];
+            } else {
+                for (int c = 0; c < C; c++) acc[c] += wgt * ld(src, pix, c);
+            }
+        }
+    }
+    for (int c = 0; c < C; c++) st(dst, uint(p), c, acc[c] * (c == 0 ? mx : c == 1 ? my : 1.0));
+#elif PASS == 5
+    const int h = prm(16), w = prm(17), C = prm(20);
+    if (p >= h * w) return;
+    const Map src = map(0), dst = map(1), fl = map(2), valid = map(3);
+    const int y = p / w, x = p % w;
+    const float sx = float(x) + ld(fl, uint(p), 0), sy = float(y) + ld(fl, uint(p), 1);
+    const float fx0 = floor(sx), fy0 = floor(sy), ax = sx - fx0, ay = sy - fy0;
+    const int x0 = int(fx0), y0 = int(fy0);
+    float wt[4] = float[4]((1.0 - ax) * (1.0 - ay), ax * (1.0 - ay), (1.0 - ax) * ay, ax * ay);
+    const int ix[4] = int[4](x0, x0 + 1, x0, x0 + 1), iy[4] = int[4](y0, y0, y0 + 1, y0 + 1);
+    float vs = 0.0;
+    [[unroll]] for (int k = 0; k < 4; k++) {
+        if (ix[k] < 0 || ix[k] >= w || iy[k] < 0 || iy[k] >= h) wt[k] = 0.0;
+        vs += wt[k];
+    }
+    if (lanes16(src, C)) {
+        float v[16];
+        [[unroll]] for (int j = 0; j < 16; j++) v[j] = 0.0;
+        [[unroll]] for (int k = 0; k < 4; k++) {
+            if (wt[k] == 0.0) continue;
+            float q[16];
+            ld16(src, uint(iy[k] * w + ix[k]), C, q);
+            [[unroll]] for (int j = 0; j < 16; j++) v[j] += wt[k] * q[j];
+        }
+        [[unroll]] for (int j = 0; j < 16; j++) {
+            const int ch = j - src.off;
+            if (ch >= 0 && ch < C) st(dst, uint(p), ch, v[j]);
+        }
+    } else {
+        for (int ch = 0; ch < C; ch++) {
+            float v = 0.0;
+            [[unroll]] for (int k = 0; k < 4; k++)
+                if (wt[k] != 0.0) v += wt[k] * ld(src, uint(iy[k] * w + ix[k]), ch);
+            st(dst, uint(p), ch, v);
+        }
+    }
+    if (!valid.none) st(valid, uint(p), 0, vs);
+#elif PASS == 6
+    const int h = prm(16), w = prm(17), H = prm(18), W = prm(19);
+    if (p >= H * W) return;
+    const Map feat = map(0), dst = map(1);
+    const uint pl = uint(prm(29)), n = uint(H * W);
+    const int y = p / W, x = p % W;
+    float o[8];
+    o[0] = float(frh[pl + uint(p)]);
+    o[1] = float(frh[pl + n + uint(p)]);
+    o[2] = float(frh[pl + 2u * n + uint(p)]);
+    int y0, y1, x0, x1;
+    float fy, fx;
+    srcc(y, h, float(H) / float(h), y0, y1, fy);
+    srcc(x, w, float(W) / float(w), x0, x1, fx);
+    [[unroll]] for (int j = 0; j < 4; j++)
+        o[3 + j] = (ld(feat, uint(y0 * w + x0), j) * (1.0 - fx) + ld(feat, uint(y0 * w + x1), j) * fx) * (1.0 - fy) +
+                   (ld(feat, uint(y1 * w + x0), j) * (1.0 - fx) + ld(feat, uint(y1 * w + x1), j) * fx) * fy;
+    o[7] = 0.0;
+    [[unroll]] for (int j = 0; j < 8; j++) st(dst, uint(p), j, o[j]);
+#elif PASS == 7
+    const int h = prm(16), w = prm(17), H = prm(18), W = prm(19);
+    if (p >= H * W) return;
+    const Map F = map(0), ff = map(1), logit = map(2), frm = map(3), full = map(4);
+    const int y = p / W, x = p % W;
+    int y0, y1, x0, x1;
+    float fy, fx;
+    srcc(y, h, float(H) / float(h), y0, y1, fy);
+    srcc(x, w, float(W) / float(w), x0, x1, fx);
+    const uint a = uint(y0 * w + x0), b = uint(y0 * w + x1), c = uint(y1 * w + x0), d = uint(y1 * w + x1);
+    const float ux = ((ld(F, a, 0) * (1.0 - fx) + ld(F, b, 0) * fx) * (1.0 - fy) + (ld(F, c, 0) * (1.0 - fx) + ld(F, d, 0) * fx) * fy) *
+                     (float(W) / float(w));
+    const float uy = ((ld(F, a, 1) * (1.0 - fx) + ld(F, b, 1) * fx) * (1.0 - fy) + (ld(F, c, 1) * (1.0 - fx) + ld(F, d, 1) * fx) * fy) *
+                     (float(H) / float(h));
+    st(ff, uint(p), 0, ux);
+    st(ff, uint(p), 1, uy);
+    const float lg = (ld(logit, a, 0) * (1.0 - fx) + ld(logit, b, 0) * fx) * (1.0 - fy) + (ld(logit, c, 0) * (1.0 - fx) + ld(logit, d, 0) * fx) * fy;
+    const float px = float(x) + ux, py = float(y) + uy, gx0 = floor(px), gy0 = floor(py), ax = px - gx0, ay = py - gy0;
+    const int ix = int(gx0), iy = int(gy0);
+    float o0 = 0.0, o1 = 0.0, o2 = 0.0, vs = 0.0;
+    [[unroll]] for (int k = 0; k < 4; k++) {
+        const int xx = ix + (k & 1), yy = iy + (k >> 1);
+        const float wt = ((k & 1) != 0 ? ax : 1.0 - ax) * ((k >> 1) != 0 ? ay : 1.0 - ay);
+        if (xx < 0 || xx >= W || yy < 0 || yy >= H) continue;
+        vs += wt;
+        float q[16];
+        ldc(frm, uint(yy * W + xx), 3, q);
+        o0 += wt * q[0];
+        o1 += wt * q[1];
+        o2 += wt * q[2];
+    }
+    st(full, uint(p), 0, o0);
+    st(full, uint(p), 1, o1);
+    st(full, uint(p), 2, o2);
+    st(full, uint(p), 3, lg);
+    st(full, uint(p), 4, vs);
+    st(full, uint(p), 5, 0.0);
+    st(full, uint(p), 6, 0.0);
+    st(full, uint(p), 7, 0.0);
+#elif PASS == 8
+    const int n = prm(16) * prm(17);
+    if (p >= n) return;
+    st(map(0), uint(p), 0, prmf(22));
+#elif PASS == 9
+    const int n = prm(16) * prm(17);
+    if (p >= n) return;
+    const Map cen = map(0), wh = map(1), wfm = map(2), flow = map(3), outm = map(4);
+    float o[32];
+    [[unroll]] for (int c = 0; c < 32; c++) o[c] = 0.0;
+    float vc[16], vh[16], vw[16];
+    ldc(cen, uint(p), 7, vc);
+    ldc(wh, uint(p), 3, vh);
+    ldc(wfm, uint(p), 4, vw);
+    [[unroll]] for (int c = 0; c < 3; c++) {
+        const float cc = vc[c], ww = vh[c];
+        o[c] = cc;
+        o[3 + c] = ww;
+        o[6 + c] = abs(ww - cc);
+    }
+    [[unroll]] for (int c = 0; c < 4; c++) {
+        const float fc = vc[3 + c], fw = vw[c];
+        o[9 + c] = fc;
+        o[13 + c] = fw;
+        o[17 + c] = abs(fw - fc);
+    }
+    const float fxv = ld(flow, uint(p), 0), fyv = ld(flow, uint(p), 1);
+    o[21] = fxv;
+    o[22] = fyv;
+    o[23] = sqrt(fxv * fxv + fyv * fyv);
+    o[24] = prmf(22);
+    [[unroll]] for (int c = 0; c < 32; c++) st(outm, uint(p), c, o[c]);
+#elif PASS == 10
+    const int h2 = prm(16), w2 = prm(17), H = prm(18), W = prm(19), vch = prm(20);
+    if (p >= H * W) return;
+    const Map logit = map(0), full = map(1), acc = map(2);
+    const float thresh = prmf(22), gslope = prmf(23);
+    const int y = p / W, x = p % W;
+    int y0, y1, x0, x1;
+    float fy, fx;
+    srcc(y, h2, float(H) / float(h2), y0, y1, fy);
+    srcc(x, w2, float(W) / float(w2), x0, x1, fx);
+    const float l = (ld(logit, uint(y0 * w2 + x0), 0) * (1.0 - fx) + ld(logit, uint(y0 * w2 + x1), 0) * fx) * (1.0 - fy) +
+                    (ld(logit, uint(y1 * w2 + x0), 0) * (1.0 - fx) + ld(logit, uint(y1 * w2 + x1), 0) * fx) * fy;
+    float fv[16];
+    ldc(full, uint(p), 8, fv);
+    const float conf = sigm(l) * fv[vch], gate = sigm((conf - thresh) * gslope), wgt = conf * gate;
+    st(acc, uint(p), 0, ld(acc, uint(p), 0) + wgt * fv[0]);
+    st(acc, uint(p), 1, ld(acc, uint(p), 1) + wgt * fv[1]);
+    st(acc, uint(p), 2, ld(acc, uint(p), 2) + wgt * fv[2]);
+    st(acc, uint(p), 3, ld(acc, uint(p), 3) + wgt);
+    st(acc, uint(p), 4, ld(acc, uint(p), 4) + gate);
+#elif PASS == 12
+    // sel[z] = ent[e] for the frame e that window position z reads (k_temporal_gather's rule)
+    const int z = int(gl_LocalInvocationIndex), t = prm(56);
+    if (gl_WorkGroupID.x != 0u || z >= t) return;
+    const float thresh = prmf(57), inv_area = prmf(58);
+    const int center = (t - 1) / 2;
+    int e = center;
+    if (thresh > 0.0) {
+        if (z > center) {
+            for (int k = center; k < z; k++) {
+                const int cs = prm(48 + k);
+                if (cs >= 0 && diff[cs] * inv_area > thresh) break;
+                e = k + 1;
+            }
+        } else {
+            for (int k = center - 1; k >= z; k--) {
+                const int cs = prm(48 + k);
+                if (cs >= 0 && diff[cs] * inv_area > thresh) break;
+                e = k;
+            }
+        }
+    } else {
+        e = z;
+    }
+    sel[z] = prm(40 + e);
+#else
+    const int H = prm(18), W = prm(19);
+    if (p >= H * W) return;
+    const Map center = map(0), acc = map(2);
+    const float minsup = prmf(22), cslope = prmf(23), eps = prmf(28);
+    const float r = sigm((ld(acc, uint(p), 4) - minsup + 0.5) * cslope), den = max(1.0 + ld(acc, uint(p), 3), eps);
+    const uint n = uint(H * W);
+    [[unroll]] for (int c = 0; c < 3; c++) {
+        const float cc = ld(center, uint(p), c), bl = (cc + ld(acc, uint(p), c)) / den;
+        outh[uint(c) * n + uint(p)] = float16_t(cc + r * (bl - cc));
+    }
+#endif
+}

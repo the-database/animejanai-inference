@@ -89,6 +89,7 @@
     X(vkCmdPipelineBarrier)             \
     X(vkCmdCopyBuffer)                  \
     X(vkCmdFillBuffer)                  \
+    X(vkCmdUpdateBuffer)                \
     X(vkCmdWriteTimestamp)              \
     X(vkCmdResetQueryPool)              \
     X(vkCreateQueryPool)                \

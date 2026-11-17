@@ -69,6 +69,7 @@
 #include "vk/device.h"
 #include "vk/imgnet.h"
 #include "vk/rife.h"
+#include "vk/tfix.h"
 #endif
 
 using Microsoft::WRL::ComPtr;
@@ -148,6 +149,7 @@ struct DmlModel {
     OrtValue *in_val = nullptr, *out_val = nullptr;
 #ifdef AJI_VULKAN
     std::shared_ptr<ajivk::ImgNet> vk;    // the native kernels run this model (no session)
+    std::shared_ptr<ajivk::TemporalNet> vkt;  // a temporal model on them (TemporalFix)
     std::string vk_onnx, vk_name;         // to reopen it on DirectML
 #endif
 };
@@ -325,6 +327,14 @@ struct aji_ctx {
         int part_groups = 0;
         ComPtr<ID3D12Resource> in_tensor, out_tensor;
         void *in_alloc = nullptr, *out_alloc = nullptr;
+#ifdef AJI_VULKAN
+        ajivk::Buffer vk_in, vk_out;     // the tensors imported, for a Vulkan model
+        ajivk::Buffer vk_diff;           // diff imported (its frame cache's scene cuts)
+        // a Vulkan model's frame cache (TemporalNet: TemporalFix's encoder): the gen of the
+        // frame in each entry (0 = none); gen: per ring slot, which store put the frame there
+        bool vk_cache = false;
+        std::vector<uint64_t> gen, cgen;
+#endif
         std::vector<int64_t> seq;    // per slot, -1 = empty
         std::vector<int> format, matrix, range;
         uint64_t runs = 0;           // model runs (AJI_TEMPORAL_STATS)
@@ -333,6 +343,8 @@ struct aji_ctx {
         bool enabled = false;
         int r = 0;                   // total radius: the sum over stages
         uint64_t ingests = 0;        // AJI_TEMPORAL_STATS
+        uint64_t encodes = 0;        // AJI_TEMPORAL_STATS: frames a Vulkan cache encoded
+        uint64_t gen_next = 1;       // the next ring store's gen
         std::vector<TemporalStage> st;
     } temporal;
 
@@ -1204,6 +1216,7 @@ void model_release(DmlModel *m)
     m->session = nullptr;
 #ifdef AJI_VULKAN
     m->vk.reset();
+    m->vkt.reset();
 #endif
 }
 
@@ -1572,6 +1585,41 @@ bool vk_rife_open(aji_ctx *c, const std::string &onnx, const std::string &name, 
     return false;
 }
 
+// A temporal model (TemporalFix) on the Vulkan native kernels at w x h (the
+// padded size), t frames; logs either way. False: open it on DirectML.
+bool vk_temporal_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const std::string &name, int w, int h, int t)
+{
+    if (!c->conf.native)
+        return false;
+    std::string why;
+    if (!c->vk) {
+        why = c->vk_why;
+    } else {
+        std::vector<char> bytes;
+        ajinative::OnnxGraph g;
+        if (!ajicore::read_file_bytes(onnx, &bytes)) {
+            why = "the model file can't be read";
+        } else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) {
+            std::unique_ptr<ajivk::TemporalNet> n = ajivk::TemporalNet::create(*c->vk, g, w, h, &why);
+            if (n && n->frames() != t) {
+                why = "the graph's window is not the model input's";
+                n.reset();
+            }
+            if (n) {
+                m->fp16 = true;
+                m->in_w = m->out_w = w;
+                m->in_h = m->out_h = h;
+                m->vkt = std::move(n);
+                c->vk->save_caches();
+                c->log_steps.push_back("Native kernels: " + name + " (" + m->vkt->describe() + ")");
+                return true;
+            }
+        }
+    }
+    c->log_steps.push_back("Native kernels not used for " + name + ": " + why + "; using DirectML");
+    return false;
+}
+
 // A D3D12 buffer (made with D3D12_HEAP_FLAG_SHARED) imported into Vulkan.
 bool vk_import(aji_ctx *c, ID3D12Resource *res, uint64_t bytes, ajivk::Buffer *out)
 {
@@ -1830,8 +1878,8 @@ void temporal_teardown(aji_ctx *c)
 {
     auto &TT = c->temporal;
     if (TT.enabled && getenv("AJI_TEMPORAL_STATS")) {
-        fprintf(stderr, "aji temporal stats: %llu ingested",
-                (unsigned long long)TT.ingests);
+        fprintf(stderr, "aji temporal stats: %llu ingested, %llu cache encodes",
+                (unsigned long long)TT.ingests, (unsigned long long)TT.encodes);
         for (size_t i = 0; i < TT.st.size(); i++)
             fprintf(stderr, "; stage %zu (%d frames): %llu runs", i,
                     TT.st[i].t, (unsigned long long)TT.st[i].runs);
@@ -1842,6 +1890,13 @@ void temporal_teardown(aji_ctx *c)
             g_dml_api->FreeGPUAllocation(T.in_alloc);
         if (T.out_alloc)
             g_dml_api->FreeGPUAllocation(T.out_alloc);
+#ifdef AJI_VULKAN
+        if (c->vk) {  // the device is idle (chain_teardown)
+            c->vk->destroy(T.vk_in);
+            c->vk->destroy(T.vk_out);
+            c->vk->destroy(T.vk_diff);
+        }
+#endif
     }
     TT = {};
 }
@@ -1868,14 +1923,38 @@ bool setup_temporal(aji_ctx *c)
         T.part_groups = ((T.w + 31) / 32) * ((T.h + 7) / 8);
         T.ring = make_buffer(c->dev.Get(),
                              (uint64_t)T.nslots * 3 * T.w * T.h * elem, false);
-        T.diff = make_buffer(c->dev.Get(), (uint64_t)T.nslots * 4, false);
+#ifdef AJI_VULKAN
+        const bool on_vk = m.vkt != nullptr;
+#else
+        const bool on_vk = false;
+#endif
+        const D3D12_HEAP_FLAGS hf = on_vk ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE;
+        T.diff = make_buffer(c->dev.Get(), (uint64_t)T.nslots * 4, false, hf);
         T.part = make_buffer(c->dev.Get(), (uint64_t)T.part_groups * 4, false);
-        T.in_tensor = make_buffer(c->dev.Get(), in_bytes, false);
-        T.out_tensor = make_buffer(c->dev.Get(), out_bytes, false);
+        T.in_tensor = make_buffer(c->dev.Get(), in_bytes, false, hf);
+        T.out_tensor = make_buffer(c->dev.Get(), out_bytes, false, hf);
         if (!T.ring || !T.diff || !T.part || !T.in_tensor || !T.out_tensor) {
             c->set_error("temporal buffer allocation failed");
             return false;
         }
+#ifdef AJI_VULKAN
+        if (on_vk) {
+            if (!vk_import(c, T.in_tensor.Get(), in_bytes, &T.vk_in) || !vk_import(c, T.out_tensor.Get(), out_bytes, &T.vk_out))
+                return false;
+            m.vkt->bind_io(T.vk_in.buf, T.vk_out.buf);
+            // AJI_NATIVE_FRAME_CACHE=off: every window encodes all its frames (for comparisons)
+            static const bool fcache = !getenv("AJI_NATIVE_FRAME_CACHE") || strcmp(getenv("AJI_NATIVE_FRAME_CACHE"), "off") != 0;
+            if (fcache && m.vkt->cache_entries() >= T.t) {
+                if (!vk_import(c, T.diff.Get(), (uint64_t)T.nslots * 4, &T.vk_diff))
+                    return false;
+                m.vkt->bind_diff(T.vk_diff.buf);
+                T.vk_cache = true;
+                T.gen.assign(T.nslots, 0);
+                T.cgen.assign(m.vkt->cache_entries(), 0);
+            }
+        }
+#endif
+        if (!on_vk) {
         if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
                            T.in_tensor.Get(), &T.in_alloc),
                        "temporal in alloc") ||
@@ -1896,11 +1975,12 @@ bool setup_temporal(aji_ctx *c)
                                          m.out_val), "temporal BindOutput"))
             return false;
         // warm the rebound command list (discovery used a temporary binding)
-        // and zero the cut metrics, then drain so later segments can recycle
-        // the command allocators
         if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
                        "temporal warmup"))
             return false;
+        }
+        // zero the cut metrics, then drain so later segments can recycle the
+        // command allocators
         {
             Recorder r{c};
             if (!r.begin() || !record_fill(c, r, T.diff.Get(), 0,
@@ -2306,7 +2386,8 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         DmlModel dm;
         const std::string onnx = c->model_dir + "\\" + m.name + ".onnx";
 #ifdef AJI_VULKAN
-        const bool on_vk = t == 1 && vk_model_open(c, &dm, onnx, m.name, cw, ch);
+        const bool on_vk = t == 1 ? vk_model_open(c, &dm, onnx, m.name, cw, ch)
+                                  : vk_temporal_open(c, &dm, onnx, m.name, bw, bh, t);
 #else
         const bool on_vk = false;
 #endif
@@ -2375,7 +2456,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     {
         bool any32 = false;
         for (const DmlModel &m : c->models)
-            any32 = any32 || (!m.vk && !m.fp16);
+            any32 = any32 || (!m.vk && !m.vkt && !m.fp16);
         for (DmlModel &m : c->models) {
             if (!any32 || !m.vk)
                 continue;
@@ -2913,6 +2994,10 @@ static int temporal_store(aji_ctx *c, size_t lv, int cur, int64_t seq,
         return AJI_ERR;
 
     T.seq[slot] = seq;
+#ifdef AJI_VULKAN
+    if (T.vk_cache)
+        T.gen[slot] = c->temporal.gen_next++;
+#endif
     T.format[slot] = format;
     T.matrix[slot] = matrix;
     T.range[slot] = range;
@@ -2999,6 +3084,90 @@ static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
     memcpy(&a.qdiv, &cut_mask, sizeof(cut_mask));
 
     Recorder r{c};
+#ifdef AJI_VULKAN
+    {
+        const Step &vst = c->steps[T.step_idx];
+        DmlModel &vm = c->models[vst.model_idx];
+        if (vm.vkt && T.vk_cache) {
+            // Per-frame work kept across windows (as aji_trt): each window frame not in the
+            // model's cache is gathered (padded) into the next free frame of in_tensor and
+            // encoded into an entry no frame of this window holds; the Vulkan side then picks
+            // each position's entry under the gather's scene-cut rule and runs the window.
+            int ent[AJI_TEMPORAL_MAX], cut[AJI_TEMPORAL_MAX], miss_e[AJI_TEMPORAL_MAX];
+            uint32_t mpack[3] = {0, 0, 0};
+            int nm = 0;
+            for (int j = 0; j < T.t; j++) {
+                const uint64_t g = T.gen[slots[j]];
+                int e = -1;
+                for (int k = 0; k < (int)T.cgen.size() && e < 0; k++)
+                    if (T.cgen[k] == g)
+                        e = k;
+                if (e < 0) {
+                    uint64_t oldest = UINT64_MAX;
+                    for (int k = 0; k < (int)T.cgen.size(); k++) {
+                        bool used = false;
+                        for (int i = 0; i < T.t; i++)
+                            used = used || T.cgen[k] == T.gen[slots[i]];
+                        if (!used && T.cgen[k] < oldest) {
+                            oldest = T.cgen[k];
+                            e = k;
+                        }
+                    }
+                    T.cgen[e] = g;
+                    mpack[nm / 6] |= (uint32_t)slots[j] << ((nm % 6) * 5);
+                    miss_e[nm++] = e;
+                    c->temporal.encodes++;
+                }
+                ent[j] = e;
+                cut[j] = (cut_mask >> j) & 1u ? slots[j + 1] : -1;
+            }
+            if (nm) {
+                KernArgs g1 = a;
+                g1.dj[0] = nm;
+                g1.dj[1] = (int)mpack[0];
+                g1.dj[2] = (int)mpack[1];
+                g1.dj[3] = (int)mpack[2];
+                g1.kr = 0.0f;  // the misses in order, no scene-cut substitution
+                uint32_t none = 0;
+                memcpy(&g1.qdiv, &none, sizeof(none));
+                if (!r.begin() ||
+                    !r.dispatch(K_TEMPORAL_GATHER, false, T.fp16, g1, NULL, NULL,
+                                T.ring.Get(), T.diff.Get(), T.in_tensor.Get(),
+                                T.fp16 ? T.pw / 2 : T.pw, T.ph, nm))
+                    return AJI_ERR;
+                r.uav_barrier();
+                if (!r.exec())
+                    return AJI_ERR;
+            }
+            const float inv_area = 1.0f / ((float)T.w * (float)T.h);
+            if (!vk_submit(c, "Vulkan temporal model", [&](VkCommandBuffer cb) {
+                    for (int i = 0; i < nm; i++)
+                        vm.vkt->record_encode(cb, miss_e[i], i);
+                    vm.vkt->record_cached(cb, ent, cut, T.threshold, inv_area);
+                    return true;
+                }))
+                return AJI_ERR_ENGINE;
+            T.runs++;
+            *cur = vst.in_buf ^ 1;
+            const uint32_t elem = 2u;
+            const uint32_t splane = (uint32_t)T.pow * (uint32_t)T.poh * elem;
+            const uint32_t dplane = (uint32_t)T.ow * (uint32_t)T.oh * elem;
+            if (!r.begin())
+                return AJI_ERR;
+            for (uint32_t pl = 0; pl < 3; pl++) {
+                if (!record_window(c, r, T.out_tensor.Get(), pl * splane,
+                                   (uint32_t)T.pow * elem, c->buf[*cur].Get(),
+                                   pl * dplane, (uint32_t)T.ow * elem,
+                                   (uint32_t)T.ow * elem, (uint32_t)T.oh))
+                    return AJI_ERR;
+            }
+            r.uav_barrier();
+            if (!r.exec())
+                return AJI_ERR;
+            return AJI_OK;
+        }
+    }
+#endif
     if (!r.begin() ||
         !r.dispatch(K_TEMPORAL_GATHER, false, T.fp16, a, NULL, NULL,
                     T.ring.Get(), T.diff.Get(), T.in_tensor.Get(),
@@ -3010,6 +3179,12 @@ static int run_temporal_stage(aji_ctx *c, size_t lv, int64_t center,
 
     const Step &st = c->steps[T.step_idx];
     DmlModel &m = c->models[st.model_idx];
+#ifdef AJI_VULKAN
+    if (m.vkt) {
+        if (!vk_submit(c, "Vulkan temporal model", [&](VkCommandBuffer cb) { m.vkt->record(cb); return true; }))
+            return AJI_ERR_ENGINE;
+    } else
+#endif
     if (!c->ort_ck(g_ort->RunWithBinding(m.session, NULL, m.binding),
                    "RunWithBinding (temporal)"))
         return AJI_ERR_ENGINE;
