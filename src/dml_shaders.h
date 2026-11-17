@@ -495,6 +495,96 @@ void cs_post_matrix(uint3 id : SV_DispatchThreadID)
     d1.Store((uint)y * (uint)dj.x + (uint)x0 * RAWSIZE, ydword);
 }
 
+// ---- cs_post_mh: cs_post_matrix + cs_h_f32 in one pass ----
+// RGB tensor -> quantized Y raw + horizontally resampled chroma fp32 (2 planes
+// cw*h), without the full-res chroma round trip. A group row covers POST_CO
+// chroma outputs: their mirrored source span's chroma and their weights sit in
+// groupshared; values and summation order are cs_post_matrix's and cs_h_f32's.
+// di = {w, h, taps, cw}, dj.x = y row stride bytes. t0/t1 = the horizontal
+// pass's starts/weights. d0 = tensor in, d1 = y raw out, d2 = chroma out.
+// Host guarantees taps <= POST_TAPS and every group's span <= POST_SPAN.
+#define POST_CO 64
+#define POST_SPAN 192
+#define POST_TAPS 16
+groupshared float sh_y[8 * POST_SPAN];
+groupshared float sh_u[8 * POST_SPAN];
+groupshared float sh_v[8 * POST_SPAN];
+groupshared float sh_w[POST_CO * POST_TAPS];
+groupshared int sh_s[POST_CO];
+
+[numthreads(32, 8, 1)]
+void cs_post_mh(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
+{
+    int w = di.x, h = di.y, taps = di.z, cw = di.w;
+    int cx0 = (int)gid.x * POST_CO;
+    int y = (int)gid.y * 8 + (int)tid.y;
+    uint flat = tid.y * 32u + tid.x;
+    int nco = min(POST_CO, cw - cx0);
+    // transposed ([tap][output]): a warp's 32 outputs read 32 banks
+    for (uint i = flat; i < (uint)(nco * taps); i += 256u)
+        sh_w[(i % (uint)taps) * POST_CO + i / (uint)taps] = weights[(uint)cx0 * (uint)taps + i];
+    if (flat < (uint)nco)
+        sh_s[flat] = starts[cx0 + (int)flat];
+    int s_lo = starts[cx0];
+    int span = starts[cx0 + nco - 1] + taps - s_lo;
+    uint plane = (uint)w * (uint)h;
+    uint srow = tid.y * POST_SPAN;
+    if (y < h) {
+        for (int i = (int)tid.x; i < span; i += 32) {
+            uint idx = (uint)y * (uint)w + (uint)mirr(s_lo + i, w);
+            float r = TLOAD(d0, idx);
+            float g = TLOAD(d0, plane + idx);
+            float b = TLOAD(d0, 2u * plane + idx);
+            float Y = kr * r + (1.0f - kr - kb) * g + kb * b;
+            sh_y[srow + i] = Y;
+            sh_u[srow + i] = (b - Y) / (2.0f * (1.0f - kb));
+            sh_v[srow + i] = (r - Y) / (2.0f * (1.0f - kr));
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (y >= h)
+        return;
+    int xend = min(2 * (cx0 + POST_CO), w);
+    for (int x0 = 2 * cx0 + (int)tid.x * TPX; x0 < xend; x0 += 32 * TPX) {
+        uint ydword = 0u;
+        [unroll]
+        for (int k = 0; k < TPX; k++) {
+            int x = min(x0 + k, w - 1);   // clamp: spill goes to row padding
+            int sl = x - s_lo;            // in the span unmirrored: reuse its Y
+            float Y;
+            if (sl >= 0 && sl < span) {
+                Y = sh_y[srow + sl];
+            } else {
+                uint idx = (uint)y * (uint)w + x;
+                float r = TLOAD(d0, idx);
+                float g = TLOAD(d0, plane + idx);
+                float b = TLOAD(d0, 2u * plane + idx);
+                Y = kr * r + (1.0f - kr - kb) * g + kb * b;
+            }
+            uint q = (uint)quant(Y * yscale + yoff, qdiv, qmax);
+#if T16
+            ydword |= (q & 0xffffu) << (k * 16);
+#else
+            ydword |= (q & 0xffu) << (k * 8);
+#endif
+        }
+        d1.Store((uint)y * (uint)dj.x + (uint)x0 * RAWSIZE, ydword);
+    }
+    uint cplane = (uint)cw * (uint)h;
+    for (int o = (int)tid.x; o < nco; o += 32) {
+        uint b0 = srow + (uint)(sh_s[o] - s_lo);
+        float a = 0.0f, c = 0.0f;
+        for (int j = 0; j < taps; j++) {
+            float wt = sh_w[j * POST_CO + o];
+            a += wt * sh_u[b0 + j];
+            c += wt * sh_v[b0 + j];
+        }
+        uint e = (uint)y * (uint)cw + (uint)(cx0 + o);
+        d2.Store(e * 4u, asuint(a));
+        d2.Store((cplane + e) * 4u, asuint(c));
+    }
+}
+
 // ---- cs_h_f32: horizontal resample of N planar fp32 planes ----
 // di = {src w, dst w, taps, rows}. d0 = f32 in, d1 = f32 out. z = plane.
 [numthreads(32, 8, 1)]
