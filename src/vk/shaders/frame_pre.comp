@@ -1,0 +1,63 @@
+#version 450
+// The pre kernels of a 4:2:0 frame (HLSL cs_uv_h, cs_v_f32, cs_pre_combine), by PASS:
+//   1 uv_h: horizontal resample of interleaved raw chroma -> 2 planar fp32 (raw units).
+//     di = {src (cw), dst (W), taps, rows (ch)}, dj.x = uv row stride bytes. d0 uv raw, d1 f32 out.
+//   2 v_f32: vertical resample of fp32 planes (z = plane). di = {w, src rows, taps, dst rows}.
+//     d0 f32 in, d1 f32 out.
+//   3 combine: Y raw + upsampled chroma -> the fp16 RGB tensor, 2 px per invocation (x covers
+//     w/2). di = {w, h}, dj.x = y row stride bytes, dj.y = destination element offset. d0 y raw,
+//     d1 uv f32 (2 planes w*h), d2 tensor.
+#extension GL_GOOGLE_include_directive : require
+#include "frame_common.glsl"
+
+void main()
+{
+    const ivec4 di = DI(), dj = DJ();
+#if PASS == 1
+    const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= di.y || y >= di.w) return;
+    const uint row = uint(y) * uint(dj.x);
+    const int s0 = starts[x];
+    float u = 0.0, v = 0.0;
+    for (int j = 0; j < di.z; j++) {
+        const int sx = mirr(s0 + j, di.x);
+        const float w = weights[x * di.z + j];
+        u += w * RAWLOAD(d0, row + (2u * uint(sx)) * RAWSIZE);
+        v += w * RAWLOAD(d0, row + (2u * uint(sx) + 1u) * RAWSIZE);
+    }
+    const uint plane = uint(di.y) * uint(di.w), idx = uint(y) * uint(di.y) + uint(x);
+    d1[idx] = floatBitsToUint(u);
+    d1[plane + idx] = floatBitsToUint(v);
+#elif PASS == 2
+    const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= di.x || y >= di.w) return;
+    const uint sp = gl_GlobalInvocationID.z * uint(di.x) * uint(di.y);
+    const uint dp = gl_GlobalInvocationID.z * uint(di.x) * uint(di.w);
+    const int s0 = starts[y];
+    float a = 0.0;
+    for (int j = 0; j < di.z; j++) a += weights[y * di.z + j] * F32(d0, sp + uint(mirr(s0 + j, di.y)) * uint(di.x) + uint(x));
+    d1[dp + uint(y) * uint(di.x) + uint(x)] = floatBitsToUint(a);
+#else
+    const int w = di.x, h = di.y;
+    const int x0 = int(gl_GlobalInvocationID.x) * 2, y = int(gl_GlobalInvocationID.y);
+    if (x0 >= w || y >= h) return;
+    const uint plane = uint(w) * uint(h);
+    float rgb[6];
+    for (int k = 0; k < 2; k++) {
+        const int x = x0 + k;
+        const uint idx = uint(y) * uint(w) + uint(x);
+        const float Y = (RAWLOAD(d0, uint(y) * uint(dj.x) + uint(x) * RAWSIZE) - yoff()) / yscale();
+        const float U = (F32(d1, idx) - coff()) / cscale();
+        const float V = (F32(d1, plane + idx) - coff()) / cscale();
+        const float kg = 1.0 - kr() - kb();
+        rgb[k * 3 + 0] = Y + 2.0 * (1.0 - kr()) * V;
+        rgb[k * 3 + 2] = Y + 2.0 * (1.0 - kb()) * U;
+        rgb[k * 3 + 1] = Y - (2.0 * kb() * (1.0 - kb()) * U + 2.0 * kr() * (1.0 - kr()) * V) / kg;
+    }
+    const uint base = uint(dj.y) + uint(y) * uint(w) + uint(x0);
+    for (int p = 0; p < 3; p++) {
+        const uint e = uint(p) * plane + base;  // even: w is even
+        d2[e >> 1] = f32_to_f16(rgb[p]) | (f32_to_f16(rgb[3 + p]) << 16);
+    }
+#endif
+}

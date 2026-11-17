@@ -140,3 +140,15 @@ g3_plain_i64_o64_n0a2r0u0o0_t8r1  gconv_plain.comp  CINP=64 COUTP=64 IN=0 ACT=2 
 g3_plain_i64_o64_n0a2r0u0o0_t4r1  gconv_plain.comp  CINP=64 COUTP=64 IN=0 ACT=2 NRES=0 UP2=0 OUT=0 TH=4 RPS=1
 g3_plain_i64_o16_n0a0r0u0o3_t8r1  gconv_plain.comp  CINP=64 COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 OUT=3 TH=8 RPS=1
 g3_plain_i64_o16_n0a0r0u0o3_t4r1  gconv_plain.comp  CINP=64 COUTP=16 IN=0 ACT=0 NRES=0 UP2=0 OUT=3 TH=4 RPS=1
+
+# A 4:2:0 frame's pre and post (vk/frame.cpp; the HLSL kernels of dml_shaders.h): u8 = NV12, u16 = P010.
+fr_pre1_u8    frame_pre.comp   PASS=1 T16=0
+fr_pre2_u8    frame_pre.comp   PASS=2 T16=0
+fr_pre3_u8    frame_pre.comp   PASS=3 T16=0
+fr_post1_u8   frame_post.comp  PASS=1 T16=0 TPX=4
+fr_post2_u8   frame_post.comp  PASS=2 T16=0 TPX=2
+fr_pre1_u16   frame_pre.comp   PASS=1 T16=1
+fr_pre2_u16   frame_pre.comp   PASS=2 T16=1
+fr_pre3_u16   frame_pre.comp   PASS=3 T16=1
+fr_post1_u16  frame_post.comp  PASS=1 T16=1 TPX=2
+fr_post2_u16  frame_post.comp  PASS=2 T16=1 TPX=1

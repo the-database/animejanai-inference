@@ -525,8 +525,8 @@ if(AJI_VULKAN)
                             "-DAJI_VK_INCLUDE=<dir containing vulkan/vulkan_core.h>")
     endif()
     add_library(aji_vk_core OBJECT src/vk/vk.cpp src/vk/device.cpp src/vk/kernels.cpp src/vk/executor.cpp
-                src/vk/gconv.cpp src/vk/esrgan.cpp src/core/fileio.cpp)
-    target_include_directories(aji_vk_core PRIVATE src)
+                src/vk/gconv.cpp src/vk/esrgan.cpp src/vk/frame.cpp src/core/fileio.cpp)
+    target_include_directories(aji_vk_core PRIVATE src include)
     target_include_directories(aji_vk_core SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
     set_target_properties(aji_vk_core PROPERTIES
         POSITION_INDEPENDENT_CODE ON
@@ -544,6 +544,15 @@ if(AJI_VULKAN)
     endif()
     target_include_directories(aji_vk_model_test PRIVATE src)
     target_include_directories(aji_vk_model_test SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
+    # By hand: raw NV12 / P010 frames through a model on Vulkan alone, no D3D (vk/frame.h)
+    add_executable(aji_harness_vk src/harness_vk.cpp $<TARGET_OBJECTS:aji_vk_core> $<TARGET_OBJECTS:aji_vk_shaders>
+                   $<TARGET_OBJECTS:aji_native_host>)
+    target_include_directories(aji_harness_vk PRIVATE src include)
+    target_include_directories(aji_harness_vk SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
+    if(UNIX)
+        find_package(Threads REQUIRED)
+        target_link_libraries(aji_harness_vk PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+    endif()
 
     if(WIN32)
         # aji_vk (backend=Vulkan): aji_dml.cpp built with AJI_VULKAN. The D3D12
