@@ -552,6 +552,16 @@ libavutil libavfilter libswscale`. The configure output says which:
 
 If a release build comes out without `aji_encode.exe`, this is why.
 
+**`aji_encode --backend vulkan`** (built with `AJI_VULKAN`: `AJI_ENCODE_VULKAN`, the Vulkan
+headers) follows `--backend directml` at each of its branch points: CPU decode, uploads into libav
+Vulkan pools on libav's own Vulkan device (handed to `aji_create_vk`; it enables cooperative
+matrices, so cm16), readback for the encoder, 4:2:0 only, held-frame copies through
+`aji_copy_frame`. Each AVVkFrame is an `aji_vk_image` in `vkw[]`, read from the frame in
+`fill_aji_frame` and written back by `vk_sync` after every libaji call. SPANF3 1080p to 4K ffv1:
+55 fps on the 5090, within 1 level of `--backend directml` with the same backend=Vulkan conf, the
+same 23 of 191 frames reused. The Linux release's `aji_encode` still links CUDA (a CUDA-free
+start needs CUDA loaded lazily, as `/DELAYLOAD` does on Windows).
+
 ### The CUDA-architecture trap
 
 `CMakeLists.txt:9-17` sets a full arch list **only** `if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)`:

@@ -27,6 +27,10 @@
  * CPU and uploaded, read back for encoding, 4:2:0 output only. No CUDA call
  * is made, and nvcuda/cudart are delay-loaded, so it runs on GPUs without
  * the NVIDIA driver.
+ *
+ * --backend vulkan (the conf must say backend=Vulkan): the same, on Vulkan
+ * frames from libav Vulkan pools on libav's Vulkan device, which libaji
+ * takes with aji_create_vk (Linux AMD / Intel; Windows too).
  */
 
 #include <limits.h>
@@ -49,6 +53,9 @@
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
+#ifdef AJI_ENCODE_VULKAN
+#include <libavutil/hwcontext_vulkan.h>
+#endif
 #ifdef _WIN32
 #define COBJMACROS      /* C-style DXGI calls (GPU listing, amf_pick_adapter) */
 #include <windows.h>
@@ -358,6 +365,16 @@ typedef struct {
     int              dml;            /* DirectML backend: frames are shared D3D11
                                         textures (libav D3D11 frames), and no
                                         CUDA call is ever made */
+    int              vk;             /* Vulkan backend: frames are libav Vulkan
+                                        frames, the rest as DirectML's */
+#ifdef AJI_ENCODE_VULKAN
+    aji_vk_device    vkdev;          /* libav's Vulkan device, for aji_create_vk */
+    /* each AVVkFrame handed to libaji as an aji_vk_image: read from the
+     * frame at each call, written back after it (AVVkFrame's rule); stable
+     * addresses, as the held-frame engine keeps its anchor's */
+    struct { AVVkFrame *f; aji_vk_image d; int dirty; } vkw[256];
+    int              vkw_n;
+#endif
     void            *d3d11_dev;      /* ID3D11Device* of the D3D11VA hwdevice */
     int              gpu_index;      /* DirectML: the upscaling GPU's DXGI index, -1 if unknown */
     unsigned         gpu_vendor;     /* ... and its PCI vendor id (AMF/QSV follow it) */
@@ -861,6 +878,143 @@ static int setup_d3d11(enc_ctx *c)
 #endif
 }
 
+#ifdef AJI_ENCODE_VULKAN
+#if !defined(FF_API_VULKAN_SYNC_QUEUES) || FF_API_VULKAN_SYNC_QUEUES
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+static void vk_lock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    AVHWDeviceContext *dc = opaque;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    if (vk->lock_queue)
+        vk->lock_queue(dc, family, index);
+}
+
+static void vk_unlock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    AVHWDeviceContext *dc = opaque;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    if (vk->unlock_queue)
+        vk->unlock_queue(dc, family, index);
+}
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
+#else
+static void vk_lock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    (void)opaque, (void)family, (void)index;
+}
+
+static void vk_unlock_queue(void *opaque, uint32_t family, uint32_t index)
+{
+    (void)opaque, (void)family, (void)index;
+}
+#endif
+#endif
+
+/* Vulkan: libav's Vulkan device (--device: its index), handed to libaji as
+ * it was created (aji_create_vk): a compute queue of its families, its lock,
+ * its extensions and features. */
+static int setup_vulkan(enc_ctx *c)
+{
+#ifdef AJI_ENCODE_VULKAN
+    char dev[24];
+    if (c->o.device)
+        snprintf(dev, sizeof dev, "%llu", (unsigned long long)c->o.device);
+    if (av_hwdevice_ctx_create(&c->hw_device, AV_HWDEVICE_TYPE_VULKAN,
+                               c->o.device ? dev : NULL, NULL, 0) < 0) {
+        loge("av_hwdevice_ctx_create(Vulkan) failed");
+        return -1;
+    }
+    AVHWDeviceContext *dc = (AVHWDeviceContext *)c->hw_device->data;
+    AVVulkanDeviceContext *vk = dc->hwctx;
+    int fam = -1;
+    for (int i = 0; i < vk->nb_qf && fam < 0; i++)
+        if (vk->qf[i].flags & VK_QUEUE_COMPUTE_BIT)
+            fam = vk->qf[i].idx;
+    if (fam < 0) {
+        loge("the Vulkan device has no compute queue");
+        return -1;
+    }
+    PFN_vkGetDeviceQueue get_queue =
+        (PFN_vkGetDeviceQueue)vk->get_proc_addr(vk->inst, "vkGetDeviceQueue");
+    VkQueue queue = VK_NULL_HANDLE;
+    if (get_queue)
+        get_queue(vk->act_dev, (uint32_t)fam, 0, &queue);
+    if (!queue) {
+        loge("cannot get the Vulkan device's compute queue");
+        return -1;
+    }
+    c->vkdev = (aji_vk_device){
+        .struct_size = sizeof(aji_vk_device),
+        .get_instance_proc_addr = (void *)vk->get_proc_addr,
+        .instance = vk->inst,
+        .physical_device = vk->phys_dev,
+        .device = vk->act_dev,
+        .queue = queue,
+        .queue_family = (uint32_t)fam,
+        .queue_index = 0,
+        .lock_queue = vk_lock_queue,
+        .unlock_queue = vk_unlock_queue,
+        .lock_opaque = dc,
+        .enabled_extensions = vk->enabled_dev_extensions,
+        .num_enabled_extensions = vk->nb_enabled_dev_extensions,
+        .enabled_features = &vk->device_features,
+    };
+    return 0;
+#else
+    (void)c;
+    loge("this aji_encode was built without Vulkan");
+    return -1;
+#endif
+}
+
+#ifdef AJI_ENCODE_VULKAN
+/* the aji_vk_image of a Vulkan AVFrame, read from its AVVkFrame now */
+static aji_vk_image *vk_bind(enc_ctx *c, const AVFrame *av)
+{
+    AVVkFrame *f = (AVVkFrame *)av->data[0];
+    int k = 0;
+    while (k < c->vkw_n && c->vkw[k].f != f)
+        k++;
+    if (k == c->vkw_n) {
+        if (c->vkw_n == (int)(sizeof c->vkw / sizeof c->vkw[0])) {
+            loge("more than %d Vulkan frames in use", c->vkw_n);
+            return NULL;
+        }
+        c->vkw[c->vkw_n++].f = f;
+    }
+    c->vkw[k].d = (aji_vk_image){
+        .image = f->img[0], .layout = f->layout[0], .queue_family = f->queue_family[0],
+        .access = f->access[0], .semaphore = f->sem[0], .value = f->sem_value[0],
+    };
+    c->vkw[k].dirty = 1;
+    return &c->vkw[k].d;
+}
+#endif
+
+/* after a libaji call: what it left on the Vulkan frames back on them */
+static void vk_sync(enc_ctx *c)
+{
+#ifdef AJI_ENCODE_VULKAN
+    for (int k = 0; k < c->vkw_n; k++) {
+        if (!c->vkw[k].dirty)
+            continue;
+        AVVkFrame *f = c->vkw[k].f;
+        f->layout[0] = (VkImageLayout)c->vkw[k].d.layout;
+        f->access[0] = (VkAccessFlagBits)c->vkw[k].d.access;
+        f->queue_family[0] = c->vkw[k].d.queue_family;
+        f->sem_value[0] = c->vkw[k].d.value;
+        c->vkw[k].dirty = 0;
+    }
+#else
+    (void)c;
+#endif
+}
+
 /* ---- input + decoder ----------------------------------------------------- */
 
 static int open_input(enc_ctx *c)
@@ -1054,7 +1208,7 @@ static void resolve_pixfmt(enc_ctx *c)
      * host repack before upload produces the output format directly: an
      * 8-bit source for a 10-bit file is widened there, and 4:2:2 / 4:4:4
      * sources are subsampled. */
-    if (c->dml)
+    if (c->dml || c->vk)
         c->src_aji_fmt = c->out_aji_fmt;
 
     /* The output keeps the source's transfer tags and HDR metadata (no tone
@@ -1128,7 +1282,7 @@ static int open_decoder(enc_ctx *c)
 {
     /* deinterlacing filters run on the CPU: decode there too */
     const int want_hw = (c->o.decoder != DEC_CPU) && !c->o.no_zerocopy &&
-                        !c->dml && !c->dgraph;
+                        !c->dml && !c->vk && !c->dgraph;
     if (!want_hw)
         return open_cpu_decoder(c);
     const AVCodec *codec =
@@ -1687,7 +1841,11 @@ static int init_aji(enc_ctx *c)
                                    &qnum, &qden) == 1 &&
         rife_factor_ok(c, &qnum, &qden) < 0)
         return -1;
+#ifdef AJI_ENCODE_VULKAN
+    c->aji = c->vk ? aji_create_vk(&p, &c->vkdev) : aji_create(&p);
+#else
     c->aji = aji_create(&p);
+#endif
     if (!c->aji) { loge("aji_create failed"); return -1; }
 
     progress("build_engine", 0, 0, 0, 0);
@@ -1786,7 +1944,9 @@ static AVBufferRef *make_pool(enc_ctx *c, enum AVPixelFormat sw, int w, int h,
     fc->sw_format         = sw;
     fc->width             = w;
     fc->height            = h;
-    if (c->dml) {
+    if (c->vk) {
+        fc->format = AV_PIX_FMT_VULKAN;
+    } else if (c->dml) {
 #ifdef _WIN32
         fc->format = AV_PIX_FMT_D3D11;
         AVD3D11VAFramesContext *dx = (AVD3D11VAFramesContext *)fc->hwctx;
@@ -1799,7 +1959,7 @@ static AVBufferRef *make_pool(enc_ctx *c, enum AVPixelFormat sw, int w, int h,
         fc->initial_pool_size = n;
     }
     if (av_hwframe_ctx_init(ref) < 0) {
-        loge("%s frame pool init failed for %dx%d %s", c->dml ? "D3D11" : "CUDA",
+        loge("%s frame pool init failed for %dx%d %s", c->vk ? "Vulkan" : c->dml ? "D3D11" : "CUDA",
              w, h, av_get_pix_fmt_name(sw));
         av_buffer_unref(&ref);
     }
@@ -1831,6 +1991,14 @@ static void fill_aji_frame(enc_ctx *c, aji_frame *f, AVFrame *av, int output)
     f->matrix = aji_matrix_from_av(c->color_space);
     f->range  = aji_range_from_av(c->color_range);
     f->siting = aji_siting_from_av(c->chroma_loc);
+#ifdef AJI_ENCODE_VULKAN
+    if (c->vk && av->format == AV_PIX_FMT_VULKAN) {
+        f->plane[0] = vk_bind(c, av);
+        f->plane[1] = f->plane[2] = NULL;
+        f->stride[0] = f->stride[1] = f->stride[2] = 0;
+        return;
+    }
+#endif
     f->plane[0] = av->data[0];
     f->plane[1] = av->data[1];
     f->plane[2] = av->data[2];
@@ -3211,6 +3379,7 @@ static int ingest(enc_ctx *c, AVFrame *dec)
     aji_frame in_f;
     fill_aji_frame(c, &in_f, dec, 0);
     int ret = aji_ingest(c->aji, &in_f, c->in_seq, c->stream);
+    vk_sync(c);
     if (ret != AJI_OK) {
         loge("aji_ingest: %d: %s", ret, aji_last_error(c->aji));
         return -1;
@@ -3229,6 +3398,7 @@ static AVFrame *infer_next_seq(enc_ctx *c)
     aji_frame out_f;
     fill_aji_frame(c, &out_f, out, 1);
     int ret = aji_infer_seq(c->aji, c->out_seq, &out_f, c->stream);
+    vk_sync(c);
     if (ret != AJI_OK) {
         loge("aji_infer_seq: %d: %s", ret, aji_last_error(c->aji));
         av_frame_free(&out);
@@ -3279,6 +3449,7 @@ static AVFrame *infer_enqueue(enc_ctx *c, AVFrame *dec)
     fill_aji_frame(c, &in_f, dec, 0);
     fill_aji_frame(c, &out_f, out, 1);
     int ret = aji_infer(c->aji, &in_f, &out_f, c->stream);
+    vk_sync(c);
     if (ret != AJI_OK) {
         loge("aji_infer: %d: %s", ret, aji_last_error(c->aji));
         av_frame_free(&out);
@@ -3386,6 +3557,30 @@ static int frame_damaged(const AVFrame *f)
  * the D3D11 context, for the anchor, and marks the context */
 static int reuse_arrived(enc_ctx *c, held_frame *h, AVFrame *dec)
 {
+    if (c->vk) {
+        /* an exact copy (aji_copy_frame) on libaji's queue, for the anchor */
+        if (!c->anchor_pool &&
+            !(c->anchor_pool = make_pool(c, src_sw_fmt(c), c->src_w, c->src_h, 1)))
+            return -1;
+        h->copy = av_frame_alloc();
+        if (!h->copy || av_hwframe_get_buffer(c->anchor_pool, h->copy, 0) < 0) {
+            loge("held frames: no image for a frame's copy");
+            av_frame_free(&h->copy);
+            return -1;
+        }
+        aji_frame fs, fd;
+        fill_aji_frame(c, &fs, dec, 0);
+        fill_aji_frame(c, &fd, h->copy, 0);
+        const int r = aji_copy_frame(c->aji, &fs, &fd);
+        vk_sync(c);
+        if (r != AJI_OK) {
+            loge("held frames: aji_copy_frame: %d (%s)", r, aji_last_error(c->aji));
+            av_frame_free(&h->copy);
+            return -1;
+        }
+        h->mark = 0;
+        return 0;
+    }
     if (c->dml) {
 #ifdef _WIN32
         if (!c->anchor_pool &&
@@ -3423,7 +3618,7 @@ static int reuse_arrived(enc_ctx *c, held_frame *h, AVFrame *dec)
  * copy from arrival; on CUDA a copy now, on diff_stream */
 static int reuse_anchor_copy(enc_ctx *c, held_frame *h)
 {
-    if (c->dml) {
+    if (c->dml || c->vk) {
         if (!h->copy) return -1;
         av_frame_free(&c->anchor_src);
         c->anchor_src = h->copy;
@@ -3507,7 +3702,7 @@ static int reuse_decide(enc_ctx *c, const held_frame *p, const held_frame *n,
                         const held_frame *n2)
 {
     if (!c->held) return 0;
-    if (c->reuse && n && n2 && !c->dml && reuse_wait(c, p, n, n2) < 0) {
+    if (c->reuse && n && n2 && !c->dml && !c->vk && reuse_wait(c, p, n, n2) < 0) {
         loge("held frames: cudaStreamWaitEvent failed; reusing no more frames");
         c->reuse = 0;
     }
@@ -3520,8 +3715,13 @@ static int reuse_decide(enc_ctx *c, const held_frame *p, const held_frame *n,
     }
     aji_held_decision d;
     memset(&d, 0, sizeof(d));   /* UPSCALE, should the call refuse */
+#ifdef AJI_ENCODE_VULKAN
+    if (c->vk && c->anchor_src)
+        vk_bind(c, c->anchor_src);   /* the engine's anchor: its image's state now */
+#endif
     aji_held_decide(c->held, &dp, ahead ? &dn : NULL, ahead ? &dn2 : NULL,
                     c->diff_stream, &d);
+    vk_sync(c);
     if (d.error && c->reuse) {
         loge("held frames: aji_frame_diff: %d (%s); reusing no more frames",
              d.error, aji_last_error(c->aji));
@@ -3666,6 +3866,7 @@ static AVFrame *upscale_one(enc_ctx *c, AVFrame *dec)
     fill_aji_frame(c, &in_f, dec, 0);
     fill_aji_frame(c, &out_f, out, 1);
     int ret = aji_infer(c->aji, &in_f, &out_f, c->stream);
+    vk_sync(c);
     if (ret != AJI_OK) {
         loge("aji_infer: %d: %s", ret, aji_last_error(c->aji));
         av_frame_free(&out);
@@ -3757,6 +3958,7 @@ static int rife_step(enc_ctx *c, AVFrame *up, int held)
         fill_aji_frame(c, &b, c->up_cur, 1);
         fill_aji_frame(c, &o, interp, 1);
         int ret = aji_infer_rife(c->aji, &a, &b, t, &o, c->stream);
+        vk_sync(c);
         AVFrame *emit = interp;
         if (ret == AJI_SCENE) { emit = c->up_prev; c->scene_dupes++; }
         else if (ret != AJI_OK) {
@@ -3893,6 +4095,7 @@ static int rife_first_consume(enc_ctx *c, held_frame p, int skip)
         fill_aji_frame(c, &in_f, dec, 0);
         fill_aji_frame(c, &out_f, cur, 0);
         int ret = aji_resize(c->aji, &in_f, &out_f, c->stream);
+        vk_sync(c);
         if (ret != AJI_OK)
             loge("aji_resize: %d: %s", ret, aji_last_error(c->aji));
         int r = ret == AJI_OK ? sync_aji(c) : -1;
@@ -3923,6 +4126,7 @@ static int rife_first_consume(enc_ctx *c, held_frame p, int skip)
             fill_aji_frame(c, &o, interp, 0);
             int ret = aji_infer_rife(c->aji, &a, &b, (double)acc / c->rnum, &o,
                                      c->stream);
+            vk_sync(c);
             if (ret == AJI_SCENE) {
                 c->scene_dupes++;
                 /* off the grid, N itself wasn't put out (or upscaled) */
@@ -4072,7 +4276,7 @@ static int reuse_setup(enc_ctx *c)
         loge("held frames: setup failed");
         return -1;
     }
-    if (!c->dml) {      /* DirectML makes no CUDA call (see push_reuse) */
+    if (!c->dml && !c->vk) {  /* DirectML and Vulkan make no CUDA call (see push_reuse) */
         int prio_lo = 0, prio_hi = 0;
         cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
         if (cudaStreamCreateWithPriority(&c->diff_stream, cudaStreamNonBlocking,
@@ -4509,7 +4713,7 @@ static void usage(void)
 "           [--no-audio] [--no-subs] [--no-chapters]"
 " [--progress none|line|json]\n"
 "           [--build-only] [--log <f>] [--decoder auto|nvdec|cpu]"
-" [--backend tensorrt|tensorrt-rtx|directml]\n"
+" [--backend tensorrt|tensorrt-rtx|directml|vulkan]\n"
 "           [--device <id>] (a GPU id= from --probe-encoders; default: on\n"
 "                           DirectML the high-performance GPU, on TensorRT CUDA device 0)\n"
 "           [--deinterlace off|ivtc|bwdif] [--square-pixels off|before|after]\n"
@@ -4676,19 +4880,21 @@ int main(int argc, char **argv)
      * dispatcher loads; this only picks the device the frames live on. */
     if (!av_strcasecmp(c.o.backend, "directml")) {
         c.dml = 1;
+    } else if (!av_strcasecmp(c.o.backend, "vulkan")) {
+        c.vk = 1;
     } else if (av_strcasecmp(c.o.backend, "tensorrt") &&
                av_strcasecmp(c.o.backend, "tensorrt-rtx")) {
         /* tensorrt-rtx: CUDA frames, like tensorrt */
-        loge("unknown --backend '%s' (tensorrt|tensorrt-rtx|directml)",
+        loge("unknown --backend '%s' (tensorrt|tensorrt-rtx|directml|vulkan)",
              c.o.backend);
         return 2;
     }
-    if (c.dml && c.o.pix_fmt >= OUT_444P8) {
-        loge("the DirectML backend outputs 4:2:0 only (--pix-fmt yuv420p or "
-             "yuv420p10)");
+    if ((c.dml || c.vk) && c.o.pix_fmt >= OUT_444P8) {
+        loge("the %s backend outputs 4:2:0 only (--pix-fmt yuv420p or "
+             "yuv420p10)", c.vk ? "Vulkan" : "DirectML");
         return 2;
     }
-    if (c.dml && c.o.engine) {
+    if ((c.dml || c.vk) && c.o.engine) {
         loge("direct mode (--engine) is TensorRT-only");
         return 2;
     }
@@ -4719,7 +4925,7 @@ int main(int argc, char **argv)
     if (open_input(&c) < 0) goto out;
     if (c.o.deint && setup_deint(&c) < 0) goto out;
     resolve_pixfmt(&c);    /* needs src_aji_fmt from open_input */
-    if ((c.dml ? setup_d3d11(&c) : setup_cuda(&c)) < 0) goto out;
+    if ((c.dml ? setup_d3d11(&c) : c.vk ? setup_vulkan(&c) : setup_cuda(&c)) < 0) goto out;
     if (init_aji(&c) < 0) goto out;
 
     if (c.o.build_only) {
