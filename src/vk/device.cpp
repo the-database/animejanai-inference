@@ -698,6 +698,8 @@ void Device::memory(uint64_t *free_bytes, uint64_t *total_bytes) const
         if (bp.heapBudget[heap] > 0)
             *free_bytes = bp.heapBudget[heap] > bp.heapUsage[heap] ? bp.heapBudget[heap] - bp.heapUsage[heap] : 0;
     }
+    // a virtual GPU (the Android emulator's gfxstream) reports the host's budget for a smaller heap
+    if (*free_bytes > *total_bytes) *free_bytes = *total_bytes;
 }
 
 VkCommandBuffer Device::begin()
