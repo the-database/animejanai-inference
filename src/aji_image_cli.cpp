@@ -6,6 +6,8 @@
  *   aji_image --model M.onnx [--backend trt|trtrtx|dml|vulkan] [--device ID]
  *             [--tile N|WxH] [--overlap N] [--cache DIR] [--trtexec PATH] [--gray]
  *             [--repeat N] [--async] [--even] [--probe] IN.(pgm|ppm) OUT.(pgm|ppm)
+ *   aji_image --model M.onnx [--backend ...] --probe-only
+ *     (aji_img_native_probe alone: whether the model runs natively there, or why not)
  *
  * Images are binary PNM (P5 gray / P6 RGB, 8-bit). --gray feeds a P6
  * input as luma (1 channel), exercising the gray path. The model loads
@@ -123,7 +125,7 @@ int main(int argc, char **argv)
     const char *in_path = nullptr, *out_path = nullptr;
     uint64_t device = 0;
     int tile = 0, tile_h = 0, overlap = 0, repeat = 1;
-    bool list = false, gray = false, async = false, even = false, probe = false;
+    bool list = false, gray = false, async = false, even = false, probe = false, probe_only = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -146,6 +148,7 @@ int main(int argc, char **argv)
         else if (a == "--tile") { const char *v = next(); if (!v) return usage(); tile = atoi(v); const char *x = strchr(v, 'x'); tile_h = x ? atoi(x + 1) : 0; }
         else if (a == "--overlap") { const char *v = next(); if (!v) return usage(); overlap = atoi(v); }
         else if (a == "--probe") probe = true;
+        else if (a == "--probe-only") probe = probe_only = true;
         else if (a == "--repeat") { const char *v = next(); if (!v) return usage(); repeat = atoi(v); }
         else if (!in_path) in_path = argv[i];
         else if (!out_path) out_path = argv[i];
@@ -214,6 +217,10 @@ int main(int argc, char **argv)
                     MB(pm.model_weights), MB(pm.model_activations), MB(pm.model_buffers), MB(pm.device_free), now_ms() - t0);
         else
             fprintf(stderr, "probe: not native (%d): %s (%.0f ms)\n", pr, aji_img_last_error(c), now_ms() - t0);
+        if (probe_only) {
+            aji_img_destroy(&c);
+            return pr == AJI_IMG_OK ? 0 : 3;
+        }
         t0 = now_ms();
     }
     aji_img_model *m = aji_img_load(c, &mp);
