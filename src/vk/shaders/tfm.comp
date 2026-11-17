@@ -19,6 +19,8 @@
 //   15 imgout: an NHWC map's first 3 channels, cropped, into the network output (NCHW fp16, binding 3)
 //   16 tgate: DAT's token gate, sigmoid(w2 . gelu(W1 x + b1) + b2) per token
 //   17 mix: DAT's interaction, z = a * cg[c] + b * tg[t] (or a * tg[t] + b * cg[c])
+//   18-25 TFDAT's alignment (tfdat_kernels.cu): flow add, flow upsample + feature warp, frame warp +
+//      unshuffle + occlusion, unshuffle, similarity, gate, column scale, resize
 //   13 colsum2: partial column sums of a map over token chunks (then colsum adds them up)
 //   14 convert: a map into another (fp32 <-> fp16), n channels
 //
@@ -154,7 +156,39 @@ shared float smean[512], shid[512];
 shared float sred[256];
 #elif PASS == 16
 shared float sgw[4000], sgb[16], sgw2[16];  // W1 [r][C] (r * C <= 4000), b1, w2: 16 KB with the rest
+#elif PASS == 22
+shared float ssim[8][32];
 #endif
+
+// TFDAT's resampling (tfdat_kernels.cu): 2 up(F) at (y, x) of the 2h x 2w grid (Resize linear,
+// half_pixel, x2, times 2; F an fp32 flow map at h x w), and the clamped bilinear warp's corners.
+vec2 upflow(Map F, int h, int w, int y, int x)
+{
+    float vy = clamp((float(y) + 0.5) * 0.5 - 0.5, 0.0, float(h - 1)), vx = clamp((float(x) + 0.5) * 0.5 - 0.5, 0.0, float(w - 1));
+    const int y0 = int(vy), x0 = int(vx), y1 = min(y0 + 1, h - 1), x1 = min(x0 + 1, w - 1);
+    const float fy = vy - float(y0), fx = vx - float(x0);
+    vec2 r;
+    [[unroll]] for (int k = 0; k < 2; k++) {
+        const float a = ld(F, uint(y0 * w + x0), k), b = ld(F, uint(y0 * w + x1), k), c = ld(F, uint(y1 * w + x0), k),
+                    d = ld(F, uint(y1 * w + x1), k);
+        r[k] = 2.0 * ((a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + d * fx) * fy);
+    }
+    return r;
+}
+void warp_taps(int y, int x, vec2 u, int H, int W, out int ti[4], out float tw[4])
+{
+    const float fx0 = floor(u.x), fy0 = floor(u.y), ax = u.x - fx0, ay = u.y - fy0;
+    const int xa = x + int(fx0), ya = y + int(fy0);
+    const int x0 = clamp(xa, 0, W - 1), x1 = clamp(xa + 1, 0, W - 1), y0 = clamp(ya, 0, H - 1), y1 = clamp(ya + 1, 0, H - 1);
+    ti[0] = y0 * W + x0;
+    ti[1] = y0 * W + x1;
+    ti[2] = y1 * W + x0;
+    ti[3] = y1 * W + x1;
+    tw[0] = (1.0 - ax) * (1.0 - ay);
+    tw[1] = ax * (1.0 - ay);
+    tw[2] = (1.0 - ax) * ay;
+    tw[3] = ax * ay;
+}
 
 void main()
 {
@@ -655,5 +689,140 @@ void main()
     }
     if (vec8at(Z, c0)) st8(Z, uint(t), c0, o);
     else [[unroll]] for (int e = 0; e < 8; e++) st(Z, uint(t), c0 + e, o[e]);
+#elif PASS == 18
+    // TFDAT (tfdat_kernels.cu): F = U + D[0..1]. 16 M; m0 D (fp16), m1 U (fp32 flows, none: 0), m2 F
+    const int t = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    if (t >= prm(16)) return;
+    const Map D = map(0), U = map(1), F = map(2);
+    st(F, uint(t), 0, (U.none ? 0.0 : ld(U, uint(t), 0)) + ld(D, uint(t), 0));
+    st(F, uint(t), 1, (U.none ? 0.0 : ld(U, uint(t), 1)) + ld(D, uint(t), 1));
+#elif PASS == 19
+    // At 2h x 2w: U = 2 up(F); dst[0:C] = warp(feat, U), dst[uoff..] = U (fp16), zeros to the stride.
+    // 16 h, 17 w, 18 C (a multiple of 8), 19 uoff; m0 F (fp32 at h x w), m1 feat, m2 dst, m3 U out.
+    // A thread a pixel's 8 channels.
+    const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int h = prm(16), w = prm(17), C = prm(18), uoff = prm(19), G = C / 8, H = 2 * h, W = 2 * w;
+    if (i >= H * W * G) return;
+    const int g = i % G, p = i / G, y = p / W, x = p % W, c = g * 8;
+    const Map F = map(0), FT = map(1), DS = map(2), UO = map(3);
+    const vec2 u = upflow(F, h, w, y, x);
+    int ti[4];
+    float tw[4];
+    warp_taps(y, x, u, H, W, ti, tw);
+    float a[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    [[unroll]] for (int k = 0; k < 4; k++) {
+        float v[8];
+        if (vec8at(FT, c)) ld8(FT, uint(ti[k]), c, v);
+        else [[unroll]] for (int j = 0; j < 8; j++) v[j] = ld(FT, uint(ti[k]), c + j);
+        [[unroll]] for (int j = 0; j < 8; j++) a[j] += tw[k] * v[j];
+    }
+    if (vec8at(DS, c)) st8(DS, uint(p), c, a);
+    else [[unroll]] for (int j = 0; j < 8; j++) st(DS, uint(p), c + j, a[j]);
+    if (g == 0) {
+        st(DS, uint(p), uoff, u.x);
+        st(DS, uint(p), uoff + 1, u.y);
+        for (int k = uoff + 2; k < DS.stride; k++) st(DS, uint(p), k, 0.0);
+        st(UO, uint(p), 0, u.x);
+        st(UO, uint(p), 1, u.y);
+    }
+#elif PASS == 20
+    // The neighbour frame (input planes at 19) warped at full resolution H x W by 2 up(F) (F at H/2 x
+    // W/2), pixel-unshuffled by U into wus (channel c*U*U + dy*U + dx, zeros to its stride), and
+    // conf channel 1 = the U x U mean of mean_c |warped - centre| (centre planes at 20; the other
+    // channels zero). 16 H, 17 W, 18 U; m0 F, m1 wus, m2 conf (stride 16). A thread a feature pixel.
+    const int q = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int H = prm(16), W = prm(17), U = prm(18), nbo = prm(19), cto = prm(20), h = H / U, w = W / U, plane = H * W;
+    if (q >= h * w) return;
+    const int qy = q / w, qx = q % w;
+    const Map F = map(0), WU = map(1), CF = map(2);
+    float occ = 0.0;
+    for (int dy = 0; dy < U; dy++)
+        for (int dx = 0; dx < U; dx++) {
+            const int y = U * qy + dy, x = U * qx + dx;
+            const vec2 u = upflow(F, H / 2, W / 2, y, x);
+            int ti[4];
+            float tw[4];
+            warp_taps(y, x, u, H, W, ti, tw);
+            float d = 0.0;
+            for (int c = 0; c < 3; c++) {
+                const int pl = nbo + c * plane;
+                const float v = tw[0] * float(inh[pl + ti[0]]) + tw[1] * float(inh[pl + ti[1]]) + tw[2] * float(inh[pl + ti[2]]) +
+                                tw[3] * float(inh[pl + ti[3]]);
+                const float vh = float(float16_t(v));
+                st(WU, uint(q), c * U * U + dy * U + dx, vh);
+                d += abs(vh - float(inh[cto + c * plane + y * W + x]));
+            }
+            occ += d / 3.0;
+        }
+    for (int k = 3 * U * U; k < WU.stride; k++) st(WU, uint(q), k, 0.0);
+    for (int k = 0; k < 16; k++) st(CF, uint(q), k, k == 1 ? occ / float(U * U) : 0.0);
+#elif PASS == 21
+    // pixel_unshuffle(U) of the input planes at 19 (H x W) into dst (stride >= 3 U^2, zeros past them).
+    // 16 H, 17 W, 18 U; m0 dst
+    const int q = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int H = prm(16), W = prm(17), U = prm(18), fo = prm(19), h = H / U, w = W / U;
+    if (q >= h * w) return;
+    const int qy = q / w, qx = q % w;
+    const Map O = map(0);
+    for (int c = 0; c < 3; c++)
+        for (int dy = 0; dy < U; dy++)
+            for (int dx = 0; dx < U; dx++) st(O, uint(q), c * U * U + dy * U + dx, float(inh[fo + (c * H + U * qy + dy) * W + U * qx + dx]));
+    for (int k = 3 * U * U; k < O.stride; k++) st(O, uint(q), k, 0.0);
+#elif PASS == 22
+    // conf[t][0] = scale * a[t] . b[t]: 16 M, 17 C, 18 scale (float); m0 a, m1 b, m2 conf. 32 lanes a
+    // token, each a pair of channels in 64, summed as k_sim's shuffles add them.
+    const int lane = int(gl_LocalInvocationIndex) % 32, slot = int(gl_LocalInvocationIndex) / 32;
+    const int t = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 8 + slot;
+    const int M = prm(16), C = prm(17);
+    const Map A = map(0), B = map(1);
+    float s = 0.0;
+    if (t < M)
+        for (int c = 2 * lane; c < C; c += 64) s += ld(A, uint(t), c) * ld(B, uint(t), c) + (c + 1 < C ? ld(A, uint(t), c + 1) * ld(B, uint(t), c + 1) : 0.0);
+    ssim[slot][lane] = s;
+    barrier();
+    for (int k = 16; k > 0; k >>= 1) {
+        if (lane < k) ssim[slot][lane] += ssim[slot][lane + k];
+        barrier();
+    }
+    if (lane == 0 && t < M) st(map(2), uint(t), 0, ssim[slot][0] * prmf(18));
+#elif PASS == 23
+    // out = x * sigmoid(g[t][0]) for c < C, zeros to pad16(C): 16 M, 17 C; m0 x, m1 g, m2 out.
+    // A thread 8 channels of a token.
+    const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int M = prm(16), C = prm(17), G = (C + 15) / 16 * 2;
+    if (i >= M * G) return;
+    const int t = i / G, c0 = (i % G) * 8;
+    const float k = sigm(ld(map(1), uint(t), 0));
+    const Map X = map(0), O = map(2);
+    [[unroll]] for (int j = 0; j < 8; j++) st(O, uint(t), c0 + j, c0 + j < C ? ld(X, uint(t), c0 + j) * k : 0.0);
+#elif PASS == 24
+    // out = x * cm[c] for c < C, zeros to pad16(C): 16 M, 17 C, 18 cm (arena floats); m0 x, m1 out
+    const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int M = prm(16), C = prm(17), cm = prm(18), G = (C + 15) / 16 * 2;
+    if (i >= M * G) return;
+    const int t = i / G, c0 = (i % G) * 8;
+    const Map X = map(0), O = map(1);
+    [[unroll]] for (int j = 0; j < 8; j++) st(O, uint(t), c0 + j, c0 + j < C ? ld(X, uint(t), c0 + j) * arf[cm + c0 + j] : 0.0);
+#elif PASS == 25
+    // The input planes at 19 (H x W) bilinearly resized xS (half-pixel, clamped) into dst (16
+    // channels, zeros past 3) at SH x SW: 16 H, 17 W, 18 S; m0 dst
+    const int p = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int H = prm(16), W = prm(17), S = prm(18), fo = prm(19), OW = S * W;
+    if (p >= S * S * H * W) return;
+    const int y = p / OW, x = p % OW;
+    const float inv = 1.0 / float(S);
+    float vy = clamp((float(y) + 0.5) * inv - 0.5, 0.0, float(H - 1)), vx = clamp((float(x) + 0.5) * inv - 0.5, 0.0, float(W - 1));
+    const int y0 = int(vy), x0 = int(vx), y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+    const float fy = vy - float(y0), fx = vx - float(x0);
+    const Map O = map(0);
+    for (int c = 0; c < 16; c++) {
+        float o = 0.0;
+        if (c < 3) {
+            const int q = fo + c * H * W;
+            const float a = float(inh[q + y0 * W + x0]), b = float(inh[q + y0 * W + x1]), cc = float(inh[q + y1 * W + x0]), d = float(inh[q + y1 * W + x1]);
+            o = (a * (1.0 - fx) + b * fx) * (1.0 - fy) + (cc * (1.0 - fx) + d * fx) * fy;
+        }
+        st(O, uint(p), c, o);
+    }
 #endif
 }

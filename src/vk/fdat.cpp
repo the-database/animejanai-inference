@@ -11,6 +11,7 @@
 
 #include "native/onnx_graph.h"
 #include "native/onnx_read.h"
+#include "vk/fdat_body.h"
 #include "vk/imgnet.h"
 #include "vk/tnet.h"
 
@@ -26,21 +27,9 @@ bool refuse_(std::string *why, const std::string &m)
     return false;
 }
 
-// One block's weights as the CUDA parse reads them (fdat_body.cpp), on the host.
-struct Block {
-    bool spatial = true;
-    std::vector<float> ln1g, ln1b, ln2g, ln2b, qkv, wp, bp, dw, bias, cg1, cg2, temp, sg, fc1, fc2, smix;
-    float scale = 1.f, eps1 = 1e-5f, eps2 = 1e-5f, clip = 1.1920928955078125e-07f, pre = 0.f;
-    int shift = 0;
-};
+}  // namespace
 
-struct Body {
-    int C = 0, CP = 0, QS = 0, HS = 0, heads = 0, hd = 0, ws = 8, cgr = 0, ngroups = 0, nblk = 0;
-    std::vector<Block> blocks;
-    std::vector<Conv> gconvs;
-};
-
-bool parse_body(const Reader &rd, const std::string &prefix, int C, Body *b, std::string *why)
+bool fdat_parse_body(const Reader &rd, const std::string &prefix, int C, FdatBody *b, std::string *why)
 {
     b->C = C;
     b->CP = pad16(C);
@@ -58,7 +47,7 @@ bool parse_body(const Reader &rd, const std::string &prefix, int C, Body *b, std
         b->gconvs.push_back(cg);
         for (int bi = 0; bi < b->nblk; bi++) {
             const std::string B = Gp + "blocks." + std::to_string(bi) + "/";
-            Block k;
+            FdatBlock k;
             std::vector<float> v, v2;
             std::vector<int64_t> d;
             const ajinative::OnnxNode *ln1 = rd.node(B + "n1/LayerNormalization"), *ln2 = rd.node(B + "n2/LayerNormalization");
@@ -136,97 +125,46 @@ bool parse_body(const Reader &rd, const std::string &prefix, int C, Body *b, std
     return true;
 }
 
-class VkFdat : public ImgNet {
-public:
-    explicit VkFdat(Device &d) : net_(d) {}
-    static std::unique_ptr<ImgNet> build(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why);
-    const Buffer &input() const override { return net_.input(); }
-    const Buffer &output() const override { return net_.output(); }
-    void bind_io(VkBuffer in, VkBuffer out) override { net_.bind_io(in, out); }
-    bool record(VkCommandBuffer cb, int w, int h) const override
-    {
-        if (w != w_ || h != h_) return false;
-        net_.record(cb);
-        return true;
-    }
-    int out_w() const override { return w_ * scale_; }
-    int out_h() const override { return h_ * scale_; }
-    size_t device_bytes() const override { return net_.device_bytes(); }
-    size_t weight_bytes() const override { return net_.weight_bytes(); }
-    std::string describe() const override { return what_; }
-    std::string profile(Device &dev) const override { return net_.profile(dev); }
-    void suffix(const std::string &s) override { what_ += s; }
+namespace {
 
-private:
-    TNet net_;
-    int w_ = 0, h_ = 0, scale_ = 4;
-    std::string what_;
-};
-
-std::unique_ptr<ImgNet> VkFdat::build(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why)
+// The body's scratch: X, N1, CF, AT, QKV, H2, SUMS, CM
+template <class P>
+void body_layout(const FdatBody &B, int bh, int bw, P take, VkDeviceSize o[8])
 {
-    Reader rd(g);
-    if (!rd.node("/groups/groups.0/blocks.0/n1/LayerNormalization")) return refuse_(why, "not an FDAT graph"), nullptr;
-    std::unique_ptr<VkFdat> f(new VkFdat(dev));
-    Conv cfirst, cafter, cu0, cu2, cu3;
-    bool unshuffle = false;
-    if (rd.node("/conv_first/conv_first.1/Conv")) {
-        if (!rd.conv("/conv_first/conv_first.1/Conv", &cfirst, why)) return nullptr;
-        unshuffle = true;
-        if (cfirst.cin != 12) return refuse_(why, "FDAT unshuffle input"), nullptr;
-    } else {
-        if (!rd.conv("/conv_first/Conv", &cfirst, why)) return nullptr;
-        if (cfirst.cin != 3) return refuse_(why, "FDAT input channels"), nullptr;
-    }
-    const int C = cfirst.cout;
-    if (!rd.conv("/conv_after/Conv", &cafter, why) || !rd.conv("/upsampler/upsampler.0/ConvTranspose", &cu0, why) ||
-        !rd.conv("/upsampler/upsampler.2/ConvTranspose", &cu2, why) || !rd.conv("/upsampler/upsampler.3/Conv", &cu3, why))
-        return nullptr;
-    if (cu0.cin != C || cu0.cout != C || cu2.cin != C || cu2.cout != 3 || cu3.cin != 3 || cu3.cout != 3)
-        return refuse_(why, "FDAT upsampler shape (expected transpose+conv)"), nullptr;
-    Body B;
-    if (!parse_body(rd, "/", C, &B, why)) return nullptr;
-    if (w < 1 || h < 1 || (unshuffle && (w % 2 || h % 2))) return refuse_(why, "this model needs even tile dimensions"), nullptr;
-    f->w_ = w;
-    f->h_ = h;
-    f->scale_ = unshuffle ? 2 : 4;
-    const int bw = unshuffle ? w / 2 : w, bh = unshuffle ? h / 2 : h;
-    const int CP = B.CP, QS = B.QS, HS = B.HS, heads = B.heads, hd = B.hd, M = bw * bh;
-    TNet &n = f->net_;
+    const VkDeviceSize Mb = (VkDeviceSize)bw * bh;
+    const VkDeviceSize sz[8] = {Mb * B.CP * 2, Mb * B.CP * 2, Mb * B.CP * 2, Mb * B.CP * 2, Mb * B.QS * 2, Mb * B.HS * 2,
+                                (VkDeviceSize)B.CP * 4, (VkDeviceSize)B.CP * 4};
+    for (int i = 0; i < 8; i++) o[i] = take(sz[i]);
+}
 
-    // ---- the arena
+}  // namespace
+
+VkDeviceSize fdat_body_scratch(const TNet &n, const FdatBody &B, int bh, int bw)
+{
+    TCarve c;
+    c.align = n.align();
+    VkDeviceSize o[8];
+    body_layout(B, bh, bw, [&](VkDeviceSize b) { return c.take(b); }, o);
+    return c.off;
+}
+
+void fdat_record_body(TNet &n, const FdatBody &B, VkDeviceSize G, int bh, int bw, TCarve *scratch)
+{
+    const int C = B.C, CP = B.CP, QS = B.QS, HS = B.HS, heads = B.heads, hd = B.hd, M = bw * bh;
+    VkDeviceSize o[8];
+    body_layout(B, bh, bw, [&](VkDeviceSize b) { return scratch ? scratch->take(b) : n.place(b); }, o);
     const VkDeviceSize Mb = (VkDeviceSize)M;
-    const VkDeviceSize XS = n.place(Mb * CP * 2), G = n.place(Mb * CP * 2), X = n.place(Mb * CP * 2), N1 = n.place(Mb * CP * 2),
-                       CF = n.place(Mb * CP * 2), AT = n.place(Mb * CP * 2), QKV = n.place(Mb * QS * 2), H2 = n.place(Mb * HS * 2);
+    const VkDeviceSize X = o[0], N1 = o[1], CF = o[2], AT = o[3], QKV = o[4], H2 = o[5], SUMS = o[6], CM = o[7];
     const VkDeviceSize H1 = QKV;  // the MLP's hidden layer: the attention is done with QKV before fc1
-    const VkDeviceSize SUMS = n.place(CP * 4), CM = n.place(CP * 4);
-    const VkDeviceSize T = n.place(Mb * CP * 2), U1 = n.place(Mb * 4 * CP * 2), U2 = n.place(Mb * 16 * 16 * 2);
     // channel attention: per chunk partials, the reduced statistics, the softmax
     const int S = heads * hd * hd + 2 * C, tpc = 256, nch = (M + tpc - 1) / tpc;  // chunks enough to fill the GPU
     const int PART = n.add_part((size_t)nch * S), STATS = n.add_part(S), ATTN = n.add_part((size_t)heads * hd * hd);
-
-    // ---- conv_first
-    {
-        TNet::ConvIO io;
-        io.in = unshuffle ? 2 : 1;
-        io.src_in = true;
-        io.cinp = 16;
-        io.IH = bh;
-        io.IW = bw;
-        io.H = bh;
-        io.W = bw;
-        io.dst = XS;
-        io.dst_bytes = Mb * CP * 2;
-        io.dst_stride = CP;
-        n.conv(conv_taps(cfirst, nullptr), cfirst.b, cfirst.cin, C, io, {32, 16}, &cfirst);
-    }
-    n.copy(XS, G, Mb * CP * 2);
     const auto hm = [](VkDeviceSize o, int s, int off = 0) { return hmap(o, s, off); };
     size_t bi = 0;
     for (int gi = 0; gi < B.ngroups; gi++) {
         n.copy(G, X, Mb * CP * 2);
         for (int k = 0; k < B.nblk; k++, bi++) {
-            const Block &b = B.blocks[bi];
+            const FdatBlock &b = B.blocks[bi];
             n.layernorm(hm(X, CP), hm(N1, CP), M, C, CP, n.add_wf(b.ln1g), n.add_wf(b.ln1b), b.eps1);
             n.gemm(hm(N1, CP), M, n.add_mat(b.qkv, {}, C, 3 * C), hm(QKV, QS));
             n.dwconv(hm(N1, CP), hm(CF, CP), bh, bw, C, n.add_wf(b.dw), -1, true, b.spatial ? SUMS : ~0ull);
@@ -321,6 +259,92 @@ std::unique_ptr<ImgNet> VkFdat::build(Device &dev, const ajinative::OnnxGraph &g
         io.r1_stride = CP;
         n.conv(conv_taps(B.gconvs[gi], nullptr), B.gconvs[gi].b, C, C, io, {64, 48, 32, 16}, &B.gconvs[gi]);
     }
+}
+
+namespace {
+
+class VkFdat : public ImgNet {
+public:
+    explicit VkFdat(Device &d) : net_(d) {}
+    static std::unique_ptr<ImgNet> build(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why);
+    const Buffer &input() const override { return net_.input(); }
+    const Buffer &output() const override { return net_.output(); }
+    void bind_io(VkBuffer in, VkBuffer out) override { net_.bind_io(in, out); }
+    bool record(VkCommandBuffer cb, int w, int h) const override
+    {
+        if (w != w_ || h != h_) return false;
+        net_.record(cb);
+        return true;
+    }
+    int out_w() const override { return w_ * scale_; }
+    int out_h() const override { return h_ * scale_; }
+    size_t device_bytes() const override { return net_.device_bytes(); }
+    size_t weight_bytes() const override { return net_.weight_bytes(); }
+    std::string describe() const override { return what_; }
+    std::string profile(Device &dev) const override { return net_.profile(dev); }
+    void suffix(const std::string &s) override { what_ += s; }
+
+private:
+    TNet net_;
+    int w_ = 0, h_ = 0, scale_ = 4;
+    std::string what_;
+};
+
+std::unique_ptr<ImgNet> VkFdat::build(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why)
+{
+    Reader rd(g);
+    if (!rd.node("/groups/groups.0/blocks.0/n1/LayerNormalization")) return refuse_(why, "not an FDAT graph"), nullptr;
+    std::unique_ptr<VkFdat> f(new VkFdat(dev));
+    Conv cfirst, cafter, cu0, cu2, cu3;
+    bool unshuffle = false;
+    if (rd.node("/conv_first/conv_first.1/Conv")) {
+        if (!rd.conv("/conv_first/conv_first.1/Conv", &cfirst, why)) return nullptr;
+        unshuffle = true;
+        if (cfirst.cin != 12) return refuse_(why, "FDAT unshuffle input"), nullptr;
+    } else {
+        if (!rd.conv("/conv_first/Conv", &cfirst, why)) return nullptr;
+        if (cfirst.cin != 3) return refuse_(why, "FDAT input channels"), nullptr;
+    }
+    const int C = cfirst.cout;
+    if (!rd.conv("/conv_after/Conv", &cafter, why) || !rd.conv("/upsampler/upsampler.0/ConvTranspose", &cu0, why) ||
+        !rd.conv("/upsampler/upsampler.2/ConvTranspose", &cu2, why) || !rd.conv("/upsampler/upsampler.3/Conv", &cu3, why))
+        return nullptr;
+    if (cu0.cin != C || cu0.cout != C || cu2.cin != C || cu2.cout != 3 || cu3.cin != 3 || cu3.cout != 3)
+        return refuse_(why, "FDAT upsampler shape (expected transpose+conv)"), nullptr;
+    FdatBody B;
+    if (!fdat_parse_body(rd, "/", C, &B, why)) return nullptr;
+    if (w < 1 || h < 1 || (unshuffle && (w % 2 || h % 2))) return refuse_(why, "this model needs even tile dimensions"), nullptr;
+    f->w_ = w;
+    f->h_ = h;
+    f->scale_ = unshuffle ? 2 : 4;
+    const int bw = unshuffle ? w / 2 : w, bh = unshuffle ? h / 2 : h;
+    const int CP = B.CP, heads = B.heads, M = bw * bh;
+    TNet &n = f->net_;
+
+    // ---- the arena
+    const VkDeviceSize Mb = (VkDeviceSize)M;
+    const VkDeviceSize XS = n.place(Mb * CP * 2), G = n.place(Mb * CP * 2);
+    const VkDeviceSize T = n.place(Mb * CP * 2), U1 = n.place(Mb * 4 * CP * 2), U2 = n.place(Mb * 16 * 16 * 2);
+
+    // ---- conv_first
+    {
+        TNet::ConvIO io;
+        io.in = unshuffle ? 2 : 1;
+        io.src_in = true;
+        io.cinp = 16;
+        io.IH = bh;
+        io.IW = bw;
+        io.H = bh;
+        io.W = bw;
+        io.dst = XS;
+        io.dst_bytes = Mb * CP * 2;
+        io.dst_stride = CP;
+        n.conv(conv_taps(cfirst, nullptr), cfirst.b, cfirst.cin, C, io, {32, 16}, &cfirst);
+    }
+    n.copy(XS, G, Mb * CP * 2);
+    fdat_record_body(n, B, G, bh, bw);
+    const auto hm = [](VkDeviceSize o, int s, int off = 0) { return hmap(o, s, off); };
+    (void)hm;
     // conv_after + the shallow features
     {
         TNet::ConvIO io;
@@ -392,7 +416,7 @@ std::unique_ptr<ImgNet> VkFdat::build(Device &dev, const ajinative::OnnxGraph &g
     if (!n.finish((VkDeviceSize)3 * w * h * 2, (VkDeviceSize)3 * f->out_w() * f->out_h() * 2, why)) return nullptr;
     char buf[200];
     bool shifted = false;
-    for (const Block &b : B.blocks) shifted |= b.shift != 0;
+    for (const FdatBlock &b : B.blocks) shifted |= b.shift != 0;
     std::snprintf(buf, sizeof buf, "FDAT %dx, %d groups x %d blocks, %d channels, %d heads, %dx%d windows%s; Vulkan %s", f->scale_, B.ngroups,
                   B.nblk, C, heads, B.ws, B.ws, shifted ? " (shifted)" : "", family_name(dev.family()));
     f->what_ = buf;

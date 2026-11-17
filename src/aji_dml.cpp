@@ -1585,7 +1585,7 @@ bool vk_rife_open(aji_ctx *c, const std::string &onnx, const std::string &name, 
     return false;
 }
 
-// A temporal model (TemporalFix) on the Vulkan native kernels at w x h (the
+// A temporal model (TemporalFix, TFDAT) on the Vulkan native kernels at w x h (the
 // padded size), t frames; logs either way. False: open it on DirectML.
 bool vk_temporal_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const std::string &name, int w, int h, int t)
 {
@@ -1607,8 +1607,10 @@ bool vk_temporal_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const st
             }
             if (n) {
                 m->fp16 = true;
-                m->in_w = m->out_w = w;
-                m->in_h = m->out_h = h;
+                m->in_w = w;
+                m->in_h = h;
+                m->out_w = w * n->scale();
+                m->out_h = h * n->scale();
                 m->vkt = std::move(n);
                 c->vk->save_caches();
                 c->log_steps.push_back("Native kernels: " + name + " (" + m->vkt->describe() + ")");

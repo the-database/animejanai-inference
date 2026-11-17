@@ -530,7 +530,7 @@ if(AJI_VULKAN)
                             "-DAJI_VK_INCLUDE=<dir containing vulkan/vulkan_core.h>")
     endif()
     add_library(aji_vk_core OBJECT src/vk/vk.cpp src/vk/device.cpp src/vk/kernels.cpp src/vk/executor.cpp
-                src/vk/gconv.cpp src/vk/esrgan.cpp src/vk/rife.cpp src/vk/tfix.cpp src/vk/tnet.cpp src/vk/fdat.cpp src/vk/hat.cpp src/vk/dat.cpp src/vk/frame.cpp src/core/fileio.cpp)
+                src/vk/gconv.cpp src/vk/esrgan.cpp src/vk/rife.cpp src/vk/tfix.cpp src/vk/tnet.cpp src/vk/fdat.cpp src/vk/hat.cpp src/vk/dat.cpp src/vk/tfdat.cpp src/vk/frame.cpp src/core/fileio.cpp)
     target_include_directories(aji_vk_core PRIVATE src include)
     target_include_directories(aji_vk_core SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
     set_target_properties(aji_vk_core PROPERTIES

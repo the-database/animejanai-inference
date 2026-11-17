@@ -47,6 +47,18 @@ struct TWin {
     int bias = -1, rtab = -1, rt_w = 0, rt_offy = 0, rt_offx = 0, tn = 0;
 };
 
+// Arena bytes bump-allocated from a base with place()'s alignment: steps that never overlap in time
+// share one region (TNet::align()).
+struct TCarve {
+    VkDeviceSize off = 0, align = 16;
+    VkDeviceSize take(VkDeviceSize bytes)
+    {
+        const VkDeviceSize o = off;
+        off += (bytes + align - 1) / align * align;
+        return o;
+    }
+};
+
 // One tfm.comp parameter entry (64 ints).
 struct TArgs {
     int32_t v[64] = {};
@@ -64,6 +76,7 @@ public:
 
     // ---- layout (before finish)
     VkDeviceSize place(VkDeviceSize bytes);  // arena bytes, aligned for descriptors and uvec4s
+    VkDeviceSize align() const;              // place()'s alignment
     int add_wf(const std::vector<float> &v);  // fp32 store: offset in floats
     int add_wh(const std::vector<uint16_t> &h);  // fp16 store (GEMM weights): offset in halfs
     int add_wh_zero(size_t halfs);              // a zeroed fp16 region (written on the GPU)
@@ -86,7 +99,7 @@ public:
         VkDeviceSize src = 0, dst = 0, r1 = 0;     // arena offsets (r1: when nres)
         VkDeviceSize src_bytes = 0, dst_bytes = 0, r1_bytes = 0;
         int nres = 0;
-        int src_off = 0, src_stride = 0, dst_stride = 0, r1_stride = 0;
+        int src_off = 0, src_stride = 0, dst_off = 0, dst_stride = 0, r1_stride = 0;  // offsets in halfs, multiples of 8
         int IH = 0, IW = 0, H = 0, W = 0, cinp = 16, sy = 0;
     };
     void conv(const std::vector<uint16_t> &taps, const std::vector<float> &bias, int cin, int cout, const ConvIO &io,
