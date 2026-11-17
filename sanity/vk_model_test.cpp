@@ -362,13 +362,22 @@ int temporal_main(int argc, char **argv)
         return 1;
     }
     std::printf("device %u: %s, family %s\n", dev->info().index, dev->info().name.c_str(), ajivk::family_name(dev->family()));
-    // 7 frames of a pan (3 pixels right, 2 down per frame) with noise that changes per frame
+    const auto t0 = std::chrono::steady_clock::now();
+    auto t = ajivk::TemporalNet::create(*dev, g, w, h, &why);
+    const double cs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!t) {
+        std::fprintf(stderr, "vulkan temporal %dx%d: %s\n", w, h, why.c_str());
+        return 1;
+    }
+    std::printf("%s (create %.2f s, %.0f MB)\n", t->describe().c_str(), cs, t->device_bytes() / 1048576.0);
+    // the window: frames of a pan (3 pixels right, 2 down per frame) with noise that changes per frame
+    const int nf = t->frames(), S = t->scale(), mid = nf / 2;
     const size_t plane = (size_t)w * h;
-    const auto a = synth(w + 32, h + 32);
-    const int aw = w + 32, ah = h + 32;
-    std::vector<float> win(plane * 21);
+    const auto a = synth(w + 3 * nf + 8, h + 2 * nf + 8);
+    const int aw = w + 3 * nf + 8, ah = h + 2 * nf + 8;
+    std::vector<float> win(plane * 3 * nf);
     uint32_t sd = 777u;
-    for (int k = 0; k < 7; k++)
+    for (int k = 0; k < nf; k++)
         for (int c = 0; c < 3; c++)
             for (int y = 0; y < h; y++)
                 for (int x = 0; x < w; x++) {
@@ -378,15 +387,7 @@ int temporal_main(int argc, char **argv)
                     win[((size_t)(3 * k + c) * h + y) * w + x] = std::fmin(1.f, std::fmax(0.f, v));
                 }
     const auto hin = to_half(win);
-    const auto t0 = std::chrono::steady_clock::now();
-    auto t = ajivk::TemporalNet::create(*dev, g, w, h, &why);
-    const double cs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    if (!t) {
-        std::fprintf(stderr, "vulkan temporal %dx%d: %s\n", w, h, why.c_str());
-        return 1;
-    }
-    std::printf("%s (create %.2f s, %.0f MB)\n", t->describe().c_str(), cs, t->device_bytes() / 1048576.0);
-    std::vector<uint16_t> out(plane * 3);
+    std::vector<uint16_t> out(plane * 3 * S * S);
     if (!dev->upload(t->input(), hin.data(), hin.size() * 2, &why) || !t->run(*dev, &why) ||
         !dev->download(t->output(), out.data(), out.size() * 2, &why)) {
         std::fprintf(stderr, "vulkan temporal run: %s\n", why.c_str());
@@ -397,7 +398,7 @@ int temporal_main(int argc, char **argv)
     int bad = nonfinite != 0;
     // the frame cache: the frames encoded into scrambled entries, the window run from them, must
     // give the whole-window output bit for bit
-    {
+    if (t->cache_entries() >= 7) {
         const int perm[7] = {3, 5, 0, 6, 1, 2, 4}, nocut[7] = {-1, -1, -1, -1, -1, -1, -1};
         VkCommandBuffer cb = dev->begin();
         for (int z = 0; z < 7; z++) t->record_encode(cb, perm[z], z);
@@ -442,7 +443,7 @@ int temporal_main(int argc, char **argv)
         vkDestroyQueryPool(dev->device(), qp, nullptr);
     };
     timed("whole window", [&](VkCommandBuffer cb) { t->record(cb); });
-    {
+    if (t->cache_entries() >= 7) {
         // steady state: one new frame encoded per window
         const int ent[7] = {0, 1, 2, 3, 4, 5, 6}, nocut[7] = {-1, -1, -1, -1, -1, -1, -1};
         int k = 0;
@@ -455,8 +456,8 @@ int temporal_main(int argc, char **argv)
     dev->save_caches();
     if (nonfinite) std::printf("%zu non-finite outputs: FAIL\n", nonfinite);
     // against the centre frame: how much the model changed it
-    {
-        std::vector<float> cen(win.begin() + plane * 9, win.begin() + plane * 12);
+    if (S == 1) {
+        std::vector<float> cen(win.begin() + plane * 3 * mid, win.begin() + plane * 3 * (mid + 1));
         const Cmp c = compare(out, cen);
         std::printf("output vs the centre frame: %.1f dB (how much it changed)\n", c.db);
     }
@@ -484,7 +485,7 @@ int temporal_main(int argc, char **argv)
             }
             const Cmp c = compare(out, cf);
             const bool ok = c.nan == 0 && c.db >= min_db;
-            std::printf("vs CUDA native TemporalFix at %dx%d: %.1f dB, max %.4f (%.1f levels), %.2f%% bit-identical: %s\n", w, h, c.db,
+            std::printf("vs CUDA native at %dx%d: %.1f dB, max %.4f (%.1f levels), %.2f%% bit-identical: %s\n", w, h, c.db,
                         c.maxd, c.maxd * 255, 100.0 * same / co.size(), ok ? "ok" : "FAIL");
             bad += !ok;
             cudaFree(din);

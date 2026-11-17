@@ -167,7 +167,7 @@ off; any other value, or no key, is on. Image path: `AJI_NATIVE=off` (or `0`, `n
 |---|---|---|
 | SPAN, SPANF3, span_s, Compact (SRVGG) | `native/lower` + `native/executor` at the chain's size | the same plan and executor behind `ImgNet` (`build_lowered`, `native/framenet.cpp`), per tile |
 | ESRGAN, FDAT (M, XL), HAT-L, DAT-2 | the `native/imgnet` builders on the whole frame (`FrameNet::image`), when it fits in memory (ESRGAN, FDAT, HAT and DAT also on Vulkan: `vk/esrgan.cpp`, `vk/fdat.cpp`, `vk/hat.cpp`, `vk/dat.cpp`) | the `native/imgnet` builders, per tile |
-| TFDAT, TemporalFix | `native/vidnet` in the temporal stage (TemporalFix also on Vulkan: `vk/tfix`) | — |
+| TFDAT, TemporalFix | `native/vidnet` in the temporal stage (also on Vulkan: `vk/tfdat.cpp`, `vk/tfix`) | — |
 | RIFE | `native/rife` (the graph read by `native/rife_plan`, which Vulkan's `vk/rife` shares) | — |
 
 Video, single-frame models: in `aji_configure` (`try_native` in `aji_trt.cpp`) the model's ONNX
@@ -304,8 +304,8 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   ESRGAN (RRDBNet 64/32, 2x unshuffle and 4x) follows `native/esrgan.cpp`'s plan on it, with its
   intermediates in one arena by lifetime; a tile whose buffers exceed `maxStorageBufferRange` is
   refused. `ImgNet::create` tries ESRGAN, then the lowering.
-- **`vk/tnet`, `vk/fdat.cpp`, `vk/hat.cpp`, `vk/dat.cpp`, `tfm.comp`: the transformer image models
-  on Vulkan** (FDAT, HAT, DAT; TFDAT to follow). `TNet` is one arena of maps (as `tfix.comp`'s), fp32 / fp16 weight
+- **`vk/tnet`, `vk/fdat.cpp`, `vk/hat.cpp`, `vk/dat.cpp`, `vk/tfdat.cpp`, `tfm.comp`: the
+  transformer models on Vulkan** (FDAT, HAT, DAT; TFDAT in the temporal stage). `TNet` is one arena of maps (as `tfix.comp`'s), fp32 / fp16 weight
   stores, a partial-sums buffer and a list of steps: gconv dispatches, `tfm.comp` passes, copies,
   fills. `tfm.comp` ports `native/tfm.cu` and `fdat_kernels.cu`: the GEMM (fp32 sums, tfm's
   epilogue: bias, act, column scale, two residuals, act last), LayerNorm (32 lanes a token),
@@ -334,6 +334,13 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   Wp), so any size runs; the token gate (`tgate`, a thread a token) and the mix are tfm.comp
   passes 16 and 17, the depthwise conv takes a map to multiply by (the SGFN). Both shipped exports
   72 dB from CUDA native; 720x480 page 0.63 s (CUDA 0.32; DirectML can't load them).
+  TFDAT v2 (`vk/tfdat.cpp`, a `TemporalNet` with `scale()` and no frame cache, tried before
+  TemporalFix) follows native/tfdat.cpp; its alignment kernels are tfm.comp passes 18-25, the FDAT
+  body is `vk/fdat_body.h` (shared with vk/fdat.cpp), and the alignment, the body's scratch and the
+  tail share one arena region (`TCarve`), as CUDA's phases do. bndl animefilm v3 2x: 73 dB from
+  CUDA native; 1080p window 245 ms (CUDA 120), 720x480 in aji_vk 46 ms a frame (DirectML 1490).
+  The v1 exports (no flow_net) aren't read, as on CUDA. Convs can write at a channel offset
+  (`ConvIO::dst_off`).
   `AJI_TNET_SKIP=<step label prefix>` records no dispatch for those steps: per-step timestamps
   attribute time to the wrong step on NVIDIA, so this is how to see what a kind of step costs.
   `aji_vk_model_test image <onnx> W H` (any image model vs CUDA native), `gemm M K N [act]`,

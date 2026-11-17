@@ -875,8 +875,16 @@ bool TemporalNet::run(Device &dev, std::string *why) const
     return dev.submit_wait(cb, why);
 }
 
+std::unique_ptr<TemporalNet> build_tfdat(Device &dev, const ajinative::OnnxGraph &g, int W, int H, std::string *why);
+
 std::unique_ptr<TemporalNet> TemporalNet::create(Device &dev, const ajinative::OnnxGraph &g, int W, int H, std::string *why)
 {
+    std::string w1;
+    if (auto n = build_tfdat(dev, g, W, H, &w1)) return n;
+    if (w1.rfind("not a TFDAT", 0) != 0) {
+        if (why) *why = w1;
+        return nullptr;
+    }
     return VkTfix::build(dev, g, W, H, why);
 }
 

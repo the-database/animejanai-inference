@@ -21,7 +21,8 @@ bool fail(std::string *why, const std::string &m)
 
 const char *kPassName[] = {"",          "gemm",     "ln",      "dw",     "colsum",  "winattn", "chanstats", "chanreduce",
                            "chansoft",  "chanfold", "aimcg",   "aimsg",  "imgin",   "colsum2", "convert",    "imgout",
-                           "tgate",     "mix"};
+                           "tgate",     "mix",      "tfflow",  "tfupwarp", "tfwarp", "tfunshuf", "tfsim", "tfgate",
+                           "tfcolscale", "tfresize"};
 
 void full_barrier(VkCommandBuffer cb)
 {
@@ -62,11 +63,13 @@ TNet::~TNet()
     for (Buffer *b : {&arena_, &wfb_, &whb_, &gwb_, &gbb_, &partb_, &gprm_, &tprm_}) dev_.destroy(*b);
 }
 
+VkDeviceSize TNet::align() const { return std::max<VkDeviceSize>(dev_.info().storage_align, 16); }
+
 VkDeviceSize TNet::place(VkDeviceSize bytes)
 {
-    const VkDeviceSize align = std::max<VkDeviceSize>(dev_.info().storage_align, 16);
+    const VkDeviceSize a = align();
     const VkDeviceSize o = ar_;
-    ar_ += (bytes + align - 1) / align * align;
+    ar_ += (bytes + a - 1) / a * a;
     return o;
 }
 
@@ -375,6 +378,7 @@ void TNet::conv(const std::vector<uint16_t> &taps, const std::vector<float> &bia
     o.p.src_off = io.src_off;
     o.p.src_stride = io.src_stride;
     o.p.dst_stride = io.dst_stride;
+    o.p.dst_off = io.dst_off;
     o.p.r1_stride = io.r1_stride;
     o.p.sy = io.sy;
     o.w = wi;

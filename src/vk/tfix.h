@@ -29,17 +29,18 @@ namespace ajivk {
 
 class TemporalNet {
 public:
-    // W, H multiples of 8. Null and *why when the graph isn't TemporalFix ("not a TemporalFix
-    // graph") or the device can't run it at that size.
+    // W, H multiples of 8 (TFDAT: of 32). Null and *why when the graph is neither TemporalFix nor
+    // TFDAT (vk/tfdat.cpp; "not a TemporalFix graph") or the device can't run it at that size.
     static std::unique_ptr<TemporalNet> create(Device &dev, const ajinative::OnnxGraph &g, int W, int H, std::string *why);
     virtual ~TemporalNet() = default;
     virtual int frames() const = 0;
+    virtual int scale() const { return 1; }  // the output is scale times the frame size
     virtual const Buffer &input() const = 0;
     virtual const Buffer &output() const = 0;
     virtual void bind_io(VkBuffer in, VkBuffer out) = 0;
     // Appends one window to cb (the caller orders the input before and the output after).
     virtual void record(VkCommandBuffer cb) const = 0;
-    int cache_entries() const { return frames(); }
+    virtual int cache_entries() const { return frames(); }  // 0: no frame cache (record_encode / record_cached unused)
     // Input frame `frame` of the window buffer into cache entry `entry`.
     virtual void record_encode(VkCommandBuffer cb, int entry, int frame) const = 0;
     // A window from the cache: ent[z] the entry of window position z; cut_slot[z] (< 0: none) the
