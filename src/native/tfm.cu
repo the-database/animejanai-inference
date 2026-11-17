@@ -531,9 +531,9 @@ __global__ void __launch_bounds__(256) k_ln8x(const TI *in, int sin, TO *out, in
     }
 }
 
-// Copies between fp32 and fp16 token maps, 8 channels per thread.
+// Copies between fp32 and fp16 token maps, 8 channels per thread, times a scale.
 template <typename TI, typename TO>
-__global__ void k_convert(const TI *in, int sin, TO *out, int sout, int M, int n)
+__global__ void k_convert(const TI *in, int sin, TO *out, int sout, int M, int n, float scale)
 {
     const int G = n / 8;
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -546,6 +546,8 @@ __global__ void k_convert(const TI *in, int sin, TO *out, int sout, int M, int n
     } else {
         unpack8(*reinterpret_cast<const uint4 *>(in + (size_t)t * sin + c), v);
     }
+    if (scale != 1.f)
+        for (float &x : v) x *= scale;
     if constexpr (sizeof(TO) == 4) {
         *reinterpret_cast<float4 *>(out + (size_t)t * sout + c) = make_float4(v[0], v[1], v[2], v[3]);
         *reinterpret_cast<float4 *>(out + (size_t)t * sout + c + 4) = make_float4(v[4], v[5], v[6], v[7]);
@@ -1024,14 +1026,14 @@ cudaError_t tlayernorm2(const void *in, bool in_f32, int sin, void *out, bool ou
     return cudaGetLastError();
 }
 
-cudaError_t tconvert(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int n, cudaStream_t s)
+cudaError_t tconvert(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int n, cudaStream_t s, float scale)
 {
     if (n % 8 || sin % 8 || sout % 8 || ((uintptr_t)in | (uintptr_t)out) % 16) return cudaErrorInvalidValue;
     const unsigned grid = (unsigned)(((size_t)M * (n / 8) + 255) / 256);
-    if (in_f32 && !out_f32) k_convert<float, half><<<grid, 256, 0, s>>>((const float *)in, sin, (half *)out, sout, M, n);
-    else if (!in_f32 && out_f32) k_convert<half, float><<<grid, 256, 0, s>>>((const half *)in, sin, (float *)out, sout, M, n);
-    else if (in_f32) k_convert<float, float><<<grid, 256, 0, s>>>((const float *)in, sin, (float *)out, sout, M, n);
-    else k_convert<half, half><<<grid, 256, 0, s>>>((const half *)in, sin, (half *)out, sout, M, n);
+    if (in_f32 && !out_f32) k_convert<float, half><<<grid, 256, 0, s>>>((const float *)in, sin, (half *)out, sout, M, n, scale);
+    else if (!in_f32 && out_f32) k_convert<half, float><<<grid, 256, 0, s>>>((const half *)in, sin, (float *)out, sout, M, n, scale);
+    else if (in_f32) k_convert<float, float><<<grid, 256, 0, s>>>((const float *)in, sin, (float *)out, sout, M, n, scale);
+    else k_convert<half, half><<<grid, 256, 0, s>>>((const half *)in, sin, (half *)out, sout, M, n, scale);
     return cudaGetLastError();
 }
 

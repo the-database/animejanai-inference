@@ -131,7 +131,7 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
         else if (n.op == "Mul" && anyconst && sub && n.in[0] == sub->out[0]) continue;  // the image range
         else if (n.op == "Mul" && anyconst && gelu_const_mul(rd, n)) continue;           // a spelled-out GELU
         else if (n.op == "Mul" && anyconst) ev.push_back({Ev::MULC, &n});
-        else if (n.op == "Add" && !allin && !anyconst) ev.push_back({Ev::ADDS, &n});
+        else if (n.op == "Add" && !allin && (!anyconst || attn_const(rd, n))) ev.push_back({Ev::ADDS, &n});
         else if (n.op == "Sub" && anyconst && !sub) sub = &n;
     }
     size_t at = 0;
@@ -476,8 +476,9 @@ std::unique_ptr<ImgNet> VkDat::build(Device &dev, const ajinative::OnnxGraph &g,
             n.gemm(hm(PR, CP), M, mat(bk.fc2), fm(S, CP), 0, false, -1, fm(S, CP));
         }
         // the group conv plus the group input, fp32 sums and output
-        n.convert(fm(S, CP), hm(S16, CP), M, CP);
-        n.conv_gemm(hm(S16, CP), h, w, CP, n.add_conv_mat(conv_taps(gconvs[gi], nullptr), gconvs[gi].b, C, CP, C), fm(S, CP), fm(GIN, CP));
+        n.convert(fm(S, CP), hm(S16, CP), M, CP, TNet::kStreamScale);  // the weights carry the inverse
+        const std::vector<float> inv(C, 1.f / TNet::kStreamScale);
+        n.conv_gemm(hm(S16, CP), h, w, CP, n.add_conv_mat(conv_taps(gconvs[gi], &inv), gconvs[gi].b, C, CP, C), fm(S, CP), fm(GIN, CP));
     }
     // ---- the tail
     lnorm(fin, fm(S, CP), hm(N1, CP));

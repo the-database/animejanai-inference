@@ -163,7 +163,8 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
         up_ln(r, hgr.oc.n2, C, &gr.oc.n2);
         if (!up_attn(r, hg, hgr.oc.at, true, &gr.oc.at, why)) return nullptr;
         up_mlp(r, hg, hgr.oc.fc1, hgr.oc.fc2, &gr.oc.mlp);
-        gr.conv.w = r.gup(conv_taps(hgr.conv, nullptr), hgr.conv.b, C, CP, C, CP);
+        const std::vector<float> inv(C, 1.f / kStreamScale);  // its input is the stream's scaled fp16 copy
+        gr.conv.w = r.gup(conv_taps(hgr.conv, &inv), hgr.conv.b, C, CP, C, CP);
         f->groups.push_back(std::move(gr));
     }
     // tail
@@ -331,7 +332,7 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         pr.mark(P_PROJ);
         CK(mlp_step(o.n2, o.mlp));
         // the group conv plus the group input, in fp32
-        K(tconvert(S, true, CP, S16, false, CP, M, CP, s));
+        K(tconvert(S, true, CP, S16, false, CP, M, CP, s, kStreamScale));
         GConvArgs a = ga(S16, CP, h, w, S, CP, h, w);
         a.acc32 = true;
         a.out_f32 = true;

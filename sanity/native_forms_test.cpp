@@ -188,6 +188,19 @@ int main()
         CHECK(near(c.w[0], 1.0));
     }
 
+    // ---- a shifted-window mask a fixed-size export baked in, against a linear's bias
+    {
+        G g;
+        g.init(tensor_v("mask", {1, 2, 1, 4, 4}, std::vector<float>(32, -100.f)));
+        g.init(tensor_v("bias", {4}, {0, 0, 0, 0}));
+        g.node("Add", {"input", "mask"}, {"m"});
+        g.node("Add", {"m", "bias"}, {"output"});
+        OnnxGraph og;
+        CHECK(parse(g, "input", "output", &og));
+        Reader rd(og);
+        CHECK(attn_const(rd, *find_op(og, "Add", 0)) && !attn_const(rd, *find_op(og, "Add", 1)));
+    }
+
     std::printf("native forms: ok\n");
     return 0;
 }

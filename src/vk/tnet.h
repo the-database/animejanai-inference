@@ -132,7 +132,10 @@ public:
     // The channel sums of a map (C channels over M tokens) into sums (arena float offset)
     void colsums(const TMap &in, int M, int C, VkDeviceSize sums);
     // A map into another of n channels (fp32 <-> fp16)
-    void convert(const TMap &in, const TMap &out, int M, int n);
+    void convert(const TMap &in, const TMap &out, int M, int n, float scale = 1.f);
+    // the residual stream's fp16 copy for a group conv, scaled down to stay in fp16's range (the
+    // conv's weights carry the inverse; native/tfm.h's kStreamScale)
+    static constexpr float kStreamScale = 1.f / 32;
     // cm = sigmoid(W2 act(W1 (sums / M * in_scale) + b1) + b2), act GELU or ReLU (b1, b2 < 0: none)
     void chan_gate(VkDeviceSize sums, int M, int C, int r, int w1, int b1, int w2, int b2, bool relu, float in_scale, VkDeviceSize cm,
                    int cpad);

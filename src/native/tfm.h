@@ -62,7 +62,11 @@ cudaError_t tlayernorm(const void *in, int sin, void *out, int sout, int M, int 
 cudaError_t tlayernorm2(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int C, int cpad,
                         const float *gamma, const float *beta, float eps, cudaStream_t s);
 // Element copies between fp32 and fp16 token maps: n channels per token (a multiple of 8).
-cudaError_t tconvert(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int n, cudaStream_t s);
+cudaError_t tconvert(const void *in, bool in_f32, int sin, void *out, bool out_f32, int sout, int M, int n, cudaStream_t s,
+                     float scale = 1.f);
+// The residual stream's fp16 copy for a group conv, scaled down so a stream past fp16's range (a
+// pretrained DAT-2's last group reaches ~1.4e5) stays finite; the conv's weights carry the inverse.
+constexpr float kStreamScale = 1.f / 32;
 
 struct TWinAttn {
     const void *qkv = nullptr;  // tokens [H][W][sq]: q at qo + h*hd, k at ko + h*hd, v at vo + h*hd

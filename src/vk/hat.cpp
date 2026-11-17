@@ -272,8 +272,9 @@ std::unique_ptr<ImgNet> VkHat::build(Device &dev, const ajinative::OnnxGraph &g,
         n.gemm(hm(AT, CP), M, mat(o.at.proj), fm(S, CP), 0, false, -1, fm(S, CP));
         mlp_step(o.n2, o.mlp);
         // the group conv plus the group input, fp32 sums and output
-        n.convert(fm(S, CP), hm(S16, CP), M, CP);
-        n.conv_gemm(hm(S16, CP), ph, pw, CP, n.add_conv_mat(conv_taps(gr.conv, nullptr), gr.conv.b, C, CP, C), fm(S, CP), fm(GIN, CP));
+        n.convert(fm(S, CP), hm(S16, CP), M, CP, TNet::kStreamScale);  // the weights carry the inverse
+        const std::vector<float> inv(C, 1.f / TNet::kStreamScale);
+        n.conv_gemm(hm(S16, CP), ph, pw, CP, n.add_conv_mat(conv_taps(gr.conv, &inv), gr.conv.b, C, CP, C), fm(S, CP), fm(GIN, CP));
     }
     // ---- the tail
     lnorm(fin, fm(S, CP), hm(N1, CP));

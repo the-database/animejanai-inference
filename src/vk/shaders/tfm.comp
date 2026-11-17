@@ -622,11 +622,11 @@ void main()
     for (int t = chunk * tpc; t < min(M, chunk * tpc + tpc); t++) s += ld(I, uint(t), c);
     part[po + chunk * C + c] = s;
 #elif PASS == 14
-    // 16 M, 17 n; m0 in, m1 out
+    // 16 M, 17 n, 18 a scale (float); m0 in, m1 out
     const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
     const int M = prm(16), n = prm(17);
     if (i >= M * n) return;
-    st(map(1), uint(i / n), i % n, ld(map(0), uint(i / n), i % n));
+    st(map(1), uint(i / n), i % n, ld(map(0), uint(i / n), i % n) * prmf(18));
 #elif PASS == 15
     // 16 h, 17 w (the output), 18 the map's width, 19 clamp to [0, 1]; m0 in
     const int t = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);

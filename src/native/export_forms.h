@@ -99,6 +99,20 @@ inline bool l2_root(const Reader &rd, const OnnxNode &n)
            e[0] == 2.f;
 }
 
+// An Add of a constant shaped like attention scores ([..., T, T], T > 1): a window attention's bias or
+// shifted-window mask that a fixed-size export baked in (the mask then holds only for the export's
+// size; the native kernels build it for the input's).
+inline bool attn_const(const Reader &rd, const OnnxNode &n)
+{
+    if (n.op != "Add" || n.in.size() != 2) return false;
+    for (const std::string &i : n.in)
+        if (const OnnxTensor *t = rd.tensor(i)) {
+            const size_t r = t->dims.size();
+            return r >= 3 && t->dims[r - 1] == t->dims[r - 2] && t->dims[r - 1] > 1;
+        }
+    return false;
+}
+
 // The head from its Sub (input minus a 3-vector constant), with the scalar Mul of its output if any.
 inline bool img_range_head(const Reader &rd, const OnnxNode *sub, ImgRange *r)
 {

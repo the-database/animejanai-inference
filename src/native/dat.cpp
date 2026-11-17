@@ -132,7 +132,7 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
         else if (n.op == "Mul" && anyconst && sub && n.in[0] == sub->out[0]) continue;  // the image range
         else if (n.op == "Mul" && anyconst && gelu_const_mul(rd, n)) continue;           // a spelled-out GELU
         else if (n.op == "Mul" && anyconst) ev.push_back({Ev::MULC, &n});
-        else if (n.op == "Add" && !allin && !anyconst) ev.push_back({Ev::ADDS, &n});
+        else if (n.op == "Add" && !allin && (!anyconst || attn_const(rd, n))) ev.push_back({Ev::ADDS, &n});
         else if (n.op == "Sub" && anyconst && !sub) sub = &n;
     }
     size_t at = 0;
@@ -313,7 +313,8 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
         const OnnxNode *gc = take(Ev::CV);
         if (!gc || !rd.conv(gc->name, &c, why) || c.cin != C || c.cout != C || c.lrelu) return refuse(why, "DAT group conv"), nullptr;
         GOp op;
-        op.w = r.gup(conv_taps(c, nullptr), c.b, C, CP, C, CP);
+        const std::vector<float> inv(C, 1.f / kStreamScale);  // its input is the stream's scaled fp16 copy
+        op.w = r.gup(conv_taps(c, &inv), c.b, C, CP, C, CP);
         f->gconvs.push_back(op);
         f->groups.push_back(std::move(blocks));
     }
@@ -515,7 +516,7 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             CK(gemm(*b.fc2, PR, CP, S, CP, TAct::None, true));
             pr.mark(P_FC2);
         }
-        K(tconvert(S, true, CP, S16, false, CP, M, CP, s));
+        K(tconvert(S, true, CP, S16, false, CP, M, CP, s, kStreamScale));
         GConvArgs a = ga(S16, CP, h, w, S, CP, h, w);
         a.acc32 = true;
         a.out_f32 = true;

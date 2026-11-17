@@ -307,13 +307,14 @@ void TNet::colsums(const TMap &in, int M, int C, VkDeviceSize sums)
     pass_threads(4, r, C, "colsum");
 }
 
-void TNet::convert(const TMap &in, const TMap &out, int M, int n)
+void TNet::convert(const TMap &in, const TMap &out, int M, int n, float scale)
 {
     TArgs t;
     t.map(0, in);
     t.map(1, out);
     t.v[16] = M;
     t.v[17] = n;
+    t.f(18, scale);
     pass_threads(14, t, (long long)M * n, "convert");
 }
 
