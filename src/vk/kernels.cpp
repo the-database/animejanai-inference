@@ -95,15 +95,18 @@ bool concat_dispatch(const Device &dev, int c, int nsrc, Dispatch *d, std::strin
         d->threads = d->local_size;
         break;
     case Family::SG16:
-        d->module = "cat_sg16" + base + "_b4";
-        d->subgroup = 16;
-        d->threads = (uint32_t)(16 * (c / 16) * 4);
+    case Family::PLAIN: {
+        // 4 blocks of 16 pixels, or 2 where that tile passes the shared memory (64 channels x 4
+        // sources: 36 KB, over the 32 KB of Intel Xe and phones)
+        const int pb = d->shared_bytes <= dev.info().max_shared ? 4 : 2;
+        const bool sg = dev.family() == Family::SG16;
+        d->module = std::string(sg ? "cat_sg16" : "cat_plain") + base + "_b" + std::to_string(pb);
+        d->subgroup = sg ? 16 : 0;
+        d->threads = (uint32_t)((sg ? 16 : 8) * (c / 16) * pb);
+        d->tile_px = 16 * pb;
+        d->shared_bytes = (uint32_t)(nsrc * d->tile_px * (c + 8) * 2);
         break;
-    case Family::PLAIN:
-        d->module = "cat_plain" + base + "_b4";
-        d->subgroup = 0;
-        d->threads = (uint32_t)(8 * (c / 16) * 4);
-        break;
+    }
     default:
         return fail(why, "no kernel family");
     }
