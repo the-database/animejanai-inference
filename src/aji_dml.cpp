@@ -99,20 +99,34 @@ enum Kern {
     K_H_F32, K_UV_V_STORE, K_RS_H, K_RS_V,
     K_FILL, K_WINDOW, K_RIFE_CONSTS, K_SCD_PARTIAL, K_SCD_FINAL,
     K_PRE_RGB10, K_POST_RGB10, K_RGB_DIFF_PARTIAL, K_TEMPORAL_GATHER,
-    K_FRAME_DIFF,
+    K_FRAME_DIFF, K_POST_MH,
 };
 const char *const KERN_ENTRY[] = {
     "cs_uv_h", "cs_v_f32", "cs_pre_combine", "cs_post_matrix",
     "cs_h_f32", "cs_uv_v_store", "cs_rs_h", "cs_rs_v",
     "cs_fill", "cs_window", "cs_rife_consts", "cs_scd_partial",
     "cs_scd_final", "cs_pre_rgb10", "cs_post_rgb10", "cs_rgb_diff_partial",
-    "cs_temporal_gather", "cs_frame_diff",
+    "cs_temporal_gather", "cs_frame_diff", "cs_post_mh",
 };
+
+// cs_post_mh's tile: POST_CO outputs per group row, their source span and taps in
+// groupshared (dml_shaders.h has the same numbers)
+constexpr int POST_CO = 64, POST_SPAN = 192, POST_TAPS = 16;
 
 struct DmlPass {
     int taps = 0, src = 0, dst = 0;
-    ComPtr<ID3D12Resource> starts, wt;   // upload heap, GENERIC_READ
+    int span_co = 0;   // widest source span of POST_CO consecutive outputs
+    // default heap, read as root SRVs; filled from starts_up/wt_up by
+    // the first recording after build_pass (aji_ctx::table_uploads)
+    ComPtr<ID3D12Resource> starts, wt;
+    ComPtr<ID3D12Resource> starts_up, wt_up;   // upload heap, GENERIC_READ
 };
+
+// post's horizontal chroma pass fits cs_post_mh's tile
+bool post_fused(const DmlPass &ph)
+{
+    return ph.taps <= POST_TAPS && ph.span_co <= POST_SPAN;
+}
 
 struct DmlPlan {
     enum Kind { PRE, POST, RESIZE } kind = PRE;
@@ -187,6 +201,11 @@ struct aji_ctx {
     ComPtr<ID3D12GraphicsCommandList> cl;
     std::vector<ClEntry> cl_free;
     std::vector<std::pair<ClEntry, uint64_t>> cl_busy;
+    struct TableUpload {
+        ComPtr<ID3D12Resource> dst, src;
+        uint64_t bytes;
+    };
+    std::vector<TableUpload> table_uploads;   // Recorder::flush_tables
     ComPtr<ID3D12Fence> fence;
     HANDLE fence_event = NULL;
     uint64_t fence_val = 0;
@@ -473,20 +492,31 @@ bool build_pass(aji_ctx *c, DmlPass *p, int src, int dst, double shift,
     p->taps = w.taps;
     p->src = src;
     p->dst = dst;
-    p->starts = make_buffer(c->dev.Get(), (uint64_t)dst * 4, true);
-    p->wt = make_buffer(c->dev.Get(), w.wt.size() * 4, true);
-    if (!p->starts || !p->wt)
+    for (int g = 0; g < dst; g += POST_CO) {
+        const int last = std::min(g + POST_CO, dst) - 1;
+        p->span_co = std::max(p->span_co, w.start[last] + w.taps - w.start[g]);
+    }
+    const uint64_t sbytes = (uint64_t)dst * 4, wbytes = w.wt.size() * 4;
+    p->starts_up = make_buffer(c->dev.Get(), sbytes, true);
+    p->wt_up = make_buffer(c->dev.Get(), wbytes, true);
+    p->starts = make_buffer(c->dev.Get(), sbytes, false);
+    p->wt = make_buffer(c->dev.Get(), wbytes, false);
+    if (!p->starts_up || !p->wt_up || !p->starts || !p->wt)
         return false;
     void *m = nullptr;
     D3D12_RANGE none = {0, 0};
-    if (FAILED(p->starts->Map(0, &none, &m)))
+    if (FAILED(p->starts_up->Map(0, &none, &m)))
         return false;
-    memcpy(m, w.start.data(), (size_t)dst * 4);
-    p->starts->Unmap(0, NULL);
-    if (FAILED(p->wt->Map(0, &none, &m)))
+    memcpy(m, w.start.data(), (size_t)sbytes);
+    p->starts_up->Unmap(0, NULL);
+    if (FAILED(p->wt_up->Map(0, &none, &m)))
         return false;
-    memcpy(m, w.wt.data(), w.wt.size() * 4);
-    p->wt->Unmap(0, NULL);
+    memcpy(m, w.wt.data(), (size_t)wbytes);
+    p->wt_up->Unmap(0, NULL);
+    // every thread reads these tables: from system memory they cost the
+    // resample passes more than their data (0.12 ms of a 4K post on a 5090)
+    c->table_uploads.push_back({p->starts, p->starts_up, sbytes});
+    c->table_uploads.push_back({p->wt, p->wt_up, wbytes});
     return true;
 }
 
@@ -524,10 +554,14 @@ std::unique_ptr<DmlPlan> post_plan_create(aji_ctx *c, int format, int w, int h,
     const int cw = w >> 1, ch = h >> 1;
     double sx, sy;
     aji_resample::chroma_shifts(siting, false, &sx, &sy);
-    p->tmp0 = make_buffer(c->dev.Get(), (uint64_t)2 * w * h * 4, false);
-    p->tmp1 = make_buffer(c->dev.Get(), (uint64_t)2 * cw * h * 4, false);
     if (!build_pass(c, &p->ph, w, cw, sx, filter) ||
-        !build_pass(c, &p->pv, h, ch, sy, filter) || !p->tmp0 || !p->tmp1)
+        !build_pass(c, &p->pv, h, ch, sy, filter))
+        return nullptr;
+    // full-res chroma scratch only for the unfused matrix + horizontal pass
+    if (!post_fused(p->ph))
+        p->tmp0 = make_buffer(c->dev.Get(), (uint64_t)2 * w * h * 4, false);
+    p->tmp1 = make_buffer(c->dev.Get(), (uint64_t)2 * cw * h * 4, false);
+    if ((!post_fused(p->ph) && !p->tmp0) || !p->tmp1)
         return nullptr;
     return p;
 }
@@ -559,7 +593,7 @@ ID3D12PipelineState *get_pso(aji_ctx *c, Kern k, bool t16, bool io16)
     char t16s[2] = {char('0' + t16), 0}, io16s[2] = {char('0' + io16), 0};
     // dword-granular stores: u8 packs 4 luma / 2 chroma px, u16 2 / 1
     const char *tpx = "1";
-    if (k == K_POST_MATRIX)
+    if (k == K_POST_MATRIX || k == K_POST_MH)
         tpx = t16 ? "2" : "4";
     else if (k == K_UV_V_STORE)
         tpx = t16 ? "1" : "2";
@@ -701,6 +735,25 @@ struct Recorder {
         open = false;
         return true;
     }
+    // resample tables built since the last recording: copy them to their
+    // default-heap buffers (COMMON promotes to COPY_DEST), then make them
+    // shader resources; at the end of the list they decay back to COMMON
+    void flush_tables() {
+        if (c->table_uploads.empty())
+            return;
+        std::vector<D3D12_RESOURCE_BARRIER> bs;
+        for (auto &u : c->table_uploads) {
+            c->cl->CopyBufferRegion(u.dst.Get(), 0, u.src.Get(), 0, u.bytes);
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition = {u.dst.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+            bs.push_back(b);
+        }
+        c->cl->ResourceBarrier((UINT)bs.size(), bs.data());
+        c->table_uploads.clear();
+    }
     void uav_barrier() {
         D3D12_RESOURCE_BARRIER b = {};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -717,6 +770,7 @@ struct Recorder {
                   ID3D12Resource *s0, ID3D12Resource *s1, ID3D12Resource *u0,
                   ID3D12Resource *u1, ID3D12Resource *u2,
                   int gx, int gy, int gz) {
+        flush_tables();
         return dispatch_on(c, c->cl.Get(), k, t16, io16, args, s0, s1, u0,
                            u1, u2, gx, gy, gz);
     }
@@ -847,17 +901,30 @@ bool record_post(aji_ctx *c, Recorder &r, DmlPlan *p, const aji_csp &csp,
     KernArgs a = csp_args(csp, qdiv, qmax);
     const int tpx_y = t16 ? 2 : 4, tpx_uv = t16 ? 1 : 2;
 
-    a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch;
-    if (!r.dispatch(K_POST_MATRIX, t16, io16, a, NULL, NULL, src,
-                    y_buf, p->tmp0.Get(), (w + tpx_y - 1) / tpx_y, h, 1))
-        return false;
-    r.uav_barrier();
+    if (post_fused(p->ph)) {
+        // matrix + horizontal chroma pass fused (one group row per
+        // POST_CO chroma outputs)
+        a.di[0] = w; a.di[1] = h; a.di[2] = p->ph.taps; a.di[3] = cw;
+        a.dj[0] = (int)pitch;
+        if (!r.dispatch(K_POST_MH, t16, io16, a, p->ph.starts.Get(),
+                        p->ph.wt.Get(), src, y_buf, p->tmp1.Get(),
+                        32 * ((cw + POST_CO - 1) / POST_CO), h, 1))
+            return false;
+        r.uav_barrier();
+    } else {
+        a.di[0] = w; a.di[1] = h; a.dj[0] = (int)pitch;
+        if (!r.dispatch(K_POST_MATRIX, t16, io16, a, NULL, NULL, src,
+                        y_buf, p->tmp0.Get(), (w + tpx_y - 1) / tpx_y, h, 1))
+            return false;
+        r.uav_barrier();
 
-    a.di[0] = w; a.di[1] = cw; a.di[2] = p->ph.taps; a.di[3] = h;
-    if (!r.dispatch(K_H_F32, t16, io16, a, p->ph.starts.Get(), p->ph.wt.Get(),
-                    p->tmp0.Get(), p->tmp1.Get(), NULL, cw, h, 2))
-        return false;
-    r.uav_barrier();
+        a.di[0] = w; a.di[1] = cw; a.di[2] = p->ph.taps; a.di[3] = h;
+        if (!r.dispatch(K_H_F32, t16, io16, a, p->ph.starts.Get(),
+                        p->ph.wt.Get(), p->tmp0.Get(), p->tmp1.Get(), NULL,
+                        cw, h, 2))
+            return false;
+        r.uav_barrier();
+    }
 
     a.di[0] = cw; a.di[1] = h; a.di[2] = p->pv.taps; a.di[3] = ch;
     a.dj[0] = (int)pitch;
