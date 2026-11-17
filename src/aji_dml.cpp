@@ -3321,7 +3321,7 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return 0;
+    if (c && c->vkv) return c->vkv->pre_resize(work_w, work_h);
 #endif
     if (!c || !c->has_pre_resize)
         return 0;
@@ -3340,7 +3340,7 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
                                      const aji_frame *out, void *cu_stream)
 {
 #ifdef AJI_VULKAN
-    if (c && c->vkv) return AJI_ERR;
+    if (c && c->vkv) return c->vkv->resize(in, out);
 #endif
     (void)cu_stream;
     if (!c || !in || !out)
@@ -4240,6 +4240,16 @@ static int frame_diff(aji_ctx *c, const aji_frame *a, const aji_frame *b,
         sum[i] = (long long)(int32_t)acc[17 + i] * 65536 + (long long)acc[1 + i];
     aji_frame_diff_regions(w, h, fmt, rgb ? 3 : 1, sum, out->region_mean);
     return AJI_OK;
+}
+
+// aji_copy_frame: Vulkan frames only
+extern "C" AJI_EXPORT int aji_copy_frame(aji_ctx *c, const aji_frame *in, const aji_frame *out)
+{
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->copy_frame(in, out);
+#endif
+    if (c) c->set_error("aji_copy_frame: Vulkan frames only");
+    return AJI_ERR;
 }
 
 extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,

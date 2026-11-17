@@ -194,7 +194,7 @@ bool VkVideo::rife_setup(const AjiChainConf &chain, int w, int h, double fps)
     else
         std::snprintf(buf, sizeof buf, "Applied RIFE v%d Interpolation %.3fx;    New Video FPS: %.3f", chain.rife_model, factor, fps * factor);
     const std::string kernels = "Native kernels: " + model + " (" + R.net->describe() + ")";
-    if (R.before) log_steps_.insert(log_steps_.begin(), {buf, kernels});
+    if (R.before) log_steps_.insert(log_steps_.begin() + (pre_.on ? 1 : 0), {buf, kernels});
     else log_steps_.insert(log_steps_.end(), {buf, kernels});
     R.on = true;
     return true;
@@ -465,6 +465,11 @@ void VkVideo::teardown()
     if (dev_ && ticket_) wait(ticket_);
     rife_teardown();
     temporal_teardown();
+    pre_.io.reset();
+    pre_.rs.reset();
+    dev_->destroy(pre_.a);
+    dev_->destroy(pre_.b);
+    pre_ = PreResize{};
     io_.reset();
     steps_.clear();
     for (Buffer &b : chain_) dev_->destroy(b);
@@ -519,6 +524,7 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
     if (!conf_.native) return passthrough("Vulkan frames run on the native kernels, which [global] native=off turns off: passthrough");
 
     int cw = w, ch = h;
+    int first_rs_log = -1;  // the first model's explicit resize: its log line (steps_[0])
     for (const AjiModelConf &m : chain->models) {
         if (m.name.empty()) continue;
         const std::string onnx = model_dir_ + "/" + m.name + ".onnx";
@@ -536,6 +542,7 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
             r.in_h = ch;
             r.out_w = nw;
             r.out_h = nh;
+            if (steps_.empty() && &m == &chain->models.front()) first_rs_log = (int)log_steps_.size();
             steps_.push_back(std::move(r));
             cw = nw;
             ch = nh;
@@ -645,10 +652,37 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
         if (rife_dir_.empty()) {
             log_steps_.push_back("RIFE requested by the chain but no rife model dir is configured; interpolation disabled");
         } else {
-            // RIFE-first interpolates at the source size (the D3D12 path hoists the first model's resize
-            // ahead of it; here that resize stays in the chain)
-            rife_.before = chain->rife_before_upscale;
-            rife_setup(*chain, rife_.before ? w : cw, rife_.before ? h : ch, fps);
+            // RIFE-first would feed interpolated frames into a temporal model's window: interpolate
+            // the upscaled frames instead (as aji_dml.cpp)
+            rife_.before = chain->rife_before_upscale && stages_.empty();
+            if (chain->rife_before_upscale && !stages_.empty())
+                log_steps_.push_back("RIFE before upscale is not supported with a temporal model; interpolating after upscale");
+            // RIFE-first: the first model's explicit resize is hoisted ahead of RIFE (the caller
+            // applies it to source frames with aji_resize), so RIFE and the rest run at the work size
+            if (rife_.before && first_rs_log >= 0 && steps_.size() > 1) {
+                PreResize &P = pre_;
+                P.sw = w;
+                P.sh = h;
+                P.ww = steps_[0].out_w;
+                P.wh = steps_[0].out_h;
+                std::string why2;
+                if (!dev_->make_buffer(&P.a, (VkDeviceSize)3 * P.sw * P.sh * 2, false, &why2) ||
+                    !dev_->make_buffer(&P.b, (VkDeviceSize)3 * P.ww * P.wh * 2, false, &why2) ||
+                    !(P.rs = RgbResize::create(*dev_, P.sw, P.sh, P.ww, P.wh, P.a.buf, P.b.buf, &why2))) {
+                    fail("pre-RIFE resize %dx%d -> %dx%d: %s", P.sw, P.sh, P.ww, P.wh, why2.c_str());
+                    teardown();
+                    return AJI_ERR;
+                }
+                P.on = true;
+                steps_.erase(steps_.begin());
+                log_steps_.erase(log_steps_.begin() + first_rs_log);
+                char buf[160];
+                std::snprintf(buf, sizeof buf, "Applied Resize Before Upscale: %dx%d (before RIFE)", P.ww, P.wh);
+                log_steps_.insert(log_steps_.begin(), buf);
+                in_w_ = P.ww;
+                in_h_ = P.wh;
+            }
+            rife_setup(*chain, rife_.before ? in_w_ : cw, rife_.before ? in_h_ : ch, fps);
         }
     }
     // the chain buffers: every step reads one and writes the other
@@ -1432,6 +1466,150 @@ int VkVideo::frame_diff(const aji_frame *a, const aji_frame *b, aji_frame_diff_r
     long long sum[16];
     for (int i = 0; i < 16; i++) sum[i] = (long long)(int32_t)acc[17 + i] * 65536 + (long long)acc[1 + i];
     aji_frame_diff_regions(a->width, a->height, fmt, 1, sum, out->region_mean);
+    return AJI_OK;
+}
+
+// ---- RIFE-first's pre-RIFE resize -----------------------------------------------------------------
+
+int VkVideo::pre_resize(int *work_w, int *work_h) const
+{
+    if (!active_ || !pre_.on) return 0;
+    if (work_w) *work_w = pre_.ww;
+    if (work_h) *work_h = pre_.wh;
+    return 1;
+}
+
+int VkVideo::resize(const aji_frame *in, const aji_frame *out)
+{
+    PreResize &P = pre_;
+    if (!active_ || !P.on) {
+        fail("aji_resize without a configured pre-RIFE downscale");
+        return AJI_ERR;
+    }
+    if (!in || !out || !in->plane[0] || !out->plane[0]) return AJI_ERR;
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010) {
+        fail("unsupported input format %d", in->format);
+        return AJI_ERR_FORMAT;
+    }
+    if (out->format != in->format) {
+        fail("output format must match input");
+        return AJI_ERR_FORMAT;
+    }
+    if (in->width != P.sw || in->height != P.sh || out->width != P.ww || out->height != P.wh) {
+        fail("aji_resize dims %dx%d->%dx%d do not match configured %dx%d->%dx%d", in->width, in->height, out->width, out->height, P.sw, P.sh,
+             P.ww, P.wh);
+        return AJI_ERR_SHAPE;
+    }
+    const FrameFormat fi{in->format, in->matrix, in->range, in->siting}, fo{out->format, in->matrix, in->range, AJI_SITING_LEFT};
+    std::string why;
+    if (!P.io || !(P.io->in_format() == fi) || !(P.io->out_format() == fo)) {
+        if (P.io && ticket_) wait(ticket_);
+        P.io = FrameIO::create(*dev_, P.sw, P.sh, P.ww, P.wh, fi, fo, P.a.buf, P.b.buf, &why);
+        if (!P.io) {
+            fail("aji_resize: %s", why.c_str());
+            return AJI_ERR;
+        }
+    }
+    auto *ii = static_cast<aji_vk_image *>(in->plane[0]);
+    auto *oi = static_cast<aji_vk_image *>(out->plane[0]);
+    int slot = 0;
+    VkCommandBuffer cb = dev_->frame_begin(&slot);
+    if (!cb) {
+        fail("aji_resize: an earlier Vulkan submit has not finished after 10 s");
+        return AJI_ERR;
+    }
+    const uint32_t bps = in->format == AJI_FMT_P010 ? 2 : 1;
+    full_barrier(cb);
+    copy_planes(cb, ii, P.io->in_y().buf, P.io->in_uv().buf, P.io->in_pitch(), P.sw, P.sh, bps, true);
+    step_barrier(cb);
+    P.io->record_pre(cb);
+    step_barrier(cb);
+    P.rs->record(cb);
+    P.io->record_post(cb);
+    mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    copy_planes(cb, oi, P.io->out_y().buf, P.io->out_uv().buf, P.io->out_pitch(), P.ww, P.wh, bps, false);
+    const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ii->semaphore), ii->value},
+                                       {static_cast<VkSemaphore>(oi->semaphore), oi->value}};
+    const uint64_t t = ticket_ + 1;
+    const Device::SemValue sig[3] = {
+        {tl_, t}, {static_cast<VkSemaphore>(ii->semaphore), ii->value + 1}, {static_cast<VkSemaphore>(oi->semaphore), oi->value + 1}};
+    if (!dev_->frame_submit(slot, waits, 2, sig, 3, &why)) {
+        fail("aji_resize: %s", why.c_str());
+        return AJI_ERR;
+    }
+    ticket_ = t;
+    ii->value += 1;
+    ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
+    ii->queue_family = dev_->queue_family();
+    oi->value += 1;
+    oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    oi->queue_family = dev_->queue_family();
+    return AJI_OK;
+}
+
+int VkVideo::copy_frame(const aji_frame *in, const aji_frame *out)
+{
+    if (!in || !out || !in->plane[0] || !out->plane[0]) return AJI_ERR;
+    if (in->format != out->format || (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010)) {
+        fail("aji_copy_frame: the frames must be NV12 or P010, the same format");
+        return AJI_ERR_FORMAT;
+    }
+    if (in->width != out->width || in->height != out->height || (in->width & 1) || (in->height & 1)) {
+        fail("aji_copy_frame dims %dx%d vs %dx%d", in->width, in->height, out->width, out->height);
+        return AJI_ERR_SHAPE;
+    }
+    auto *ii = static_cast<aji_vk_image *>(in->plane[0]);
+    auto *oi = static_cast<aji_vk_image *>(out->plane[0]);
+    if (ii == oi) return AJI_OK;
+    int slot = 0;
+    VkCommandBuffer cb = dev_->frame_begin(&slot);
+    if (!cb) {
+        fail("aji_copy_frame: an earlier Vulkan submit has not finished after 10 s");
+        return AJI_ERR;
+    }
+    VkImageMemoryBarrier ib[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
+    ib[0].srcAccessMask = ib[1].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    ib[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    ib[0].oldLayout = static_cast<VkImageLayout>(ii->layout);
+    ib[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ib[0].image = static_cast<VkImage>(ii->image);
+    ib[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    ib[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // replaced
+    ib[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    ib[1].image = static_cast<VkImage>(oi->image);
+    for (auto &b : ib) {
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, ib);
+    VkImageCopy r[2] = {};
+    for (int p = 0; p < 2; p++) {
+        const VkImageAspectFlags a = p ? VK_IMAGE_ASPECT_PLANE_1_BIT : VK_IMAGE_ASPECT_PLANE_0_BIT;
+        r[p].srcSubresource = r[p].dstSubresource = {a, 0, 0, 1};
+        r[p].extent = {(uint32_t)(p ? in->width / 2 : in->width), (uint32_t)(p ? in->height / 2 : in->height), 1};
+    }
+    vkCmdCopyImage(cb, ib[0].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ib[1].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, r);
+    const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ii->semaphore), ii->value},
+                                       {static_cast<VkSemaphore>(oi->semaphore), oi->value}};
+    const uint64_t t = ticket_ + 1;
+    const Device::SemValue sig[3] = {
+        {tl_, t}, {static_cast<VkSemaphore>(ii->semaphore), ii->value + 1}, {static_cast<VkSemaphore>(oi->semaphore), oi->value + 1}};
+    std::string why;
+    if (!dev_->frame_submit(slot, waits, 2, sig, 3, &why)) {
+        fail("aji_copy_frame: %s", why.c_str());
+        return AJI_ERR;
+    }
+    ticket_ = t;
+    ii->value += 1;
+    ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
+    ii->queue_family = dev_->queue_family();
+    oi->value += 1;
+    oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    oi->queue_family = dev_->queue_family();
     return AJI_OK;
 }
 

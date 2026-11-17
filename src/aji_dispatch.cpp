@@ -53,6 +53,7 @@ struct aji_backend {
     int (*pre_resize)(aji_ctx *, int *, int *);
     int (*resize)(aji_ctx *, const aji_frame *, const aji_frame *, void *);
     int (*resize_frame)(aji_ctx *, const aji_frame *, const aji_frame *, void *);
+    int (*copy_frame)(aji_ctx *, const aji_frame *, const aji_frame *);
     int (*frame_diff)(aji_ctx *, const aji_frame *, const aji_frame *,
                       aji_frame_diff_result *, void *);
     int (*frame_diff_marked)(aji_ctx *, const aji_frame *, const aji_frame *,
@@ -213,6 +214,8 @@ static bool load_backend(const char *stem, aji_backend *be,
     // Optional too: aji_resize_frame is TensorRT-only (DirectML has none);
     // aji_frame_diff is in every backend since its DirectML port.
     *(void **)&be->resize_frame = lib_sym(be->lib, "aji_resize_frame");
+    // aji_copy_frame: Vulkan frames only (aji_vk)
+    *(void **)&be->copy_frame = lib_sym(be->lib, "aji_copy_frame");
     *(void **)&be->frame_diff = lib_sym(be->lib, "aji_frame_diff");
     // DirectML only; the forwarders below stand in for the rest
     *(void **)&be->frame_diff_marked = lib_sym(be->lib, "aji_frame_diff_marked");
@@ -534,6 +537,13 @@ extern "C" AJI_EXPORT int aji_resize_frame(aji_ctx *c, const aji_frame *in,
     if (!c || !c->be.resize_frame)
         return AJI_ERR;
     return c->be.resize_frame(c->inner, in, out, cu_stream);
+}
+
+extern "C" AJI_EXPORT int aji_copy_frame(aji_ctx *c, const aji_frame *in, const aji_frame *out)
+{
+    if (!c || !c->be.copy_frame)
+        return AJI_ERR;
+    return c->be.copy_frame(c->inner, in, out);
 }
 
 extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
