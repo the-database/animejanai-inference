@@ -7,12 +7,15 @@
  *
  *   aji_vk_frames_test --conf C --model-dir D --slot N --input in.raw --width W --height H
  *                      [--frames N] [--output out.raw] [--format nv12|p010] [--out-format nv12|p010]
- *                      [--no-coopmat]
+ *                      [--no-coopmat] [--rife --rife-model-dir R]
  *
  * --no-coopmat tells libaji the device was created without cooperative matrices (they are left
  * out of the features chain and the extension list): the family it then picks is the one a
  * player that didn't enable them gets. Raw files as aji_harness_dml's: per frame the Y plane, then
  * the interleaved CbCr plane; 16-bit little-endian MSB-aligned for P010.
+ *
+ * --rife: aji_harness_dml --rife's interpolation-only loop (a scale-free 2/1 RIFE chain): writes
+ * f0, i01, f1, i12, ..., the left frame in place of an interpolated one on a scene change.
  */
 #include <chrono>
 #include <cstdio>
@@ -125,22 +128,98 @@ bool transfer(Device &dev, Image &im, const Buffer &stage, int w, int h, int bps
     return true;
 }
 
+// aji_harness_dml --rife's loop on Vulkan frames
+bool run_rife(Device &dev, aji_ctx *c, const char *input, const char *output, int w, int h, int frames, bool p010)
+{
+    int rn = 0, rd = 0;
+    if (!aji_rife_factor(c, &rn, &rd) || rn != 2 * rd) {
+        std::fprintf(stderr, "rife test needs an active scale-free 2/1 rife chain\n");
+        return false;
+    }
+    std::string why;
+    const int bps = p010 ? 2 : 1;
+    const size_t fb = (size_t)w * h * 3 / 2 * bps;
+    Image fr[3];
+    Buffer st;
+    for (Image &im : fr)
+        if (!make_image(dev, w, h, p010, &im, &why)) {
+            std::fprintf(stderr, "rife images: %s\n", why.c_str());
+            return false;
+        }
+    if (!dev.make_buffer(&st, fb, true, &why)) return false;
+    aji_frame fd[3];
+    for (int i = 0; i < 3; i++) {
+        fd[i] = aji_frame{};
+        fd[i].width = w;
+        fd[i].height = h;
+        fd[i].format = p010 ? AJI_FMT_P010 : AJI_FMT_NV12;
+        fd[i].matrix = AJI_MATRIX_BT709;
+        fd[i].range = AJI_RANGE_LIMITED;
+        fd[i].siting = AJI_SITING_LEFT;
+        fd[i].plane[0] = &fr[i].d;
+    }
+    std::ifstream fi(input, std::ios::binary);
+    std::ofstream fo;
+    if (output) fo.open(output, std::ios::binary);
+    std::vector<char> raw(fb);
+    int prev = -1, cur = 0, n = 0, interp = 0, scenes = 0, timed = 0;
+    double ms = 0;
+    while (n < frames && fi.read(raw.data(), (std::streamsize)fb)) {
+        std::memcpy(st.map, raw.data(), fb);
+        if (!transfer(dev, fr[cur], st, w, h, bps, true, &why)) return false;
+        if (prev >= 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int ret = aji_infer_rife_with_scene(c, &fd[prev], &fd[cur], 0.5, &fd[2], nullptr, -1);
+            const double t = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (interp + scenes >= 1) ms += t, timed++;
+            int emit;
+            if (ret == AJI_OK) emit = 2, interp++;
+            else if (ret == AJI_SCENE) emit = prev, scenes++;
+            else {
+                std::fprintf(stderr, "aji_infer_rife: %d: %s\n", ret, aji_last_error(c));
+                return false;
+            }
+            if (!transfer(dev, fr[emit], st, w, h, bps, false, &why)) return false;
+            if (fo) fo.write(static_cast<const char *>(st.map), (std::streamsize)fb);
+        }
+        if (fo) fo.write(raw.data(), (std::streamsize)fb);
+        if (prev < 0) prev = cur, cur = 1;
+        else std::swap(prev, cur);
+        n++;
+    }
+    std::printf("rife: %d source frames, %d interpolated, %d scene skips, %.1f ms/interp avg (%d timed)\n", n, interp, scenes,
+                timed ? ms / timed : 0.0, timed);
+    aji_destroy(&c);
+    dev.destroy(st);
+    for (Image &im : fr) {
+        vkDestroySemaphore(dev.device(), im.sem, nullptr);
+        vkDestroyImage(dev.device(), im.img, nullptr);
+        vkFreeMemory(dev.device(), im.mem, nullptr);
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
 {
-    const char *conf = nullptr, *model_dir = nullptr, *input = nullptr, *output = nullptr;
+    const char *conf = nullptr, *model_dir = nullptr, *input = nullptr, *output = nullptr, *rife_dir = nullptr;
     int w = 0, h = 0, frames = 1 << 30, slot = 1;
-    bool p010 = false, out_p010 = false, no_cm = false;
+    bool p010 = false, out_p010 = false, no_cm = false, rife = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
         if (!std::strcmp(a, "--no-coopmat")) {
             no_cm = true;
             continue;
         }
+        if (!std::strcmp(a, "--rife")) {
+            rife = true;
+            continue;
+        }
         i++;
         if (!std::strcmp(a, "--conf")) conf = v;
         else if (!std::strcmp(a, "--model-dir")) model_dir = v;
+        else if (!std::strcmp(a, "--rife-model-dir")) rife_dir = v;
         else if (!std::strcmp(a, "--input")) input = v;
         else if (!std::strcmp(a, "--output")) output = v;
         else if (!std::strcmp(a, "--width")) w = std::atoi(v);
@@ -195,6 +274,7 @@ int main(int argc, char **argv)
     p.conf_path = conf;
     p.model_dir = model_dir;
     p.slot = slot;
+    p.rife_model_dir = rife_dir;
     p.log = log_cb;
     aji_ctx *c = aji_create_vk(&p, &vd);
     if (!c) {
@@ -204,6 +284,7 @@ int main(int argc, char **argv)
     int ow = 0, oh = 0;
     const int act = aji_configure(c, w, h, 23.976, &ow, &oh);
     std::printf("%s", aji_current_log(c));
+    if (rife) return run_rife(*dev, c, input, output, w, h, frames, p010) ? 0 : 1;
     if (act != 1) {
         std::fprintf(stderr, "aji_configure: %d (%s)\n", act, aji_last_error(c));
         aji_destroy(&c);

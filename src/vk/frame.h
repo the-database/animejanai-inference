@@ -35,10 +35,13 @@ struct FrameFormat {
 
 class FrameIO {
 public:
-    // w x h input planes (format in) to rgb_in (fp16 [3][h][w]), rgb_out (fp16 [3][oh][ow]) to
-    // ow x oh output planes (format out: its matrix and range, a left-sited 4:2:0). Even sizes.
+    // w x h input planes (format in) to rgb_in (fp16 [3][h][w] from element rgb_in_offset),
+    // rgb_out (fp16 [3][oh][ow]) to ow x oh output planes (format out: its matrix and range, a
+    // left-sited 4:2:0). Even sizes. filter: the chroma resampling (AJI_FILTER_*: Spline36 for the
+    // chain, bilinear for RIFE as the other backends).
     static std::unique_ptr<FrameIO> create(Device &dev, int w, int h, int ow, int oh, const FrameFormat &in, const FrameFormat &out,
-                                           VkBuffer rgb_in, VkBuffer rgb_out, std::string *why);
+                                           VkBuffer rgb_in, VkBuffer rgb_out, std::string *why, int filter = 0 /* AJI_FILTER_SPLINE36 */,
+                                           uint32_t rgb_in_offset = 0);
     ~FrameIO();
     FrameIO(const FrameIO &) = delete;
     FrameIO &operator=(const FrameIO &) = delete;

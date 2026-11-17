@@ -392,14 +392,22 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   planes copied out of the image (`vkCmdCopyImageToBuffer`, per plane aspect), the output copied in,
   the images' semaphores and the context's own timeline (aji_flush's tickets) signalled. Resizes
   before upscale run as `RgbResize` (`frame_resize.comp`, the HLSL cs_rs_h / cs_rs_v; the factor,
-  then the height fitted to 16:9, as aji_dml.cpp's). Not yet there, passed through or left out
-  with the reason in the log: RIFE, temporal models, frame diff, and models without Vulkan
-  kernels (no DirectML on this path). On
+  then the height fitted to 16:9, as aji_dml.cpp's). RIFE as aji_dml.cpp's: padded to 64 and
+  centred (studio-black borders filled once), two `FrameIO`s with bilinear chroma and BT.709 into
+  the model input at element offsets 0 and 3 * plane, the timestep plane by `vkCmdFillBuffer`
+  (truncating fp16), channels 7..10 (mesh) once by `fr_rife_consts`, the scene detection
+  (`frame_scd.comp`, SCDetect's metric over the padded luma, divided by the padded area) read back
+  between two submits, post and a cropped copy into the output image; synchronous like the
+  other backends'. A RIFE-only chain configures to 0 with RIFE active, as the D3D12 path.
+  RIFE-first interpolates at the source size (no pre-RIFE resize hoist). Not yet there, passed
+  through or left out with the reason in the log: temporal models, frame diff, and models
+  without Vulkan kernels (no DirectML on this path). On
   Windows `aji_vk.dll`'s exports (aji_dml.cpp) forward a Vulkan-frames context (`c->vkv`); on Linux
   `aji_vk_frames.cpp` is the video ABI. The dispatcher's `aji_create_vk` always loads aji_vk.
   `aji_vk_frames_test` plays the player (a device of its own, NV12 / P010 images, `--no-coopmat`
   reports a device without cooperative matrices): SPANF3 720x480 0.64 ms a frame on the 5090,
-  within 1 level of the D3D12 path.
+  within 1 level of the D3D12 path. `--rife --rife-model-dir` is aji_harness_dml `--rife`'s loop:
+  rife_v4.14 1080p 4.3 ms, 74.6 dB against the D3D12 path; same scene skips on cut clips.
 - **`aji_img_vk.cpp`: the image ABI on Vulkan (`AJI_IMG_VULKAN`, `aji_image --backend vulkan`).**
   A `core/tiling` `TileModel` over the executor at the model's tile: the same cover, reflect pad
   and blend as the other backends. Every model must lower; one that doesn't is refused with the

@@ -330,6 +330,10 @@ fr_post1_u16  frame_post.comp  PASS=1 T16=1 TPX=2
 fr_post2_u16  frame_post.comp  PASS=2 T16=1 TPX=1
 fr_rs_h       frame_resize.comp  PASS=1
 fr_rs_v       frame_resize.comp  PASS=2
+fr_scd1_u8    frame_scd.comp  PASS=1 T16=0
+fr_scd1_u16   frame_scd.comp  PASS=1 T16=1
+fr_scd2       frame_scd.comp  PASS=2
+fr_rife_consts frame_scd.comp  PASS=3
 
 # RIFE's resampling (vk/rife.cpp): a block's input, the ensemble merge, the interpolated frame.
 rife_gather_f0_m1_k1_t1_b1_r0  rife.comp  PASS=1 F=0 NM=1 KV=1 NT=1 B0=1 REV=0

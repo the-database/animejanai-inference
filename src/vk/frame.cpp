@@ -52,7 +52,7 @@ FrameIO::~FrameIO()
 }
 
 std::unique_ptr<FrameIO> FrameIO::create(Device &dev, int w, int h, int ow, int oh, const FrameFormat &fi, const FrameFormat &fo,
-                                         VkBuffer rgb_in, VkBuffer rgb_out, std::string *why)
+                                         VkBuffer rgb_in, VkBuffer rgb_out, std::string *why, int filter, uint32_t rgb_in_offset)
 {
     if (w < 2 || h < 2 || (w & 1) || (h & 1)) return fail(why, "4:2:0 frames need even sizes"), nullptr;
     if ((ow & 1) || (oh & 1) || ow < 2 || oh < 2) return fail(why, "the output size is odd"), nullptr;
@@ -71,9 +71,8 @@ std::unique_ptr<FrameIO> FrameIO::create(Device &dev, int w, int h, int ow, int 
     double sx, sy, dx, dy;
     aji_resample::chroma_shifts(fi.siting, true, &sx, &sy);
     aji_resample::chroma_shifts(AJI_SITING_LEFT, false, &dx, &dy);
-    const aji_resample::weights tbl[4] = {
-        aji_resample::compute(cw, w, sx, AJI_FILTER_SPLINE36), aji_resample::compute(ch, h, sy, AJI_FILTER_SPLINE36),
-        aji_resample::compute(ow, ocw, dx, AJI_FILTER_SPLINE36), aji_resample::compute(oh, och, dy, AJI_FILTER_SPLINE36)};
+    const aji_resample::weights tbl[4] = {aji_resample::compute(cw, w, sx, filter), aji_resample::compute(ch, h, sy, filter),
+                                          aji_resample::compute(ow, ocw, dx, filter), aji_resample::compute(oh, och, dy, filter)};
     // the fused post pass's tile (frame_post.comp): 64 outputs per group row, span <= 192, taps <= 16
     {
         int span = 0;
@@ -108,7 +107,7 @@ std::unique_ptr<FrameIO> FrameIO::create(Device &dev, int w, int h, int ow, int 
     a[1].di[0] = w; a[1].di[1] = ch; a[1].di[2] = tbl[1].taps; a[1].di[3] = h;
     a[2] = csp_args(ci, 0, 0);
     a[2].di[0] = w; a[2].di[1] = h;
-    a[2].dj[0] = (int)p->in_pitch_; a[2].dj[1] = 0;
+    a[2].dj[0] = (int)p->in_pitch_; a[2].dj[1] = (int)rgb_in_offset;
     a[3] = csp_args(co, qdiv, qmax);
     a[3].di[0] = ow; a[3].di[1] = oh; a[3].di[2] = tbl[2].taps; a[3].di[3] = ocw;
     a[3].dj[0] = (int)p->out_pitch_;
