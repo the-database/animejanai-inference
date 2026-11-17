@@ -12,6 +12,7 @@
 #ifndef AJI_VK_DEVICE_H
 #define AJI_VK_DEVICE_H
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -32,6 +33,9 @@ struct DeviceInfo {
     uint32_t vendor = 0, device_id = 0, driver_version = 0;
     uint8_t luid[8] = {};
     bool luid_valid = false;
+    bool discrete = false;               // VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    bool pci_valid = false;              // VK_EXT_pci_bus_info
+    uint32_t pci_domain = 0, pci_bus = 0, pci_device = 0;
     uint32_t subgroup = 0, min_subgroup = 0, max_subgroup = 0;
     uint32_t max_shared = 0;             // maxComputeSharedMemorySize
     uint32_t max_invocations = 0;        // maxComputeWorkGroupInvocations
@@ -58,6 +62,7 @@ struct Buffer {
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
     void *map = nullptr;  // host-visible buffers stay mapped
+    VkDeviceSize alloc = 0;  // device-local bytes this Device allocated for it (Device::allocated)
 };
 
 class Device {
@@ -100,6 +105,13 @@ public:
     // is specialization constant 0; subgroup, when not 0, is required (full subgroups).
     // Cached by (module, local_size, subgroup); the Device owns it. Null and *why on failure.
     VkPipeline pipeline(const char *module, uint32_t local_size, uint32_t subgroup, std::string *why);
+
+    // The largest device-local heap's size, and what this process may still allocate in it
+    // (VK_EXT_memory_budget: its budget minus its usage; without the extension, the heap size
+    // less what this Device allocated).
+    void memory(uint64_t *free_bytes, uint64_t *total_bytes) const;
+    // What this Device's own allocations hold, in bytes.
+    uint64_t allocated() const { return allocated_; }
 
     // A buffer of kBindings * 16 zero bytes for descriptor slots a kernel does not read.
     VkBuffer dummy() const { return dummy_.buf; }
@@ -172,6 +184,7 @@ private:
     bool interop_ = false;
     Buffer dummy_;
     Buffer stage_;  // upload/download staging, grown on demand
+    std::atomic<uint64_t> allocated_{0};
 };
 
 }  // namespace ajivk

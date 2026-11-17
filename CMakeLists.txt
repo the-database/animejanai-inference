@@ -550,9 +550,10 @@ if(AJI_VULKAN)
         # frame pipeline is DirectML's; each model that lowers to the native
         # kernels runs on the Vulkan executor on the same adapter, the others
         # on DirectML. Ships beside aji_dml with the same ONNX Runtime and
-        # DirectML DLLs; Vulkan is loaded at run time.
+        # DirectML DLLs; Vulkan is loaded at run time. Its image ABI is
+        # aji_img_vk.cpp (AJI_IMG_VULKAN), all Vulkan.
         add_library(aji_vk SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp
-            src/core/ort_dml.cpp src/aji_img_dml.cpp src/core/tiling.cpp ${AJI_HALF_SOURCES}
+            src/core/ort_dml.cpp src/aji_img_vk.cpp src/core/tiling.cpp ${AJI_HALF_SOURCES}
             $<TARGET_OBJECTS:aji_vk_core> $<TARGET_OBJECTS:aji_vk_shaders>
             $<TARGET_OBJECTS:aji_native_host>)
         target_include_directories(aji_vk
@@ -563,11 +564,19 @@ if(AJI_VULKAN)
         target_link_libraries(aji_vk PRIVATE d3d12 d3d11 dxgi d3dcompiler)
         set_target_properties(aji_vk PROPERTIES CXX_VISIBILITY_PRESET hidden)
         add_dependencies(aji_harness_dml aji_vk)
-    endif()
-    if(UNIX)
+    else()
+        # libaji_vk.so (Linux, Android): the image ABI on Vulkan for now (aji_img_vk.cpp); the
+        # video ABI follows with the Vulkan frame pipeline.
         find_package(Threads REQUIRED)
+        add_library(aji_vk SHARED src/aji_img_vk.cpp src/onnx_shape.cpp src/core/tiling.cpp ${AJI_HALF_SOURCES}
+            $<TARGET_OBJECTS:aji_vk_core> $<TARGET_OBJECTS:aji_vk_shaders> $<TARGET_OBJECTS:aji_native_host>)
+        target_include_directories(aji_vk PUBLIC include PRIVATE src)
+        target_include_directories(aji_vk SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
+        target_link_libraries(aji_vk PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+        set_target_properties(aji_vk PROPERTIES CXX_VISIBILITY_PRESET hidden)
         target_link_libraries(aji_vk_model_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
     endif()
+    add_dependencies(aji_image aji_vk)
 endif()
 
 # Self-contained tests for ctest. CI runs `ctest -L cpu` (no GPU on hosted

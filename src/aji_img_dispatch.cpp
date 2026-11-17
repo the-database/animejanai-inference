@@ -2,7 +2,7 @@
  * aji_img_dispatch.cpp — the image ABI (aji_image.h) in aji.dll.
  *
  * Forwards to the backend named in aji_img_create_params (aji_trt /
- * aji_trtrtx / aji_dml from our own directory), so a consumer loads one library and
+ * aji_trtrtx / aji_dml / aji_vk from our own directory), so a consumer loads one library and
  * never links TensorRT or ONNX Runtime. Backend libraries are loaded on
  * first use and stay loaded for the life of the process.
  */
@@ -48,7 +48,7 @@ struct ImgBackend {
 };
 
 std::mutex g_mu;
-ImgBackend g_trt, g_trtrtx, g_dml;
+ImgBackend g_trt, g_trtrtx, g_dml, g_vk;
 
 void *sym(void *lib, const char *name)
 {
@@ -65,6 +65,7 @@ ImgBackend *backend_for(int backend, std::string *err)
     const char *stem = backend == AJI_IMG_TENSORRT     ? "aji_trt"
                      : backend == AJI_IMG_TENSORRT_RTX ? "aji_trtrtx"
                      : backend == AJI_IMG_DIRECTML     ? "aji_dml"
+                     : backend == AJI_IMG_VULKAN       ? "aji_vk"
                                                        : nullptr;
     if (!stem) {
         *err = "unknown backend " + std::to_string(backend);
@@ -73,6 +74,7 @@ ImgBackend *backend_for(int backend, std::string *err)
     std::lock_guard<std::mutex> lock(g_mu);
     ImgBackend &b = backend == AJI_IMG_TENSORRT       ? g_trt
                   : backend == AJI_IMG_TENSORRT_RTX ? g_trtrtx
+                  : backend == AJI_IMG_VULKAN       ? g_vk
                                                     : g_dml;
     if (!b.tried) {
         b.tried = true;

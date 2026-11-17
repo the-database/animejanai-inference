@@ -8,8 +8,8 @@
  * detection, pre/post resizes) belongs to the caller.
  *
  * Exported by aji.dll / libaji.so, which forwards to the backend chosen
- * at aji_img_create (aji_trt / aji_trtrtx / aji_dml, loaded from its own
- * directory), and by the backend libraries themselves.
+ * at aji_img_create (aji_trt / aji_trtrtx / aji_dml / aji_vk, loaded from
+ * its own directory), and by the backend libraries themselves.
  *
  * Models are ONNX files with one NCHW input and one NCHW output
  * (C = 1 or 3), an integer scale, and a dynamic or fixed spatial shape.
@@ -56,6 +56,12 @@ enum aji_img_backend {
                                  trtexec_env are ignored. aji.dll builds
                                  from before this value reject it as an
                                  unknown backend. */
+    AJI_IMG_VULKAN = 4,     /* libaji's native kernels on Vulkan (aji_vk;
+                               in development, built with AJI_VULKAN): every
+                               model must lower to them, there is no engine
+                               fallback (aji_img_load refuses the rest with
+                               the reason). Windows, Linux, Android. aji.dll
+                               builds from before this value reject it. */
 };
 
 enum aji_img_status {

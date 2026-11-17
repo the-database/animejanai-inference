@@ -283,6 +283,16 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
     waits, runs the model and signals, and D3D12 waits.
   - Frames are never imported as textures: a shared D3D11 NV12 texture imported straight into
     Vulkan reads wrong chroma on NVIDIA, and Intel allows no arrays.
+- **`aji_img_vk.cpp`: the image ABI on Vulkan (`AJI_IMG_VULKAN`, `aji_image --backend vulkan`).**
+  A `core/tiling` `TileModel` over the executor at the model's tile: the same cover, reflect pad
+  and blend as the other backends. Every model must lower; one that doesn't is refused with the
+  reason (no engine fallback, since it also runs where there is no DirectML). Device ids are the
+  PCI address as the other backends report it (`VK_EXT_pci_bus_info`), else the LUID, else the
+  list position plus one (phones). `aji_img_memory_get` uses `VK_EXT_memory_budget` when there;
+  `aji_img_native_probe` is a load and a release. One upscale at a time per context. It's in
+  `aji_vk.dll` on Windows (in place of `aji_img_dml.cpp`) and is `libaji_vk.so` elsewhere,
+  Android included. Tiling is on the host for now, so it's as fast as DirectML's image path, not
+  the CUDA path's GPU tiling.
 - **`aji_vk_model_test`** (by hand): one model on the executor, timed, against the fp32 CPU
   reference of its plan (`sanity/native_ref.h`), and against the CUDA executor when built with CUDA.
   `aji_vk_model_test list` prints the devices and families, `info [N]` the full capability
