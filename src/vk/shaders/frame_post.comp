@@ -1,0 +1,120 @@
+#version 450
+// The post kernels of a 4:2:0 frame (HLSL cs_post_mh, cs_uv_v_store), by PASS:
+//   1 mh: the RGB tensor -> quantized Y raw + horizontally downsampled chroma fp32 (2 planes
+//     cw*h), the chroma never stored at full resolution (cs_post_mh's tile and order).
+//     di = {w, h, taps, cw}, dj.x = y row stride bytes. d0 tensor, d1 y raw, d2 chroma.
+//   2 uv_v: vertical chroma resample + quantize + interleave, TPX chroma px per invocation.
+//     di = {cw, src rows (h), taps, dst rows (ch)}, dj.x = uv row stride bytes. d0 chroma f32,
+//     d1 uv raw.
+#extension GL_GOOGLE_include_directive : require
+#include "frame_common.glsl"
+
+#if PASS == 1
+#define POST_CO 64
+#define POST_SPAN 192
+#define POST_TAPS 16
+shared float sh_y[8 * POST_SPAN];
+shared float sh_u[8 * POST_SPAN];
+shared float sh_v[8 * POST_SPAN];
+shared float sh_w[POST_CO * POST_TAPS];
+shared int sh_s[POST_CO];
+#endif
+
+void main()
+{
+    const ivec4 di = DI(), dj = DJ();
+#if PASS == 1
+    const uvec3 gid = gl_WorkGroupID, tid = gl_LocalInvocationID;
+    const int w = di.x, h = di.y, taps = di.z, cw = di.w;
+    const int cx0 = int(gid.x) * POST_CO;
+    const int y = int(gid.y) * 8 + int(tid.y);
+    const uint lin = tid.y * 32u + tid.x;
+    const int nco = min(POST_CO, cw - cx0);
+    for (uint i = lin; i < uint(nco * taps); i += 256u)
+        sh_w[(i % uint(taps)) * POST_CO + i / uint(taps)] = weights[uint(cx0) * uint(taps) + i];
+    if (lin < uint(nco)) sh_s[lin] = starts[cx0 + int(lin)];
+    const int s_lo = starts[cx0];
+    const int span = starts[cx0 + nco - 1] + taps - s_lo;
+    const uint plane = uint(w) * uint(h);
+    const uint srow = tid.y * POST_SPAN;
+    if (y < h) {
+        for (int i = int(tid.x); i < span; i += 32) {
+            const uint idx = uint(y) * uint(w) + uint(mirr(s_lo + i, w));
+            const float r = TLOAD(d0, idx);
+            const float g = TLOAD(d0, plane + idx);
+            const float b = TLOAD(d0, 2u * plane + idx);
+            const float Y = kr() * r + (1.0 - kr() - kb()) * g + kb() * b;
+            sh_y[srow + uint(i)] = Y;
+            sh_u[srow + uint(i)] = (b - Y) / (2.0 * (1.0 - kb()));
+            sh_v[srow + uint(i)] = (r - Y) / (2.0 * (1.0 - kr()));
+        }
+    }
+    barrier();
+    if (y >= h) return;
+    const int xend = min(2 * (cx0 + POST_CO), w);
+    for (int x0 = 2 * cx0 + int(tid.x) * TPX; x0 < xend; x0 += 32 * TPX) {
+        uint ydword = 0u;
+        for (int k = 0; k < TPX; k++) {
+            const int x = min(x0 + k, w - 1);  // clamp: spill goes to row padding
+            const int sl = x - s_lo;
+            float Y;
+            if (sl >= 0 && sl < span) {
+                Y = sh_y[srow + uint(sl)];
+            } else {
+                const uint idx = uint(y) * uint(w) + uint(x);
+                const float r = TLOAD(d0, idx);
+                const float g = TLOAD(d0, plane + idx);
+                const float b = TLOAD(d0, 2u * plane + idx);
+                Y = kr() * r + (1.0 - kr() - kb()) * g + kb() * b;
+            }
+            const float yq = Y * yscale() + yoff();
+            const uint q = uint(quant(yq, qdiv(), qmax()));
+#if T16
+            ydword |= (q & 0xffffu) << (k * 16);
+#else
+            ydword |= (q & 0xffu) << (k * 8);
+#endif
+        }
+        d1[(uint(y) * uint(dj.x) + uint(x0) * RAWSIZE) >> 2] = ydword;
+    }
+    const uint cplane = uint(cw) * uint(h);
+    for (int o = int(tid.x); o < nco; o += 32) {
+        const uint b0 = srow + uint(sh_s[o] - s_lo);
+        float a = 0.0, c = 0.0;
+        for (int j = 0; j < taps; j++) {
+            const float wt = sh_w[j * POST_CO + o];
+            a += wt * sh_u[b0 + uint(j)];
+            c += wt * sh_v[b0 + uint(j)];
+        }
+        const uint e = uint(y) * uint(cw) + uint(cx0 + o);
+        d2[e] = floatBitsToUint(a);
+        d2[cplane + e] = floatBitsToUint(c);
+    }
+#else
+    const int cw = di.x;
+    const int x0 = int(gl_GlobalInvocationID.x) * TPX, y = int(gl_GlobalInvocationID.y);
+    if (x0 >= cw || y >= di.w) return;
+    const uint plane = uint(cw) * uint(di.y);
+    const int s0 = starts[y];
+    uint dword = 0u;
+    for (int k = 0; k < TPX; k++) {
+        const int x = min(x0 + k, cw - 1);  // clamp: spill goes to row padding
+        float u = 0.0, v = 0.0;
+        for (int j = 0; j < di.z; j++) {
+            const uint row = uint(mirr(s0 + j, di.y)) * uint(cw) + uint(x);
+            const float w = weights[y * di.z + j];
+            u += w * F32(d0, row);
+            v += w * F32(d0, plane + row);
+        }
+        const float uq = u * cscale() + coff(), vq = v * cscale() + coff();
+        const uint qu = uint(quant(uq, qdiv(), qmax()));
+        const uint qv = uint(quant(vq, qdiv(), qmax()));
+#if T16
+        dword = qu | (qv << 16u);
+#else
+        dword |= (qu | (qv << 8u)) << (k * 16);
+#endif
+    }
+    d1[(uint(y) * uint(dj.x) + uint(x0) * 2u * RAWSIZE) >> 2] = dword;
+#endif
+}

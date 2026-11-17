@@ -291,6 +291,14 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   (RRDBNet 64/32, 2x unshuffle and 4x) follows `native/esrgan.cpp`'s plan on it, with its
   intermediates in one arena by lifetime; a tile whose buffers exceed `maxStorageBufferRange` is
   refused. `ImgNet::create` tries ESRGAN, then the lowering.
+- **`vk/frame`: a 4:2:0 frame on Vulkan alone, no D3D** (for Linux and Android): raw NV12 / P010
+  planes in buffers, pre (`frame_pre.comp`), the executor, post (`frame_post.comp`) in one
+  command buffer. The kernels are GLSL ports of `dml_shaders.h`'s pre/post with the same
+  `resample.h` tables; within one level of the DirectML path (division rounds differently
+  across APIs, so not bit-identical). `aji_harness_vk` runs raw files through it (`--format
+  p010`, `--matrix`, `--range`, `--siting`) and builds for Android. The caller-facing frame ABI
+  (a shared `VkDevice`'s images for mpv on Linux, host memory or `AHardwareBuffer` on Android)
+  is still to come.
 - **`aji_img_vk.cpp`: the image ABI on Vulkan (`AJI_IMG_VULKAN`, `aji_image --backend vulkan`).**
   A `core/tiling` `TileModel` over the executor at the model's tile: the same cover, reflect pad
   and blend as the other backends. Every model must lower; one that doesn't is refused with the
