@@ -20,7 +20,8 @@ bool fail(std::string *why, const std::string &m)
 }
 
 const char *kPassName[] = {"",          "gemm",     "ln",      "dw",     "colsum",  "winattn", "chanstats", "chanreduce",
-                           "chansoft",  "chanfold", "aimcg",   "aimsg",  "imgin",   "colsum2", "convert",    "imgout"};
+                           "chansoft",  "chanfold", "aimcg",   "aimsg",  "imgin",   "colsum2", "convert",    "imgout",
+                           "tgate",     "mix"};
 
 void full_barrier(VkCommandBuffer cb)
 {
@@ -164,6 +165,113 @@ void TNet::imgin(const TMap &out, int h, int w, int ph, int pw, const float mean
     t.v[21] = ph;
     t.v[22] = pw;
     pass_threads(12, t, (long long)ph * pw, "imgin");
+}
+
+bool bias_table(const std::vector<float> &bias, int heads, int wh, int ww, int kwh, int kww, int kpad, std::vector<float> *tab, int *tw_,
+                int *offy_, int *offx_, int *tn)
+{
+    const int kh = kwh ? kwh : wh, kw = kwh ? kww : ww, kp = kwh ? kpad : 0, Tq = wh * ww, Tk = kh * kw;
+    const int th = kh + wh - 1, tw = kw + ww - 1, offy = kp + wh - 1, offx = kp + ww - 1;
+    if ((int)bias.size() != heads * Tq * Tk) return false;
+    tab->assign((size_t)heads * th * tw, 0.f);
+    std::vector<char> seen(tab->size(), 0);
+    for (int h = 0; h < heads; h++)
+        for (int r = 0; r < Tq; r++)
+            for (int c = 0; c < Tk; c++) {
+                const int dy = c / kw - kp - r / ww + offy, dx = c % kw - kp - r % ww + offx;
+                if (dy < 0 || dy >= th || dx < 0 || dx >= tw) return false;
+                const size_t ti = ((size_t)h * th + dy) * tw + dx;
+                const float v = bias[((size_t)h * Tq + r) * Tk + c];
+                if (seen[ti] && (*tab)[ti] != v) return false;
+                seen[ti] = 1;
+                (*tab)[ti] = v;
+            }
+    *tw_ = tw;
+    *offy_ = offy;
+    *offx_ = offx;
+    *tn = th * tw;
+    return true;
+}
+
+void TNet::winattn(const TWin &a, const TMap &qkv, const TMap &out, const std::string &label)
+{
+    const int Hp = a.Hp ? a.Hp : a.H, Wp = a.Wp ? a.Wp : a.W;
+    const int nwx = (Wp + a.ww - 1) / a.ww, nwy = (Hp + a.wh - 1) / a.wh, nqb = (a.wh * a.ww + 63) / 64;
+    if (a.hd > 32 || a.hd % 2) {
+        failed_ = "window attention with heads of " + std::to_string(a.hd) + " channels";
+        return;
+    }
+    TArgs t;
+    t.map(0, qkv);
+    t.map(1, out);
+    t.v[16] = a.H;
+    t.v[17] = a.W;
+    t.v[18] = a.heads;
+    t.v[19] = a.hd;
+    t.v[20] = a.wh;
+    t.v[21] = a.ww;
+    t.v[22] = a.sy;
+    t.v[23] = a.sx;
+    t.v[28] = nwx;
+    t.v[29] = Hp;
+    t.v[30] = Wp;
+    t.f(31, a.scale);
+    t.v[32] = a.bias;
+    t.v[33] = a.qo;
+    t.v[34] = a.ko;
+    t.v[35] = a.vo;
+    const long long wg = (long long)nwx * nwy * a.heads * nqb;
+    t.v[36] = (int32_t)wg;
+    t.v[37] = nqb;
+    t.v[38] = a.kwh;
+    t.v[39] = a.kww;
+    t.v[40] = a.kpad;
+    t.v[41] = a.mask ? 1 : 0;
+    t.v[42] = a.rtab;
+    t.v[43] = a.rt_w;
+    t.v[44] = a.rt_offy;
+    t.v[45] = a.rt_offx;
+    t.v[46] = a.tn;
+    const uint32_t gx = (uint32_t)std::min<long long>(wg, 65535), gy = (uint32_t)((wg + gx - 1) / gx);
+    pass(5, t, gx, gy, label);
+}
+
+void TNet::token_gate(const TMap &x, int M, int C, int r, int w1, int b1, int w2, float b2, VkDeviceSize tg)
+{
+    if (r > 16 || r * C > 4000) {  // tfm.comp keeps W1 in 16 KB of shared memory
+        failed_ = "a token gate " + std::to_string(r) + " x " + std::to_string(C);
+        return;
+    }
+    TArgs t;
+    t.map(0, x);
+    t.v[16] = M;
+    t.v[17] = C;
+    t.v[18] = r;
+    t.v[19] = w1;
+    t.v[20] = b1;
+    t.v[21] = w2;
+    t.f(22, b2);
+    t.v[23] = (int32_t)(tg / 4);
+    pass_threads(16, t, M, "tgate");
+}
+
+void TNet::mix(const TMap &a, const TMap &b, const TMap &z, int M, int C, int cpad, VkDeviceSize cg, VkDeviceSize tg, int mode)
+{
+    TArgs t;
+    t.map(0, a);
+    t.map(1, b);
+    t.map(2, z);
+    t.v[16] = M;
+    t.v[17] = C;
+    t.v[18] = cpad;
+    t.v[19] = (int32_t)(cg / 4);
+    t.v[20] = (int32_t)(tg / 4);
+    t.v[21] = mode;
+    if (cpad % 8) {
+        failed_ = "a mix over " + std::to_string(cpad) + " channels";
+        return;
+    }
+    pass_threads(17, t, (long long)M * (cpad / 8), "mix");
 }
 
 void TNet::imgout(const TMap &in, int h, int w, int mw)
@@ -376,7 +484,7 @@ void TNet::layernorm(const TMap &in, const TMap &out, int M, int C, int cpad, in
     pass(2, t, gx, gy, "ln");
 }
 
-void TNet::dwconv(const TMap &in, const TMap &out, int H, int W, int C, int w, int bias, bool gelu, VkDeviceSize sums)
+void TNet::dwconv(const TMap &in, const TMap &out, int H, int W, int C, int w, int bias, bool gelu, VkDeviceSize sums, const TMap &mul)
 {
     if (C > 2048) {
         failed_ = "a depthwise conv over " + std::to_string(C) + " channels";
@@ -388,6 +496,7 @@ void TNet::dwconv(const TMap &in, const TMap &out, int H, int W, int C, int w, i
     TArgs t;
     t.map(0, in);
     t.map(1, out);
+    t.map(2, mul);
     t.v[16] = H;
     t.v[17] = W;
     t.v[18] = C;

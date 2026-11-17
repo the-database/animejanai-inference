@@ -17,6 +17,8 @@
 //   12 imgin: the network input (NCHW fp16, binding 0) minus a mean into an NHWC map, zeros to 16,
 //      reflect-padded to a larger size
 //   15 imgout: an NHWC map's first 3 channels, cropped, into the network output (NCHW fp16, binding 3)
+//   16 tgate: DAT's token gate, sigmoid(w2 . gelu(W1 x + b1) + b2) per token
+//   17 mix: DAT's interaction, z = a * cg[c] + b * tg[t] (or a * tg[t] + b * cg[c])
 //   13 colsum2: partial column sums of a map over token chunks (then colsum adds them up)
 //   14 convert: a map into another (fp32 <-> fp16), n channels
 //
@@ -150,6 +152,8 @@ shared float sq[64][33], skk[64][33];
 shared float smean[512], shid[512];
 #elif PASS == 11
 shared float sred[256];
+#elif PASS == 16
+shared float sgw[4000], sgb[16], sgw2[16];  // W1 [r][C] (r * C <= 4000), b1, w2: 16 KB with the rest
 #endif
 
 void main()
@@ -246,7 +250,8 @@ void main()
     }
 #elif PASS == 3
     // 16 H, 17 W, 18 C (<= 2048; the last group of 8 may be partial), 19 w (wf, [C][9]), 20 bias (wf, < 0 none), 21 gelu,
-    // 22 sums (part offset, < 0 none: then [workgroups][C] partials there); m0 in, m1 out.
+    // 22 sums (part offset, < 0 none: then [workgroups][C] partials there); m0 in, m1 out, m2 a
+    // map the result is multiplied by (after the GELU; none: not).
     // As tfm.cu's k_dw8s: a thread is one 8-channel group of one column over a strip of 8 rows,
     // the three input rows of its window kept as it moves down; adjacent threads take adjacent
     // channel groups of a pixel (NP = 256 / (C / 8) columns a workgroup).
@@ -256,7 +261,7 @@ void main()
     const int strips = (H + 7) / 8, cols = W * strips;
     const int g = lid % G, pidx = wgi * NP + lid / G, c0 = g * 8;
     const bool live = lid < NP * G && pidx < cols;
-    const Map I = map(0), O = map(1);
+    const Map I = map(0), O = map(1), MU = map(2);
     const int nc = min(8, C - c0);  // channels of this group
     const bool vi = vec8at(I, c0), vo = vec8at(O, c0) && nc == 8;
     float part8[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -289,6 +294,7 @@ void main()
             [[unroll]] for (int j = 0; j < 8; j++) {
                 if (bo >= 0 && j < nc) a[j] += wf[bo + c0 + j];
                 if (ge != 0) a[j] = gelu(a[j]);
+                if (!MU.none && j < nc) a[j] *= ld(MU, uint(y * W + x), c0 + j);
                 if (j < nc) part8[j] += a[j];
             }
             if (vo) st8(O, uint(y * W + x), c0, a);
@@ -595,5 +601,59 @@ void main()
     const Map I = map(0);
     const uint pix = uint((t / w) * mw + t % w);
     for (int c = 0; c < 3; c++) outh[c * n + t] = float16_t(ld(I, pix, c));
+#elif PASS == 16
+    // 16 M, 17 C, 18 r (<= 16), 19 w1 (wf [r][C]), 20 b1 (wf), 21 w2 (wf [r]), 22 b2 (float), 23 out
+    // (arena floats [M]); m0 x. A thread a token, the weights in shared memory.
+    const int M = prm(16), C = prm(17), r = prm(18), w1 = prm(19), b1 = prm(20), w2 = prm(21), oo = prm(23);
+    const int lid = int(gl_LocalInvocationIndex);
+    for (int i = lid; i < r * C; i += 256) sgw[i] = wf[w1 + i];
+    if (lid < r) {
+        sgb[lid] = wf[b1 + lid];
+        sgw2[lid] = wf[w2 + lid];
+    }
+    barrier();
+    const int t = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    if (t >= M) return;
+    const Map X = map(0);
+    float acc[16];
+    [[unroll]] for (int j = 0; j < 16; j++) acc[j] = 0.0;
+    for (int c = 0; c < C; c += 8) {
+        float v[8];
+        if (vec8at(X, c) && c + 8 <= C) ld8(X, uint(t), c, v);
+        else [[unroll]] for (int e = 0; e < 8; e++) v[e] = c + e < C ? ld(X, uint(t), c + e) : 0.0;
+        [[unroll]] for (int e = 0; e < 8; e++)
+            if (c + e < C)
+                [[unroll]] for (int j = 0; j < 16; j++)
+                    if (j < r) acc[j] += v[e] * sgw[j * C + c + e];
+    }
+    float o = 0.0;
+    for (int j = 0; j < r; j++) o += sgw2[j] * gelu(acc[j] + sgb[j]);
+    arf[oo + t] = sigm(o + prmf(22));
+#elif PASS == 17
+    // 16 M, 17 C, 18 cpad (a multiple of 8), 19 cg (arena floats [C]), 20 tg (arena floats [M]),
+    // 21 mode; m0 a, m1 b, m2 z (zero from C to cpad). A thread 8 channels of a token.
+    const int i = int(gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x);
+    const int M = prm(16), C = prm(17), cpad = prm(18), cg = prm(19), tg = prm(20), mode = prm(21), G = cpad / 8;
+    if (i >= M * G) return;
+    const int t = i / G, c0 = (i % G) * 8;
+    const Map A = map(0), B = map(1), Z = map(2);
+    float a[8], b[8], o[8];
+    if (vec8at(A, c0) && vec8at(B, c0)) {
+        ld8(A, uint(t), c0, a);
+        ld8(B, uint(t), c0, b);
+    } else {
+        [[unroll]] for (int e = 0; e < 8; e++) {
+            a[e] = c0 + e < C ? ld(A, uint(t), c0 + e) : 0.0;
+            b[e] = c0 + e < C ? ld(B, uint(t), c0 + e) : 0.0;
+        }
+    }
+    const float k = arf[tg + t];
+    [[unroll]] for (int e = 0; e < 8; e++) {
+        const int c = c0 + e;
+        const float g = c < C ? arf[cg + c] : 0.0;
+        o[e] = c < C ? (mode == 0 ? a[e] * g + b[e] * k : a[e] * k + b[e] * g) : 0.0;
+    }
+    if (vec8at(Z, c0)) st8(Z, uint(t), c0, o);
+    else [[unroll]] for (int e = 0; e < 8; e++) st(Z, uint(t), c0 + e, o[e]);
 #endif
 }
