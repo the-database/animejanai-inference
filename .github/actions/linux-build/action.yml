@@ -14,8 +14,12 @@ description: >-
 # counterpart of the gyan.dev shared build the Windows aji_encode links. BtbN prunes old
 # autobuilds: when FFMPEG_URL 404s, move to a current 9.0 build and update FFMPEG_SHA256.
 #
-# Both land in /opt/aji-deps, which is cached under a key made of these pins. The step exports
-# FFMPEG_ROOT for the caller's later steps.
+# The Vulkan backend (libaji_vk.so) needs glslc and the Vulkan headers at build time only: the
+# LunarG SDK, as ci.yml's vulkan job takes it (Ubuntu 22.04's glslc crashes on the
+# cooperative-matrix kernels). Nothing Vulkan is linked or shipped.
+#
+# All of them land in /opt/aji-deps, which is cached under a key made of these pins. The step
+# exports FFMPEG_ROOT and VULKAN_SDK for the caller's later steps.
 
 runs:
   using: composite
@@ -29,14 +33,17 @@ runs:
         TRT_CUDA=13.4
         FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-07-12-47/ffmpeg-n9.0.2-48-gd4070a14ce-linux64-gpl-shared-9.0.tar.xz
         FFMPEG_SHA256=7dfdfcb76a6193bed9f7be2de3fbd1ca51714bcc3d9ce819e5b4097944989496
+        VKSDK_VERSION=1.4.309.0
         {
           echo "TRT_VERSION=$TRT_VERSION"
           echo "TRT_CUDA=$TRT_CUDA"
           echo "FFMPEG_URL=$FFMPEG_URL"
           echo "FFMPEG_SHA256=$FFMPEG_SHA256"
           echo "FFMPEG_ROOT=/opt/aji-deps/ffmpeg"
+          echo "VKSDK_VERSION=$VKSDK_VERSION"
+          echo "VULKAN_SDK=/opt/aji-deps/vulkansdk/$VKSDK_VERSION/x86_64"
         } >> "$GITHUB_ENV"
-        echo "key=aji-linux-deps-trt$TRT_VERSION-cuda$TRT_CUDA-ffmpeg$FFMPEG_SHA256" >> "$GITHUB_OUTPUT"
+        echo "key=aji-linux-deps-trt$TRT_VERSION-cuda$TRT_CUDA-ffmpeg$FFMPEG_SHA256-vk$VKSDK_VERSION" >> "$GITHUB_OUTPUT"
 
     - uses: actions/cache@v6
       with:
@@ -89,6 +96,14 @@ runs:
           rm -f ffmpeg.tar.xz
         fi
 
+        # glslc and the Vulkan headers (build tools only)
+        if [ ! -x "$VULKAN_SDK/bin/glslc" ]; then
+          rm -rf /opt/aji-deps/vulkansdk && mkdir -p /opt/aji-deps/vulkansdk
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/$VKSDK_VERSION/linux/vulkansdk-linux-x86_64-$VKSDK_VERSION.tar.xz" \
+            | tar -xJ -C /opt/aji-deps/vulkansdk
+        fi
+        "$VULKAN_SDK/bin/glslc" --version | head -1
+
     - name: Build aji (full per-SM kernel set)
       shell: bash
       run: |
@@ -98,6 +113,8 @@ runs:
         export PKG_CONFIG_PATH="$FFMPEG_ROOT/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
         cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
           -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" \
+          -DAJI_VULKAN=ON -DAJI_GLSLC="$VULKAN_SDK/bin/glslc" -DAJI_VK_INCLUDE="$VULKAN_SDK/include" -DAJI_GLSLC_JOBS=4 \
           -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$FFMPEG_ROOT/lib"
         cmake --build build -j"$(nproc)"
         test -x build/aji_encode || { echo "aji_encode was not built (ffmpeg not found)"; exit 1; }
+        test -f build/libaji_vk.so || { echo "libaji_vk.so was not built"; exit 1; }

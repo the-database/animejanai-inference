@@ -100,11 +100,16 @@ per-SM builder resources, which the *package* ships but this build does not need
 Before configuring, the action fetches BtbN's FFmpeg 9.0 `linux64-gpl-shared` build
 (pinned by `FFMPEG_URL` + `FFMPEG_SHA256`) into `/opt/aji-deps/ffmpeg` (`$FFMPEG_ROOT`) and puts
 its `lib/pkgconfig` on `PKG_CONFIG_PATH`, so `aji_encode` builds. BtbN prunes old autobuilds;
-when the pinned URL 404s, move to a current 9.0 build and update the checksum.
+when the pinned URL 404s, move to a current 9.0 build and update the checksum. It also fetches
+the LunarG Vulkan SDK (`VKSDK_VERSION`) into `/opt/aji-deps/vulkansdk` (`$VULKAN_SDK`): glslc
+and the headers for `libaji_vk.so`, build tools only (the shaders are embedded; the library opens
+the driver's `libvulkan.so.1` at run time). Ubuntu 22.04's own glslc crashes on the
+cooperative-matrix kernels.
 
 ```bash
 cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_TRT_ROOT=/usr \
   -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual" \
+  -DAJI_VULKAN=ON -DAJI_GLSLC="$VULKAN_SDK/bin/glslc" -DAJI_VK_INCLUDE="$VULKAN_SDK/include" -DAJI_GLSLC_JOBS=4 \
   -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$FFMPEG_ROOT/lib"
 cmake --build build -j"$(nproc)"
 ctest --test-dir build -L cpu --output-on-failure    # the CPU-only tests
@@ -113,16 +118,18 @@ ctest --test-dir build -L cpu --output-on-failure    # the CPU-only tests
 `-rpath-link` lets the linker resolve the libav libraries' own dependencies (libswresample,
 ...), which are not on any default search path.
 
-Staging ships **four files only**, flat, so the assembler extracts them straight into
+Staging ships **five files only**, flat, so the assembler extracts them straight into
 `animejanai/inference/`:
 
 ```bash
-cp build/libaji.so build/libaji_trt.so build/aji_harness build/aji_kernel_test stage/
+cp build/libaji.so build/libaji_trt.so build/libaji_vk.so build/aji_harness build/aji_kernel_test stage/
 tar --zstd -C stage -cf aji-linux-x64.tar.zst .
 ```
 
 Note what is **not** in that tarball: `aji_encode` and both DML targets (Windows-only). The
-Windows zip carries seven files.
+Windows zip carries eight files. `libaji_vk.so` is the Vulkan backend for every GPU vendor:
+Vulkan frames (`aji_create_vk`, mpv's `hwdec=vulkan`) and the image ABI; it needs no CUDA, so
+`backend=Vulkan` runs on AMD and Intel machines that can't load `libaji_trt.so`.
 
 `aji_encode` ships separately, for VideoJaNai, as `aji-encode-linux-x64.tar.zst`: the binary
 plus the libav sonames it links (`libavcodec.so.63`, ...), with RPATH set to `$ORIGIN`, also
