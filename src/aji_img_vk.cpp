@@ -1,9 +1,9 @@
 /*
  * aji_img_vk.cpp — the image ABI (aji_image.h) on Vulkan: AJI_IMG_VULKAN.
  *
- * Each model runs on libaji's native kernels through the Vulkan executor (vk/executor.h): the ONNX
- * graph is lowered (native/lower.h) and instantiated for the model's tile; core/tiling covers the
- * image with tiles, reflect-pads small images and blends the overlaps, as on the other backends.
+ * Each model runs on libaji's native kernels on Vulkan for the model's tile (vk/imgnet.h): ESRGAN on
+ * the general conv, the conv nets the video path lowers (SPAN, SPANF3, Compact) on the executor;
+ * core/tiling's cover, reflect pad and overlap blend, as on the other backends.
  * A model that doesn't lower, or a device without a kernel family, is refused with the reason:
  * there is no fallback inside this backend (it also runs where there is no DirectML: Linux,
  * Android), so a caller that wants one picks another backend.
@@ -33,11 +33,10 @@
 #include "core/fileio.h"
 #include "core/half_array.h"
 #include "core/tiling.h"
-#include "native/lower.h"
 #include "native/onnx_graph.h"
 #include "onnx_shape.h"
 #include "vk/device.h"
-#include "vk/executor.h"
+#include "vk/imgnet.h"
 
 using namespace ajicore;
 
@@ -126,7 +125,7 @@ struct aji_img_model : TileModel {
     aji_img_ctx *c = nullptr;
     std::string name;
     int overlap = DEFAULT_OVERLAP;
-    std::unique_ptr<ajivk::Executor> ex;
+    std::unique_ptr<ajivk::ImgNet> net;
     std::vector<uint16_t> in16, out16;
 
     int run_tile(const float *in, float *out, std::string *err) override
@@ -141,8 +140,8 @@ struct aji_img_model : TileModel {
             t0 = t1;
         }
         ajivk::Device &dev = *c->dev;
-        if (!dev.upload(ex->input(), in16.data(), in16.size() * 2, err) || !ex->run(tile_w, tile_h, err) ||
-            !dev.download(ex->output(), out16.data(), out16.size() * 2, err)) {
+        if (!dev.upload(net->input(), in16.data(), in16.size() * 2, err) || !net->run(dev, tile_w, tile_h, err) ||
+            !dev.download(net->output(), out16.data(), out16.size() * 2, err)) {
             *err = name + ": Vulkan: " + *err;
             return AJI_IMG_ERR;
         }
@@ -190,31 +189,30 @@ std::unique_ptr<aji_img_model> build_model(aji_img_ctx *c, const aji_img_model_p
     }
     m->overlap = std::min(p->overlap > 0 ? p->overlap : DEFAULT_OVERLAP, std::min(m->tile_w, m->tile_h) / 2);
     ajinative::OnnxGraph g;
-    ajinative::Plan plan;
     std::string why;
-    if (!ajinative::parse_onnx(blob.data(), blob.size(), &g, &why) || !ajinative::lower(g, &plan, &why)) {
+    if (!ajinative::parse_onnx(blob.data(), blob.size(), &g, &why)) {
         *e = m->name + ": not on native kernels: " + why;
         return nullptr;
     }
     {
         std::lock_guard<std::mutex> run(c->run_mu);  // the device's one-shot queue times the variants
         c->dev->set_cache_dir(c->cache_dir.empty() ? dir_of(p->onnx_path) : c->cache_dir);
-        m->ex = ajivk::Executor::create(*c->dev, plan, m->tile_w, m->tile_h, &why);
-        if (m->ex) c->dev->save_caches();
+        m->net = ajivk::ImgNet::create(*c->dev, g, m->tile_w, m->tile_h, &why);
+        if (m->net) c->dev->save_caches();
     }
-    if (!m->ex) {
+    if (!m->net) {
         *e = m->name + ": not on native kernels at " + std::to_string(m->tile_w) + "x" + std::to_string(m->tile_h) + ": " + why;
         return nullptr;
     }
-    if (m->ex->out_w() % m->tile_w || m->ex->out_h() % m->tile_h || m->ex->out_w() / m->tile_w != m->ex->out_h() / m->tile_h) {
+    if (m->net->out_w() % m->tile_w || m->net->out_h() % m->tile_h || m->net->out_w() / m->tile_w != m->net->out_h() / m->tile_h) {
         *e = m->name + ": output is not an integer-scale image of the tile";
         return nullptr;
     }
-    m->scale = m->ex->out_w() / m->tile_w;
+    m->scale = m->net->out_w() / m->tile_w;
     m->in_ch = m->out_ch = 3;
     try {
         m->in16.resize((size_t)3 * m->tile_w * m->tile_h);
-        m->out16.resize((size_t)3 * m->ex->out_w() * m->ex->out_h());
+        m->out16.resize((size_t)3 * m->net->out_w() * m->net->out_h());
     } catch (const std::bad_alloc &) {
         *e = m->name + ": out of host memory for tile buffers";
         return nullptr;
@@ -229,11 +227,11 @@ void fill_memory(aji_img_ctx *c, const aji_img_model *m, aji_img_memory *out)
     // the GPU tiling scratch (rows live in host memory): grows to the largest image yet
     const VkTileScratch &g = c->gpu;
     out->ctx_scratch = g.img.size + g.band.size + g.wx.size + g.wy.size + g.params.size;
-    if (m && m->ex) {
-        const uint64_t io = m->ex->input().size + m->ex->output().size;
-        out->model_weights = m->ex->weight_bytes();
+    if (m && m->net) {
+        const uint64_t io = m->net->input().size + m->net->output().size;
+        out->model_weights = m->net->weight_bytes();
         out->model_buffers = io;
-        const uint64_t all = m->ex->device_bytes();
+        const uint64_t all = m->net->device_bytes();
         out->model_activations = all > out->model_weights + io ? all - out->model_weights - io : 0;
         out->activations_shared = 0;
     }
@@ -426,8 +424,8 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in, const aji_img_buffer
     TileSets sets(dev);
     VkDescriptorSet s_ext = VK_NULL_HANDLE, s_blend = VK_NULL_HANDLE, s_flush = VK_NULL_HANDLE;
     if (!p_flush || !sets.init(3, &why) ||
-        !(s_ext = sets.make({{0, g.img.buf}, {1, m.ex->input().buf}, {7, g.params.buf}}, &why)) ||
-        !(s_blend = sets.make({{0, m.ex->output().buf}, {1, g.wx.buf}, {2, g.wy.buf}, {3, g.band.buf}, {7, g.params.buf}}, &why)) ||
+        !(s_ext = sets.make({{0, g.img.buf}, {1, m.net->input().buf}, {7, g.params.buf}}, &why)) ||
+        !(s_blend = sets.make({{0, m.net->output().buf}, {1, g.wx.buf}, {2, g.wy.buf}, {3, g.band.buf}, {7, g.params.buf}}, &why)) ||
         !(s_flush = sets.make({{0, g.band.buf}, {1, g.rows.buf}, {7, g.params.buf}}, &why))) {
         *err = "Vulkan tiling: " + why;
         return AJI_IMG_ERR;
@@ -452,7 +450,7 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in, const aji_img_buffer
         for (int i = 0; i < nx && ok; i++) {
             run_kernel(cb, p_ext, s_ext, j * nx + i, (uint32_t)((m.in_ch * Tw * Th + 1) / 2));
             compute_barrier(cb);
-            ok = m.ex->record(cb, Tw, Th);
+            ok = m.net->record(cb, Tw, Th);
             compute_barrier(cb);
             run_kernel(cb, p_blend, s_blend, total + j * nx + i, (uint32_t)(cols * band_rows));
             compute_barrier(cb);
@@ -554,8 +552,8 @@ extern "C" AJI_IMG_EXPORT aji_img_model *aji_img_load(aji_img_ctx *c, const aji_
         c->set_error(e);
         return nullptr;
     }
-    c->info("native kernels: " + m->name + " (Vulkan " + ajivk::family_name(c->dev->family()) + ", tile " +
-            std::to_string(m->tile_w) + "x" + std::to_string(m->tile_h) + ")");
+    c->info("native kernels: " + m->name + " (" + m->net->describe() + ", tile " + std::to_string(m->tile_w) + "x" +
+            std::to_string(m->tile_h) + ")");
     aji_img_model *raw = m.release();
     c->models.insert(raw);
     return raw;

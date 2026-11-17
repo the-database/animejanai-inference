@@ -44,7 +44,7 @@ int check_module(const SpirvModule &m)
     }
     CHECK(i == m.words);
     CHECK(entry_points == 1);
-    const bool kernel = !std::strncmp(m.name, "c3_", 3) || !std::strncmp(m.name, "cat_", 4);
+    const bool kernel = !std::strncmp(m.name, "c3_", 3) || !std::strncmp(m.name, "cat_", 4) || !std::strncmp(m.name, "g3_", 3);
     if (kernel) CHECK(caps.count(kCapFloat16));  // the model kernels; the tiling ones are fp32
     if (std::strstr(m.name, "_cm16_")) CHECK(caps.count(kCapCooperativeMatrixKHR));
     if (std::strstr(m.name, "_sg16_")) {

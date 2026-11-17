@@ -40,6 +40,8 @@ struct DeviceInfo {
     uint32_t max_shared = 0;             // maxComputeSharedMemorySize
     uint32_t max_invocations = 0;        // maxComputeWorkGroupInvocations
     uint32_t max_groups[2] = {0, 0};     // maxComputeWorkGroupCount x, y
+    uint64_t max_storage_range = 0;      // maxStorageBufferRange: the largest storage binding
+    uint64_t storage_align = 16;         // minStorageBufferOffsetAlignment
     double timestamp_ns = 0.0;           // timestampPeriod; 0 if the queue can't time
     uint64_t device_local_bytes = 0;     // the largest device-local heap
     bool cm16 = false, sg16 = false, plain = false;  // the device can run that family

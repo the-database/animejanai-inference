@@ -1,0 +1,88 @@
+#version 450
+// General 3x3 conv with no subgroup operations (plain), for the image networks
+// (gconv_common.glsl): gconv_sg16's blocking with the inputs read straight from the shared tile;
+// a thread owns two adjacent output channels for a row of 16 pixels. Same accumulation as sg16.
+// Defines: CINP, COUTP, IN, ACT, NRES, UP2, OUT, TH (tile rows), RPS (rows per thread group).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "gconv_common.glsl"
+
+const int GT = 8, NG = COUTP / 16, KCC = KCH / 16, NGR = NG * (TH / RPS);
+layout(local_size_x = GT * NGR) in;
+
+layout(std430, binding = 3) readonly buffer Wt { uvec4 wp[]; };  // as sg16
+
+void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
+{
+    f16vec2 p;
+    p = unpackFloat2x16(u0.x); v[0] = p.x; v[1] = p.y;
+    p = unpackFloat2x16(u0.y); v[2] = p.x; v[3] = p.y;
+    p = unpackFloat2x16(u0.z); v[4] = p.x; v[5] = p.y;
+    p = unpackFloat2x16(u0.w); v[6] = p.x; v[7] = p.y;
+    p = unpackFloat2x16(u1.x); v[8] = p.x; v[9] = p.y;
+    p = unpackFloat2x16(u1.y); v[10] = p.x; v[11] = p.y;
+    p = unpackFloat2x16(u1.z); v[12] = p.x; v[13] = p.y;
+    p = unpackFloat2x16(u1.w); v[14] = p.x; v[15] = p.y;
+}
+
+void fma_px(int ai, float16_t w0[16], float16_t w1[16], inout float16_t acc0, inout float16_t acc1)
+{
+    const uvec4 u0 = sm[ai], u1 = sm[ai + 1];
+    const uint a[8] = uint[8](u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w);
+    [[unroll]] for (int kp = 0; kp < 8; kp++) {
+        const f16vec2 v = unpackFloat2x16(a[kp]);
+        acc0 = fma(v.x, w0[2 * kp], acc0);
+        acc0 = fma(v.y, w0[2 * kp + 1], acc0);
+        acc1 = fma(v.x, w1[2 * kp], acc1);
+        acc1 = fma(v.y, w1[2 * kp + 1], acc1);
+    }
+}
+
+void main()
+{
+    const int tid = int(gl_LocalInvocationIndex), nth = GT * NGR;
+    const int grp = tid / GT, lane = tid % GT;
+    const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
+    const int H = prm(0), W = prm(1);
+    const int g = grp % NG, row0 = (grp / NG) * RPS, ch = g * 16 + 2 * lane;
+    float tot0[RPS][16], tot1[RPS][16];
+    float16_t acc0[RPS][16], acc1[RPS][16];
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+        tot0[r][m] = 0.0;
+        tot1[r][m] = 0.0;
+    }
+
+    [[dont_unroll]] for (int c = 0; c < NCHUNK; c++) {
+        if (c > 0) barrier();
+        fill_chunk(c, tid, nth, tx0, ty0, H, W);
+        barrier();
+        [[dont_unroll]] for (int t = 0; t < 9; t++) {
+            const int dy = t / 3, dx = t % 3;
+            [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+                acc0[r][m] = float16_t(0.0);
+                acc1[r][m] = float16_t(0.0);
+            }
+            [[unroll]] for (int kc = 0; kc < KCC; kc++) {
+                const int wi = (((t * (CINP / 16) + c * KCC + kc) * NG + g) * 16 + 2 * lane) * 2;
+                float16_t w0[16], w1[16];
+                unpack16(wp[wi], wp[wi + 1], w0);
+                unpack16(wp[wi + 2], wp[wi + 3], w1);
+                [[unroll]] for (int r = 0; r < RPS; r++)
+                    [[unroll]] for (int m = 0; m < 16; m++)
+                        fma_px(((row0 + r + dy) * (TW + 2) + m + dx) * (KP / 8) + kc * 2, w0, w1, acc0[r][m], acc1[r][m]);
+            }
+            [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
+                tot0[r][m] += float(acc0[r][m]);
+                tot1[r][m] += float(acc1[r][m]);
+            }
+        }
+    }
+    barrier();  // the halo is no longer read: shared memory becomes the staging tile
+    [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++)
+        sm_set_pair(((row0 + r) * TW + m) * SP + ch, packFloat2x16(f16vec2(float16_t(tot0[r][m]), float16_t(tot1[r][m]))));
+    barrier();
+    write_out(tid, nth, tx0, ty0, H, W);
+}

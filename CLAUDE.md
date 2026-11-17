@@ -283,6 +283,14 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
     waits, runs the model and signals, and D3D12 waits.
   - Frames are never imported as textures: a shared D3D11 NV12 texture imported straight into
     Vulkan reads wrong chroma on NVIDIA, and Intel allows no arrays.
+- **`vk/gconv`, `vk/esrgan.cpp`, `vk/imgnet.h`:** the general 3x3 conv (`gconv_*.comp`, the
+  counterpart of CUDA's gconv): a channel prefix of a wider NHWC buffer in, a channel slice out, at
+  strides and offsets per dispatch (a parameter buffer); the input tile in shared memory up to 64
+  channels at a time; bias, two scaled residuals and LeakyReLU per element in fp32 in the writer;
+  nearest 2x upsampling of the input on the fly; NCHW in (or its unshuffle) and NCHW out. ESRGAN
+  (RRDBNet 64/32, 2x unshuffle and 4x) follows `native/esrgan.cpp`'s plan on it, with its
+  intermediates in one arena by lifetime; a tile whose buffers exceed `maxStorageBufferRange` is
+  refused. `ImgNet::create` tries ESRGAN, then the lowering.
 - **`aji_img_vk.cpp`: the image ABI on Vulkan (`AJI_IMG_VULKAN`, `aji_image --backend vulkan`).**
   A `core/tiling` `TileModel` over the executor at the model's tile: the same cover, reflect pad
   and blend as the other backends. Every model must lower; one that doesn't is refused with the

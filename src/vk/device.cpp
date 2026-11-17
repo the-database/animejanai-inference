@@ -74,6 +74,8 @@ DeviceInfo probe(VkPhysicalDevice p, uint32_t index)
     d.max_invocations = pr.limits.maxComputeWorkGroupInvocations;
     d.max_groups[0] = pr.limits.maxComputeWorkGroupCount[0];
     d.max_groups[1] = pr.limits.maxComputeWorkGroupCount[1];
+    d.max_storage_range = pr.limits.maxStorageBufferRange;
+    d.storage_align = pr.limits.minStorageBufferOffsetAlignment ? pr.limits.minStorageBufferOffsetAlignment : 16;
     d.timestamp_ns = pr.limits.timestampComputeAndGraphics ? pr.limits.timestampPeriod : 0.0;
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(p, &mp);
@@ -696,6 +698,8 @@ void Device::memory(uint64_t *free_bytes, uint64_t *total_bytes) const
         if (bp.heapBudget[heap] > 0)
             *free_bytes = bp.heapBudget[heap] > bp.heapUsage[heap] ? bp.heapBudget[heap] - bp.heapUsage[heap] : 0;
     }
+    // a virtual GPU (the Android emulator's gfxstream) reports the host's budget for a smaller heap
+    if (*free_bytes > *total_bytes) *free_bytes = *total_bytes;
 }
 
 VkCommandBuffer Device::begin()
