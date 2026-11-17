@@ -124,7 +124,18 @@ jobs:
           "$SDK/bin/glslc" --version | head -1
           cmake -S . -B build-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DAJI_CUDA=OFF -DAJI_VULKAN=ON \
             -DAJI_GLSLC="$SDK/bin/glslc" -DAJI_VK_INCLUDE="$SDK/include"
-          cmake --build build-vk
+          # the first errors also as annotations, readable without the log
+          set -o pipefail
+          cmake --build build-vk 2>&1 | tee build-vk.log || {
+            grep -m 20 -iE "error|FAILED" build-vk.log | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: vulkan-build-log
+          path: build-vk.log
+          retention-days: 7
       - name: CPU-only tests
         run: ctest --test-dir build-vk -L cpu --output-on-failure
       - name: Build for android-arm64 (NDK)
