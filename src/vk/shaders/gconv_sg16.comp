@@ -1,10 +1,10 @@
 #version 450
-// General 3x3 conv for 16-lane subgroups (sg16), for the image networks (gconv_common.glsl):
-// conv3x3_sg16's register blocking (a lane per output channel of a 16-channel group, a row of 16
-// pixels, inputs broadcast between lanes as packed fp16 pairs), the input tile in shared memory
-// KCH channels at a time. fp16 partial sums per (chunk, tap), then fp32; the sum is staged as
-// fp16 and goes through the writer's epilogue.
-// Defines: CINP, COUTP, IN, ACT, NRES, UP2, OUT, TH (tile rows), RPS (rows per subgroup).
+// General 3x3 conv for 16-lane subgroups (sg16), for the image and frame networks
+// (gconv_common.glsl): conv3x3_sg16's register blocking (a lane per output channel of a 16-channel
+// group, a row of 16 pixels, inputs broadcast between lanes as packed fp16 pairs), the input tile
+// in shared memory a chunk at a time. fp16 partial sums per (chunk, tap), then fp32; the sum is
+// staged as fp16 and goes through the writer's epilogue.
+// Defines: COUTP, IN, ACT, NRES, UP2, STRIDE, OUT, KMAX, TH (tile rows), RPS (rows per subgroup).
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -15,10 +15,10 @@
 
 #include "gconv_common.glsl"
 
-const int NG = COUTP / 16, KCC = KCH / 16, NSG = NG * (TH / RPS);
+const int NG = COUTP / 16, NSG = NG * (TH / RPS);
 layout(local_size_x = 16 * NSG) in;
 
-layout(std430, binding = 3) readonly buffer Wt { uvec4 wp[]; };  // [9][CINP/16][NG][16 lanes][16 k]
+layout(std430, binding = 3) readonly buffer Wt { uvec4 wp[]; };  // [9][cinp/16][NG][16 lanes][16 k]
 
 void unpack16(uvec4 u0, uvec4 u1, out float16_t v[16])
 {
@@ -49,25 +49,27 @@ void main()
     const int tid = int(gl_LocalInvocationIndex), nth = 16 * NSG;
     const int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
     const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
-    const int H = prm(0), W = prm(1);
+    const int H = prm(0), W = prm(1), cinp = prm(13), kch = prm(17);
+    const int wz = zs() * (9 * cinp * COUTP / 8);  // this slice's weights (uvec4s)
+    const int nchunk = cinp / kch, kcc = kch / 16, kp8 = (kch + 8) / 8;
     const int g = sg % NG, row0 = (sg / NG) * RPS, ch = g * 16 + lane;
     float tot[RPS][16];
     float16_t acc[RPS][16];
     [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) tot[r][m] = 0.0;
 
-    [[dont_unroll]] for (int c = 0; c < NCHUNK; c++) {
+    [[dont_unroll]] for (int c = 0; c < nchunk; c++) {
         if (c > 0) barrier();
-        fill_chunk(c, tid, nth, tx0, ty0, H, W);
+        fill_chunk(c, kch, tid, nth, tx0, ty0);
         barrier();
         [[dont_unroll]] for (int t = 0; t < 9; t++) {
             const int dy = t / 3, dx = t % 3;
             [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) acc[r][m] = float16_t(0.0);
-            [[unroll]] for (int kc = 0; kc < KCC; kc++) {
-                const int wi = (((t * (CINP / 16) + c * KCC + kc) * NG + g) * 16 + lane) * 2;
+            [[dont_unroll]] for (int kc = 0; kc < kcc; kc++) {
+                const int wi = wz + (((t * (cinp / 16) + c * kcc + kc) * NG + g) * 16 + lane) * 2;
                 float16_t w[16];
                 unpack16(wp[wi], wp[wi + 1], w);
                 [[unroll]] for (int r = 0; r < RPS; r++) {
-                    const int ai = ((row0 + r + dy) * (TW + 2) + lane + dx) * (KP / 8) + kc * 2;
+                    const int ai = halo_px(row0 + r, lane, dy, dx) * kp8 + kc * 2;
                     fma16(sm[ai], sm[ai + 1], w, acc[r]);
                 }
             }

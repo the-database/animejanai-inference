@@ -4,9 +4,9 @@
 
 #include <cuda_runtime.h>
 
-namespace ajinative {
+#include "native/rife_plan.h"  // kRifeMaxBlocks
 
-constexpr int kRifeMaxBlocks = 6;
+namespace ajinative {
 
 struct RifeFrame {
     const void *in11 = nullptr;  // NCHW fp16, frames at planes 0-2 and 3-5

@@ -1,8 +1,8 @@
 #version 450
-// General 3x3 conv with no subgroup operations (plain), for the image networks
-// (gconv_common.glsl): gconv_sg16's blocking with the inputs read straight from the shared tile;
-// a thread owns two adjacent output channels for a row of 16 pixels. Same accumulation as sg16.
-// Defines: CINP, COUTP, IN, ACT, NRES, UP2, OUT, TH (tile rows), RPS (rows per thread group).
+// General 3x3 conv with no subgroup operations (plain), for the image and frame networks
+// (gconv_common.glsl): gconv_sg16's blocking with the inputs read straight from the shared tile; a
+// thread owns two adjacent output channels for a row of 16 pixels. Same accumulation as sg16.
+// Defines: COUTP, IN, ACT, NRES, UP2, STRIDE, OUT, KMAX, TH (tile rows), RPS (rows per thread group).
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require
@@ -10,7 +10,7 @@
 
 #include "gconv_common.glsl"
 
-const int GT = 8, NG = COUTP / 16, KCC = KCH / 16, NGR = NG * (TH / RPS);
+const int GT = 8, NG = COUTP / 16, NGR = NG * (TH / RPS);
 layout(local_size_x = GT * NGR) in;
 
 layout(std430, binding = 3) readonly buffer Wt { uvec4 wp[]; };  // as sg16
@@ -46,7 +46,9 @@ void main()
     const int tid = int(gl_LocalInvocationIndex), nth = GT * NGR;
     const int grp = tid / GT, lane = tid % GT;
     const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
-    const int H = prm(0), W = prm(1);
+    const int H = prm(0), W = prm(1), cinp = prm(13), kch = prm(17);
+    const int wz = zs() * (9 * cinp * COUTP / 8);  // this slice's weights (uvec4s)
+    const int nchunk = cinp / kch, kcc = kch / 16, kp8 = (kch + 8) / 8;
     const int g = grp % NG, row0 = (grp / NG) * RPS, ch = g * 16 + 2 * lane;
     float tot0[RPS][16], tot1[RPS][16];
     float16_t acc0[RPS][16], acc1[RPS][16];
@@ -55,9 +57,9 @@ void main()
         tot1[r][m] = 0.0;
     }
 
-    [[dont_unroll]] for (int c = 0; c < NCHUNK; c++) {
+    [[dont_unroll]] for (int c = 0; c < nchunk; c++) {
         if (c > 0) barrier();
-        fill_chunk(c, tid, nth, tx0, ty0, H, W);
+        fill_chunk(c, kch, tid, nth, tx0, ty0);
         barrier();
         [[dont_unroll]] for (int t = 0; t < 9; t++) {
             const int dy = t / 3, dx = t % 3;
@@ -65,14 +67,14 @@ void main()
                 acc0[r][m] = float16_t(0.0);
                 acc1[r][m] = float16_t(0.0);
             }
-            [[unroll]] for (int kc = 0; kc < KCC; kc++) {
-                const int wi = (((t * (CINP / 16) + c * KCC + kc) * NG + g) * 16 + 2 * lane) * 2;
+            [[dont_unroll]] for (int kc = 0; kc < kcc; kc++) {
+                const int wi = wz + (((t * (cinp / 16) + c * kcc + kc) * NG + g) * 16 + 2 * lane) * 2;
                 float16_t w0[16], w1[16];
                 unpack16(wp[wi], wp[wi + 1], w0);
                 unpack16(wp[wi + 2], wp[wi + 3], w1);
                 [[unroll]] for (int r = 0; r < RPS; r++)
                     [[unroll]] for (int m = 0; m < 16; m++)
-                        fma_px(((row0 + r + dy) * (TW + 2) + m + dx) * (KP / 8) + kc * 2, w0, w1, acc0[r][m], acc1[r][m]);
+                        fma_px(halo_px(row0 + r, m, dy, dx) * kp8 + kc * 2, w0, w1, acc0[r][m], acc1[r][m]);
             }
             [[unroll]] for (int r = 0; r < RPS; r++) [[unroll]] for (int m = 0; m < 16; m++) {
                 tot0[r][m] += float(acc0[r][m]);

@@ -1,10 +1,10 @@
 #version 450
-// General 3x3 conv on VK_KHR_cooperative_matrix 16x16x16 with fp16 accumulate (cm16), for the
-// image networks (gconv_common.glsl). A workgroup computes TH x 16 output pixels for all COUTP
-// output channels; each subgroup WR rows of 16 pixels as an implicit GEMM over 9 taps x CINP, the
-// input tile in shared memory KCH channels at a time, the weights (row-major [9][CINP][COUTP])
-// from the buffer. The sum goes to the staging tile and through the writer's epilogue.
-// Defines: CINP, COUTP, IN, ACT, NRES, UP2, OUT, WARPS (subgroups), WR (rows per subgroup).
+// General 3x3 conv on VK_KHR_cooperative_matrix 16x16x16 with fp16 accumulate (cm16), for the image
+// and frame networks (gconv_common.glsl). A workgroup computes TH x 16 output pixels for all COUTP
+// output channels; each subgroup WR rows of 16 pixels as an implicit GEMM over 9 taps x cinp, the
+// input tile in shared memory a chunk at a time, the weights (row-major [9][cinp][COUTP]) from the
+// buffer. The sum goes to the staging tile and through the writer's epilogue.
+// Defines: COUTP, IN, ACT, NRES, UP2, STRIDE, OUT, KMAX, WARPS (subgroups), WR (rows per subgroup).
 // local_size_x (specialization constant 0) = WARPS * the subgroup size.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
@@ -19,7 +19,7 @@ layout(local_size_x_id = 0) in;
 const int TH = WARPS * WR;
 #include "gconv_common.glsl"
 
-layout(std430, binding = 3) readonly buffer Wt { uvec4 wt[]; };  // [9][CINP][COUTP]
+layout(std430, binding = 3) readonly buffer Wt { uvec4 wt[]; };  // [9][cinp][COUTP]
 
 #define ACC_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #define A_T coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -27,32 +27,34 @@ layout(std430, binding = 3) readonly buffer Wt { uvec4 wt[]; };  // [9][CINP][CO
 
 void main()
 {
-    const int KCC = KCH / 16, NT = COUTP / 16;
+    const int NT = COUTP / 16;
     const int tid = int(gl_LocalInvocationIndex), nth = int(gl_WorkGroupSize.x);
     const int sg = int(gl_SubgroupID);
     const int tx0 = int(gl_WorkGroupID.x) * TW, ty0 = int(gl_WorkGroupID.y) * TH;
-    const int H = prm(0), W = prm(1);
+    const int H = prm(0), W = prm(1), cinp = prm(13), kch = prm(17);
+    const int wz = zs() * (9 * cinp * COUTP / 8);  // this slice's weights (uvec4s)
+    const int nchunk = cinp / kch, kcc = kch / 16, kp8 = (kch + 8) / 8;
 
     ACC_T acc[WR][NT];
     [[unroll]] for (int i = 0; i < WR; i++)
         [[unroll]] for (int n = 0; n < NT; n++) acc[i][n] = ACC_T(0.0);
     const int row0 = sg * WR;
 
-    [[dont_unroll]] for (int ch = 0; ch < NCHUNK; ch++) {
+    [[dont_unroll]] for (int ch = 0; ch < nchunk; ch++) {
         if (ch > 0) barrier();  // the previous chunk is no longer read
-        fill_chunk(ch, tid, nth, tx0, ty0, H, W);
+        fill_chunk(ch, kch, tid, nth, tx0, ty0);
         barrier();
         [[dont_unroll]] for (int t = 0; t < 9; t++) {
             const int dy = t / 3, dx = t % 3;
-            [[unroll]] for (int kc = 0; kc < KCC; kc++) {
-                const int k0 = ch * KCH + kc * 16;
+            [[dont_unroll]] for (int kc = 0; kc < kcc; kc++) {
+                const int k0 = ch * kch + kc * 16;
                 B_T b[NT];
                 [[unroll]] for (int n = 0; n < NT; n++)
-                    coopMatLoad(b[n], wt, uint(((t * CINP + k0) * COUTP + n * 16) / 8), uint(COUTP / 8),
+                    coopMatLoad(b[n], wt, uint(wz + ((t * cinp + k0) * COUTP + n * 16) / 8), uint(COUTP / 8),
                                 gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (int i = 0; i < WR; i++) {
                     A_T a;
-                    coopMatLoad(a, sm, uint(((row0 + i + dy) * (TW + 2) + dx) * (KP / 8) + kc * 2), uint(KP / 8),
+                    coopMatLoad(a, sm, uint(halo_px(row0 + i, 0, dy, dx) * kp8 + kc * 2), uint(S * kp8),
                                 gl_CooperativeMatrixLayoutRowMajor);
                     [[unroll]] for (int n = 0; n < NT; n++) acc[i][n] = coopMatMulAdd(a, b[n], acc[i][n]);
                 }

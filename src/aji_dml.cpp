@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -67,6 +68,7 @@
 #include "native/onnx_graph.h"
 #include "vk/device.h"
 #include "vk/executor.h"
+#include "vk/rife.h"
 #endif
 
 using Microsoft::WRL::ComPtr;
@@ -294,6 +296,10 @@ struct aji_ctx {
         void *in_alloc = nullptr, *out_alloc = nullptr;
         ComPtr<ID3D12Resource> scd_part, scd_sum, scd_read;
         int scd_groups = 0;
+#ifdef AJI_VULKAN
+        std::unique_ptr<ajivk::Rife> vk;  // RIFE on Vulkan (no session): in/out tensors shared
+        ajivk::Buffer vk_in, vk_out;      // in_tensor / out_tensor imported
+#endif
     } rife;
 
     // Temporal (multi-frame) model steps, one stage per temporal model,
@@ -1486,14 +1492,12 @@ bool vk_model_open(aji_ctx *c, DmlModel *m, const std::string &onnx, const std::
     return false;
 }
 
-// One Vulkan model step, queued without a CPU wait: our queue signals the
-// handoff fence, Vulkan waits for it, runs the model straight from chain
-// buffer in_buf into the other one (bind_io at configure) and signals; our
-// queue waits for that before the next step.
-bool vk_run_model(aji_ctx *c, const DmlModel &m, int in_buf)
+// Vulkan work queued without a CPU wait: our queue signals the handoff fence,
+// Vulkan waits for it, runs what rec records (on shared buffers) and signals;
+// our queue waits for that before its next work.
+bool vk_submit(aji_ctx *c, const char *what, const std::function<bool(VkCommandBuffer)> &rec)
 {
     using namespace ajivk;
-    (void)in_buf;
     const uint64_t ready = ++c->vk_val, done = ++c->vk_val;
     if (FAILED(c->queue->Signal(c->vk_fence.Get(), ready))) {
         c->set_error("handoff fence signal failed");
@@ -1502,20 +1506,20 @@ bool vk_run_model(aji_ctx *c, const DmlModel &m, int in_buf)
     int slot = 0;
     VkCommandBuffer cb = c->vk->frame_begin(&slot);
     if (!cb) {
-        c->set_error("Vulkan model step: an earlier Vulkan submit has not finished after 10 s");
+        c->set_error("%s: an earlier Vulkan submit has not finished after 10 s", what);
         return false;
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    const bool ok = m.vk->record(cb, m.in_w, m.in_h);
+    const bool ok = rec(cb);
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     std::string why;
     if (!c->vk->frame_submit(slot, c->vk_sem, ready, done, &why) || !ok) {
-        c->set_error("Vulkan model step: %s", ok ? why.c_str() : "the executor refused the frame size");
+        c->set_error("%s: %s", what, ok ? why.c_str() : "the frame size was refused");
         return false;
     }
     if (FAILED(c->queue->Wait(c->vk_fence.Get(), done))) {
@@ -1523,6 +1527,55 @@ bool vk_run_model(aji_ctx *c, const DmlModel &m, int in_buf)
         return false;
     }
     return true;
+}
+
+// One Vulkan model step: from chain buffer in_buf into the other one (bind_io
+// at configure).
+bool vk_run_model(aji_ctx *c, const DmlModel &m, int in_buf)
+{
+    (void)in_buf;
+    return vk_submit(c, "Vulkan model step", [&](VkCommandBuffer cb) { return m.vk->record(cb, m.in_w, m.in_h); });
+}
+
+// RIFE on Vulkan at the padded size (unless native=off or the device can't
+// run it); logs either way. False: open it on DirectML.
+bool vk_rife_open(aji_ctx *c, const std::string &onnx, const std::string &name, int w, int h)
+{
+    if (!c->conf.native)
+        return false;
+    std::string why;
+    if (!c->vk) {
+        why = c->vk_why;
+    } else {
+        std::vector<char> bytes;
+        ajinative::OnnxGraph g;
+        if (!ajicore::read_file_bytes(onnx, &bytes)) {
+            why = "the model file can't be read";
+        } else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) {
+            c->rife.vk = ajivk::Rife::create(*c->vk, g, w, h, &why);
+            if (c->rife.vk) {
+                c->vk->save_caches();
+                c->log_steps.push_back("Native kernels: " + name + " (" + c->rife.vk->describe() + ")");
+                return true;
+            }
+        }
+    }
+    c->log_steps.push_back("Native kernels not used for " + name + ": " + why + "; using DirectML");
+    return false;
+}
+
+// A D3D12 buffer (made with D3D12_HEAP_FLAG_SHARED) imported into Vulkan.
+bool vk_import(aji_ctx *c, ID3D12Resource *res, uint64_t bytes, ajivk::Buffer *out)
+{
+    HANDLE h = NULL;
+    std::string why;
+    const bool ok = SUCCEEDED(c->dev->CreateSharedHandle(res, NULL, GENERIC_ALL, NULL, &h)) &&
+                    c->vk->import_d3d12_buffer(h, bytes, out, &why);
+    if (h)
+        CloseHandle(h);
+    if (!ok)
+        c->set_error("sharing a buffer with Vulkan failed: %s", why.empty() ? "CreateSharedHandle failed" : why.c_str());
+    return ok;
 }
 #endif
 
@@ -1583,6 +1636,14 @@ std::string rife_model_name(int code, bool ensemble)
 void rife_teardown(aji_ctx *c)
 {
     auto &R = c->rife;
+#ifdef AJI_VULKAN
+    // the device is idle (chain_teardown)
+    R.vk.reset();
+    if (c->vk) {
+        c->vk->destroy(R.vk_in);
+        c->vk->destroy(R.vk_out);
+    }
+#endif
     model_release(&R.model);
     if (R.in_alloc)
         g_dml_api->FreeGPUAllocation(R.in_alloc);
@@ -1619,8 +1680,19 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
         return false;
     }
     const std::string onnx = c->rife_model_dir + "\\" + model + ".onnx";
-    if (!model_open(c, &R.model, onnx, R.pw, R.ph, 11))
+#ifdef AJI_VULKAN
+    const bool on_vk = vk_rife_open(c, onnx, model, R.pw, R.ph);
+#else
+    const bool on_vk = false;
+#endif
+    if (on_vk) {
+        // the native kernels read and write fp16
+        R.model.fp16 = true;
+        R.model.in_w = R.model.out_w = R.pw;
+        R.model.in_h = R.model.out_h = R.ph;
+    } else if (!model_open(c, &R.model, onnx, R.pw, R.ph, 11)) {
         return false;
+    }
     if (R.model.out_w != R.pw || R.model.out_h != R.ph) {
         c->set_error("%s: output %dx%d does not match padded input %dx%d",
                      onnx.c_str(), R.model.out_w, R.model.out_h, R.pw, R.ph);
@@ -1629,17 +1701,27 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
 
     const size_t plane = (size_t)R.pw * R.ph;
     const size_t elem = R.model.fp16 ? 2 : 4;
-    R.in_tensor = make_buffer(c->dev.Get(), plane * 11 * elem, false);
-    R.out_tensor = make_buffer(c->dev.Get(), plane * 3 * elem, false);
+    const D3D12_HEAP_FLAGS hf = on_vk ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE;
+    R.in_tensor = make_buffer(c->dev.Get(), plane * 11 * elem, false, hf);
+    R.out_tensor = make_buffer(c->dev.Get(), plane * 3 * elem, false, hf);
     if (!R.in_tensor || !R.out_tensor) {
         c->set_error("rife tensor allocation failed");
         return false;
     }
-    if (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
+#ifdef AJI_VULKAN
+    if (on_vk) {
+        if (!vk_import(c, R.in_tensor.Get(), plane * 11 * elem, &R.vk_in) ||
+            !vk_import(c, R.out_tensor.Get(), plane * 3 * elem, &R.vk_out))
+            return false;
+        R.vk->bind_io(R.vk_in.buf, R.vk_out.buf);
+    }
+#endif
+    if (!on_vk && (!c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
                        R.in_tensor.Get(), &R.in_alloc), "rife in alloc") ||
         !c->ort_ck(g_dml_api->CreateGPUAllocationFromD3DResource(
-                       R.out_tensor.Get(), &R.out_alloc), "rife out alloc"))
+                       R.out_tensor.Get(), &R.out_alloc), "rife out alloc")))
         return false;
+    if (!on_vk) {
     R.model.in_val = make_tensor(c, R.in_alloc, plane * 11 * elem, 1, 11,
                                  R.ph, R.pw, R.model.fp16);
     R.model.out_val = make_tensor(c, R.out_alloc, plane * 3 * elem, 1, 3,
@@ -1653,6 +1735,7 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
                                      R.model.out_name.c_str(),
                                      R.model.out_val), "rife BindOutput"))
         return false;
+    }
 
     // scene-detect reduction buffers (unpadded luma)
     const int gx = (w + 31) / 32, gy = (h + 7) / 8;
@@ -1685,8 +1768,8 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     // warm the rebound command list once (the discovery runs used the
     // temporary binding), then drain the queue so the consts/warmup work
     // is done before any later segment recycles the command allocators
-    if (!c->ort_ck(g_ort->RunWithBinding(R.model.session, NULL,
-                                         R.model.binding), "rife warmup"))
+    if (!on_vk && !c->ort_ck(g_ort->RunWithBinding(R.model.session, NULL,
+                                                   R.model.binding), "rife warmup"))
         return false;
     drain_queue(c, 30000);
 
@@ -3579,6 +3662,12 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
     if (!r.exec())
         return AJI_ERR;
 
+#ifdef AJI_VULKAN
+    if (R.vk) {
+        if (!vk_submit(c, "Vulkan RIFE", [&](VkCommandBuffer cb) { R.vk->record(cb); return true; }))
+            return AJI_ERR_ENGINE;
+    } else
+#endif
     if (!c->ort_ck(g_ort->RunWithBinding(R.model.session, NULL,
                                          R.model.binding),
                    "rife RunWithBinding"))

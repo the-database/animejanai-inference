@@ -17,7 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
+
 #include <vector>
 
 #include "native/lower.h"
@@ -103,19 +103,13 @@ public:
 private:
     struct Conv1 {
         GConvShape s;
+        int cinp = 16;
         VkDeviceSize woff = 0, wsize = 0, boff = 0, bsize = 0;
     };
-    struct Op {
+    struct Op : GConvOp {
         int conv = 0;  // into convs_
         Ref src, dst, r1, r2;
-        GConvParams p;
-        int variant = 0;
-        VkPipeline pipe[kConvVariants] = {};
-        Dispatch disp[kConvVariants];
-        int nvar = 1;
-        VkDescriptorSet set = VK_NULL_HANDLE;
     };
-    void record_op(VkCommandBuffer cb, const Op &o, int entry, int v) const;
 
     Device &dev_;
     int scale_ = 4, nf = 64, gc = 32, nb = 0, DS = 0, w_ = 0, h_ = 0;
@@ -129,16 +123,6 @@ private:
     std::string what_;
 };
 
-void Esrgan::record_op(VkCommandBuffer cb, const Op &o, int entry, int v) const
-{
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, o.pipe[v]);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev_.pipeline_layout(), 0, 1, &o.set, 0, nullptr);
-    const int32_t pc[4] = {entry, 0, 0, 0};
-    vkCmdPushConstants(cb, dev_.pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
-    const Dispatch &d = o.disp[v];
-    vkCmdDispatch(cb, (uint32_t)((o.p.W + 15) / 16), (uint32_t)((o.p.H + d.tile_h - 1) / d.tile_h), 1);
-}
-
 bool Esrgan::record(VkCommandBuffer cb, int w, int h) const
 {
     if (w != w_ || h != h_) return false;
@@ -147,7 +131,7 @@ bool Esrgan::record(VkCommandBuffer cb, int w, int h) const
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     for (size_t i = 0; i < ops_.size(); i++) {
         if (i) vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-        record_op(cb, ops_[i], (int)i, ops_[i].variant);
+        gconv_record(dev_, cb, ops_[i], ops_[i].variant);
     }
     return true;
 }
@@ -193,15 +177,16 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
     // weights, packed for the family, into one buffer (each conv's at an aligned offset)
     std::vector<uint16_t> wall, ball;
     const VkDeviceSize align = std::max<VkDeviceSize>(dev.info().storage_align, 16);
-    const auto add_conv = [&](const Conv &c, float scale, const GConvShape &s) -> int {
+    const auto add_conv = [&](const Conv &c, float scale, int cinp, const GConvShape &s) -> int {
         std::vector<float> sc(c.cout, scale);
         const std::vector<uint16_t> taps = conv_taps(c, scale == 1.f ? nullptr : &sc);
-        const std::vector<uint16_t> pw = gconv_pack(fam, taps.data(), c.cin, s, c.cout);
+        const std::vector<uint16_t> pw = gconv_pack(fam, taps.data(), c.cin, cinp, c.cout, 0, s.coutp);
         std::vector<float> b(c.cout);
         for (int o = 0; o < c.cout; o++) b[o] = c.b[o] * scale;
         const std::vector<uint16_t> pb = pack_vector(b.data(), c.cout, s.coutp);
         Conv1 cv;
         cv.s = s;
+        cv.cinp = cinp;
         const size_t aw = align / 2;
         wall.resize((wall.size() + aw - 1) / aw * aw);
         cv.woff = wall.size() * 2;
@@ -214,9 +199,8 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
         e->convs_.push_back(cv);
         return (int)e->convs_.size() - 1;
     };
-    const auto shape = [](int cinp, int coutp, int in, int act, int nres, int up2, int out) {
+    const auto shape = [](int coutp, int in, int act, int nres, int up2, int out) {
         GConvShape s;
-        s.cinp = cinp;
         s.coutp = coutp;
         s.in = in;
         s.act = act;
@@ -225,7 +209,7 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
         s.out = out;
         return s;
     };
-    const int i_first = add_conv(c0, 1.f, shape(16, 64, e->unshuffle_ ? 2 : 1, 0, 0, 0, 0));
+    const int i_first = add_conv(c0, 1.f, 16, shape(64, e->unshuffle_ ? 2 : 1, 0, 0, 0, 0));
     std::vector<int> i_dense;
     for (int i = 0; i < nb; i++)
         for (int r = 1; r <= 3; r++) {
@@ -235,12 +219,12 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
                 if (!rd.conv(pre + "conv" + std::to_string(k) + "/conv" + std::to_string(k) + ".0/Conv", &c, why)) return nullptr;
                 if (c.cin != e->nf + (k - 1) * e->gc || c.cout != e->gc || c.stride != 1 || !c.lrelu)
                     return refuse_(why, pre + ": dense conv shape"), nullptr;
-                i_dense.push_back(add_conv(c, 1.f, shape(c.cin, 32, 0, 2, 0, 0, 0)));
+                i_dense.push_back(add_conv(c, 1.f, c.cin, shape(32, 0, 2, 0, 0, 0)));
             }
             Conv c5;
             if (!rd.conv(c5name(pre), &c5, why)) return nullptr;
             if (c5.cin != e->DS || c5.cout != e->nf || c5.lrelu) return refuse_(why, pre + ": last conv shape"), nullptr;
-            i_dense.push_back(add_conv(c5, r == 3 ? e->rrdb_scale_ : 1.f, shape(e->DS, 64, 0, 0, r == 3 ? 2 : 1, 0, 0)));
+            i_dense.push_back(add_conv(c5, r == 3 ? e->rrdb_scale_ : 1.f, e->DS, shape(64, 0, 0, r == 3 ? 2 : 1, 0, 0)));
         }
     Conv cb, cu1, cu2, chr, cl;
     if (!rd.conv("/model/model.1/sub/sub." + std::to_string(nb) + "/Conv", &cb, why) || !rd.conv("/model/model.3/Conv", &cu1, why) ||
@@ -249,11 +233,11 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
     if (cb.cin != e->nf || cb.cout != e->nf || cb.lrelu || !cu1.lrelu || !cu2.lrelu || !chr.lrelu || cl.lrelu || cl.cout != 3 ||
         cu1.cin != e->nf || cu2.cin != e->nf || chr.cin != e->nf || cl.cin != e->nf)
         return refuse_(why, "ESRGAN upsampler shape"), nullptr;
-    const int i_body = add_conv(cb, 1.f, shape(64, 64, 0, 0, 1, 0, 0));
-    const int i_up1 = add_conv(cu1, 1.f, shape(64, 64, 0, 2, 0, 1, 0));
-    const int i_up2 = add_conv(cu2, 1.f, shape(64, 64, 0, 2, 0, 1, 0));
-    const int i_hr = add_conv(chr, 1.f, shape(64, 64, 0, 2, 0, 0, 0));
-    const int i_last = add_conv(cl, 1.f, shape(64, 16, 0, 0, 0, 0, 3));
+    const int i_body = add_conv(cb, 1.f, 64, shape(64, 0, 0, 1, 0, 0));
+    const int i_up1 = add_conv(cu1, 1.f, 64, shape(64, 0, 2, 0, 1, 0));
+    const int i_up2 = add_conv(cu2, 1.f, 64, shape(64, 0, 2, 0, 1, 0));
+    const int i_hr = add_conv(chr, 1.f, 64, shape(64, 0, 2, 0, 0, 0));
+    const int i_last = add_conv(cl, 1.f, 64, shape(16, 0, 0, 0, 0, 3));
 
     // buffers: the tile in and out (owned), the intermediates in the arena
     const VkDeviceSize px = (VkDeviceSize)bw * bh;
@@ -290,6 +274,8 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
     const auto op = [&](int conv, Ref src, int soff, int sstride, Ref dst, int doff, int dstride, int H, int W) {
         Op o;
         o.conv = conv;
+        o.s = e->convs_[conv].s;
+        o.entry = (int)e->ops_.size();
         o.src = src;
         o.dst = dst;
         o.p.H = H;
@@ -298,6 +284,9 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
         o.p.src_stride = sstride;
         o.p.dst_off = doff;
         o.p.dst_stride = dstride;
+        o.p.cinp = e->convs_[conv].cinp;
+        o.p.IH = H;  // stride 1: the input is the conv's size (the upsampled one, with UP2)
+        o.p.IW = W;
         e->ops_.push_back(o);
         return &e->ops_.back();
     };
@@ -330,7 +319,11 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
     op(i_hr, P, 0, e->nf, Q, 0, e->nf, 4 * bh, 4 * bw);
     op(i_last, Q, 0, e->nf, TILE_OUT, 0, 0, 4 * bh, 4 * bw);
 
-    // parameters, descriptor sets, pipelines
+    // each op's modules (and its halo chunk), then parameters, descriptor sets, pipelines
+    for (Op &o : e->ops_) {
+        std::string w2;
+        if (!gconv_prepare(dev, &o, &w2)) return refuse_(why, "kernel: " + w2), nullptr;
+    }
     std::vector<GConvParams> prm;
     for (const Op &o : e->ops_) prm.push_back(o.p);
     if (!dev.make_buffer(&e->params_, prm.size() * sizeof(GConvParams), false, why) ||
@@ -375,67 +368,9 @@ std::unique_ptr<ImgNet> Esrgan::build(Device &dev, const ajinative::OnnxGraph &g
     }
 
     // tile variants: fixed (AJI_VK_VARIANT), stored, or timed once per distinct (module, size)
-    const char *fix = std::getenv("AJI_VK_VARIANT");
-    const bool can_time = dev.info().timestamp_ns > 0;
-    std::map<std::string, int> picked;
-    VkQueryPool qp = VK_NULL_HANDLE;
-    if (can_time && !fix) {
-        VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-        qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qpi.queryCount = 2 * kConvVariants;
-        vkCreateQueryPool(dev.device(), &qpi, nullptr, &qp);
-    }
-    for (size_t i = 0; i < e->ops_.size(); i++) {
-        Op &o = e->ops_[i];
-        const GConvShape &s = e->convs_[o.conv].s;
-        o.nvar = 0;
-        for (int v = 0; v < kConvVariants; v++) {
-            std::string w2;
-            if (!gconv_dispatch(dev, s, v, &o.disp[v], &w2)) {
-                if (v == 0) return refuse_(why, "kernel: " + w2), nullptr;
-                break;
-            }
-            o.nvar = v + 1;
-        }
-        const std::string key = "g3:" + o.disp[0].module + ":" + std::to_string(o.p.W) + "x" + std::to_string(o.p.H);
-        int v = fix ? std::min(std::max(std::atoi(fix), 0), o.nvar - 1) : -1;
-        if (v < 0) {
-            auto it = picked.find(key);
-            if (it != picked.end()) v = it->second;
-            else if ((v = dev.cached_variant(key)) >= o.nvar) v = -1;
-        }
-        const int lo = v >= 0 ? v : 0, hi = v >= 0 ? v + 1 : o.nvar;
-        for (int k = lo; k < hi; k++) {
-            o.pipe[k] = dev.pipeline(o.disp[k].module.c_str(), o.disp[k].local_size, o.disp[k].subgroup, why);
-            if (!o.pipe[k]) return nullptr;
-        }
-        if (v < 0) {
-            v = 0;
-            if (qp && o.nvar > 1) {
-                double best = -1;
-                for (int k = 0; k < o.nvar; k++) {
-                    VkCommandBuffer cb = dev.begin();
-                    vkCmdResetQueryPool(cb, qp, 0, 2);
-                    e->record_op(cb, o, (int)i, k);  // warm-up
-                    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
-                    for (int r = 0; r < 3; r++) e->record_op(cb, o, (int)i, k);
-                    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
-                    if (!dev.submit_wait(cb, why)) return nullptr;
-                    uint64_t t[2];
-                    vkGetQueryPoolResults(dev.device(), qp, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-                    const double ms = (double)(t[1] - t[0]);
-                    if (best < 0 || ms < best) {
-                        best = ms;
-                        v = k;
-                    }
-                }
-            }
-            dev.store_variant(key, v);
-        }
-        picked[key] = v;
-        o.variant = v;
-    }
-    if (qp) vkDestroyQueryPool(dev.device(), qp, nullptr);
+    std::vector<GConvOp *> gops;
+    for (Op &o : e->ops_) gops.push_back(&o);
+    if (!gconv_choose(dev, gops, why)) return nullptr;
     char buf[160];
     std::snprintf(buf, sizeof buf, "ESRGAN %dx, %d RRDB, %d features, growth %d; Vulkan %s", e->scale_, nb, e->nf, e->gc, family_name(fam));
     e->what_ = buf;

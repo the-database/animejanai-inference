@@ -112,7 +112,7 @@ endif()
 # the CUDA backends, and on its own (aji_native_host) for the CPU tests and the builds without
 # CUDA.
 set(AJI_NATIVE_HOST_SOURCES src/native/onnx_graph.cpp src/native/lower.cpp
-    src/native/layout.cpp src/native/pack.cpp)
+    src/native/layout.cpp src/native/pack.cpp src/native/rife_plan.cpp)
 add_library(aji_native_host OBJECT ${AJI_NATIVE_HOST_SOURCES})
 target_include_directories(aji_native_host PRIVATE src)
 set_target_properties(aji_native_host PROPERTIES
@@ -525,7 +525,7 @@ if(AJI_VULKAN)
                             "-DAJI_VK_INCLUDE=<dir containing vulkan/vulkan_core.h>")
     endif()
     add_library(aji_vk_core OBJECT src/vk/vk.cpp src/vk/device.cpp src/vk/kernels.cpp src/vk/executor.cpp
-                src/vk/gconv.cpp src/vk/esrgan.cpp src/vk/frame.cpp src/core/fileio.cpp)
+                src/vk/gconv.cpp src/vk/esrgan.cpp src/vk/rife.cpp src/vk/frame.cpp src/core/fileio.cpp)
     target_include_directories(aji_vk_core PRIVATE src include)
     target_include_directories(aji_vk_core SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
     set_target_properties(aji_vk_core PROPERTIES
@@ -561,6 +561,14 @@ if(AJI_VULKAN)
     if(UNIX)
         find_package(Threads REQUIRED)
         target_link_libraries(aji_vk_conv_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+    endif()
+    # The general conv's modes (ESRGAN, RIFE) against a CPU reference (ctest -L gpu)
+    add_executable(aji_vk_gconv_test sanity/vk_gconv_test.cpp $<TARGET_OBJECTS:aji_vk_core>
+                   $<TARGET_OBJECTS:aji_vk_shaders> $<TARGET_OBJECTS:aji_native_host>)
+    target_include_directories(aji_vk_gconv_test PRIVATE src)
+    target_include_directories(aji_vk_gconv_test SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
+    if(UNIX)
+        target_link_libraries(aji_vk_gconv_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
     endif()
 
     if(WIN32)
@@ -631,4 +639,6 @@ if(AJI_VULKAN)
     # any Vulkan GPU with a kernel family (skips without one)
     add_test(NAME aji_vk_conv_test COMMAND aji_vk_conv_test)
     set_tests_properties(aji_vk_conv_test PROPERTIES LABELS gpu)
+    add_test(NAME aji_vk_gconv_test COMMAND aji_vk_gconv_test)
+    set_tests_properties(aji_vk_gconv_test PROPERTIES LABELS gpu)
 endif()
