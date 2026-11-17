@@ -253,18 +253,10 @@ std::unique_ptr<ImgNet> VkFdat::build(Device &dev, const ajinative::OnnxGraph &g
                 const long long wg = (long long)nwx * nwy * heads * nqb;
                 a.v[36] = (int32_t)wg;
                 a.v[37] = nqb;
+                a.v[42] = -1;  // the bias is the full table at 32, not a relative-position one
                 const uint32_t gx = (uint32_t)std::min<long long>(wg, 65535), gy = (uint32_t)((wg + gx - 1) / gx);
                 n.pass(5, a, gx, gy, "winattn");
-                TArgs cg;
-                cg.v[16] = (int32_t)(SUMS / 4);
-                cg.v[17] = M;
-                cg.v[18] = C;
-                cg.v[19] = B.cgr;
-                cg.v[20] = n.add_wf(b.cg1);
-                cg.v[21] = n.add_wf(b.cg2);
-                cg.v[22] = (int32_t)(CM / 4);
-                cg.v[23] = CP;
-                n.pass(10, cg, 1, 1, "aimcg");
+                n.chan_gate(SUMS, M, C, B.cgr, n.add_wf(b.cg1), -1, n.add_wf(b.cg2), -1, false, 1.f, CM, CP);
                 n.gemm(hm(AT, CP), M, n.add_mat(b.wp, b.bp, C, C), hm(X, CP), 0, false, (int)(CM / 4), hm(CF, CP), hm(X, CP));
             } else {
                 TArgs cs;

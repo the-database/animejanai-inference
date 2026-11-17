@@ -19,7 +19,8 @@ bool fail(std::string *why, const std::string &m)
     return false;
 }
 
-const char *kPassName[] = {"", "gemm", "ln", "dw", "colsum", "winattn", "chanstats", "chanreduce", "chansoft", "chanfold", "aimcg", "aimsg"};
+const char *kPassName[] = {"",          "gemm",     "ln",      "dw",     "colsum",  "winattn", "chanstats", "chanreduce",
+                           "chansoft",  "chanfold", "aimcg",   "aimsg",  "imgin",   "colsum2", "convert",    "imgout"};
 
 void full_barrier(VkCommandBuffer cb)
 {
@@ -112,6 +113,117 @@ TNet::Mat TNet::add_mat(const std::vector<float> &w, const std::vector<float> &b
     return m;
 }
 
+TNet::Mat TNet::add_conv_mat(const std::vector<uint16_t> &taps, const std::vector<float> &bias, int cin, int cinp, int cout)
+{
+    Mat m;
+    m.K = m.Kp = 9 * cinp;
+    m.N = cout;
+    m.Np = pad16i(cout);
+    std::vector<uint16_t> h((size_t)m.Kp * m.Np, 0);
+    for (int t = 0; t < 9; t++)
+        for (int i = 0; i < cin; i++)
+            for (int o = 0; o < cout; o++) h[((size_t)t * cinp + i) * m.Np + o] = taps[((size_t)t * cin + i) * cout + o];
+    m.w = add_wh(h);
+    std::vector<float> b(m.Np, 0.f);
+    std::copy(bias.begin(), bias.end(), b.begin());
+    m.bias = add_wf(b);
+    return m;
+}
+
+void TNet::conv_gemm(const TMap &in, int H, int W, int cinp, const Mat &w, const TMap &out, const TMap &add1)
+{
+    TArgs t;
+    t.map(0, in);
+    t.map(1, out);
+    t.map(2, add1);
+    const int M = H * W;
+    t.v[16] = M;
+    t.v[17] = w.Kp;
+    t.v[18] = w.Np;
+    t.v[21] = w.w;
+    t.v[22] = w.bias;
+    t.f(28, 0.2f);
+    t.v[29] = -1;
+    t.v[30] = -1;
+    t.v[31] = 1;
+    t.v[32] = H;
+    t.v[33] = W;
+    t.v[34] = cinp;
+    char lb[64];
+    std::snprintf(lb, sizeof lb, "gemm conv %dx%d", w.Kp, w.Np);
+    pass(1, t, (uint32_t)((w.Np + 63) / 64), (uint32_t)((M + 63) / 64), lb);
+}
+
+void TNet::imgin(const TMap &out, int h, int w, int ph, int pw, const float mean[3])
+{
+    TArgs t;
+    t.map(0, out);
+    t.v[16] = h;
+    t.v[17] = w;
+    for (int c = 0; c < 3; c++) t.f(18 + c, mean[c]);
+    t.v[21] = ph;
+    t.v[22] = pw;
+    pass_threads(12, t, (long long)ph * pw, "imgin");
+}
+
+void TNet::imgout(const TMap &in, int h, int w, int mw)
+{
+    TArgs t;
+    t.map(0, in);
+    t.v[16] = h;
+    t.v[17] = w;
+    t.v[18] = mw;
+    pass_threads(15, t, (long long)h * w, "imgout");
+}
+
+void TNet::colsums(const TMap &in, int M, int C, VkDeviceSize sums)
+{
+    const int tpc = 256, chunks = (M + tpc - 1) / tpc;
+    const int po = add_part((size_t)chunks * C);
+    TArgs t;
+    t.map(0, in);
+    t.v[16] = M;
+    t.v[17] = C;
+    t.v[18] = tpc;
+    t.v[19] = po;
+    pass(13, t, (uint32_t)((C + 255) / 256), (uint32_t)chunks, "colsum2");
+    TArgs r;
+    r.v[16] = C;
+    r.v[17] = chunks;
+    r.v[18] = po;
+    r.v[19] = (int32_t)(sums / 4);
+    pass_threads(4, r, C, "colsum");
+}
+
+void TNet::convert(const TMap &in, const TMap &out, int M, int n)
+{
+    TArgs t;
+    t.map(0, in);
+    t.map(1, out);
+    t.v[16] = M;
+    t.v[17] = n;
+    pass_threads(14, t, (long long)M * n, "convert");
+}
+
+void TNet::chan_gate(VkDeviceSize sums, int M, int C, int r, int w1, int b1, int w2, int b2, bool relu, float in_scale, VkDeviceSize cm,
+                     int cpad)
+{
+    TArgs t;
+    t.v[16] = (int32_t)(sums / 4);
+    t.v[17] = M;
+    t.v[18] = C;
+    t.v[19] = r;
+    t.v[20] = w1;
+    t.v[21] = w2;
+    t.v[22] = (int32_t)(cm / 4);
+    t.v[23] = cpad;
+    t.v[24] = b1;
+    t.v[25] = b2;
+    t.v[26] = relu ? 1 : 0;
+    t.f(27, in_scale);
+    pass(10, t, 1, 1, "chan_gate");
+}
+
 void TNet::conv(const std::vector<uint16_t> &taps, const std::vector<float> &bias, int cin, int cout, const ConvIO &io,
                 std::initializer_list<int> widths, const void *key)
 {
@@ -142,6 +254,7 @@ void TNet::conv(const std::vector<uint16_t> &taps, const std::vector<float> &bia
     o.s.coutp = coutp;
     o.s.in = io.in;
     o.s.act = io.act;
+    o.p.slope = io.slope;
     o.s.nres = io.nres;
     o.s.stride = io.stride;
     o.s.out = io.out;
@@ -220,7 +333,7 @@ void TNet::zero(VkDeviceSize off, VkDeviceSize bytes)
 }
 
 void TNet::gemm(const TMap &a, int M, const Mat &w, const TMap &out, int act, bool act_last, int colscale, const TMap &add1,
-                const TMap &add2, float slope)
+                const TMap &add2, float slope, int add2scale)
 {
     TArgs t;
     t.map(0, a);
@@ -236,7 +349,7 @@ void TNet::gemm(const TMap &a, int M, const Mat &w, const TMap &out, int act, bo
     t.v[22] = w.bias;
     t.f(28, slope);
     t.v[29] = colscale;
-    t.v[30] = -1;
+    t.v[30] = add2scale;
     char lb[64];
     std::snprintf(lb, sizeof lb, "gemm %dx%d", w.Kp, w.Np);
     pass(1, t, (uint32_t)((w.Np + 63) / 64), (uint32_t)((M + 63) / 64), lb);
@@ -312,7 +425,9 @@ void TNet::step_sets(VkBuffer in, VkBuffer out)
             bi[4] = {gbb_.buf, w.boff, w.bsize};
             bi[7] = {gprm_.buf, 0, VK_WHOLE_SIZE};
         } else {
+            bi[0] = {in, 0, VK_WHOLE_SIZE};  // imgin reads the network input
             bi[2] = {arena_.buf, 0, VK_WHOLE_SIZE};
+            bi[3] = {out, 0, VK_WHOLE_SIZE};  // imgout writes the output
             bi[4] = {wfb_.buf, 0, VK_WHOLE_SIZE};
             bi[5] = {whb_.buf, 0, VK_WHOLE_SIZE};
             bi[6] = {partb_.buf, 0, VK_WHOLE_SIZE};

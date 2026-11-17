@@ -4,7 +4,7 @@
  * (aji_vk's model steps), the counterpart of native/framenet.h. create() recognises ESRGAN
  * (RRDBNet, as traiNNer/chaiNNer export it, with or without the 2x pixel-unshuffle; vk/esrgan.cpp,
  * on the general conv), FDAT (vk/fdat.cpp, on tfm.comp) and otherwise lowers the graph to the conv nets the video path runs (SPAN,
- * SPANF3, Compact; on vk/executor.h). Input and output are buffers it owns, NCHW fp16 RGB at the
+ * SPANF3, Compact; on vk/executor.h). HAT (vk/hat.cpp) is tried after FDAT. Input and output are buffers it owns, NCHW fp16 RGB at the
  * input size and at scale times it, until bind_io points it at the caller's.
  */
 #ifndef AJI_VK_IMGNET_H
@@ -64,6 +64,8 @@ public:
 std::unique_ptr<ImgNet> build_esrgan(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why);
 // FDAT (vk/fdat.cpp) the same way ("not an FDAT graph").
 std::unique_ptr<ImgNet> build_fdat(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why);
+// HAT (vk/hat.cpp; "not a HAT graph"). Any size: the input is reflect-padded to its windows.
+std::unique_ptr<ImgNet> build_hat(Device &dev, const ajinative::OnnxGraph &g, int w, int h, std::string *why);
 
 }  // namespace ajivk
 
