@@ -147,25 +147,27 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
 
 extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
 {
-    (void)c;
-    return 0;
+    AJI_VKV(0)
+    return c->v->temporal_radius();
 }
 
 extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in, uint64_t seq, void *cu_stream)
 {
-    (void)c, (void)in, (void)seq, (void)cu_stream;
-    return AJI_ERR;
+    (void)cu_stream;
+    AJI_VKV(AJI_ERR)
+    return c->v->ingest(in, seq);
 }
 
 extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq, const aji_frame *out, void *cu_stream)
 {
-    (void)c, (void)seq, (void)out, (void)cu_stream;
-    return AJI_ERR;
+    (void)cu_stream;
+    AJI_VKV(AJI_ERR)
+    return c->v->infer_seq(seq, out);
 }
 
 extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
 {
-    (void)c;
+    if (c && c->v) c->v->temporal_reset();
 }
 
 extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a, const aji_frame *b, aji_frame_diff_result *out, void *cu_stream)

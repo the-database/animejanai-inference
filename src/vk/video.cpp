@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "core/fileio.h"
@@ -12,6 +13,8 @@
 #include "onnx_shape.h"
 
 namespace ajivk {
+
+constexpr int AJI_TEMPORAL_MAX_FRAMES = 15;  // kernels.h's AJI_TEMPORAL_MAX (the gather's 3 x 6 slots of 5 bits)
 
 namespace {
 
@@ -459,6 +462,7 @@ void VkVideo::teardown()
 {
     if (dev_ && ticket_) wait(ticket_);
     rife_teardown();
+    temporal_teardown();
     io_.reset();
     steps_.clear();
     for (Buffer &b : chain_) dev_->destroy(b);
@@ -521,7 +525,8 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
         AjiOnnxInput oin;
         int t = aji_onnx_input(bytes.data(), bytes.size(), &oin) ? aji_onnx_temporal_frames(oin) : 1;
         if (m.frames > 0) t = m.frames;
-        if (t > 1) return passthrough(m.name + ": temporal models are not on Vulkan frames yet: passthrough");
+        if (t > 1 && (t % 2 == 0 || t > AJI_TEMPORAL_MAX_FRAMES))
+            return passthrough(m.name + ": temporal models need an odd frame count up to 15: passthrough");
         // resizes before upscale: the factor, then the height (fitted to 16:9), as aji_dml.cpp's
         const auto resize_to = [&](int nw, int nh, const char *what) {
             Step r;
@@ -549,6 +554,51 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
         }
         std::string why;
         ajinative::OnnxGraph g;
+        if (t > 1) {
+            // opened at the input padded to 32 (the exported graphs' alignment), the output cropped
+            const int bw = (cw + 31) / 32 * 32, bh = (ch + 31) / 32 * 32;
+            std::unique_ptr<TemporalNet> tn;
+            if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) tn = TemporalNet::create(*dev_, g, bw, bh, &why);
+            if (tn && tn->frames() != t) {
+                why = "the graph's window is not the model input's";
+                tn.reset();
+            }
+            if (!tn)
+                return passthrough("Native kernels not used for " + m.name + ": " + why + "; Vulkan frames have no DirectML to fall back to: passthrough");
+            log_steps_.push_back("Native kernels: " + m.name + " (" + tn->describe() + ")");
+            Stage T;
+            T.t = t;
+            T.r = (t - 1) / 2;
+            T.step = steps_.size();
+            T.w = cw;
+            T.h = ch;
+            T.pw = bw;
+            T.ph = bh;
+            T.pow = bw * tn->scale();
+            T.poh = bh * tn->scale();
+            T.ow = cw * tn->scale();
+            T.oh = ch * tn->scale();
+            T.threshold = (float)m.temporal_scene_threshold;
+            Step s;
+            s.in_w = cw;
+            s.in_h = ch;
+            s.out_w = T.ow;
+            s.out_h = T.oh;
+            s.tnet = std::move(tn);
+            s.stage = (int)stages_.size();
+            cw = T.ow;
+            ch = T.oh;
+            char buf[256];
+            if (T.threshold > 0)
+                std::snprintf(buf, sizeof buf, "Applied Temporal Model: %s (%d frames, scene threshold %g);    New Video Resolution: %dx%d",
+                              m.name.c_str(), t, T.threshold, cw, ch);
+            else
+                std::snprintf(buf, sizeof buf, "Applied Temporal Model: %s (%d frames);    New Video Resolution: %dx%d", m.name.c_str(), t, cw, ch);
+            log_steps_.push_back(buf);
+            stages_.push_back(std::move(T));
+            steps_.push_back(std::move(s));
+            continue;
+        }
         std::unique_ptr<ImgNet> net;
         if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) {
             ajinative::Plan plan;
@@ -612,11 +662,18 @@ int VkVideo::configure(int w, int h, double fps, int *out_w, int *out_h)
         Step &s = steps_[k];
         if (s.net) {
             s.net->bind_io(chain_[k % 2].buf, chain_[(k + 1) % 2].buf);
+        } else if (s.tnet) {
+            // its own input (the gathered window) and output (cropped into chain_[(k + 1) % 2])
         } else if (!(s.rs = RgbResize::create(*dev_, s.in_w, s.in_h, s.out_w, s.out_h, chain_[k % 2].buf, chain_[(k + 1) % 2].buf, &why))) {
             fail("resize %dx%d -> %dx%d: %s", s.in_w, s.in_h, s.out_w, s.out_h, why.c_str());
             teardown();
             return AJI_ERR;
         }
+    }
+    if (!stages_.empty() && !temporal_setup(&why)) {
+        fail("temporal setup: %s", why.c_str());
+        teardown();
+        return AJI_ERR;
     }
     dev_->save_caches();
     active_ = true;
@@ -632,6 +689,10 @@ int VkVideo::infer(const aji_frame *in, const aji_frame *out)
 {
     if (!active_) {
         fail("aji_infer: no chain is configured");
+        return AJI_ERR;
+    }
+    if (!stages_.empty()) {
+        fail("aji_infer: the chain has a temporal model: drive it with aji_ingest + aji_infer_seq");
         return AJI_ERR;
     }
     if (!in || !out || !in->plane[0] || !out->plane[0]) {
@@ -734,6 +795,476 @@ int VkVideo::infer(const aji_frame *in, const aji_frame *out)
     ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
     ii->queue_family = dev_->queue_family();
+    oi->value += 1;
+    oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    oi->queue_family = dev_->queue_family();
+    return AJI_OK;
+}
+
+// ---- temporal models ----------------------------------------------------------------------------
+
+namespace {
+
+struct KArgs {
+    int32_t di[4], dj[4];
+    float kr, kb, yoff, yscale, coff, cscale, qdiv, qmax;
+};
+
+void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkAccessFlags sa, VkPipelineStageFlags dst, VkAccessFlags da)
+{
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = sa;
+    mb.dstAccessMask = da;
+    vkCmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
+constexpr VkPipelineStageFlags kCT = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+constexpr VkAccessFlags kRW = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+
+// everything before (this and earlier submits) visible to everything after
+void full_barrier(VkCommandBuffer cb)
+{
+    mem_barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, kCT, kRW);
+}
+
+void step_barrier(VkCommandBuffer cb) { mem_barrier(cb, kCT, kRW, kCT, kRW); }
+
+// an image's planes into a FrameIO's input buffers, or its output buffers into an image
+void copy_planes(VkCommandBuffer cb, aji_vk_image *im, VkBuffer y, VkBuffer uv, uint32_t pitch, int w, int h, uint32_t bps, bool in)
+{
+    VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    ib.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    ib.dstAccessMask = in ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+    ib.oldLayout = in ? static_cast<VkImageLayout>(im->layout) : VK_IMAGE_LAYOUT_UNDEFINED;  // the output is replaced
+    ib.newLayout = in ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.image = static_cast<VkImage>(im->image);
+    ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
+    VkBufferImageCopy r[2] = {};
+    r[0].bufferRowLength = pitch / bps;
+    r[0].imageSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1};
+    r[0].imageExtent = {(uint32_t)w, (uint32_t)h, 1};
+    r[1].bufferRowLength = pitch / (2 * bps);
+    r[1].imageSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1};
+    r[1].imageExtent = {(uint32_t)w / 2, (uint32_t)h / 2, 1};
+    const VkImage img = static_cast<VkImage>(im->image);
+    if (in) {
+        vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, y, 1, &r[0]);
+        vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, uv, 1, &r[1]);
+    } else {
+        vkCmdCopyBufferToImage(cb, y, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r[0]);
+        vkCmdCopyBufferToImage(cb, uv, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r[1]);
+    }
+}
+
+}  // namespace
+
+void VkVideo::temporal_teardown()
+{
+    io_pre_.reset();
+    for (Stage &T : stages_)
+        for (Buffer *b : {&T.ring, &T.diff, &T.part}) dev_->destroy(*b);
+    stages_.clear();
+    if (tpool_) vkDestroyDescriptorPool(dev_->device(), tpool_, nullptr);
+    tpool_ = VK_NULL_HANDLE;
+    dev_->destroy(tparams_);
+    temporal_r_ = 0;
+}
+
+// The rings, metrics, parameter entries and descriptor sets of the configured temporal steps.
+bool VkVideo::temporal_setup(std::string *why)
+{
+    temporal_r_ = 0;
+    for (const Stage &T : stages_) temporal_r_ += T.r;
+    if (2 * temporal_r_ + 5 > 32) return *why = "the temporal models' combined window is too large (ring slots are 5 bits)", false;
+    static const bool fcache = !getenv("AJI_NATIVE_FRAME_CACHE") || std::strcmp(getenv("AJI_NATIVE_FRAME_CACHE"), "off") != 0;
+    for (size_t lv = 0; lv < stages_.size(); lv++) {
+        Stage &T = stages_[lv];
+        TemporalNet &net = *steps_[T.step].tnet;
+        // stage 0 keeps the last 2R+5 ingested (callers ingest up to R+4 ahead); later stages
+        // are filled on demand and need only their window
+        T.nslots = lv == 0 ? 2 * temporal_r_ + 5 : T.t + 4;
+        T.part_groups = ((T.w + 31) / 32) * ((T.h + 7) / 8);
+        T.seq.assign(T.nslots, -1);
+        T.format.assign(T.nslots, 0);
+        T.matrix.assign(T.nslots, 0);
+        T.range.assign(T.nslots, 0);
+        if (!dev_->make_buffer(&T.ring, (VkDeviceSize)T.nslots * 3 * T.w * T.h * 2, false, why) ||
+            !dev_->make_buffer(&T.diff, (VkDeviceSize)T.nslots * 4, false, why) ||
+            !dev_->make_buffer(&T.part, (VkDeviceSize)T.part_groups * 4, false, why))
+            return false;
+        if (fcache && net.cache_entries() >= T.t) {
+            net.bind_diff(T.diff.buf);
+            T.cache = true;
+            T.gen.assign(T.nslots, 0);
+            T.cgen.assign(net.cache_entries(), 0);
+        }
+    }
+    const char *mods[3] = {"fr_tdiff", "fr_scd2", "fr_tgather"};
+    for (int k = 0; k < 3; k++)
+        if (!(tpipes_[k] = dev_->pipeline(mods[k], 0, 0, why))) return false;
+    if (!dev_->make_buffer(&tparams_, (VkDeviceSize)stages_.size() * 3 * sizeof(KArgs), false, why)) return false;
+    const uint32_t nsets = (uint32_t)stages_.size() * 3;
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nsets * Device::kBindings};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = nsets;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(dev_->device(), &pi, nullptr, &tpool_) != VK_SUCCESS) return *why = "descriptor pool", false;
+    for (Stage &T : stages_) {
+        const VkBuffer d[3][3] = {{T.ring.buf, VK_NULL_HANDLE, T.part.buf},
+                                  {T.part.buf, T.diff.buf, VK_NULL_HANDLE},
+                                  {T.ring.buf, T.diff.buf, steps_[T.step].tnet->input().buf}};
+        for (int k = 0; k < 3; k++) {
+            VkDescriptorSetLayout l = dev_->set_layout();
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = tpool_;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &l;
+            if (vkAllocateDescriptorSets(dev_->device(), &ai, &T.sets[k]) != VK_SUCCESS) return *why = "descriptor set", false;
+            VkDescriptorBufferInfo bi[Device::kBindings];
+            for (auto &b : bi) b = {dev_->dummy(), 0, VK_WHOLE_SIZE};
+            for (int j = 0; j < 3; j++)
+                if (d[k][j]) bi[2 + j] = {d[k][j], 0, VK_WHOLE_SIZE};
+            bi[7] = {tparams_.buf, 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet wr[Device::kBindings];
+            for (int j = 0; j < Device::kBindings; j++) {
+                wr[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                wr[j].dstSet = T.sets[k];
+                wr[j].dstBinding = (uint32_t)j;
+                wr[j].descriptorCount = 1;
+                wr[j].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                wr[j].pBufferInfo = &bi[j];
+            }
+            vkUpdateDescriptorSets(dev_->device(), Device::kBindings, wr, 0, nullptr);
+        }
+    }
+    return true;
+}
+
+int VkVideo::tslot(size_t lv, int64_t seq) const
+{
+    const Stage &T = stages_[lv];
+    if (seq < 0) return -1;
+    const int slot = (int)(seq % T.nslots);
+    return T.seq[slot] == seq ? slot : -1;
+}
+
+// One parameter entry, in the command buffer: after every earlier read of it, before what follows.
+void VkVideo::set_param(VkCommandBuffer cb, uint32_t entry, const void *ka) const
+{
+    mem_barrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    vkCmdUpdateBuffer(cb, tparams_.buf, (VkDeviceSize)entry * sizeof(KArgs), sizeof(KArgs), ka);
+    mem_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+}
+
+// steps [from, to) of the chain (no temporal step among them), each after a barrier
+void VkVideo::rec_steps(VkCommandBuffer cb, size_t from, size_t to) const
+{
+    for (size_t k = from; k < to; k++) {
+        const Step &s = steps_[k];
+        step_barrier(cb);
+        if (s.rs) s.rs->record(cb);
+        else (void)s.net->record(cb, s.in_w, s.in_h);
+    }
+    step_barrier(cb);
+}
+
+// The step's input (chain_[step % 2]) as `seq` into stage lv's ring, and its cut metric against
+// seq - 1 when that is held.
+void VkVideo::rec_store(VkCommandBuffer cb, size_t lv, int64_t seq, int format, int matrix, int range)
+{
+    Stage &T = stages_[lv];
+    const int slot = (int)(seq % T.nslots);
+    const uint32_t fe = 3u * (uint32_t)T.w * (uint32_t)T.h;  // frame elements
+    const VkBufferCopy c{0, (VkDeviceSize)slot * fe * 2, (VkDeviceSize)fe * 2};
+    vkCmdCopyBuffer(cb, chain_[T.step % 2].buf, T.ring.buf, 1, &c);
+    step_barrier(cb);
+    const int prev = tslot(lv, seq - 1);
+    const uint32_t base = (uint32_t)lv * 3;
+    if (prev >= 0) {
+        KArgs a{};
+        a.di[0] = T.w;
+        a.di[1] = T.h;
+        a.di[2] = (T.w + 31) / 32;
+        a.dj[0] = (int32_t)((uint32_t)prev * fe);
+        a.dj[1] = (int32_t)((uint32_t)slot * fe);
+        set_param(cb, base, &a);
+        KArgs f{};
+        f.di[0] = T.part_groups;
+        f.dj[0] = slot;
+        set_param(cb, base + 1, &f);
+        for (int k = 0; k < 2; k++) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, tpipes_[k]);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev_->pipeline_layout(), 0, 1, &T.sets[k], 0, nullptr);
+            const int32_t pc[4] = {(int32_t)(base + k), 0, 0, 0};
+            vkCmdPushConstants(cb, dev_->pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+            if (k == 0) vkCmdDispatch(cb, (uint32_t)(T.w + 31) / 32, (uint32_t)(T.h + 7) / 8, 1);
+            else vkCmdDispatch(cb, 1, 1, 1);
+            step_barrier(cb);
+        }
+    } else {
+        vkCmdFillBuffer(cb, T.diff.buf, (VkDeviceSize)slot * 4, 4, 0);
+        step_barrier(cb);
+    }
+    T.seq[slot] = seq;
+    if (T.cache) T.gen[slot] = gen_next_++;
+    T.format[slot] = format;
+    T.matrix[slot] = matrix;
+    T.range[slot] = range;
+}
+
+// Stage lv's model on the window around `center` (held in cslot), its output cropped into
+// chain_[(step + 1) % 2]. Window frames not held take the nearest held one toward the center; a
+// cut metric counts only between two consecutive held frames (aji_dml.cpp's rules).
+void VkVideo::rec_stage(VkCommandBuffer cb, size_t lv, int64_t center, int cslot)
+{
+    Stage &T = stages_[lv];
+    TemporalNet &net = *steps_[T.step].tnet;
+    int slots[AJI_TEMPORAL_MAX_FRAMES];
+    bool held[AJI_TEMPORAL_MAX_FRAMES];
+    slots[T.r] = cslot;
+    held[T.r] = true;
+    for (int dir = -1; dir <= 1; dir += 2) {
+        bool clamped = false;
+        for (int k = 1; k <= T.r; k++) {
+            const int j = T.r + dir * k;
+            const int s = clamped ? -1 : tslot(lv, center + dir * k);
+            clamped = s < 0;
+            slots[j] = clamped ? slots[j - dir] : s;
+            held[j] = !clamped;
+        }
+    }
+    uint32_t packed[3] = {0, 0, 0}, cut_mask = 0;
+    for (int j = 0; j < T.t; j++) {
+        packed[j / 6] |= (uint32_t)slots[j] << ((j % 6) * 5);
+        if (j + 1 < T.t && held[j] && held[j + 1]) cut_mask |= 1u << j;
+    }
+    KArgs a{};
+    a.di[0] = T.w;
+    a.di[1] = T.h;
+    a.di[2] = T.pw;
+    a.di[3] = T.ph;
+    a.kb = 1.0f / ((float)T.w * (float)T.h);
+    const uint32_t entry = (uint32_t)lv * 3 + 2;
+    const auto gather = [&](int n) {
+        set_param(cb, entry, &a);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, tpipes_[2]);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev_->pipeline_layout(), 0, 1, &T.sets[2], 0, nullptr);
+        const int32_t pc[4] = {(int32_t)entry, 0, 0, 0};
+        vkCmdPushConstants(cb, dev_->pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cb, (uint32_t)(T.pw / 2 + 31) / 32, (uint32_t)(T.ph + 7) / 8, (uint32_t)n);
+        step_barrier(cb);
+    };
+    if (T.cache) {
+        // per-frame work kept across windows: each window frame not in the model's cache is gathered
+        // into the next free frame of its input and encoded into an entry this window doesn't hold;
+        // the model then picks each position's entry under the gather's cut rule
+        int ent[AJI_TEMPORAL_MAX_FRAMES], cut[AJI_TEMPORAL_MAX_FRAMES], miss_e[AJI_TEMPORAL_MAX_FRAMES];
+        uint32_t mpack[3] = {0, 0, 0};
+        int nm = 0;
+        for (int j = 0; j < T.t; j++) {
+            const uint64_t g = T.gen[slots[j]];
+            int e = -1;
+            for (int k = 0; k < (int)T.cgen.size() && e < 0; k++)
+                if (T.cgen[k] == g) e = k;
+            if (e < 0) {
+                uint64_t oldest = UINT64_MAX;
+                for (int k = 0; k < (int)T.cgen.size(); k++) {
+                    bool used = false;
+                    for (int i = 0; i < T.t; i++) used = used || T.cgen[k] == T.gen[slots[i]];
+                    if (!used && T.cgen[k] < oldest) {
+                        oldest = T.cgen[k];
+                        e = k;
+                    }
+                }
+                T.cgen[e] = g;
+                mpack[nm / 6] |= (uint32_t)slots[j] << ((nm % 6) * 5);
+                miss_e[nm++] = e;
+            }
+            ent[j] = e;
+            cut[j] = (cut_mask >> j) & 1u ? slots[j + 1] : -1;
+        }
+        if (nm) {
+            a.dj[0] = nm;  // the misses in order, no cut substitution
+            a.dj[1] = (int32_t)mpack[0];
+            a.dj[2] = (int32_t)mpack[1];
+            a.dj[3] = (int32_t)mpack[2];
+            a.kr = 0.0f;
+            gather(nm);
+            for (int i = 0; i < nm; i++) net.record_encode(cb, miss_e[i], i);
+        }
+        step_barrier(cb);
+        net.record_cached(cb, ent, cut, T.threshold, 1.0f / ((float)T.w * (float)T.h));
+    } else {
+        a.dj[0] = T.t;
+        a.dj[1] = (int32_t)packed[0];
+        a.dj[2] = (int32_t)packed[1];
+        a.dj[3] = (int32_t)packed[2];
+        a.kr = T.threshold;
+        std::memcpy(&a.qdiv, &cut_mask, 4);
+        gather(T.t);
+        net.record(cb);
+    }
+    step_barrier(cb);
+    // crop the padded output (pow x poh) into the step's output (ow x oh), fp16 planes
+    const VkBuffer dst = chain_[(T.step + 1) % 2].buf;
+    std::vector<VkBufferCopy> rc;
+    if (T.pow == T.ow) {
+        for (int pl = 0; pl < 3; pl++)
+            rc.push_back({(VkDeviceSize)pl * T.pow * T.poh * 2, (VkDeviceSize)pl * T.ow * T.oh * 2, (VkDeviceSize)T.ow * T.oh * 2});
+    } else {
+        for (int pl = 0; pl < 3; pl++)
+            for (int y = 0; y < T.oh; y++)
+                rc.push_back({((VkDeviceSize)pl * T.poh + y) * T.pow * 2, ((VkDeviceSize)pl * T.oh + y) * T.ow * 2, (VkDeviceSize)T.ow * 2});
+    }
+    vkCmdCopyBuffer(cb, net.output().buf, dst, (uint32_t)rc.size(), rc.data());
+    step_barrier(cb);
+}
+
+// Stage lv's ring to hold frame p if it can: stage lv-1 on its window around p (those frames made
+// held first, oldest first) and the steps between the two. Not when the source frame was never
+// ingested: the frame stays absent and windows clamp around it.
+void VkVideo::rec_ensure(VkCommandBuffer cb, size_t lv, int64_t p)
+{
+    if (p < 0 || lv == 0 || tslot(lv, p) >= 0) return;
+    const Stage &S = stages_[lv - 1];
+    for (int64_t q = p - S.r; q <= p + S.r; q++) rec_ensure(cb, lv - 1, q);
+    const int cslot = tslot(lv - 1, p);
+    if (cslot < 0) return;
+    rec_stage(cb, lv - 1, p, cslot);
+    rec_steps(cb, S.step + 1, stages_[lv].step);
+    rec_store(cb, lv, p, S.format[cslot], S.matrix[cslot], S.range[cslot]);
+}
+
+void VkVideo::temporal_reset()
+{
+    for (Stage &T : stages_) std::fill(T.seq.begin(), T.seq.end(), -1);
+}
+
+int VkVideo::ingest(const aji_frame *in, uint64_t seq)
+{
+    if (!active_ || stages_.empty()) {
+        fail("aji_ingest without an active temporal configuration");
+        return AJI_ERR;
+    }
+    if (!in || !in->plane[0] || seq > (uint64_t)INT64_MAX) return AJI_ERR;
+    if (in->width != in_w_ || in->height != in_h_) {
+        fail("aji_ingest: frame size %dx%d, configured %dx%d", in->width, in->height, in_w_, in_h_);
+        return AJI_ERR_SHAPE;
+    }
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010) {
+        fail("aji_ingest: Vulkan frames are NV12 or P010");
+        return AJI_ERR_FORMAT;
+    }
+    if (tslot(0, (int64_t)seq) >= 0) return AJI_OK;  // already held
+    std::string why;
+    const FrameFormat fi{in->format, in->matrix, in->range, in->siting};
+    if (!io_pre_ || !(io_pre_->in_format() == fi)) {
+        if (io_pre_ && ticket_) wait(ticket_);
+        const FrameFormat fo{in->format, in->matrix, in->range, AJI_SITING_LEFT};
+        io_pre_ = FrameIO::create(*dev_, in_w_, in_h_, 2, 2, fi, fo, chain_[0].buf, chain_[0].buf, &why);
+        if (!io_pre_) {
+            fail("aji_ingest: %s", why.c_str());
+            return AJI_ERR;
+        }
+    }
+    auto *ii = static_cast<aji_vk_image *>(in->plane[0]);
+    int slot = 0;
+    VkCommandBuffer cb = dev_->frame_begin(&slot);
+    if (!cb) {
+        fail("aji_ingest: an earlier Vulkan submit has not finished after 10 s");
+        return AJI_ERR;
+    }
+    full_barrier(cb);
+    copy_planes(cb, ii, io_pre_->in_y().buf, io_pre_->in_uv().buf, io_pre_->in_pitch(), in_w_, in_h_, in->format == AJI_FMT_P010 ? 2 : 1, true);
+    step_barrier(cb);
+    io_pre_->record_pre(cb);
+    rec_steps(cb, 0, stages_[0].step);
+    rec_store(cb, 0, (int64_t)seq, in->format, in->matrix, in->range);
+    const Device::SemValue w1{static_cast<VkSemaphore>(ii->semaphore), ii->value};
+    const uint64_t t = ticket_ + 1;
+    const Device::SemValue sig[2] = {{tl_, t}, {static_cast<VkSemaphore>(ii->semaphore), ii->value + 1}};
+    if (!dev_->frame_submit(slot, &w1, 1, sig, 2, &why)) {
+        fail("aji_ingest: %s", why.c_str());
+        return AJI_ERR;
+    }
+    ticket_ = t;
+    ii->value += 1;
+    ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
+    ii->queue_family = dev_->queue_family();
+    return AJI_OK;
+}
+
+int VkVideo::infer_seq(uint64_t seq, const aji_frame *out)
+{
+    if (!active_ || stages_.empty()) {
+        fail("aji_infer_seq without an active temporal configuration");
+        return AJI_ERR;
+    }
+    if (!out || !out->plane[0]) return AJI_ERR;
+    const int64_t center = (int64_t)seq;
+    const int islot = seq > (uint64_t)INT64_MAX ? -1 : tslot(0, center);
+    if (islot < 0) {
+        fail("aji_infer_seq: frame %llu was not ingested", (unsigned long long)seq);
+        return AJI_ERR;
+    }
+    if (out->width != out_w_ || out->height != out_h_) {
+        fail("aji_infer_seq: frame size %dx%d, configured %dx%d", out->width, out->height, out_w_, out_h_);
+        return AJI_ERR_SHAPE;
+    }
+    if (out->format != AJI_FMT_NV12 && out->format != AJI_FMT_P010) {
+        fail("aji_infer_seq: Vulkan frames are NV12 or P010");
+        return AJI_ERR_FORMAT;
+    }
+    const Stage &S0 = stages_[0];
+    const FrameFormat fi{S0.format[islot], S0.matrix[islot], S0.range[islot], AJI_SITING_LEFT};
+    const FrameFormat fo{out->format, out->matrix, out->range, AJI_SITING_LEFT};
+    std::string why;
+    if (!io_ || !(io_->out_format() == fo)) {
+        if (io_ && ticket_) wait(ticket_);
+        io_ = FrameIO::create(*dev_, in_w_, in_h_, out_w_, out_h_, fi, fo, chain_[0].buf, chain_[steps_.size() % 2].buf, &why);
+        if (!io_) {
+            fail("aji_infer_seq: %s", why.c_str());
+            return AJI_ERR;
+        }
+    }
+    auto *oi = static_cast<aji_vk_image *>(out->plane[0]);
+    int slot = 0;
+    VkCommandBuffer cb = dev_->frame_begin(&slot);
+    if (!cb) {
+        fail("aji_infer_seq: an earlier Vulkan submit has not finished after 10 s");
+        return AJI_ERR;
+    }
+    full_barrier(cb);
+    // stacked temporal models: the last stage's window brought up to date
+    const size_t last = stages_.size() - 1;
+    const Stage &T = stages_[last];
+    for (int64_t q = center - T.r; last > 0 && q <= center + T.r; q++) rec_ensure(cb, last, q);
+    const int cslot = tslot(last, center);
+    if (cslot < 0) {
+        // what was recorded (the earlier stages' stores) still runs: the rings' state says it did
+        const Device::SemValue s1{tl_, ticket_ + 1};
+        if (dev_->frame_submit(slot, nullptr, 0, &s1, 1, &why)) ticket_++;
+        fail("aji_infer_seq: frame %llu is not available", (unsigned long long)seq);
+        return AJI_ERR;
+    }
+    rec_stage(cb, last, center, cslot);
+    rec_steps(cb, T.step + 1, steps_.size());
+    io_->record_post(cb);
+    mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    copy_planes(cb, oi, io_->out_y().buf, io_->out_uv().buf, io_->out_pitch(), out_w_, out_h_, out->format == AJI_FMT_P010 ? 2 : 1, false);
+    const Device::SemValue w1{static_cast<VkSemaphore>(oi->semaphore), oi->value};
+    const uint64_t t = ticket_ + 1;
+    const Device::SemValue sig[2] = {{tl_, t}, {static_cast<VkSemaphore>(oi->semaphore), oi->value + 1}};
+    if (!dev_->frame_submit(slot, &w1, 1, sig, 2, &why)) {
+        fail("aji_infer_seq: %s", why.c_str());
+        return AJI_ERR;
+    }
+    ticket_ = t;
     oi->value += 1;
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
