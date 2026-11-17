@@ -70,6 +70,7 @@
 #include "vk/imgnet.h"
 #include "vk/rife.h"
 #include "vk/tfix.h"
+#include "vk/video.h"
 #endif
 
 using Microsoft::WRL::ComPtr;
@@ -241,6 +242,8 @@ struct aji_ctx {
     // on DirectML). vk_buf: buf[] imported, while a chain has a Vulkan model.
     std::unique_ptr<ajivk::Device> vk;
     std::string vk_why;           // why vk is null
+    // a Vulkan-frames context (aji_create_vk): every export forwards to it
+    std::unique_ptr<ajivk::VkVideo> vkv;
     ComPtr<ID3D12Fence> vk_fence; // shared: D3D12 -> Vulkan -> D3D12 handoffs
     VkSemaphore vk_sem = VK_NULL_HANDLE;
     uint64_t vk_val = 0;
@@ -2191,6 +2194,9 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
 
 extern "C" AJI_EXPORT int aji_set_slot(aji_ctx *c, int slot)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->set_slot(slot);
+#endif
     if (!c)
         return AJI_ERR;
     c->slot = slot;
@@ -2200,6 +2206,9 @@ extern "C" AJI_EXPORT int aji_set_slot(aji_ctx *c, int slot)
 extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                                         int *out_w, int *out_h)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->configure(w, h, fps, out_w, out_h);
+#endif
     if (!c || w < 2 || h < 2 || (w & 1) || (h & 1))
         return AJI_ERR_SHAPE;
 
@@ -2891,6 +2900,9 @@ static int run_post(aji_ctx *c, int format, int matrix, int range, int cur,
 extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
                                     const aji_frame *out, void *cu_stream)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->infer(in, out);
+#endif
     (void)cu_stream;
     if (!c || !in || !out)
         return AJI_ERR;
@@ -2933,11 +2945,17 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
 
 extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return 0;
+#endif
     return (c && c->active && c->temporal.enabled) ? c->temporal.r : 0;
 }
 
 extern "C" AJI_EXPORT void aji_temporal_reset(aji_ctx *c)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return;
+#endif
     if (c && c->temporal.enabled)
         for (auto &T : c->temporal.st)
             std::fill(T.seq.begin(), T.seq.end(), -1);
@@ -3009,6 +3027,9 @@ static int temporal_store(aji_ctx *c, size_t lv, int cur, int64_t seq,
 extern "C" AJI_EXPORT int aji_ingest(aji_ctx *c, const aji_frame *in,
                                      uint64_t seq, void *cu_stream)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return AJI_ERR;
+#endif
     (void)cu_stream;
     if (!c || !in)
         return AJI_ERR;
@@ -3244,6 +3265,9 @@ static int temporal_ensure(aji_ctx *c, size_t lv, int64_t p)
 extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
                                         const aji_frame *out, void *cu_stream)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return AJI_ERR;
+#endif
     (void)cu_stream;
     if (!c || !out)
         return AJI_ERR;
@@ -3296,6 +3320,9 @@ extern "C" AJI_EXPORT int aji_infer_seq(aji_ctx *c, uint64_t seq,
 
 extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return 0;
+#endif
     if (!c || !c->has_pre_resize)
         return 0;
     if (work_w)
@@ -3312,6 +3339,9 @@ extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
 extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
                                      const aji_frame *out, void *cu_stream)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return AJI_ERR;
+#endif
     (void)cu_stream;
     if (!c || !in || !out)
         return AJI_ERR;
@@ -3531,6 +3561,9 @@ extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
 
 extern "C" AJI_EXPORT const char *aji_current_log(aji_ctx *c)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->current_log();
+#endif
     return c ? c->current_log.c_str() : "";
 }
 
@@ -3542,6 +3575,9 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 
 extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return 0;
+#endif
     if (!c || !c->rife.enabled)
         return 0;
     if (num)
@@ -3553,11 +3589,17 @@ extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 
 extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return 0;
+#endif
     return (c && c->rife.enabled && c->rife.before_upscale) ? 1 : 0;
 }
 
 extern "C" AJI_EXPORT int aji_rife_enhanced_scene(aji_ctx *c)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return 0;
+#endif
     return c && c->rife.enabled && c->rife.scene_detect_enhanced;
 }
 
@@ -3569,6 +3611,9 @@ extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
 
 extern "C" AJI_EXPORT uint64_t aji_flush(aji_ctx *c, void *cu_stream)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->flush();
+#endif
     (void)cu_stream;
     if (!c || !c->done_fence)
         return 0;
@@ -3579,6 +3624,9 @@ extern "C" AJI_EXPORT uint64_t aji_flush(aji_ctx *c, void *cu_stream)
 
 extern "C" AJI_EXPORT int aji_done(aji_ctx *c, uint64_t ticket)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->done(ticket);
+#endif
     if (!c)
         return AJI_ERR;
     if (ticket == 0)
@@ -3590,6 +3638,9 @@ extern "C" AJI_EXPORT int aji_done(aji_ctx *c, uint64_t ticket)
 
 extern "C" AJI_EXPORT int aji_wait(aji_ctx *c, uint64_t ticket)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->wait(ticket);
+#endif
     if (!c)
         return AJI_ERR;
     if (ticket == 0)
@@ -3609,11 +3660,17 @@ extern "C" AJI_EXPORT int aji_infer_rife(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *b, double t,
                                          const aji_frame *out, void *cu_stream)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return AJI_ERR;
+#endif
     return aji_infer_rife_with_scene(c, a, b, t, out, cu_stream, -1);
 }
 
 extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return 0;
+#endif
     return c != nullptr;
 }
 
@@ -3622,6 +3679,9 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
                                          const aji_frame *out, void *cu_stream,
                                          int scene)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return AJI_ERR;
+#endif
     (void)cu_stream;
     if (!c || !a || !b || !out || scene < -1 || scene > 1)
         return AJI_ERR;
@@ -4187,6 +4247,9 @@ extern "C" AJI_EXPORT int aji_frame_diff(aji_ctx *c, const aji_frame *a,
                                          aji_frame_diff_result *out,
                                          void *cu_stream)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return AJI_ERR;
+#endif
     (void)cu_stream;
     return frame_diff(c, a, b, out, 0);
 }
@@ -4196,6 +4259,9 @@ extern "C" AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
                                                 aji_frame_diff_result *out,
                                                 void *cu_stream, uint64_t mark)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return AJI_ERR;
+#endif
     (void)cu_stream;
     return frame_diff(c, a, b, out, mark);
 }
@@ -4204,6 +4270,9 @@ extern "C" AJI_EXPORT int aji_frame_diff_marked(aji_ctx *c, const aji_frame *a,
 // it reaches the GPU now; aji_frame_diff_marked waits for it.
 extern "C" AJI_EXPORT uint64_t aji_d3d11_mark(aji_ctx *c)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return 0;
+#endif
     if (!c || !c->ctx11_4)
         return 0;
     c->fence_val++;
@@ -4214,6 +4283,9 @@ extern "C" AJI_EXPORT uint64_t aji_d3d11_mark(aji_ctx *c)
 
 extern "C" AJI_EXPORT const char *aji_last_error(aji_ctx *c)
 {
+#ifdef AJI_VULKAN
+    if (c && c->vkv) return c->vkv->last_error();
+#endif
     return c ? c->errbuf : "no context";
 }
 
@@ -4222,6 +4294,14 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
     if (!pc || !*pc)
         return;
     aji_ctx *c = *pc;
+#ifdef AJI_VULKAN
+    if (c->vkv) {
+        c->vkv.reset();
+        delete c;
+        *pc = nullptr;
+        return;
+    }
+#endif
     chain_teardown(c);
 #ifdef AJI_VULKAN
     if (c->vk && c->vk_sem)
@@ -4238,6 +4318,31 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         CloseHandle(c->fd.event);
     delete c;
     *pc = nullptr;
+}
+
+// A context on the caller's Vulkan device, frames as VkImages (aji.h): vk/video.h.
+extern "C" AJI_EXPORT aji_ctx *aji_create_vk(const aji_create_params *params, const aji_vk_device *device)
+{
+#ifdef AJI_VULKAN
+    if (!params || params->api_version != AJI_API_VERSION)
+        return nullptr;
+    std::string why;
+    std::unique_ptr<ajivk::VkVideo> v = ajivk::VkVideo::create(params, device, &why);
+    if (!v) {
+        if (params->log)
+            params->log(params->log_opaque, 0, ("Vulkan frames: " + why).c_str());
+        return nullptr;
+    }
+    auto c = std::make_unique<aji_ctx>();
+    c->log_fn = params->log;
+    c->log_opaque = params->log_opaque;
+    c->vkv = std::move(v);
+    return c.release();
+#else
+    (void)params;
+    (void)device;
+    return nullptr;
+#endif
 }
 
 extern "C" AJI_EXPORT int aji_stream_policy_version(void)

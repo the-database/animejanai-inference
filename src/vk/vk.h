@@ -109,7 +109,8 @@
     X(vkCmdCopyBufferToImage)           \
     X(vkCreateSemaphore)                \
     X(vkDestroySemaphore)               \
-    X(vkWaitSemaphores)
+    X(vkWaitSemaphores)                 \
+    X(vkGetSemaphoreCounterValue)
 
 namespace ajivk {
 

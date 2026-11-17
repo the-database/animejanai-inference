@@ -14,6 +14,9 @@
  *    (intptr_t)subresource index; stride[] is ignored; cu_stream is
  *    NULL. d3d11_device is required, and frame textures must be
  *    created with the SHARED + SHARED_NTHANDLE misc flags.
+ *  - Vulkan frames (a context from aji_create_vk): aji_frame.plane[0] =
+ *    aji_vk_image* (below); plane[1..2], stride[] and cu_stream are
+ *    ignored.
  *
  * Two modes:
  *  - conf mode: create with conf_path/model_dir; aji_configure() selects
@@ -496,6 +499,61 @@ AJI_EXPORT void aji_temporal_reset(aji_ctx *c);
 AJI_EXPORT const char *aji_last_error(aji_ctx *c);
 
 AJI_EXPORT void aji_destroy(aji_ctx **c);
+
+/* ---- Vulkan frames (additive: no AJI_API_VERSION bump) ----
+ *
+ * A context on the caller's Vulkan device (mpv with gpu-api=vulkan and
+ * hwdec=vulkan: libplacebo's device, FFmpeg's AVVulkanDeviceContext), taking
+ * the frames as VkImages on it: the Vulkan native kernels end to end, no copy
+ * through another API. Linux has no other Vulkan path; on Windows it is the
+ * zero-copy alternative to the D3D11 frames above. Served by aji_vk whatever
+ * the conf's backend key says (models without Vulkan kernels can't run on
+ * this path: their chain is passed through, with the reason in the log).
+ * The handles are void* / uint64_t so this header needs no Vulkan header.
+ */
+typedef struct aji_vk_device {
+    uint32_t struct_size;            /* sizeof(aji_vk_device) */
+    void *get_instance_proc_addr;    /* PFN_vkGetInstanceProcAddr the device came from */
+    void *instance;                  /* VkInstance */
+    void *physical_device;           /* VkPhysicalDevice */
+    void *device;                    /* VkDevice */
+    void *queue;                     /* VkQueue libaji submits to: compute-capable */
+    uint32_t queue_family, queue_index;
+    /* the queue's lock, when other threads submit to it too (FFmpeg's
+       AVVulkanDeviceContext.lock_queue): held around each submit; NULL: none */
+    void (*lock_queue)(void *opaque, uint32_t queue_family, uint32_t queue_index);
+    void (*unlock_queue)(void *opaque, uint32_t queue_family, uint32_t queue_index);
+    void *lock_opaque;
+    /* what the device was created with: libaji picks its kernels from these
+       (cooperative matrices need VK_KHR_cooperative_matrix and the feature) */
+    const char *const *enabled_extensions;
+    uint32_t num_enabled_extensions;
+    const void *enabled_features;    /* the VkPhysicalDeviceFeatures2 chain */
+} aji_vk_device;
+
+/* One frame on the caller's device: aji_frame.plane[0] of a Vulkan-frames
+ * context. A 4:2:0 frame is one multi-planar image (NV12:
+ * VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, P010: G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
+ * or G16_B16R16_2PLANE_420_UNORM), created with TRANSFER_SRC (input) or
+ * TRANSFER_DST (output) usage and EXCLUSIVE sharing, as FFmpeg's Vulkan frames
+ * are. Synchronisation is FFmpeg's AVVkFrame rule: libaji's work waits for
+ * semaphore to reach value, signals value + 1 and writes value + 1 here, with
+ * the layout, access and queue family it leaves the image in; the caller
+ * copies them back into its AVVkFrame. */
+typedef struct aji_vk_image {
+    void *image;                     /* VkImage */
+    int32_t layout;                  /* VkImageLayout: in, then as left */
+    uint32_t queue_family;           /* owner (VK_QUEUE_FAMILY_IGNORED: none yet); as left */
+    uint64_t access;                 /* VkAccessFlags2 of the last access; as left */
+    void *semaphore;                 /* VkSemaphore, timeline */
+    uint64_t value;                  /* ready at value; then value + 1 */
+} aji_vk_image;
+
+/* Like aji_create (conf mode), on the caller's Vulkan device: params'
+ * d3d11_device and cuda_context are ignored. The device must outlive the
+ * context. NULL when it can't (aji_vk missing, no kernel family on the device
+ * as created: the log says why). */
+AJI_EXPORT aji_ctx *aji_create_vk(const aji_create_params *params, const aji_vk_device *device);
 
 #ifdef __cplusplus
 }

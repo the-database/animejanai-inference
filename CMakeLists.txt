@@ -558,6 +558,16 @@ if(AJI_VULKAN)
         find_package(Threads REQUIRED)
         target_link_libraries(aji_harness_vk PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
     endif()
+    # By hand: the Vulkan-frames ABI (aji_create_vk) as a player uses it, a device of its own
+    # standing in for the player's, through the dispatcher
+    add_executable(aji_vk_frames_test sanity/vk_frames_test.cpp $<TARGET_OBJECTS:aji_vk_core> $<TARGET_OBJECTS:aji_vk_shaders>
+                   $<TARGET_OBJECTS:aji_native_host>)
+    target_include_directories(aji_vk_frames_test PRIVATE src include)
+    target_include_directories(aji_vk_frames_test SYSTEM PRIVATE "${AJI_VK_INCLUDE}")
+    target_link_libraries(aji_vk_frames_test PRIVATE aji)
+    if(UNIX)
+        target_link_libraries(aji_vk_frames_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+    endif()
     # Every entry of the kernel table against the CPU reference, on the device's family (ctest -L gpu)
     add_executable(aji_vk_conv_test sanity/vk_conv_test.cpp $<TARGET_OBJECTS:aji_vk_core>
                    $<TARGET_OBJECTS:aji_vk_shaders> $<TARGET_OBJECTS:aji_native_host>)
@@ -583,7 +593,7 @@ if(AJI_VULKAN)
         # on DirectML. Ships beside aji_dml with the same ONNX Runtime and
         # DirectML DLLs; Vulkan is loaded at run time. Its image ABI is
         # aji_img_vk.cpp (AJI_IMG_VULKAN), all Vulkan.
-        add_library(aji_vk SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp
+        add_library(aji_vk SHARED src/aji_dml.cpp src/aji_conf.cpp src/onnx_shape.cpp src/vk/video.cpp
             src/core/ort_dml.cpp src/aji_img_vk.cpp src/core/tiling.cpp ${AJI_HALF_SOURCES}
             $<TARGET_OBJECTS:aji_vk_core> $<TARGET_OBJECTS:aji_vk_shaders>
             $<TARGET_OBJECTS:aji_native_host>)
@@ -596,10 +606,11 @@ if(AJI_VULKAN)
         set_target_properties(aji_vk PROPERTIES CXX_VISIBILITY_PRESET hidden)
         add_dependencies(aji_harness_dml aji_vk)
     else()
-        # libaji_vk.so (Linux, Android): the image ABI on Vulkan for now (aji_img_vk.cpp); the
-        # video ABI follows with the Vulkan frame pipeline.
+        # libaji_vk.so (Linux, Android): the image ABI on Vulkan (aji_img_vk.cpp) and the video ABI
+        # for Vulkan frames (aji_vk_frames.cpp: aji_create_vk, vk/video.h).
         find_package(Threads REQUIRED)
-        add_library(aji_vk SHARED src/aji_img_vk.cpp src/onnx_shape.cpp src/core/tiling.cpp ${AJI_HALF_SOURCES}
+        add_library(aji_vk SHARED src/aji_img_vk.cpp src/aji_vk_frames.cpp src/vk/video.cpp src/aji_conf.cpp src/onnx_shape.cpp
+            src/core/tiling.cpp ${AJI_HALF_SOURCES}
             $<TARGET_OBJECTS:aji_vk_core> $<TARGET_OBJECTS:aji_vk_shaders> $<TARGET_OBJECTS:aji_native_host>)
         target_include_directories(aji_vk PUBLIC include PRIVATE src)
         target_include_directories(aji_vk SYSTEM PRIVATE "${AJI_VK_INCLUDE}")

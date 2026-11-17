@@ -375,9 +375,29 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   command buffer. The kernels are GLSL ports of `dml_shaders.h`'s pre/post with the same
   `resample.h` tables; within one level of the DirectML path (division rounds differently
   across APIs, so not bit-identical). `aji_harness_vk` runs raw files through it (`--format
-  p010`, `--matrix`, `--range`, `--siting`) and builds for Android. The caller-facing frame ABI
-  (a shared `VkDevice`'s images for mpv on Linux, host memory or `AHardwareBuffer` on Android)
-  is still to come.
+  p010`, `--matrix`, `--range`, `--siting`) and builds for Android. `FrameIO` is the two ends
+  around any RGB buffers (input and output formats apart); `FramePipeline` is FrameIO around one
+  lowered model.
+- **Vulkan frames: `aji_create_vk` (`vk/video`, additive ABI, no version bump).** A context on the
+  caller's `VkDevice` (`aji_vk_device`: handles, the queue and its lock, the enabled extensions
+  and features chain) with frames as multi-planar VkImages on it (`aji_frame.plane[0]` =
+  `aji_vk_image`: image, layout, queue family, access, timeline semaphore and value, FFmpeg's
+  `AVVkFrame` rule: wait for value, signal value + 1, write back what libaji left). For mpv with
+  `gpu-api=vulkan` + `hwdec=vulkan` on Linux and Windows. `Device::create_external` wraps the
+  caller's device: the kernel family is what the device was *created with* (cm16 needs
+  `VK_KHR_cooperative_matrix`, the feature, the memory model and subgroup size control enabled;
+  else sg16, else plain), every submit runs inside the caller's queue lock, and destroy leaves the
+  device alone. `VkVideo` runs the conf's chain (lowered models and the `ImgNet::frame` ones,
+  ping-ponging two chain buffers) between `FrameIO`'s pre and post, one submit a frame: the input
+  planes copied out of the image (`vkCmdCopyImageToBuffer`, per plane aspect), the output copied in,
+  the images' semaphores and the context's own timeline (aji_flush's tickets) signalled. Not yet
+  there, passed through or left out with the reason in the log: resizes before upscale, RIFE,
+  temporal models, frame diff, and models without Vulkan kernels (no DirectML on this path). On
+  Windows `aji_vk.dll`'s exports (aji_dml.cpp) forward a Vulkan-frames context (`c->vkv`); on Linux
+  `aji_vk_frames.cpp` is the video ABI. The dispatcher's `aji_create_vk` always loads aji_vk.
+  `aji_vk_frames_test` plays the player (a device of its own, NV12 / P010 images, `--no-coopmat`
+  reports a device without cooperative matrices): SPANF3 720x480 0.64 ms a frame on the 5090,
+  within 1 level of the D3D12 path.
 - **`aji_img_vk.cpp`: the image ABI on Vulkan (`AJI_IMG_VULKAN`, `aji_image --backend vulkan`).**
   A `core/tiling` `TileModel` over the executor at the model's tile: the same cover, reflect pad
   and blend as the other backends. Every model must lower; one that doesn't is refused with the
