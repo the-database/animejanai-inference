@@ -11,9 +11,10 @@ namespace ajinative {
 namespace {
 
 using LaunchFn = cudaError_t (*)(const dev::ConvParams &, cudaStream_t);
-constexpr int kVariants = 2;
-// Tile shapes: (warps, rows per warp). 8x2 measured best at 48 channels, 4x4 at 64 (RTX 5090).
-const char *const kVariantNames[kVariants] = {"8 warps x 2 rows", "4 warps x 4 rows"};
+constexpr int kVariants = 4;
+// Tile shapes: (warps, rows per warp), picked per op at load. 16-row tiles fit 2 CTAs per SM at 48-64
+// channels; the 8-row ones (more halo per pixel) fit 4-5, so one CTA's halo load overlaps another's MMAs.
+const char *const kVariantNames[kVariants] = {"8 warps x 2 rows", "4 warps x 4 rows", "8 warps x 1 row", "4 warps x 2 rows"};
 
 template <int CINP, int COUTP, int WARPS, int WR, int IN, int ACT, int GATE, int OUT>
 cudaError_t run_conv(const dev::ConvParams &p, cudaStream_t s)
@@ -39,7 +40,7 @@ struct Entry {
 
 #define AJI_CONV(CI, CO, IN, ACT, GATE, OUT)                                         \
     {{CI, CO, IN, ACT, GATE, OUT},                                                   \
-     {&run_conv<CI, CO, 8, 2, IN, ACT, GATE, OUT>, &run_conv<CI, CO, 4, 4, IN, ACT, GATE, OUT>}}
+     {&run_conv<CI, CO, 8, 2, IN, ACT, GATE, OUT>, &run_conv<CI, CO, 4, 4, IN, ACT, GATE, OUT>, &run_conv<CI, CO, 8, 1, IN, ACT, GATE, OUT>,       &run_conv<CI, CO, 4, 2, IN, ACT, GATE, OUT>}}
 #define AJI_BODY(C)                                                                  \
     AJI_CONV(C, C, 0, 0, 0, 0), AJI_CONV(C, C, 0, 1, 0, 0), AJI_CONV(C, C, 0, 2, 0, 0), \
     AJI_CONV(C, C, 0, 3, 0, 0), AJI_CONV(C, C, 0, 0, 1, 0), AJI_CONV(C, C, 0, 0, 2, 0), \

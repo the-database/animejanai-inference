@@ -61,12 +61,26 @@ struct TGemm {
 };
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
 
-// out = dwconv3x3(in) W + bias + add1 (fp16; FDAT's smix then fc2) in one kernel: the depthwise 3x3
-// (zero padding, no bias; dw: [W's K][9] floats) over the H x W map in (W's K channels, stride sin) as
-// tdwconv computes and rounds it, never stored. add1 may be out. W a multiple of 64. cudaErrorNotSupported
-// (nothing launched) for other shapes or AJI_NATIVE_DWMM=0: tdwconv then tgemm.
-cudaError_t tdwgemm(const TMat &w, const void *in, int sin, int H, int W, const float *dw, void *out, int so, const void *add1, int s1,
-                    cudaStream_t s);
+// out = A W + bias + add1 with A = (dwconv3x3(in) + dwb) * mul (FDAT's smix then fc2; DAT's SGFN gate
+// then fc2) in one kernel: the depthwise 3x3 (zero padding; dw: [dwc][9] floats, dwb: [dwc] or null) over
+// the H x W map in, times mul (or not), as tdwconv2 computes and rounds it, never stored. out and add1
+// fp16 or fp32; add1 may be out. W a multiple of 64. cudaErrorNotSupported (nothing launched) for other
+// shapes or AJI_NATIVE_DWMM=0: tdwconv2 then tgemm.
+struct TDwGemm {
+    const void *in = nullptr;  // [H*W][sin] fp16, W's Kpad channels read
+    int sin = 0, H = 0, W = 0;
+    const float *dw = nullptr, *dwb = nullptr;
+    int dwc = 0;  // channels of dw / dwb (0: W's K); those past it count as zero
+    const void *mul = nullptr;  // [H*W][smul] fp16, or null
+    int smul = 0;
+    void *out = nullptr;
+    int so = 0;
+    bool out_f32 = false;
+    const void *add1 = nullptr;
+    int s1 = 0;
+    bool add1_f32 = false;
+};
+cudaError_t tdwgemm(const TMat &w, const TDwGemm &g, cudaStream_t s);
 
 // The MLP out = epi(GELU(A W1 + b1) W2 + b2) in one kernel, the hidden kept on chip; the epilogue as
 // tgemm's (add1, then out; fp32 or fp16 each). Both biases required. With ln_gamma, A is an fp32 map

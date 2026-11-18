@@ -483,8 +483,10 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 pr.mark(P_WIN);
                 // channel gate from the conv branch's average, token gate from the attention
                 K(chan_gate(sums, M, C, b.cr, b.cw1, b.cb1, b.cw2, b.cb2, 0, 1.f, cg, CP, s));
-                K(dat_token_gate(AT, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
-                K(dat_mix(AT, CX, CP, cg, tg, 0, Z, M, C, s));
+                if (!collect && dat_gate_mix(AT, CX, CP, cg, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, 0, Z, s) == cudaErrorNotSupported) {
+                    CK(dat_token_gate(AT, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
+                    CK(dat_mix(AT, CX, CP, cg, tg, 0, Z, M, C, s));
+                }
             } else {
                 if (!collect) {
                     CK(cudaMemsetAsync(stats, 0, (size_t)(heads * hd * hd + 2 * C) * 4, s));
@@ -500,8 +502,10 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 // channel gate from the attention's average, token gate from the conv branch
                 K(tcolsum(AT, CP, M, C, sums, s));
                 K(chan_gate(sums, M, C, b.cr, b.cw1, b.cb1, b.cw2, b.cb2, 0, 1.f, cg, CP, s));
-                K(dat_token_gate(CX, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
-                K(dat_mix(AT, CX, CP, cg, tg, 1, Z, M, C, s));
+                if (!collect && dat_gate_mix(AT, CX, CP, cg, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, 1, Z, s) == cudaErrorNotSupported) {
+                    CK(dat_token_gate(CX, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
+                    CK(dat_mix(AT, CX, CP, cg, tg, 1, Z, M, C, s));
+                }
             }
             pr.mark(P_GATE);
             CK(gemm(*b.proj, Z, CP, S, CP, TAct::None, true));
@@ -511,10 +515,23 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             CK(gemm(*b.fc1, N1, CP, H1, FS, TAct::Gelu, false));
             pr.mark(P_FC1);
             CK(lnorm(b.n3, (const uint16_t *)H1 + CP, false, FS, N2, false));
-            K(tdwconv2(N2, CP, PR, CP, h, w, C8, b.fdw, b.fdwb, false, H1, FS, nullptr, s));
-            pr.mark(P_SMIX);
-            CK(gemm(*b.fc2, PR, CP, S, CP, TAct::None, true));
-            pr.mark(P_FC2);
+            // S += ((dw(N2) + b) * x1) fc2 in one kernel where there is one (else the gated depthwise conv, then the GEMM)
+            cudaError_t e2 = cudaErrorNotSupported;
+            if (!collect) {
+                TDwGemm dg;
+                dg.in = N2; dg.sin = CP; dg.H = h; dg.W = w; dg.dw = b.fdw; dg.dwb = b.fdwb; dg.dwc = C8; dg.mul = H1; dg.smul = FS;
+                dg.out = S; dg.so = CP; dg.out_f32 = true; dg.add1 = S; dg.s1 = CP; dg.add1_f32 = true;
+                e2 = tdwgemm(*b.fc2, dg, s);
+            }
+            if (e2 != cudaErrorNotSupported) {
+                CK(e2);
+                pr.mark(P_FC2);
+            } else {
+                K(tdwconv2(N2, CP, PR, CP, h, w, C8, b.fdw, b.fdwb, false, H1, FS, nullptr, s));
+                pr.mark(P_SMIX);
+                CK(gemm(*b.fc2, PR, CP, S, CP, TAct::None, true));
+                pr.mark(P_FC2);
+            }
         }
         K(tconvert(S, true, CP, S16, false, CP, M, CP, s, kStreamScale));
         GConvArgs a = ga(S16, CP, h, w, S, CP, h, w);

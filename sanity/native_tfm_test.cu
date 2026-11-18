@@ -307,7 +307,9 @@ static void test_dwgemm(int H, int W, int K, int N)
     TGemm g;
     g.a = d2; g.sa = Kp; g.M = M; g.out = o1; g.so = Np; g.add1 = o1; g.s1 = Np;
     tgemm(tm, g, nullptr);
-    const cudaError_t e = tdwgemm(tm, dh, Kp, H, W, ddw, o2, Np, o2, Np, nullptr);
+    TDwGemm dg;
+    dg.in = dh; dg.sin = Kp; dg.H = H; dg.W = W; dg.dw = ddw; dg.out = o2; dg.so = Np; dg.add1 = o2; dg.s1 = Np;
+    const cudaError_t e = tdwgemm(tm, dg, nullptr);
     cudaDeviceSynchronize();
     char nm[96];
     snprintf(nm, sizeof(nm), "dwgemm %dx%d %d->%d vs dwconv + gemm (values differing)", H, W, K, N);
@@ -323,6 +325,52 @@ static void test_dwgemm(int H, int W, int K, int N)
     }
     tmat_release(tm);
     cudaFree(dh); cudaFree(d2); cudaFree(o1); cudaFree(o2); cudaFree(ddw);
+}
+
+// tdwgemm in DAT's SGFN form (depthwise + bias, times the gate, fp32 stream in place) against tdwconv2
+// then tgemm: the same values.
+static void test_dwgemm_gate(int H, int W, int C)
+{
+    const int Cp = (C + 15) / 16 * 16, C8 = (C + 7) / 8 * 8, M = H * W, FS = 2 * Cp;
+    std::vector<uint16_t> n2((size_t)M * Cp, 0), h1((size_t)M * FS, 0);
+    std::vector<float> x((size_t)M * Cp, 0.f);
+    for (int m = 0; m < M; m++) {
+        for (int k = 0; k < C; k++) n2[(size_t)m * Cp + k] = hb(ur(2.f));
+        for (int k = 0; k < FS; k++) h1[(size_t)m * FS + k] = hb(ur(1.5f));
+        for (int n = 0; n < C; n++) x[(size_t)m * Cp + n] = ur(500.f);
+    }
+    std::vector<float> w((size_t)C * C), dw((size_t)C8 * 9, 0.f), dwb(C8, 0.f), b(C);
+    for (auto &v : w) v = hf(hb(ur(0.1f)));
+    for (int k = 0; k < C * 9; k++) dw[k] = ur(0.4f);
+    for (int k = 0; k < C; k++) dwb[k] = ur(0.3f);
+    for (auto &v : b) v = ur(0.2f);
+    TMat tm;
+    tmat_upload(tm, w.data(), b.data(), C, C);
+    uint16_t *dn = dev(n2), *dh = dev(h1), *dp = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
+    float *o1 = dev(x), *o2 = dev(x), *ddw = dev(dw), *ddb = dev(dwb);
+    tdwconv2(dn, Cp, dp, Cp, H, W, C8, ddw, ddb, false, dh, FS, nullptr, nullptr);
+    TGemm g;
+    g.a = dp; g.sa = Cp; g.M = M; g.out = o1; g.so = Cp; g.out_f32 = true; g.add1 = o1; g.s1 = Cp; g.add1_f32 = true;
+    tgemm(tm, g, nullptr);
+    TDwGemm dg;
+    dg.in = dn; dg.sin = Cp; dg.H = H; dg.W = W; dg.dw = ddw; dg.dwb = ddb; dg.dwc = C8; dg.mul = dh; dg.smul = FS;
+    dg.out = o2; dg.so = Cp; dg.out_f32 = true; dg.add1 = o2; dg.s1 = Cp; dg.add1_f32 = true;
+    const cudaError_t e = tdwgemm(tm, dg, nullptr);
+    cudaDeviceSynchronize();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "dwgemm gate %dx%d %d vs dwconv2 + gemm (values differing)", H, W, C);
+    if (e != cudaSuccess) {
+        printf("FAIL %s: %s\n", nm, cudaGetErrorString(e));
+        fails++;
+        checks++;
+    } else {
+        auto h1o = host(o1, x.size()), h2o = host(o2, x.size());
+        size_t diff = 0;
+        for (size_t i = 0; i < h1o.size(); i++) diff += memcmp(&h1o[i], &h2o[i], 4) != 0;
+        report(nm, (double)diff, 0);
+    }
+    tmat_release(tm);
+    cudaFree(dn); cudaFree(dh); cudaFree(dp); cudaFree(o1); cudaFree(o2); cudaFree(ddw); cudaFree(ddb);
 }
 
 static void test_ln(int M, int C)
@@ -529,6 +577,7 @@ int main()
     test_gemm_ln(77, 120, 240);    // FDAT-M's
     test_dwgemm(40, 64, 360, 180);  // FDAT-XL's smix + fc2
     test_dwgemm(9, 128, 240, 120);  // FDAT-M's
+    test_dwgemm_gate(20, 128, 180);  // DAT-2's SGFN
     test_gemm(90, 120, 120, true, false, false, true, false, true);
     test_mlp(1000, 180, 360, true);  // HAT-L's MLP, a row tail
     test_mlp(77, 180, 360, false);
