@@ -93,9 +93,10 @@ const char *variant_name(const Conv3x3 &op, int variant);
 cudaError_t launch(const Conv3x3 &op, const Tensors &t, int H, int W, int variant, cudaStream_t s);
 cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, int npx, int variant, cudaStream_t s);
 
-// Time every variant of op on stream s (writes t.dst) and return the fastest, or -1 on error.
-// Not inside stream capture.
-int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms = nullptr);
+// Time every variant of op on stream s (writes t.dst) and return the fastest, or -1 on error;
+// best16, if given, gets the fastest of the 16-row tiles (variants 0 and 1). Not inside stream capture.
+int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms = nullptr,
+                 int *best16 = nullptr);
 
 }  // namespace ajinative
 

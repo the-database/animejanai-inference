@@ -1,11 +1,9 @@
 // native/conv.cu — see conv.h. The kernels are instantiated here for a fixed set of shapes
 // (the kConv table); supported() reports what is in it.
 #include "native/conv.h"
-#include "native/device.h"
 #include "native/pack.h"
 #include "native/conv_kernels.cuh"
 
-#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -269,10 +267,9 @@ cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, 
     return e->fn(p, s);
 }
 
-int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms)
+int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms, int *best16)
 {
-    // the 8-row tiles only where L2 is large: on an RTX A5000 they win alone but cost SPAN ~2% end to end
-    const int n = std::min(variant_count(op), large_l2() ? kVariants : 2);
+    const int n = variant_count(op);
     if (n == 0) return -1;
     cudaEvent_t e0, e1;
     if (cudaEventCreate(&e0) != cudaSuccess) return -1;
@@ -280,8 +277,8 @@ int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t
         cudaEventDestroy(e0);
         return -1;
     }
-    int best = -1;
-    float best_t = 0.f;
+    int best = -1, b16 = -1;
+    float best_t = 0.f, b16_t = 0.f;
     constexpr int kWarm = 3, kRuns = 10;
     for (int v = 0; v < n; v++) {
         bool ok = true;
@@ -298,10 +295,15 @@ int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t
             best = v;
             best_t = ms;
         }
+        if (v < 2 && (b16 < 0 || ms < b16_t)) {
+            b16 = v;
+            b16_t = ms;
+        }
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
     if (best >= 0 && best_ms) *best_ms = best_t / kRuns;
+    if (best16) *best16 = best >= 0 ? b16 : -1;
     return best;
 }
 

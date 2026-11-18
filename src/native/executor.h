@@ -46,9 +46,11 @@ private:
         Conv3x3 op;
         ConcatConv1x1 cop;
         int src = -1, resid = -1, dst = -1, variant = 0;
+        int variant16 = 0;  // the fastest 16-row tile, alone
         int srcs[4] = {-1, -1, -1, -1};
     };
     const void *ptr(int t, const void *in, void *out) const;
+    void check_picks(const void *in, void *out, cudaStream_t s);
     std::vector<std::unique_ptr<Weights>> weights_;
     std::vector<Step> steps_;
     std::vector<void *> buffers_;  // owned

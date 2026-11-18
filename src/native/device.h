@@ -9,8 +9,7 @@
 namespace ajinative {
 
 // Whether the current device's L2 is 32 MB or more (RTX 4090 72 MB, 5090 96 MB; RTX A5000 / 30-series
-// 6 MB). With a small L2, prefetching rows ahead of use and tiles that re-read more halo from L2 cost:
-// they win measured alone but lose a few percent in a whole network.
+// 6 MB). With a small L2, rows prefetched ahead of use are evicted again before they are read.
 inline bool large_l2()
 {
     constexpr int kMaxDev = 16;
