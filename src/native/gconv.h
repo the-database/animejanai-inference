@@ -65,6 +65,9 @@ struct GConvArgs {
     bool out_f32 = false;
     const float *r1f = nullptr;
     int r1f_stride = 0;
+    // Optional: the output's channel sums (of the stored fp16 values) added to sums[cout_pad] (float,
+    // zeroed by the caller); fp16 NHWC output only; the launch then runs unsplit.
+    float *sums = nullptr;
 };
 
 // Floats of workspace glaunch would use to split K for a (0: it would not split).

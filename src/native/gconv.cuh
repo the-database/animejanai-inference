@@ -43,6 +43,7 @@ struct GParams {
     float *dstf;
     const float *r1f;
     int r1fs;
+    float *sums;                        // or null: the output's channel sums added here (NHWC, no split)
 };
 
 __device__ __forceinline__ half2 u2h(uint32_t u) { return *reinterpret_cast<half2 *>(&u); }
@@ -236,6 +237,16 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
             if (yy >= p.H || xx >= p.W) continue;
             *reinterpret_cast<uint4 *>(dst + ((size_t)yy * p.W + xx) * p.dstride + v * 8) =
                 *reinterpret_cast<const uint4 *>(sm + (r * TW + px) * SP + v * 8);
+        }
+        if (p.sums) {
+            // the tile's channel sums of the stored (fp16) values, one atomic per channel per CTA
+            for (int c = tid; c < COUTP; c += WARPS * 32) {
+                float sum = 0.f;
+                for (int r = 0; r < TH; r++)
+                    if (ty0 + r < p.H)
+                        for (int px = 0; px < TW && tx0 + px < p.W; px++) sum += __half2float(sm[(r * TW + px) * SP + c]);
+                atomicAdd(p.sums + och * COUTP + c, sum);
+            }
         }
     } else {
         // phase scatter: channel sx*CHP + c of all output channels -> dst[R*y + sy][R*x + sx][c]; this CTA

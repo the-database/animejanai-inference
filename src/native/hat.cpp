@@ -333,10 +333,11 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             GConvArgs c0 = ga(N1, CP, h, w, T60, crp, h, w);
             c0.act = GAct::Gelu;
             CK(Gc(b.cab0, c0));
-            CK(Gc(b.cab2, ga(T60, crp, h, w, Y, CP, h, w)));
-            pr.mark(P_CONV);
             K(cudaMemsetAsync(sums, 0, CP * 4, s));
-            K(tcolsum(Y, CP, M, C, sums, s));
+            GConvArgs c2 = ga(T60, crp, h, w, Y, CP, h, w);
+            c2.sums = sums;  // the channel gate's sums from the conv's epilogue
+            CK(Gc(b.cab2, c2));
+            pr.mark(P_CONV);
             K(chan_gate(sums, M, C, cs, b.ca1, b.cab1, b.ca2, b.cab2b, 1, 1.f / b.conv_scale, cm, CP, s));
             pr.mark(P_GATE);
             CK(gemm(*b.at.qkv, N1, CP, QKV, QS, TAct::None, false));
