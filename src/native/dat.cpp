@@ -483,8 +483,10 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 pr.mark(P_WIN);
                 // channel gate from the conv branch's average, token gate from the attention
                 K(chan_gate(sums, M, C, b.cr, b.cw1, b.cb1, b.cw2, b.cb2, 0, 1.f, cg, CP, s));
-                K(dat_token_gate(AT, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
-                K(dat_mix(AT, CX, CP, cg, tg, 0, Z, M, C, s));
+                if (!collect && dat_gate_mix(AT, CX, CP, cg, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, 0, Z, s) == cudaErrorNotSupported) {
+                    CK(dat_token_gate(AT, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
+                    CK(dat_mix(AT, CX, CP, cg, tg, 0, Z, M, C, s));
+                }
             } else {
                 if (!collect) {
                     CK(cudaMemsetAsync(stats, 0, (size_t)(heads * hd * hd + 2 * C) * 4, s));
@@ -500,8 +502,10 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 // channel gate from the attention's average, token gate from the conv branch
                 K(tcolsum(AT, CP, M, C, sums, s));
                 K(chan_gate(sums, M, C, b.cr, b.cw1, b.cb1, b.cw2, b.cb2, 0, 1.f, cg, CP, s));
-                K(dat_token_gate(CX, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
-                K(dat_mix(AT, CX, CP, cg, tg, 1, Z, M, C, s));
+                if (!collect && dat_gate_mix(AT, CX, CP, cg, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, 1, Z, s) == cudaErrorNotSupported) {
+                    CK(dat_token_gate(CX, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
+                    CK(dat_mix(AT, CX, CP, cg, tg, 1, Z, M, C, s));
+                }
             }
             pr.mark(P_GATE);
             CK(gemm(*b.proj, Z, CP, S, CP, TAct::None, true));
