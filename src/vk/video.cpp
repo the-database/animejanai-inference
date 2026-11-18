@@ -22,6 +22,19 @@ namespace {
 // Two aji_vk_images of one VkImage (one wrapper twice, or two wrappers of it)
 bool same_image(const aji_vk_image *a, const aji_vk_image *b) { return a == b || a->image == b->image; }
 
+// Queue-family ownership of a caller's image (aji.h): read from an owner other than libaji's
+// family, it is acquired from it (the caller released it to libaji's family); an output's
+// contents are replaced, so it moves without a transfer. VK_QUEUE_FAMILY_IGNORED (a CONCURRENT
+// image, or one used on libaji's family alone) transfers nothing.
+void set_owner(VkImageMemoryBarrier &b, const aji_vk_image *im, uint32_t ours, bool read)
+{
+    const bool acquire = read && im->queue_family != VK_QUEUE_FAMILY_IGNORED && im->queue_family != ours;
+    b.srcQueueFamilyIndex = acquire ? im->queue_family : VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = acquire ? ours : VK_QUEUE_FAMILY_IGNORED;
+}
+// the owner to write back: libaji's family, unless the image had none (it keeps none)
+uint32_t owner_after(const aji_vk_image *im, uint32_t ours) { return im->queue_family == VK_QUEUE_FAMILY_IGNORED ? VK_QUEUE_FAMILY_IGNORED : ours; }
+
 std::string fmt_num(double v)
 {
     if (v >= 1e300) return "inf";
@@ -343,7 +356,7 @@ int VkVideo::infer_rife(const aji_frame *a, const aji_frame *b, double t, const 
         ib2.dstAccessMask = acc;
         ib2.oldLayout = discard ? VK_IMAGE_LAYOUT_UNDEFINED : static_cast<VkImageLayout>(im->layout);
         ib2.newLayout = to;
-        ib2.srcQueueFamilyIndex = ib2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        set_owner(ib2, im, dev_->queue_family(), !discard);
         ib2.image = static_cast<VkImage>(im->image);
         ib2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib2);
@@ -407,7 +420,7 @@ int VkVideo::infer_rife(const aji_frame *a, const aji_frame *b, double t, const 
             im->value = done[i];
             im->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             im->access = VK_ACCESS_2_TRANSFER_READ_BIT;
-            im->queue_family = dev_->queue_family();
+            im->queue_family = owner_after(im, dev_->queue_family());
         }
     }
     if (scene < 0) {
@@ -465,7 +478,7 @@ int VkVideo::infer_rife(const aji_frame *a, const aji_frame *b, double t, const 
         io->value += 1;
         io->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         io->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        io->queue_family = dev_->queue_family();
+        io->queue_family = owner_after(io, dev_->queue_family());
     }
     // synchronous like the other backends' aji_infer_rife: the interpolated frame is complete on return
     return wait(ticket_);
@@ -794,6 +807,7 @@ int VkVideo::infer(const aji_frame *in, const aji_frame *out)
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     }
+    set_owner(ib[0], ii, dev_->queue_family(), true);
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, ib);
     const uint32_t ibps = in->format == AJI_FMT_P010 ? 2 : 1, obps = out->format == AJI_FMT_P010 ? 2 : 1;
     const auto region = [](uint32_t row_texels, VkImageAspectFlagBits plane, int w, int h) {
@@ -845,11 +859,11 @@ int VkVideo::infer(const aji_frame *in, const aji_frame *out)
     ii->value += 1;
     ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
-    ii->queue_family = dev_->queue_family();
+    ii->queue_family = owner_after(ii, dev_->queue_family());
     oi->value += 1;
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    oi->queue_family = dev_->queue_family();
+    oi->queue_family = owner_after(oi, dev_->queue_family());
     return AJI_OK;
 }
 
@@ -882,14 +896,15 @@ void full_barrier(VkCommandBuffer cb)
 void step_barrier(VkCommandBuffer cb) { mem_barrier(cb, kCT, kRW, kCT, kRW); }
 
 // an image's planes into a FrameIO's input buffers, or its output buffers into an image
-void copy_planes(VkCommandBuffer cb, aji_vk_image *im, VkBuffer y, VkBuffer uv, uint32_t pitch, int w, int h, uint32_t bps, bool in)
+void copy_planes(VkCommandBuffer cb, aji_vk_image *im, VkBuffer y, VkBuffer uv, uint32_t pitch, int w, int h, uint32_t bps, bool in,
+                 uint32_t family)
 {
     VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     ib.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     ib.dstAccessMask = in ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
     ib.oldLayout = in ? static_cast<VkImageLayout>(im->layout) : VK_IMAGE_LAYOUT_UNDEFINED;  // the output is replaced
     ib.newLayout = in ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    set_owner(ib, im, family, in);
     ib.image = static_cast<VkImage>(im->image);
     ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
@@ -1230,7 +1245,7 @@ int VkVideo::ingest(const aji_frame *in, uint64_t seq)
         return AJI_ERR;
     }
     full_barrier(cb);
-    copy_planes(cb, ii, io_pre_->in_y().buf, io_pre_->in_uv().buf, io_pre_->in_pitch(), in_w_, in_h_, in->format == AJI_FMT_P010 ? 2 : 1, true);
+    copy_planes(cb, ii, io_pre_->in_y().buf, io_pre_->in_uv().buf, io_pre_->in_pitch(), in_w_, in_h_, in->format == AJI_FMT_P010 ? 2 : 1, true, dev_->queue_family());
     step_barrier(cb);
     io_pre_->record_pre(cb);
     rec_steps(cb, 0, stages_[0].step);
@@ -1246,7 +1261,7 @@ int VkVideo::ingest(const aji_frame *in, uint64_t seq)
     ii->value += 1;
     ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
-    ii->queue_family = dev_->queue_family();
+    ii->queue_family = owner_after(ii, dev_->queue_family());
     return AJI_OK;
 }
 
@@ -1307,7 +1322,7 @@ int VkVideo::infer_seq(uint64_t seq, const aji_frame *out)
     rec_steps(cb, T.step + 1, steps_.size());
     io_->record_post(cb);
     mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    copy_planes(cb, oi, io_->out_y().buf, io_->out_uv().buf, io_->out_pitch(), out_w_, out_h_, out->format == AJI_FMT_P010 ? 2 : 1, false);
+    copy_planes(cb, oi, io_->out_y().buf, io_->out_uv().buf, io_->out_pitch(), out_w_, out_h_, out->format == AJI_FMT_P010 ? 2 : 1, false, dev_->queue_family());
     const Device::SemValue w1{static_cast<VkSemaphore>(oi->semaphore), oi->value};
     const uint64_t t = ticket_ + 1;
     const Device::SemValue sig[2] = {{tl_, t}, {static_cast<VkSemaphore>(oi->semaphore), oi->value + 1}};
@@ -1319,7 +1334,7 @@ int VkVideo::infer_seq(uint64_t seq, const aji_frame *out)
     oi->value += 1;
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    oi->queue_family = dev_->queue_family();
+    oi->queue_family = owner_after(oi, dev_->queue_family());
     return AJI_OK;
 }
 
@@ -1442,7 +1457,7 @@ int VkVideo::frame_diff(const aji_frame *a, const aji_frame *b, aji_frame_diff_r
     full_barrier(cb);
     const uint32_t bps = fmt == AJI_FMT_P010 ? 2 : 1;
     const int nimg = 2;
-    for (int i = 0; i < 2; i++) copy_planes(cb, im[i], D.y[i].buf, D.uv[i].buf, D.pitch, a->width, a->height, bps, true);
+    for (int i = 0; i < 2; i++) copy_planes(cb, im[i], D.y[i].buf, D.uv[i].buf, D.pitch, a->width, a->height, bps, true, dev_->queue_family());
     vkCmdFillBuffer(cb, D.acc.buf, 0, 33 * 4, 0);
     step_barrier(cb);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, D.pipe);
@@ -1473,7 +1488,7 @@ int VkVideo::frame_diff(const aji_frame *a, const aji_frame *b, aji_frame_diff_r
         im[i]->value += 1;
         im[i]->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         im[i]->access = VK_ACCESS_2_TRANSFER_READ_BIT;
-        im[i]->queue_family = dev_->queue_family();
+        im[i]->queue_family = owner_after(im[i], dev_->queue_family());
     }
     if (wait(ticket_) != AJI_OK) return AJI_ERR;
     uint32_t acc[33];
@@ -1540,14 +1555,14 @@ int VkVideo::resize(const aji_frame *in, const aji_frame *out)
     }
     const uint32_t bps = in->format == AJI_FMT_P010 ? 2 : 1;
     full_barrier(cb);
-    copy_planes(cb, ii, P.io->in_y().buf, P.io->in_uv().buf, P.io->in_pitch(), P.sw, P.sh, bps, true);
+    copy_planes(cb, ii, P.io->in_y().buf, P.io->in_uv().buf, P.io->in_pitch(), P.sw, P.sh, bps, true, dev_->queue_family());
     step_barrier(cb);
     P.io->record_pre(cb);
     step_barrier(cb);
     P.rs->record(cb);
     P.io->record_post(cb);
     mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    copy_planes(cb, oi, P.io->out_y().buf, P.io->out_uv().buf, P.io->out_pitch(), P.ww, P.wh, bps, false);
+    copy_planes(cb, oi, P.io->out_y().buf, P.io->out_uv().buf, P.io->out_pitch(), P.ww, P.wh, bps, false, dev_->queue_family());
     const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ii->semaphore), ii->value},
                                        {static_cast<VkSemaphore>(oi->semaphore), oi->value}};
     const uint64_t t = ticket_ + 1;
@@ -1561,11 +1576,11 @@ int VkVideo::resize(const aji_frame *in, const aji_frame *out)
     ii->value += 1;
     ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
-    ii->queue_family = dev_->queue_family();
+    ii->queue_family = owner_after(ii, dev_->queue_family());
     oi->value += 1;
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    oi->queue_family = dev_->queue_family();
+    oi->queue_family = owner_after(oi, dev_->queue_family());
     return AJI_OK;
 }
 
@@ -1603,6 +1618,7 @@ int VkVideo::copy_frame(const aji_frame *in, const aji_frame *out)
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     }
+    set_owner(ib[0], ii, dev_->queue_family(), true);
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, ib);
     VkImageCopy r[2] = {};
     for (int p = 0; p < 2; p++) {
@@ -1625,11 +1641,11 @@ int VkVideo::copy_frame(const aji_frame *in, const aji_frame *out)
     ii->value += 1;
     ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
-    ii->queue_family = dev_->queue_family();
+    ii->queue_family = owner_after(ii, dev_->queue_family());
     oi->value += 1;
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    oi->queue_family = dev_->queue_family();
+    oi->queue_family = owner_after(oi, dev_->queue_family());
     return AJI_OK;
 }
 

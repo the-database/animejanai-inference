@@ -7,11 +7,13 @@
  *
  *   aji_vk_frames_test --conf C --model-dir D --slot N --input in.raw --width W --height H
  *                      [--frames N] [--output out.raw] [--format nv12|p010] [--out-format nv12|p010]
- *                      [--no-coopmat] [--rife --rife-model-dir R [--rife-same]]
+ *                      [--no-coopmat] [--owned] [--rife --rife-model-dir R [--rife-same]]
  *
  * --no-coopmat tells libaji the device was created without cooperative matrices (they are left
  * out of the features chain and the extension list): the family it then picks is the one a
- * player that didn't enable them gets. Raw files as aji_harness_dml's: per frame the Y plane, then
+ * player that didn't enable them gets. The images start with no queue family owner
+ * (VK_QUEUE_FAMILY_IGNORED, as FFmpeg's CONCURRENT frames), or with --owned owned by the
+ * device's family; libaji must write back the same owner. Raw files as aji_harness_dml's: per frame the Y plane, then
  * the interleaved CbCr plane; 16-bit little-endian MSB-aligned for P010.
  *
  * A temporal chain (aji_temporal_radius > 0) runs as aji_harness_dml's: frames ingested in order,
@@ -42,12 +44,22 @@ namespace {
 
 void log_cb(void *, int level, const char *msg) { std::fprintf(stderr, "[aji:%d] %s\n", level, msg); }
 
+uint32_t g_owner = VK_QUEUE_FAMILY_IGNORED;  // the images' queue family owner (--owned: the device's)
+
 struct Image {
     VkImage img = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkSemaphore sem = VK_NULL_HANDLE;
     aji_vk_image d{};
 };
+
+// the owner libaji wrote back is the one the image came with (its own family is the device's)
+bool owner_kept(const Image &im, const char *what)
+{
+    if (im.d.queue_family == g_owner) return true;
+    std::fprintf(stderr, "%s: queue family owner %u written back, expected %u\n", what, im.d.queue_family, g_owner);
+    return false;
+}
 
 bool make_image(Device &dev, int w, int h, bool p010, Image *im, std::string *why)
 {
@@ -83,7 +95,7 @@ bool make_image(Device &dev, int w, int h, bool p010, Image *im, std::string *wh
     if (vkCreateSemaphore(dev.device(), &si, nullptr, &im->sem) != VK_SUCCESS) return *why = "semaphore", false;
     im->d.image = im->img;
     im->d.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    im->d.queue_family = VK_QUEUE_FAMILY_IGNORED;
+    im->d.queue_family = g_owner;
     im->d.semaphore = im->sem;
     im->d.value = 0;
     return true;
@@ -211,6 +223,9 @@ bool run_rife(Device &dev, aji_ctx *c, const char *input, const char *output, in
                 std::fprintf(stderr, "aji_infer_rife: %d: %s\n", ret, aji_last_error(c));
                 return false;
             }
+            if (!owner_kept(fr[prev], "aji_infer_rife a") || !owner_kept(fr[cur], "aji_infer_rife b") ||
+                (ret == AJI_OK && !owner_kept(fr[2], "aji_infer_rife out")))
+                return false;
             if (!transfer(dev, fr[emit], st, w, h, bps, false, &why)) return false;
             if (fo) fo.write(static_cast<const char *>(st.map), (std::streamsize)fb);
             if (same) {
@@ -345,6 +360,7 @@ bool run_diff(Device &dev, aji_ctx *c, const char *input, int w, int h, int fram
                 std::fprintf(stderr, "aji_frame_diff: %d: %s\n", ret, aji_last_error(c));
                 return false;
             }
+            if (!owner_kept(im[0], "aji_frame_diff") || !owner_kept(im[1], "aji_frame_diff")) return false;
             std::printf("diff %d %d %.9g", n - 1, n, r.max_tile);
             for (float v : r.region_mean) std::printf(" %.9g", v);
             std::printf("\n");
@@ -367,7 +383,7 @@ int main(int argc, char **argv)
 {
     const char *conf = nullptr, *model_dir = nullptr, *input = nullptr, *output = nullptr, *rife_dir = nullptr;
     int w = 0, h = 0, frames = 1 << 30, slot = 1, reset_at = -1;
-    bool p010 = false, out_p010 = false, no_cm = false, rife = false, rife_same = false, diff = false;
+    bool p010 = false, out_p010 = false, no_cm = false, rife = false, rife_same = false, diff = false, owned = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
         if (!std::strcmp(a, "--no-coopmat")) {
@@ -384,6 +400,10 @@ int main(int argc, char **argv)
         }
         if (!std::strcmp(a, "--diff")) {
             diff = true;
+            continue;
+        }
+        if (!std::strcmp(a, "--owned")) {
+            owned = true;
             continue;
         }
         i++;
@@ -412,6 +432,7 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "caller device: %s\n", why.c_str());
         return 1;
     }
+    if (owned) g_owner = dev->queue_family();
     const bool cm = dev->family() == Family::CM16 && !no_cm;
     const bool sg = dev->family() != Family::PLAIN;
     // what Device::create enabled (vk/device.cpp), as the player would report its own device's
@@ -512,6 +533,7 @@ int main(int argc, char **argv)
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (n >= 2) total += ms;
+        if (!owner_kept(in, "aji_infer in") || !owner_kept(out, "aji_infer out")) return 1;
         if (!transfer(*dev, out, sout, ow, oh, obps, false, &why)) {
             std::fprintf(stderr, "download: %s\n", why.c_str());
             return 1;

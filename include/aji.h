@@ -535,15 +535,23 @@ typedef struct aji_vk_device {
  * context. A 4:2:0 frame is one multi-planar image (NV12:
  * VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, P010: G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
  * or G16_B16R16_2PLANE_420_UNORM), created with TRANSFER_SRC (input) or
- * TRANSFER_DST (output) usage and EXCLUSIVE sharing, as FFmpeg's Vulkan frames
- * are. Synchronisation is FFmpeg's AVVkFrame rule: libaji's work waits for
+ * TRANSFER_DST (output) usage, CONCURRENT or EXCLUSIVE sharing (FFmpeg's
+ * Vulkan frames are CONCURRENT when it uses more than one queue family).
+ * Synchronisation is FFmpeg's AVVkFrame rule: libaji's work waits for
  * semaphore to reach value, signals value + 1 and writes value + 1 here, with
  * the layout, access and queue family it leaves the image in; the caller
- * copies them back into its AVVkFrame. */
+ * copies them back into its AVVkFrame.
+ * Queue family ownership: queue_family is VK_QUEUE_FAMILY_IGNORED for a
+ * CONCURRENT image (or an EXCLUSIVE one used only on aji_vk_device's
+ * queue_family); libaji then transfers nothing and leaves it IGNORED. An
+ * EXCLUSIVE image owned by another family carries that family here and must
+ * have been released by the caller to aji_vk_device's queue_family; libaji
+ * acquires it when it reads the image (an output's contents are replaced, so
+ * none is needed) and writes back its own family as the owner. */
 typedef struct aji_vk_image {
     void *image;                     /* VkImage */
     int32_t layout;                  /* VkImageLayout: in, then as left */
-    uint32_t queue_family;           /* owner (VK_QUEUE_FAMILY_IGNORED: none yet); as left */
+    uint32_t queue_family;           /* owner (VK_QUEUE_FAMILY_IGNORED: none); as left */
     uint64_t access;                 /* VkAccessFlags2 of the last access; as left */
     void *semaphore;                 /* VkSemaphore, timeline */
     uint64_t value;                  /* ready at value; then value + 1 */
