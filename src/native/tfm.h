@@ -53,8 +53,20 @@ struct TGemm {
     // fp32 residual streams (bf16-trained models whose stream outgrows fp16): out and/or add1 as float
     bool out_f32 = false, add1_f32 = false;
     const float *add2scale = nullptr;  // [Npad] device: add2 scaled per column before it is added, or null
+    // LayerNorm of A's rows over the first K channels (gamma, beta: K floats, device) applied on load, as
+    // tlayernorm; only without adds and for K padded to 128 / 192 / 224 / 256 (cudaErrorNotSupported
+    // otherwise, nothing launched: normalise first then)
+    const float *ln_gamma = nullptr, *ln_beta = nullptr;
+    float ln_eps = 1e-5f;
 };
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
+
+// out = dwconv3x3(in) W + bias + add1 (fp16; FDAT's smix then fc2) in one kernel: the depthwise 3x3
+// (zero padding, no bias; dw: [W's K][9] floats) over the H x W map in (W's K channels, stride sin) as
+// tdwconv computes and rounds it, never stored. add1 may be out. W a multiple of 64. cudaErrorNotSupported
+// (nothing launched) for other shapes or AJI_NATIVE_DWMM=0: tdwconv then tgemm.
+cudaError_t tdwgemm(const TMat &w, const void *in, int sin, int H, int W, const float *dw, void *out, int so, const void *add1, int s1,
+                    cudaStream_t s);
 
 // The MLP out = epi(GELU(A W1 + b1) W2 + b2) in one kernel, the hidden kept on chip; the epilogue as
 // tgemm's (add1, then out; fp32 or fp16 each). Both biases required. With ln_gamma, A is an fp32 map

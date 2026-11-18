@@ -246,6 +246,85 @@ static void test_mlp_ln(int M, int C, int hid)
     cudaFree(o1); cudaFree(o2); cudaFree(dg); cudaFree(db); cudaFree(dn); cudaFree(dlo); cudaFree(dlr);
 }
 
+// tgemm with its LayerNorm on the A load (fp16 rows, as FDAT's fc1) against tlayernorm then tgemm.
+static void test_gemm_ln(int M, int K, int N)
+{
+    const int Kp = (K + 15) / 16 * 16, Np = (N + 15) / 16 * 16;
+    std::vector<uint16_t> a((size_t)M * Kp, 0);
+    for (int m = 0; m < M; m++) {
+        const float off = ur(3.f), sc = 0.5f + std::fabs(ur(4.f));
+        for (int k = 0; k < K; k++) a[(size_t)m * Kp + k] = hb(off + sc * ur(1.f));
+    }
+    std::vector<float> w((size_t)K * N), gm(K), bt(K);
+    for (auto &v : w) v = hf(hb(ur(0.1f)));
+    for (auto &v : gm) v = 0.5f + ur(0.4f);
+    for (auto &v : bt) v = ur(0.2f);
+    TMat tm;
+    tmat_upload(tm, w.data(), nullptr, K, N);
+    uint16_t *da = dev(a), *dn = dev(std::vector<uint16_t>((size_t)M * Kp, 0)), *o1 = dev(std::vector<uint16_t>((size_t)M * Np, 0)),
+             *o2 = dev(std::vector<uint16_t>((size_t)M * Np, 0));
+    float *dg = dev(gm), *db = dev(bt);
+    tlayernorm(da, Kp, dn, Kp, M, K, Kp, dg, db, 1e-5f, nullptr);
+    TGemm g;
+    g.a = dn; g.sa = Kp; g.M = M; g.out = o1; g.so = Np; g.act = TAct::Gelu;
+    tgemm(tm, g, nullptr);
+    g.a = da; g.out = o2; g.ln_gamma = dg; g.ln_beta = db; g.ln_eps = 1e-5f;
+    const cudaError_t e = tgemm(tm, g, nullptr);
+    cudaDeviceSynchronize();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "gemm+ln %dx%dx%d vs layernorm + gemm", M, K, N);
+    if (e != cudaSuccess) {
+        printf("FAIL %s: %s\n", nm, cudaGetErrorString(e));
+        fails++;
+        checks++;
+    } else {
+        auto h1 = host(o1, (size_t)M * Np), h2 = host(o2, (size_t)M * Np);
+        double me = 0;
+        for (size_t i = 0; i < h1.size(); i++) me = std::max(me, (double)std::fabs(hf(h1[i]) - hf(h2[i])));
+        report(nm, me, 0.02);
+    }
+    tmat_release(tm);
+    cudaFree(da); cudaFree(dn); cudaFree(o1); cudaFree(o2); cudaFree(dg); cudaFree(db);
+}
+
+// tdwgemm (FDAT's smix then fc2, in place on the stream) against tdwconv then tgemm: the same values.
+static void test_dwgemm(int H, int W, int K, int N)
+{
+    const int Kp = (K + 15) / 16 * 16, Np = (N + 15) / 16 * 16, M = H * W;
+    std::vector<uint16_t> h((size_t)M * Kp, 0), x((size_t)M * Np, 0);
+    for (int m = 0; m < M; m++) {
+        for (int k = 0; k < K; k++) h[(size_t)m * Kp + k] = hb(ur(2.f));
+        for (int n = 0; n < N; n++) x[(size_t)m * Np + n] = hb(ur(8.f));
+    }
+    std::vector<float> w((size_t)K * N), dw((size_t)K * 9);
+    for (auto &v : w) v = hf(hb(ur(0.1f)));
+    for (auto &v : dw) v = ur(0.4f);
+    TMat tm;
+    tmat_upload(tm, w.data(), nullptr, K, N);
+    uint16_t *dh = dev(h), *d2 = dev(std::vector<uint16_t>((size_t)M * Kp, 0)), *o1 = dev(x), *o2 = dev(x);
+    float *ddw = dev(dw);
+    tdwconv(dh, Kp, d2, Kp, H, W, K, ddw, false, nullptr);
+    TGemm g;
+    g.a = d2; g.sa = Kp; g.M = M; g.out = o1; g.so = Np; g.add1 = o1; g.s1 = Np;
+    tgemm(tm, g, nullptr);
+    const cudaError_t e = tdwgemm(tm, dh, Kp, H, W, ddw, o2, Np, o2, Np, nullptr);
+    cudaDeviceSynchronize();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "dwgemm %dx%d %d->%d vs dwconv + gemm (values differing)", H, W, K, N);
+    if (e != cudaSuccess) {
+        printf("FAIL %s: %s\n", nm, cudaGetErrorString(e));
+        fails++;
+        checks++;
+    } else {
+        auto h1 = host(o1, (size_t)M * Np), h2 = host(o2, (size_t)M * Np);
+        size_t diff = 0;
+        for (size_t i = 0; i < h1.size(); i++) diff += h1[i] != h2[i];
+        report(nm, (double)diff, 0);
+    }
+    tmat_release(tm);
+    cudaFree(dh); cudaFree(d2); cudaFree(o1); cudaFree(o2); cudaFree(ddw);
+}
+
 static void test_ln(int M, int C)
 {
     const int cp = (C + 15) / 16 * 16 + 8;
@@ -444,6 +523,12 @@ int main()
     test_gemm(333, 192, 544, true, false, true, false, false);  // K = 192 without adds: the row-stationary kernel
     test_gemm(77, 180, 360, false, true, false, false, false);
     test_gemm(200, 224, 672, true, false, false, false, false);  // K = 224 (SST-XL+)
+    test_gemm(150, 120, 360, false, true, false, false, false);  // K = 128 (FDAT-M)
+    test_gemm(90, 256, 128, true, false, false, false, false);
+    test_gemm_ln(1000, 180, 360);  // FDAT-XL's LN2 + fc1
+    test_gemm_ln(77, 120, 240);    // FDAT-M's
+    test_dwgemm(40, 64, 360, 180);  // FDAT-XL's smix + fc2
+    test_dwgemm(9, 128, 240, 120);  // FDAT-M's
     test_gemm(90, 120, 120, true, false, false, true, false, true);
     test_mlp(1000, 180, 360, true);  // HAT-L's MLP, a row tail
     test_mlp(77, 180, 360, false);
