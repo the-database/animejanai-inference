@@ -173,7 +173,7 @@ static void test_mlp(int M, int C, int hid, bool f32)
 // and against the CPU.
 static void test_mlp_ln(int M, int C, int hid)
 {
-    const int Cp = (C + 15) / 16 * 16, Hp = (hid + 15) / 16 * 16;
+    const int Cp = (C + 15) / 16 * 16;
     std::vector<float> w1((size_t)C * hid), b1(hid), w2((size_t)hid * C), b2(C), x((size_t)M * Cp, 0.f), gm(C), bt(C);
     for (auto &v : w1) v = hf(hb(ur(0.15f)));
     for (auto &v : w2) v = hf(hb(ur(0.1f)));
