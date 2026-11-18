@@ -1,9 +1,11 @@
 // native/conv.cu — see conv.h. The kernels are instantiated here for a fixed set of shapes
 // (the kConv table); supported() reports what is in it.
 #include "native/conv.h"
+#include "native/device.h"
 #include "native/pack.h"
 #include "native/conv_kernels.cuh"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -269,7 +271,8 @@ cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, 
 
 int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms)
 {
-    const int n = variant_count(op);
+    // the 8-row tiles only where L2 is large: on an RTX A5000 they win alone but cost SPAN ~2% end to end
+    const int n = std::min(variant_count(op), large_l2() ? kVariants : 2);
     if (n == 0) return -1;
     cudaEvent_t e0, e1;
     if (cudaEventCreate(&e0) != cudaSuccess) return -1;
