@@ -233,7 +233,8 @@ int run_concat(int C, int nsrc, int npx, int *checked)
         for (int co = 0; co < C; co++) {
             double s = hc.b[co];
             for (int k = 0; k < nsrc * C; k++) s += (double)sf[k / C][(size_t)p * C + k % C] * hc.wf[(size_t)k * C + co];
-            mx = std::fmax(mx, std::fabs(s - got[(size_t)p * C + co]));
+            const double e = std::fabs(s - got[(size_t)p * C + co]);
+            mx = e == e ? std::fmax(mx, e) : 1e9;  // fmax drops a NaN
         }
     if (mx > 0.02) { std::fprintf(stderr, "concat C %d nsrc %d: max %.4f\n", C, nsrc, mx); return 1; }
     (*checked)++;

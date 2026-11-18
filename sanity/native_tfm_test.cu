@@ -22,11 +22,27 @@ static uint16_t hb(float f) { return float_to_half_bits(f); }
 static float hf(uint16_t b) { return half_bits_to_float(b); }
 static float gelu(float v) { return 0.5f * v * (1.f + std::erf(v / 1.4140625f)); }
 static int fails = 0, checks = 0;
+static cudaError_t cuda_err = cudaSuccess;  // the first CUDA error: every later check fails with it
+
+static void ck(cudaError_t e)
+{
+    if (e != cudaSuccess && cuda_err == cudaSuccess) cuda_err = e;
+}
+static void sync()
+{
+    ck(cudaDeviceSynchronize());
+    ck(cudaGetLastError());
+}
+// A running maximum error that a NaN or an infinity poisons (std::max(me, NaN) keeps me).
+static double emax(double me, double e) { return std::isfinite(e) ? std::max(me, e) : INFINITY; }
 
 static void report(const char *name, double maxe, double lim)
 {
     checks++;
-    if (!(maxe <= lim)) {
+    if (cuda_err != cudaSuccess) {
+        fails++;
+        printf("FAIL %s: %s\n", name, cudaGetErrorString(cuda_err));
+    } else if (!(maxe <= lim)) {
         fails++;
         printf("FAIL %s: max err %.5f (limit %.5f)\n", name, maxe, lim);
     }
@@ -34,14 +50,14 @@ static void report(const char *name, double maxe, double lim)
 template <typename T> T *dev(const std::vector<T> &h)
 {
     T *d = nullptr;
-    cudaMalloc(&d, h.size() * sizeof(T));
-    cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+    ck(cudaMalloc(&d, h.size() * sizeof(T)));
+    ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
     return d;
 }
 template <typename T> std::vector<T> host(const T *d, size_t n)
 {
     std::vector<T> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost));
     return h;
 }
 
@@ -58,7 +74,7 @@ static void test_gemm(int M, int K, int N, bool bias, bool gelu_, bool scale, bo
     for (auto &v : b) v = ur(0.3f);
     for (int n = 0; n < N; n++) cs[n] = ur(1.f);
     TMat tm;
-    tmat_upload(tm, w.data(), bias ? b.data() : nullptr, K, N);
+    ck(tmat_upload(tm, w.data(), bias ? b.data() : nullptr, K, N));
     uint16_t *da = dev(a), *d1 = dev(a1), *d2 = dev(a2), *dout = dev(std::vector<uint16_t>((size_t)M * so, 0));
     float *dcs = dev(cs);
     TGemm g;
@@ -67,8 +83,8 @@ static void test_gemm(int M, int K, int N, bool bias, bool gelu_, bool scale, bo
     if (add1) { g.add1 = d1; g.s1 = so; }
     if (add2) { g.add2 = d2; g.s2 = so; }
     if (lrelu_last) { g.act = TAct::LRelu; g.act_last = true; g.slope = 0.2f; }
-    tgemm(tm, g, nullptr);
-    cudaDeviceSynchronize();
+    ck(tgemm(tm, g, nullptr));
+    sync();
     auto o = host(dout, (size_t)M * so);
     double me = 0;
     for (int m = 0; m < M; m++)
@@ -80,7 +96,7 @@ static void test_gemm(int M, int K, int N, bool bias, bool gelu_, bool scale, bo
             if (add1) v += hf(a1[(size_t)m * so + n]);
             if (add2) v += hf(a2[(size_t)m * so + n]);
             if (lrelu_last && v < 0) v *= 0.2;
-            me = std::max(me, std::fabs(v - hf(o[(size_t)m * so + n])));
+            me = emax(me, std::fabs(v - hf(o[(size_t)m * so + n])));
         }
     char nm[96];
     snprintf(nm, sizeof(nm), "gemm %dx%dx%d%s%s%s%s%s%s", M, K, N, lrelu_last ? " lrelu-last" : "", bias ? " bias" : "", gelu_ ? " gelu" : "", scale ? " scale" : "",
@@ -106,29 +122,29 @@ static void test_mlp(int M, int C, int hid, bool f32)
     for (int m = 0; m < M; m++)
         for (int n = 0; n < C; n++) res[(size_t)m * Cp + n] = f32 ? ur(1000.f) : hf(hb(ur(4.f)));
     TMat m1, m2;
-    tmat_upload(m1, w1.data(), b1.data(), C, hid);
-    tmat_upload(m2, w2.data(), b2.data(), hid, C);
+    ck(tmat_upload(m1, w1.data(), b1.data(), C, hid));
+    ck(tmat_upload(m2, w2.data(), b2.data(), hid, C));
     std::vector<uint16_t> res16(res.size());
     for (size_t i = 0; i < res.size(); i++) res16[i] = hb(res[i]);
     const size_t es = f32 ? 4 : 2, n = (size_t)M * Cp;
     uint16_t *da = dev(a), *dh = dev(std::vector<uint16_t>((size_t)M * Hp, 0));
     void *dr = f32 ? (void *)dev(res) : (void *)dev(res16), *o1 = nullptr, *o2 = nullptr;
-    cudaMalloc(&o1, n * es);
-    cudaMalloc(&o2, n * es);
-    cudaMemcpy(o1, dr, n * es, cudaMemcpyDeviceToDevice);  // fp32: in place, as HAT's stream
-    cudaMemcpy(o2, dr, n * es, cudaMemcpyDeviceToDevice);
+    ck(cudaMalloc(&o1, n * es));
+    ck(cudaMalloc(&o2, n * es));
+    ck(cudaMemcpy(o1, dr, n * es, cudaMemcpyDeviceToDevice));  // fp32: in place, as HAT's stream
+    ck(cudaMemcpy(o2, dr, n * es, cudaMemcpyDeviceToDevice));
     TGemm g1;
     g1.a = da; g1.sa = Cp; g1.M = M; g1.out = dh; g1.so = Hp; g1.act = TAct::Gelu;
     TGemm g2;
     g2.a = dh; g2.sa = Hp; g2.M = M; g2.out = o1; g2.so = Cp; g2.out_f32 = f32;
     g2.add1 = f32 ? o1 : dr; g2.s1 = Cp; g2.add1_f32 = f32;
-    tgemm(m1, g1, nullptr);
-    tgemm(m2, g2, nullptr);
+    ck(tgemm(m1, g1, nullptr));
+    ck(tgemm(m2, g2, nullptr));
     TMlp t;
     t.a = da; t.sa = Cp; t.M = M; t.out = o2; t.so = Cp; t.out_f32 = f32;
     t.add1 = f32 ? o2 : dr; t.s1 = Cp; t.add1_f32 = f32;
     const cudaError_t e = tmlp(m1, m2, t, nullptr);
-    cudaDeviceSynchronize();
+    sync();
     char nm[96];
     snprintf(nm, sizeof(nm), "mlp %dx%dx%d%s", M, C, hid, f32 ? " f32" : "");
     if (e != cudaSuccess) {
@@ -137,8 +153,8 @@ static void test_mlp(int M, int C, int hid, bool f32)
         checks++;
     } else {
         std::vector<uint8_t> h1(n * es), h2(n * es);
-        cudaMemcpy(h1.data(), o1, n * es, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h2.data(), o2, n * es, cudaMemcpyDeviceToHost);
+        ck(cudaMemcpy(h1.data(), o1, n * es, cudaMemcpyDeviceToHost));
+        ck(cudaMemcpy(h2.data(), o2, n * es, cudaMemcpyDeviceToHost));
         size_t diff = 0;
         for (size_t i = 0; i < h1.size(); i += es) diff += memcmp(&h1[i], &h2[i], es) != 0;
         char nb[120];
@@ -158,7 +174,7 @@ static void test_mlp(int M, int C, int hid, bool f32)
                 const size_t i = (size_t)m * Cp + c;
                 const double got = f32 ? (double)reinterpret_cast<const float *>(h2.data())[i]
                                        : (double)hf(reinterpret_cast<const uint16_t *>(h2.data())[i]);
-                me = std::max(me, std::fabs(v - got) / (f32 ? 1.0 : std::max(1.0, std::fabs(v))));
+                me = emax(me, std::fabs(v - got) / (f32 ? 1.0 : std::max(1.0, std::fabs(v))));
             }
         }
         report(nm, me, f32 ? 2e-3 : 4e-3);
@@ -186,11 +202,11 @@ static void test_mlp_ln(int M, int C, int hid)
         for (int n = 0; n < C; n++) x[(size_t)m * Cp + n] = off + sc * ur(1.f);
     }
     TMat m1, m2;
-    tmat_upload(m1, w1.data(), b1.data(), C, hid);
-    tmat_upload(m2, w2.data(), b2.data(), hid, C);
+    ck(tmat_upload(m1, w1.data(), b1.data(), C, hid));
+    ck(tmat_upload(m2, w2.data(), b2.data(), hid, C));
     float *o1 = dev(x), *o2 = dev(x), *dg = dev(gm), *db = dev(bt);
     uint16_t *dn = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
-    tlayernorm2(o1, true, Cp, dn, false, Cp, M, C, Cp, dg, db, 1e-5f, nullptr);
+    ck(tlayernorm2(o1, true, Cp, dn, false, Cp, M, C, Cp, dg, db, 1e-5f, nullptr));
     TMlp t;
     t.a = dn; t.sa = Cp; t.M = M; t.out = o1; t.so = Cp; t.out_f32 = true; t.add1 = o1; t.s1 = Cp; t.add1_f32 = true;
     const cudaError_t e1 = tmlp(m1, m2, t, nullptr);
@@ -198,8 +214,8 @@ static void test_mlp_ln(int M, int C, int hid)
     uint16_t *dlo = dev(std::vector<uint16_t>((size_t)M * Cp, 0x7c00)), *dlr = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
     t.lno = dlo; t.slno = Cp; t.lno_gamma = db; t.lno_beta = dg; t.lno_eps = 1e-3f;  // the next LayerNorm (other parameters)
     const cudaError_t e2 = tmlp(m1, m2, t, nullptr);
-    tlayernorm2(o2, true, Cp, dlr, false, Cp, M, C, Cp, db, dg, 1e-3f, nullptr);
-    cudaDeviceSynchronize();
+    ck(tlayernorm2(o2, true, Cp, dlr, false, Cp, M, C, Cp, db, dg, 1e-3f, nullptr));
+    sync();
     char nm[96];
     snprintf(nm, sizeof(nm), "mlp+ln %dx%dx%d", M, C, hid);
     checks++;
@@ -227,8 +243,8 @@ static void test_mlp_ln(int M, int C, int hid)
                 double v = b2[c] + x[(size_t)m * Cp + c];
                 for (int j = 0; j < hid; j++) v += hv[j] * w2[(size_t)j * C + c];
                 const size_t i = (size_t)m * Cp + c;
-                me = std::max(me, std::fabs(v - h2[i]) / std::max(1.0, std::fabs(v) * 1e-3));
-                md = std::max(md, (double)std::fabs(h1[i] - h2[i]) / std::max(1.0, std::fabs((double)h1[i]) * 1e-3));
+                me = emax(me, std::fabs(v - h2[i]) / std::max(1.0, std::fabs(v) * 1e-3));
+                md = emax(md, (double)std::fabs(h1[i] - h2[i]) / std::max(1.0, std::fabs((double)h1[i]) * 1e-3));
             }
         }
         report(nm, me, 0.1);
@@ -237,7 +253,7 @@ static void test_mlp_ln(int M, int C, int hid)
         report(nb, md, 0.05);
         auto l1 = host(dlo, (size_t)M * Cp), l2 = host(dlr, (size_t)M * Cp);
         double le = 0;
-        for (size_t i = 0; i < l1.size(); i++) le = std::max(le, (double)std::fabs(hf(l1[i]) - hf(l2[i])));
+        for (size_t i = 0; i < l1.size(); i++) le = emax(le, (double)std::fabs(hf(l1[i]) - hf(l2[i])));
         snprintf(nb, sizeof(nb), "%s next layernorm vs tlayernorm2", nm);
         report(nb, le, 0.01);
     }
@@ -260,17 +276,17 @@ static void test_gemm_ln(int M, int K, int N)
     for (auto &v : gm) v = 0.5f + ur(0.4f);
     for (auto &v : bt) v = ur(0.2f);
     TMat tm;
-    tmat_upload(tm, w.data(), nullptr, K, N);
+    ck(tmat_upload(tm, w.data(), nullptr, K, N));
     uint16_t *da = dev(a), *dn = dev(std::vector<uint16_t>((size_t)M * Kp, 0)), *o1 = dev(std::vector<uint16_t>((size_t)M * Np, 0)),
              *o2 = dev(std::vector<uint16_t>((size_t)M * Np, 0));
     float *dg = dev(gm), *db = dev(bt);
-    tlayernorm(da, Kp, dn, Kp, M, K, Kp, dg, db, 1e-5f, nullptr);
+    ck(tlayernorm(da, Kp, dn, Kp, M, K, Kp, dg, db, 1e-5f, nullptr));
     TGemm g;
     g.a = dn; g.sa = Kp; g.M = M; g.out = o1; g.so = Np; g.act = TAct::Gelu;
-    tgemm(tm, g, nullptr);
+    ck(tgemm(tm, g, nullptr));
     g.a = da; g.out = o2; g.ln_gamma = dg; g.ln_beta = db; g.ln_eps = 1e-5f;
     const cudaError_t e = tgemm(tm, g, nullptr);
-    cudaDeviceSynchronize();
+    sync();
     char nm[96];
     snprintf(nm, sizeof(nm), "gemm+ln %dx%dx%d vs layernorm + gemm", M, K, N);
     if (e != cudaSuccess) {
@@ -280,7 +296,7 @@ static void test_gemm_ln(int M, int K, int N)
     } else {
         auto h1 = host(o1, (size_t)M * Np), h2 = host(o2, (size_t)M * Np);
         double me = 0;
-        for (size_t i = 0; i < h1.size(); i++) me = std::max(me, (double)std::fabs(hf(h1[i]) - hf(h2[i])));
+        for (size_t i = 0; i < h1.size(); i++) me = emax(me, (double)std::fabs(hf(h1[i]) - hf(h2[i])));
         report(nm, me, 0.02);
     }
     tmat_release(tm);
@@ -300,17 +316,17 @@ static void test_dwgemm(int H, int W, int K, int N)
     for (auto &v : w) v = hf(hb(ur(0.1f)));
     for (auto &v : dw) v = ur(0.4f);
     TMat tm;
-    tmat_upload(tm, w.data(), nullptr, K, N);
+    ck(tmat_upload(tm, w.data(), nullptr, K, N));
     uint16_t *dh = dev(h), *d2 = dev(std::vector<uint16_t>((size_t)M * Kp, 0)), *o1 = dev(x), *o2 = dev(x);
     float *ddw = dev(dw);
-    tdwconv(dh, Kp, d2, Kp, H, W, K, ddw, false, nullptr);
+    ck(tdwconv(dh, Kp, d2, Kp, H, W, K, ddw, false, nullptr));
     TGemm g;
     g.a = d2; g.sa = Kp; g.M = M; g.out = o1; g.so = Np; g.add1 = o1; g.s1 = Np;
-    tgemm(tm, g, nullptr);
+    ck(tgemm(tm, g, nullptr));
     TDwGemm dg;
     dg.in = dh; dg.sin = Kp; dg.H = H; dg.W = W; dg.dw = ddw; dg.out = o2; dg.so = Np; dg.add1 = o2; dg.s1 = Np;
     const cudaError_t e = tdwgemm(tm, dg, nullptr);
-    cudaDeviceSynchronize();
+    sync();
     char nm[96];
     snprintf(nm, sizeof(nm), "dwgemm %dx%d %d->%d vs dwconv + gemm (values differing)", H, W, K, N);
     if (e != cudaSuccess) {
@@ -345,18 +361,18 @@ static void test_dwgemm_gate(int H, int W, int C)
     for (int k = 0; k < C; k++) dwb[k] = ur(0.3f);
     for (auto &v : b) v = ur(0.2f);
     TMat tm;
-    tmat_upload(tm, w.data(), b.data(), C, C);
+    ck(tmat_upload(tm, w.data(), b.data(), C, C));
     uint16_t *dn = dev(n2), *dh = dev(h1), *dp = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
     float *o1 = dev(x), *o2 = dev(x), *ddw = dev(dw), *ddb = dev(dwb);
-    tdwconv2(dn, Cp, dp, Cp, H, W, C8, ddw, ddb, false, dh, FS, nullptr, nullptr);
+    ck(tdwconv2(dn, Cp, dp, Cp, H, W, C8, ddw, ddb, false, dh, FS, nullptr, nullptr));
     TGemm g;
     g.a = dp; g.sa = Cp; g.M = M; g.out = o1; g.so = Cp; g.out_f32 = true; g.add1 = o1; g.s1 = Cp; g.add1_f32 = true;
-    tgemm(tm, g, nullptr);
+    ck(tgemm(tm, g, nullptr));
     TDwGemm dg;
     dg.in = dn; dg.sin = Cp; dg.H = H; dg.W = W; dg.dw = ddw; dg.dwb = ddb; dg.dwc = C8; dg.mul = dh; dg.smul = FS;
     dg.out = o2; dg.so = Cp; dg.out_f32 = true; dg.add1 = o2; dg.s1 = Cp; dg.add1_f32 = true;
     const cudaError_t e = tdwgemm(tm, dg, nullptr);
-    cudaDeviceSynchronize();
+    sync();
     char nm[96];
     snprintf(nm, sizeof(nm), "dwgemm gate %dx%d %d vs dwconv2 + gemm (values differing)", H, W, C);
     if (e != cudaSuccess) {
@@ -382,8 +398,8 @@ static void test_ln(int M, int C)
     for (int c = 0; c < C; c++) { gm[c] = 1.f + ur(0.3f); bt[c] = ur(0.3f); }
     uint16_t *di = dev(in), *dout = dev(std::vector<uint16_t>((size_t)M * cp, 0x3c00));
     float *dg = dev(gm), *db = dev(bt);
-    tlayernorm(di, cp, dout, cp, M, C, (C + 15) / 16 * 16, dg, db, 1e-5f, nullptr);
-    cudaDeviceSynchronize();
+    ck(tlayernorm(di, cp, dout, cp, M, C, (C + 15) / 16 * 16, dg, db, 1e-5f, nullptr));
+    sync();
     auto o = host(dout, (size_t)M * cp);
     double me = 0;
     for (int m = 0; m < M; m++) {
@@ -392,8 +408,8 @@ static void test_ln(int M, int C)
         const double mean = s / C;
         for (int c = 0; c < C; c++) q += (hf(in[(size_t)m * cp + c]) - mean) * (hf(in[(size_t)m * cp + c]) - mean);
         const double rs = 1.0 / std::sqrt(q / C + 1e-5);
-        for (int c = 0; c < C; c++) me = std::max(me, std::fabs((hf(in[(size_t)m * cp + c]) - mean) * rs * gm[c] + bt[c] - hf(o[(size_t)m * cp + c])));
-        for (int c = C; c < (C + 15) / 16 * 16; c++) me = std::max(me, (double)std::fabs(hf(o[(size_t)m * cp + c])));
+        for (int c = 0; c < C; c++) me = emax(me, std::fabs((hf(in[(size_t)m * cp + c]) - mean) * rs * gm[c] + bt[c] - hf(o[(size_t)m * cp + c])));
+        for (int c = C; c < (C + 15) / 16 * 16; c++) me = emax(me, (double)std::fabs(hf(o[(size_t)m * cp + c])));
     }
     char nm[64];
     snprintf(nm, sizeof(nm), "layernorm %dx%d", M, C);
@@ -414,7 +430,7 @@ static void test_win(int H, int W, int heads, int hd, int wh, int ww, int sy, in
     a.qkv = dq; a.sq = sq; a.qo = 0; a.ko = C; a.vo = 2 * C; a.H = H; a.W = W; a.heads = heads; a.hd = hd; a.wh = wh; a.ww = ww;
     a.shift_y = sy; a.shift_x = sx; a.scale = 1.f / std::sqrt((float)hd); a.bias = bias ? db : nullptr; a.out = dout; a.so = so;
     const cudaError_t e = twinattn(a, nullptr);
-    cudaDeviceSynchronize();
+    sync();
     auto o = host(dout, (size_t)H * W * so);
     double me = 0;
     const int nwx = (W + ww - 1) / ww, nwy = (H + wh - 1) / wh;
@@ -444,7 +460,7 @@ static void test_win(int H, int W, int heads, int hd, int wh, int ww, int sy, in
                     for (int d = 0; d < hd; d++) {
                         double v = 0;
                         for (int j = 0; j < T; j++) v += s[j] * val(j, 2 * C, d);
-                        me = std::max(me, std::fabs(v / l - hf(o[(size_t)pix[i] * so + h * hd + d])));
+                        me = emax(me, std::fabs(v / l - hf(o[(size_t)pix[i] * so + h * hd + d])));
                     }
                 }
             }
@@ -466,10 +482,10 @@ static void test_dw_sums(int H, int W, int C)
     float *dw = dev(w), *ds = dev(std::vector<float>(C, 0.f));
     float *dfs = dev(std::vector<float>(C, 0.f));
     uint16_t *dout2 = dev(std::vector<uint16_t>((size_t)H * W * st, 0));
-    tdwconv(di, st, dout, st, H, W, C, dw, true, nullptr);
-    tdwconv(di, st, dout2, st, H, W, C, dw, true, dfs, nullptr);  // fused channel sums of the output
-    tcolsum(di, st, H * W, C, ds, nullptr);
-    cudaDeviceSynchronize();
+    ck(tdwconv(di, st, dout, st, H, W, C, dw, true, nullptr));
+    ck(tdwconv(di, st, dout2, st, H, W, C, dw, true, dfs, nullptr));  // fused channel sums of the output
+    ck(tcolsum(di, st, H * W, C, ds, nullptr));
+    sync();
     auto o = host(dout, (size_t)H * W * st);
     auto o2 = host(dout2, (size_t)H * W * st);
     auto sums = host(ds, C);
@@ -479,9 +495,9 @@ static void test_dw_sums(int H, int W, int C)
         double s = 0;
         for (int t = 0; t < H * W; t++) {
             s += hf(o2[(size_t)t * st + c]);
-            mf = std::max(mf, (double)std::fabs(hf(o2[(size_t)t * st + c]) - hf(o[(size_t)t * st + c])));
+            mf = emax(mf, (double)std::fabs(hf(o2[(size_t)t * st + c]) - hf(o[(size_t)t * st + c])));
         }
-        mf = std::max(mf, std::fabs(s - fsums[c]) / (1 + std::fabs(s)) > 2e-3 ? 1.0 : 0.0);
+        mf = emax(mf, !(std::fabs(s - fsums[c]) / (1 + std::fabs(s)) <= 2e-3) ? 1.0 : 0.0);
     }
     double me = 0, ms = 0;
     for (int y = 0; y < H; y++)
@@ -492,12 +508,12 @@ static void test_dw_sums(int H, int W, int C)
                     const int yy = y + k / 3 - 1, xx = x + k % 3 - 1;
                     if (yy >= 0 && yy < H && xx >= 0 && xx < W) v += hf(in[((size_t)yy * W + xx) * st + c]) * w[c * 9 + k];
                 }
-                me = std::max(me, (double)std::fabs(gelu((float)v) - hf(o[((size_t)y * W + x) * st + c])));
+                me = emax(me, (double)std::fabs(gelu((float)v) - hf(o[((size_t)y * W + x) * st + c])));
             }
     for (int c = 0; c < C; c++) {
         double s = 0;
         for (int t = 0; t < H * W; t++) s += hf(in[(size_t)t * st + c]);
-        ms = std::max(ms, std::fabs(s - sums[c]) / (1 + std::fabs(s)));
+        ms = emax(ms, std::fabs(s - sums[c]) / (1 + std::fabs(s)));
     }
     report("dwconv gelu", me, 0.01);
     report("colsum", ms, 1e-4);
@@ -513,8 +529,8 @@ static void test_chanstats(int M, int heads, int hd)
     const int n = heads * hd * hd + 2 * C;
     uint16_t *dq = dev(qkv);
     float *dst = dev(std::vector<float>(n, 0.f));
-    tchanstats(dq, sq, 0, C, M, heads, hd, dst, nullptr);
-    cudaDeviceSynchronize();
+    ck(tchanstats(dq, sq, 0, C, M, heads, hd, dst, nullptr));
+    sync();
     auto st = host(dst, n);
     double me = 0;
     for (int h = 0; h < heads; h++)
@@ -522,15 +538,15 @@ static void test_chanstats(int M, int heads, int hd)
             for (int e2 = 0; e2 < hd; e2++) {
                 double s = 0;
                 for (int t = 0; t < M; t++) s += hf(qkv[(size_t)t * sq + h * hd + d]) * hf(qkv[(size_t)t * sq + C + h * hd + e2]);
-                me = std::max(me, std::fabs(s - st[(h * hd + d) * hd + e2]) / (1 + std::fabs(s)));
+                me = emax(me, std::fabs(s - st[(h * hd + d) * hd + e2]) / (1 + std::fabs(s)));
             }
             double q = 0, k = 0;
             for (int t = 0; t < M; t++) {
                 q += std::pow(hf(qkv[(size_t)t * sq + h * hd + d]), 2);
                 k += std::pow(hf(qkv[(size_t)t * sq + C + h * hd + d]), 2);
             }
-            me = std::max(me, std::fabs(q - st[heads * hd * hd + h * hd + d]) / (1 + q));
-            me = std::max(me, std::fabs(k - st[heads * hd * hd + C + h * hd + d]) / (1 + k));
+            me = emax(me, std::fabs(q - st[heads * hd * hd + h * hd + d]) / (1 + q));
+            me = emax(me, std::fabs(k - st[heads * hd * hd + C + h * hd + d]) / (1 + k));
         }
     report("chanstats", me, 1e-4);
     cudaFree(dq); cudaFree(dst);
@@ -541,19 +557,32 @@ static void test_pack(int K, int N)
     std::vector<float> w((size_t)K * N);
     for (auto &v : w) v = hf(hb(ur(1.f)));
     TMat a, b;
-    tmat_upload(a, w.data(), nullptr, K, N);
-    tmat_alloc(b, K, N, nullptr);
+    ck(tmat_upload(a, w.data(), nullptr, K, N));
+    ck(tmat_alloc(b, K, N, nullptr));
     float *dw = dev(w);
-    tmat_pack(b, dw, nullptr);
-    cudaDeviceSynchronize();
+    ck(tmat_pack(b, dw, nullptr));
+    sync();
     const size_t n = (size_t)a.Kpad * a.Npad;
     auto ha = host((const uint16_t *)a.frag, n), hb2 = host((const uint16_t *)b.frag, n);
     double me = 0;
-    for (size_t i = 0; i < n; i++) me = std::max(me, (double)(ha[i] != hb2[i]));
+    for (size_t i = 0; i < n; i++) me = emax(me, (double)(ha[i] != hb2[i]));
     report("device pack == host pack", me, 0);
     tmat_release(a);
     tmat_release(b);
     cudaFree(dw);
+}
+
+// The comparison itself: a NaN result must fail its bound.
+static void test_checker()
+{
+    checks++;
+    double me = 0;
+    me = emax(me, std::fabs(1.0 - std::nan("")));
+    me = emax(me, 0.0);
+    if (me <= 1.0) {
+        fails++;
+        printf("FAIL checker: a NaN result passes its error bound\n");
+    }
 }
 
 int main()
@@ -563,6 +592,7 @@ int main()
         printf("native tfm: SKIP (no sm_80+ GPU)\n");
         return 0;
     }
+    test_checker();
     test_gemm(200, 120, 360, false, false, false, false, false);
     test_gemm(130, 120, 120, true, false, true, true, true);
     test_gemm(77, 120, 240, false, true, false, false, false);
