@@ -191,8 +191,8 @@ with 0xFF (NaN) instead of zeros, so a step reading another buffer's leftovers s
 output; with it set the output must match a normal run. Either way it becomes a `Step::NATIVE`, run by `run_steps` like a TensorRT `MODEL` step
 (same fp16 NCHW RGB in and out), so graph capture, RIFE, temporal steps and mixed chains are
 unchanged. Nothing is built: configure takes tens of milliseconds for a lowered model, 0.1–0.5 s
-for FDAT / ESRGAN and ~1 s for HAT-L / DAT-2 (reading and parsing the file, the probe, timing the
-kernel variants). The log gets
+for FDAT / ESRGAN and ~1 s for HAT-L / DAT-2 (reading and parsing the file, the probe; the kernel
+variants come from the shapes, nothing is timed). The log gets
 `Native kernels: <model> (<what>)` before the usual `Applied Model` line (`..., whole frame
 [padded to WxH], <n> MB` for the image builders), or `Native kernels not used for <model>: <why>;
 using TensorRT` (e.g. `a whole 2560x1440 frame needs ~N GB, M GB free (keeping K GB)`), and the
@@ -254,8 +254,9 @@ conv fed straight from the accumulators, sigmoid−0.5, plain residual), NCHW / 
 model input, and depth-to-space output with SRVGG's upsampled-input add. `k_concat1x1` is
 `conv_cat` without the concat buffer. `native/conv.h` is the API; `conv.cu`'s `kConv` table is the
 set of instantiated shapes (32/48/64 channels, and 24 for SuperUltraCompact: an `m16n8k8` K tail
-and an odd n8 tile, weights in `pack_fragments8`'s layout, no tanh gate or concat), each with tile
-variants that `pick_variant` times on the running GPU. `lower` widens a feature map narrower than
+and an odd n8 tile, weights in `pack_fragments8`'s layout, no tanh gate or concat), each with four
+tile variants; `tile_variant` picks one from the op's shape (nothing is timed at load;
+`pick_variant` times them for benchmarks). `lower` widens a feature map narrower than
 the backend's widths (`kernel_widths_cuda` / `kernel_widths_vulkan`) to the next one with zero
 weights (`widen`, logged as `24 ch padded to 32 ch`); the added channels stay zero, so the output
 is the model's. SuperUltraCompact, RTX 5090, device chain time: 24 channels 1.50 ms a 1080p frame

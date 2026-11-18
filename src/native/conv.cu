@@ -5,6 +5,7 @@
 #include "native/conv_kernels.cuh"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ajinative {
@@ -267,7 +268,26 @@ cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, 
     return e->fn(p, s);
 }
 
-int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms, int *best16)
+int tile_variant(const Conv3x3 &op)
+{
+    static const int env = [] {
+        const char *v = std::getenv("AJI_NATIVE_CONV_VARIANT");
+        return v && *v ? std::atoi(v) : -1;
+    }();
+    if (env >= 0 && env < kVariants) return env;
+    // Each class measured in whole networks with the others fixed (RTX 5090: SPANF3 Performance and
+    // Balanced 1080p, Compact 854, SPAN-S images; RTX A5000: Compact). The 8-row tiles (more halo per
+    // pixel, 4-5 CTAs per SM) pay where the channel count is small: the input convs and 48-channel bodies
+    // (SPAN-S images 5-13% over the 16-row ones). At 64 channels the 16-row tiles win: 4x4 with an
+    // activation (the 8-row ones cost Balanced 17%, Compact 31%), 8x2 under a gate. Output convs: 8x1
+    // from 48 channels, 8x2 from 64.
+    if (op.in != Input::NHWC || op.cin < 32) return 3;          // 4 warps x 2 rows
+    if (op.out != Output::NHWC) return op.cin <= 48 ? 2 : 0;     // 8 warps x 1 row / 8 x 2
+    if (op.cin <= 48 && op.cout <= 48) return 3;
+    return op.gate != Gate::None ? 0 : 1;                        // 8 x 2 / 4 x 4
+}
+
+int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms)
 {
     const int n = variant_count(op);
     if (n == 0) return -1;
@@ -277,8 +297,8 @@ int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t
         cudaEventDestroy(e0);
         return -1;
     }
-    int best = -1, b16 = -1;
-    float best_t = 0.f, b16_t = 0.f;
+    int best = -1;
+    float best_t = 0.f;
     constexpr int kWarm = 3, kRuns = 10;
     for (int v = 0; v < n; v++) {
         bool ok = true;
@@ -295,15 +315,10 @@ int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t
             best = v;
             best_t = ms;
         }
-        if (v < 2 && (b16 < 0 || ms < b16_t)) {
-            b16 = v;
-            b16_t = ms;
-        }
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
     if (best >= 0 && best_ms) *best_ms = best_t / kRuns;
-    if (best16) *best16 = best >= 0 ? b16 : -1;
     return best;
 }
 

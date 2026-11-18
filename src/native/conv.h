@@ -16,7 +16,7 @@
  *
  * Weights are packed once, on the host, into mma B-fragment order (pack.cpp), so each lane
  * fetches a fragment pair with one 16-byte load. Each op has a few tile-shape variants;
- * pick_variant times them on the current GPU and the caller keeps the fastest.
+ * tile_variant chooses one from the op's shape (no timing at load).
  *
  * Requires compute capability 8.0 or newer (device_supported). Internal to the CUDA backends:
  * no ABI of its own.
@@ -93,10 +93,13 @@ const char *variant_name(const Conv3x3 &op, int variant);
 cudaError_t launch(const Conv3x3 &op, const Tensors &t, int H, int W, int variant, cudaStream_t s);
 cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, int npx, int variant, cudaStream_t s);
 
-// Time every variant of op on stream s (writes t.dst) and return the fastest, or -1 on error;
-// best16, if given, gets the fastest of the 16-row tiles (variants 0 and 1). Not inside stream capture.
-int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms = nullptr,
-                 int *best16 = nullptr);
+// The tile variant to run op with, from its shape (AJI_NATIVE_CONV_VARIANT=n overrides).
+int tile_variant(const Conv3x3 &op);
+
+// Time every variant of op on stream s (writes t.dst) and return the fastest, or -1 on error. For
+// benchmarks and tests: timed alone, an op's fastest tile is not always the fastest in a network.
+// Not inside stream capture.
+int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms = nullptr);
 
 }  // namespace ajinative
 

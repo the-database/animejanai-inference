@@ -77,7 +77,11 @@ bool gsupported(const GWeights &w, const GConvArgs &a, std::string *why = nullpt
 int gvariant_count();
 // Runs all output chunks. variant < 0 picks the default.
 cudaError_t glaunch(const GWeights &w, const GConvArgs &a, int variant, cudaStream_t s);
-// Time the variants on a (writes a.dst) and return the fastest, or -1.
+// The variant the backends run for a, from its grid and the GPU's SM count (nothing is timed):
+// 8 warps per CTA unless that grid fills the GPU only ~2-5 CTAs per SM deep, or needs the k-split
+// where 4 warps would not; then 4. AJI_NATIVE_GVARIANT=n overrides.
+int gvariant_for(const GWeights &w, const GConvArgs &a);
+// Time the variants on a (writes a.dst) and return the fastest, or -1. For benchmarks and tests.
 int gpick(const GWeights &w, const GConvArgs &a, cudaStream_t s, float *best_ms = nullptr);
 
 }  // namespace ajinative

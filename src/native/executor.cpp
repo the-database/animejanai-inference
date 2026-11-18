@@ -97,88 +97,11 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
     for (size_t t = 0; t < L.buffer.size(); t++)
         if (L.buffer[t] >= 0) e->tensor_[t] = e->buffers_[L.buffer[t]];
 
-    // tile variants, timed on scratch input/output in step order
-    void *in = nullptr, *out = nullptr;
-    const size_t in_bytes = (size_t)3 * in_w * in_h * 2, out_bytes = (size_t)3 * e->out_w_ * e->out_h_ * 2;
-    if (cudaMalloc(&in, in_bytes) != cudaSuccess || cudaMalloc(&out, out_bytes) != cudaSuccess) {
-        cudaFree(in);
-        return fail("scratch allocation failed");
-    }
-    cudaMemsetAsync(in, 0, in_bytes, s);
-    for (Step &st : e->steps_) {
-        if (st.concat) {
-            const void *srcs[4];
-            for (int k = 0; k < 4; k++) srcs[k] = e->ptr(st.srcs[k], in, out);
-            if (launch(st.cop, srcs, const_cast<void *>(e->ptr(st.dst, in, out)), e->W_ * e->H_, 0, s) != cudaSuccess) {
-                reason = "concat launch failed";
-                break;
-            }
-            continue;
-        }
-        Tensors t;
-        t.src = e->ptr(st.src, in, out);
-        t.resid = e->ptr(st.resid, in, out);
-        t.dst = const_cast<void *>(e->ptr(st.dst, in, out));
-        st.variant = pick_variant(st.op, t, e->H_, e->W_, s, nullptr, &st.variant16);
-        if (st.variant < 0) { reason = "timing the tile variants failed"; break; }
-    }
-    if (reason.empty()) e->check_picks(in, out, s);
-    cudaStreamSynchronize(s);
-    cudaFree(in);
-    cudaFree(out);
-    if (!reason.empty()) return fail(reason);
+    // tile variants from the ops' shapes
+    for (Step &st : e->steps_)
+        if (!st.concat) st.variant = tile_variant(st.op);
+    (void)s;
     return e;
-}
-
-// Each op's fastest tile alone is not always fastest in the network: on an RTX A5000 the 8-row tiles win
-// SPAN's 64 -> 64 body convs alone by ~10% but run ~15% slower between the others (and make 1080p
-// video ~2% slower overall), while they win the in / out convs in place too. So time the whole network
-// with the picks as they are, with the body convs (cin == cout) on their best 16-row tile, and with every
-// conv on it, and keep the fastest.
-void Executor::check_picks(const void *in, void *out, cudaStream_t s)
-{
-    std::vector<int> cand[3];
-    for (const Step &st : steps_) {
-        const bool conv = !st.concat;
-        cand[0].push_back(st.variant);
-        cand[1].push_back(conv && st.op.cin == st.op.cout ? st.variant16 : st.variant);
-        cand[2].push_back(conv ? st.variant16 : st.variant);
-    }
-    if (cand[1] == cand[0] && cand[2] == cand[0]) return;
-    cudaEvent_t e0, e1;
-    if (cudaEventCreate(&e0) != cudaSuccess) return;
-    if (cudaEventCreate(&e1) != cudaSuccess) {
-        cudaEventDestroy(e0);
-        return;
-    }
-    auto use = [&](int c) {
-        for (size_t i = 0; i < steps_.size(); i++) steps_[i].variant = cand[c][i];
-    };
-    const int w = W_ * u_, h = H_ * u_;
-    float tot[3] = {};
-    bool ok = true;
-    for (int c = 0; c < 3 && ok; c++) {
-        use(c);
-        ok = run(in, out, w, h, s) == cudaSuccess;  // warm
-    }
-    constexpr int kRounds = 3, kRuns = 2;
-    for (int r = 0; r < kRounds && ok; r++)
-        for (int c = 0; c < 3 && ok; c++) {
-            use(c);
-            ok = cudaEventRecord(e0, s) == cudaSuccess;
-            for (int i = 0; i < kRuns && ok; i++) ok = run(in, out, w, h, s) == cudaSuccess;
-            float ms = 0.f;
-            ok = ok && cudaEventRecord(e1, s) == cudaSuccess && cudaEventSynchronize(e1) == cudaSuccess &&
-                 cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
-            tot[c] += ms;
-        }
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
-    int best = 0;
-    if (ok)
-        for (int c = 1; c < 3; c++)
-            if (tot[c] < tot[best]) best = c;
-    use(best);
 }
 
 cudaError_t Executor::run(const void *in, void *out, int w, int h, cudaStream_t s) const

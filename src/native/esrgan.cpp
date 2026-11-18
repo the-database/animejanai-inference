@@ -257,21 +257,12 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
         e->ws = (float *)e->alloc(e->ws_floats * 2);
         if (!e->ws) return refuse(why, "out of GPU memory"), nullptr;
     }
-    // check the ops and pick tile variants at the largest tile, once per distinct shape
+    // check the ops at the largest tile
     e->plan(bw, bh, &ops);
-    std::map<std::tuple<int, int, int, int, int, bool, bool>, int> picked;
     for (auto &o : ops) {
         std::string w2;
         if (!gsupported(*o.first->w, o.second, &w2)) return refuse(why, "kernel: " + w2), nullptr;
-        const auto key = std::make_tuple(o.first->w->cin_pad, o.first->w->cout_pad, o.second.H, o.second.W, o.second.src_stride,
-                                         o.second.r1 != nullptr, o.second.up2);
-        auto it = picked.find(key);
-        if (it == picked.end()) {
-            const int v = gpick(*o.first->w, o.second, s);
-            if (v < 0) return refuse(why, "kernel timing failed"), nullptr;
-            it = picked.emplace(key, v).first;
-        }
-        o.first->variant = it->second;
+        o.first->variant = gvariant_for(*o.first->w, o.second);
     }
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
     char buf[160];
