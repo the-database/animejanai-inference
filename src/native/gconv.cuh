@@ -104,7 +104,9 @@ __device__ __forceinline__ half2 g_epi(const GParams &p, half2 v, int y, int x, 
 
 // IN: 0 NHWC, 1 NCHW planes (3 channels, KCH 16). OUT: 0 NHWC, 1 phase scatter (R from params).
 // ACC: 0 fp16 accumulation (full rate), 1 fp32 accumulation (half rate on GeForce, for deep sums).
-template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0>
+// SUMS: the output's channel sums into p.sums (an instantiation of its own: the code would change how
+// every other one compiles, which cost ESRGAN's convs ~20% on sm_89).
+template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0, int SUMS = 0>
 __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
 {
 #if AJI_GCONV_ARCH_OK
@@ -238,7 +240,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
             *reinterpret_cast<uint4 *>(dst + ((size_t)yy * p.W + xx) * p.dstride + v * 8) =
                 *reinterpret_cast<const uint4 *>(sm + (r * TW + px) * SP + v * 8);
         }
-        if (p.sums) {
+        if constexpr (SUMS) {
             // the tile's channel sums of the stored (fp16) values, one atomic per channel per CTA
             for (int c = tid; c < COUTP; c += WARPS * 32) {
                 float sum = 0.f;

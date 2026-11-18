@@ -117,6 +117,11 @@ static void run(const Case &c, int variant, bool split)
         if (a.ws_floats) cudaMalloc(&dws, a.ws_floats * 4);
         a.ws = dws;
     }
+    if (dsums && !gsupported(gw, a)) {  // the sums have their own instantiations (HAT's CAB shape)
+        cudaFree(dsums);
+        dsums = nullptr;
+        a.sums = nullptr;
+    }
     std::string why;
     if (!gsupported(gw, a, &why)) {
         printf("FAIL %s: unsupported: %s\n", c.name, why.c_str());
@@ -234,6 +239,7 @@ int main()
         {"s1 160->32 none", 160, 32, 1, 0, 0, false, 32, 0, 0, 0, GAct::None, 0},
         {"s1 192->64 two residuals", 192, 64, 1, 0, 0, false, 0, 0, 0, 2, GAct::None, 0},
         {"s1 64->64 residual lrelu", 64, 64, 1, 0, 0, false, 0, 0, 0, 1, GAct::LRelu, 0},
+        {"s1 60->180 (HAT's CAB: with the channel sums)", 60, 180, 1, 0, 0, false, 0, 0, 0, 0, GAct::None, 0},
         {"s1 13->48 cout 48", 13, 48, 1, 0, 0, false, 0, 0, 0, 0, GAct::None, 0},
         {"s2 28->16 lrelu", 28, 16, 2, 0, 0, false, 0, 0, 0, 0, GAct::LRelu, 0},
         {"s2 64->128 lrelu", 64, 128, 2, 0, 0, false, 0, 0, 0, 0, GAct::LRelu, 0},
