@@ -131,7 +131,7 @@ set_target_properties(aji_trt_common PROPERTIES
 
 # Native tensor-core kernels and their ONNX lowering/executor (src/native), linked into both
 # TensorRT backends (used with [global] native=on) and the native tests.
-add_library(aji_native OBJECT src/native/conv.cu src/native/gconv.cu src/native/tfm.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/esrgan.cpp src/native/fdat.cpp src/native/fdat_body.cpp src/native/fdat_kernels.cu src/native/tfdat.cpp src/native/tfdat_kernels.cu src/native/hat.cpp src/native/dat.cpp src/native/dat_kernels.cu src/native/tfix.cpp src/native/tfix_kernels.cu src/native/img_kernels.cu
+add_library(aji_native OBJECT src/native/conv.cu src/native/gconv.cu src/native/tfm.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/esrgan.cpp src/native/fdat.cpp src/native/fdat_body.cpp src/native/fdat_kernels.cu src/native/tfdat.cpp src/native/tfdat_kernels.cu src/native/hat.cpp src/native/dat.cpp src/native/dat_kernels.cu src/native/sst.cpp src/native/sst_kernels.cu src/native/tfix.cpp src/native/tfix_kernels.cu src/native/img_kernels.cu
     ${AJI_NATIVE_HOST_SOURCES} src/native/executor.cpp src/native/framenet.cpp)
 target_include_directories(aji_native PRIVATE src)
 target_link_libraries(aji_native PRIVATE CUDA::cudart)
