@@ -902,18 +902,20 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
 // (64-token chunks in shared memory, each head's dims padded to 32), warp w doing heads w and w + 4;
 // the squared norms on the CUDA cores while copying.
 constexpr int CS_MAXH = 8;
+constexpr int CS_ROWS = 32;  // k_chanstats_mma's tokens per step: 2 x 32 x (heads x 32 + 8) halves of shared memory, 3 CTAs per SM
 __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, int qo, int ko, int M, int heads, int hd, int tpc, float *stats)
 {
 #if TFM_OK
     extern __shared__ __align__(16) unsigned char smraw[];
     const int P = heads * 32 + 8, C = heads * hd, pairs = C / 2;
-    half *s_q = reinterpret_cast<half *>(smraw), *s_k = s_q + 64 * P;
+    constexpr int R = CS_ROWS;  // tokens per step
+    half *s_q = reinterpret_cast<half *>(smraw), *s_k = s_q + R * P;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    for (int i = tid; i < 64 * P; i += 128) s_q[i] = s_k[i] = __float2half(0.f);
+    for (int i = tid; i < R * P; i += 128) s_q[i] = s_k[i] = __float2half(0.f);
     float acc[2][2][4][4] = {};
     float nrm[2][2] = {};
     const int t0 = blockIdx.x * tpc, t1 = min(M, t0 + tpc);
-    for (int tb = t0; tb < t1; tb += 64) {
+    for (int tb = t0; tb < t1; tb += R) {
         __syncthreads();
 #pragma unroll
         for (int j = 0; j < 2; j++) {
@@ -925,7 +927,7 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
             half *dst = (isk ? s_k : s_q) + h * 32 + d;
             float n0 = 0.f, n1 = 0.f;
 #pragma unroll 8
-            for (int r = 0; r < 64; r++) {
+            for (int r = 0; r < R; r++) {
                 half2 v = __float2half2_rn(0.f);
                 if (tb + r < t1) v = *reinterpret_cast<const half2 *>(src + (size_t)r * sq);
                 *reinterpret_cast<half2 *>(dst + r * P) = v;
@@ -942,7 +944,7 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
             const int h = warp + 4 * hi;
             if (h >= heads) continue;
 #pragma unroll
-            for (int ks = 0; ks < 4; ks++) {
+            for (int ks = 0; ks < R / 16; ks++) {
                 const int r = ks * 16 + (lane & 7), mj = lane >> 3;
                 uint32_t a[2][4], b[2][4];
 #pragma unroll
@@ -1891,13 +1893,16 @@ cudaError_t tchanstats(const void *qkv, int sq, int qo, int ko, int M, int heads
 {
     const int C = heads * hd, total = heads * hd * hd + 2 * C;
     if (hd <= 32 && hd % 2 == 0 && heads <= CS_MAXH && C <= 256 && sq % 2 == 0 && qo % 2 == 0 && ko % 2 == 0 && (uintptr_t)qkv % 4 == 0) {
-        const int smem = 2 * 64 * (heads * 32 + 8) * 2;
-        static bool set = false;
-        if (!set) {
-            cudaFuncSetAttribute(k_chanstats_mma, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * 64 * (CS_MAXH * 32 + 8) * 2);
-            set = true;
-        }
-        const int tpc = std::max(64, ((M + 255) / 256 + 63) / 64 * 64);
+        const int smem = 2 * CS_ROWS * (heads * 32 + 8) * 2;
+        static const int sms = [] {
+            int dev = 0, n = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+            cudaFuncSetAttribute(k_chanstats_mma, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * CS_ROWS * (CS_MAXH * 32 + 8) * 2);
+            return std::max(1, n);
+        }();
+        // ~2 waves of 3 CTAs per SM (each CTA's partial sums go out as atomics: fewer, longer CTAs)
+        const int tpc = std::max(CS_ROWS, (M + 6 * sms - 1) / (6 * sms) + CS_ROWS - 1) / CS_ROWS * CS_ROWS;
         k_chanstats_mma<<<(M + tpc - 1) / tpc, 128, smem, s>>>((const half *)qkv, sq, qo, ko, M, heads, hd, tpc, stats);
         return cudaGetLastError();
     }
