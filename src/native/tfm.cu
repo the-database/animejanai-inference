@@ -807,80 +807,96 @@ __global__ void __launch_bounds__(512) k_winattn_g(WinG P)
 // Depthwise 3x3, one thread per (8 channels, column, strip of DW_R rows): the 3x3 window slides down
 // the strip so each output row loads one new input row (3 pixels), weights held in registers.
 constexpr int DW_R = 8;
-// C may stop inside the last group of 8 (C even; the rows are read 8 channels wide, so the strides
-// cover the rounded-up width): the channels past C get zero weights and are neither stored nor summed
-// (depthwise, so nothing of them reaches a real channel).
+template <int V> struct DwVec;
+template <> struct DwVec<8> { using T = uint4; };
+template <> struct DwVec<4> { using T = uint2; };
+// V channels per thread (8, or 4: half the registers, ~100 instead of ~190, for 4+ CTAs per SM). C may
+// stop inside the last group of V (C even; the rows are read V channels wide, so the strides cover the
+// rounded-up width): the channels past C get zero weights and are neither stored nor summed (depthwise,
+// so nothing of them reaches a real channel).
+template <int V>
 __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out, int sout, int H, int W, int C, const float *w, int gelu_,
                                               float *sums, const float *bias = nullptr, const half *mul = nullptr, int smul = 0)
 {
+    using VT = typename DwVec<V>::T;
+    auto unpackv = [](const VT &u, float (&v)[V]) {
+        const half2 *h = reinterpret_cast<const half2 *>(&u);
+#pragma unroll
+        for (int j = 0; j < V / 2; j++) {
+            const float2 f = __half22float2(h[j]);
+            v[2 * j] = f.x;
+            v[2 * j + 1] = f.y;
+        }
+    };
     __shared__ float ss[1024];
     if (sums) {
         for (int i = threadIdx.x; i < C; i += blockDim.x) ss[i] = 0.f;
         __syncthreads();
     }
-    const int G = (C + 7) / 8, strips = (H + DW_R - 1) / DW_R;
+    const int G = (C + V - 1) / V, strips = (H + DW_R - 1) / DW_R;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const bool live = i < G * W * strips;
-    const int g = i % G, rest = i / G, x = rest % W, y0 = (rest / W) * DW_R, c = g * 8;
-    float part[8] = {};
-    const bool full = c + 8 <= C;
+    const int g = i % G, rest = i / G, x = rest % W, y0 = (rest / W) * DW_R, c = g * V;
+    float part[V] = {};
+    const bool full = c + V <= C;
     if (live) {
-        float wr[9][8];
+        float wr[9][V];
 #pragma unroll
         for (int k = 0; k < 9; k++)
 #pragma unroll
-            for (int j = 0; j < 8; j++) wr[k][j] = c + j < C ? __ldg(w + (c + j) * 9 + k) : 0.f;
-        auto row = [&](int y, uint4 (&r)[3]) {
+            for (int j = 0; j < V; j++) wr[k][j] = c + j < C ? __ldg(w + (c + j) * 9 + k) : 0.f;
+        auto row = [&](int y, VT (&r)[3]) {
 #pragma unroll
             for (int dx = 0; dx < 3; dx++) {
                 const int xx = x + dx - 1;
-                r[dx] = (y >= 0 && y < H && xx >= 0 && xx < W) ? *reinterpret_cast<const uint4 *>(in + ((size_t)y * W + xx) * sin + c)
-                                                               : make_uint4(0, 0, 0, 0);
+                r[dx] = (y >= 0 && y < H && xx >= 0 && xx < W) ? *reinterpret_cast<const VT *>(in + ((size_t)y * W + xx) * sin + c) : VT{};
             }
         };
-        uint4 r0[3], r1[3], r2[3];
+        VT r0[3], r1[3], r2[3];
         row(y0 - 1, r0);
         row(y0, r1);
 #pragma unroll 2
         for (int y = y0; y < min(H, y0 + DW_R); y++) {
             row(y + 1, r2);
-            float a[8] = {};
+            float a[V] = {};
 #pragma unroll
             for (int dx = 0; dx < 3; dx++) {
-                float v[8];
-                unpack8(r0[dx], v);
+                float v[V];
+                unpackv(r0[dx], v);
 #pragma unroll
-                for (int j = 0; j < 8; j++) a[j] += v[j] * wr[dx][j];
-                unpack8(r1[dx], v);
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[dx][j];
+                unpackv(r1[dx], v);
 #pragma unroll
-                for (int j = 0; j < 8; j++) a[j] += v[j] * wr[3 + dx][j];
-                unpack8(r2[dx], v);
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[3 + dx][j];
+                unpackv(r2[dx], v);
 #pragma unroll
-                for (int j = 0; j < 8; j++) a[j] += v[j] * wr[6 + dx][j];
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[6 + dx][j];
             }
             if (bias)
 #pragma unroll
-                for (int j = 0; j < 8; j++) a[j] += c + j < C ? __ldg(bias + c + j) : 0.f;
+                for (int j = 0; j < V; j++) a[j] += c + j < C ? __ldg(bias + c + j) : 0.f;
             if (gelu_)
 #pragma unroll
-                for (int j = 0; j < 8; j++) a[j] = gelu(a[j]);
+                for (int j = 0; j < V; j++) a[j] = gelu(a[j]);
             if (mul) {
-                float m[8];
-                unpack8(*reinterpret_cast<const uint4 *>(mul + ((size_t)y * W + x) * smul + c), m);
+                float m[V];
+                unpackv(*reinterpret_cast<const VT *>(mul + ((size_t)y * W + x) * smul + c), m);
 #pragma unroll
-                for (int j = 0; j < 8; j++) a[j] *= m[j];
+                for (int j = 0; j < V; j++) a[j] *= m[j];
             }
-            const uint4 pk = pack8(a);
-            if (full) {
-                *reinterpret_cast<uint4 *>(out + ((size_t)y * W + x) * sout + c) = pk;
-            } else {
-                const uint32_t *pw = reinterpret_cast<const uint32_t *>(&pk);
+            VT pk;
+            uint32_t *pw = reinterpret_cast<uint32_t *>(&pk);
 #pragma unroll
-                for (int j = 0; j < 4; j++)
+            for (int j = 0; j < V / 2; j++) pw[j] = h2u(__floats2half2_rn(a[2 * j], a[2 * j + 1]));
+            if (full) {
+                *reinterpret_cast<VT *>(out + ((size_t)y * W + x) * sout + c) = pk;
+            } else {
+#pragma unroll
+                for (int j = 0; j < V / 2; j++)
                     if (c + 2 * j < C) *reinterpret_cast<uint32_t *>(out + ((size_t)y * W + x) * sout + c + 2 * j) = pw[j];
             }
 #pragma unroll
-            for (int j = 0; j < 8; j++) part[j] += c + j < C ? a[j] : 0.f;
+            for (int j = 0; j < V; j++) part[j] += c + j < C ? a[j] : 0.f;
 #pragma unroll
             for (int dx = 0; dx < 3; dx++) {
                 r0[dx] = r1[dx];
@@ -891,7 +907,7 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
     if (sums) {
         if (live)
 #pragma unroll
-            for (int j = 0; j < 8; j++)
+            for (int j = 0; j < V; j++)
                 if (c + j < C) atomicAdd(ss + c + j, part[j]);
         __syncthreads();
         for (int k = threadIdx.x; k < C; k += blockDim.x) atomicAdd(sums + k, ss[k]);
@@ -1883,6 +1899,16 @@ cudaError_t twinattn(const TWinAttn &a, cudaStream_t s)
     return cudaGetLastError();
 }
 
+// k_dw8s's channels per thread: 4 (AJI_NATIVE_DWV=8: 8)
+static int dw_vec()
+{
+    static const int v = [] {
+        const char *e = std::getenv("AJI_NATIVE_DWV");
+        return e && std::atoi(e) == 8 ? 8 : 4;
+    }();
+    return v;
+}
+
 cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, float *sums,
                     cudaStream_t s)
 {
@@ -1892,7 +1918,10 @@ cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, 
     if (vec) {
         const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
         if (n < (1ll << 31)) {
-            k_dw8s<<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums);
+            if (dw_vec() == 8)
+                k_dw8s<8><<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums);
+            else
+                k_dw8s<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums);
             return cudaGetLastError();
         }
     }
@@ -1911,7 +1940,11 @@ cudaError_t tdwconv2(const void *in, int sin, void *out, int sout, int H, int W,
         ((uintptr_t)in | (uintptr_t)out | (uintptr_t)mul) % 16)
         return cudaErrorInvalidValue;
     const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
-    k_dw8s<<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, bias,
+    if (dw_vec() == 8)
+        k_dw8s<8><<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, bias,
+                                                      (const half *)mul, smul);
+    else
+        k_dw8s<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, bias,
                                                       (const half *)mul, smul);
     return cudaGetLastError();
 }
