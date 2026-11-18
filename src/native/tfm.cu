@@ -2,6 +2,7 @@
 #include "native/tfm.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 
@@ -1695,14 +1696,28 @@ void tmat_release(TMat &m)
 }
 
 // Whether the GEMM / MLP / depthwise-GEMM kernels prefetch their rows into L2 ahead of use (they only
-// pay where L2 holds them until then). AJI_NATIVE_L2PREFETCH=0 / 1 overrides.
+// pay where L2 holds them until then: an L2 of 32 MB or more). AJI_NATIVE_L2PREFETCH=0 / 1 overrides.
 static int l2_prefetch()
 {
     static const int env = [] {
         const char *v = std::getenv("AJI_NATIVE_L2PREFETCH");
         return v && *v ? std::atoi(v) : -1;
     }();
-    return env >= 0 ? (env ? 1 : 0) : 1;
+    if (env >= 0) return env ? 1 : 0;
+    // On by L2 size: RTX 5090 (96 MB) HAT-L proj 40.6 -> 34.8 ms per 512 tile with them; RTX A5000 (6 MB)
+    // HAT-L and DAT-2 ~3% slower with them (the rows are evicted again before the kernel reads them).
+    constexpr int kMaxDev = 16;
+    static std::atomic<int> on[kMaxDev] = {};  // 0 unknown, 1 off, 2 on
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDev) return 0;
+    int v = on[dev].load(std::memory_order_relaxed);
+    if (!v) {
+        int l2 = 0;
+        if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev) != cudaSuccess) l2 = 0;
+        v = l2 >= (32 << 20) ? 2 : 1;
+        on[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 2;
 }
 
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
