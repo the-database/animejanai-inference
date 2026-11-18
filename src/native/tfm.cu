@@ -65,6 +65,7 @@ struct GemmP {
     int k;  // A's real columns: those from k up to kpad load as zeros (A may be a slice whose row ends sooner)
     const float *lng, *lnb;  // k_gemm_rs only: A LayerNorm'd over its k channels on load, or null
     float lneps;
+    int pf;  // L2 prefetches (l2_prefetch())
 };
 
 // RES: out is one of the adds, an fp32 stream (prefetched, the epilogue in two passes; see below).
@@ -83,7 +84,7 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
 #pragma unroll
         for (int k = 0; k < 4; k++) acc[n][k] = 0.f;
     // the tile's residual rows into L2 now, so the epilogue's reads don't wait on DRAM
-    if (RES) {
+    if (RES && p.pf) {
         const int cols = min(64, p.njt * 16 - j0 * 16);
         const int b1 = p.add1 ? cols * (p.add1_f32 ? 4 : 2) : 0, b2 = p.add2 ? cols * 2 : 0;
         const int l1 = (b1 + 127) / 128, l2 = (b2 + 127) / 128;
@@ -1028,7 +1029,7 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
 #pragma unroll
     for (int hh = 0; hh < 2; hh++) {
         const int r = hh ? r1 : r0;
-        if (r >= p.M) continue;
+        if (r >= p.M || !p.pf) continue;
         const char *ra = reinterpret_cast<const char *>(p.a + (size_t)r * p.sa);
         for (int l = tq; l * 128 < KC1 * 32; l += 4) asm volatile("prefetch.global.L2 [%0];" ::"l"(ra + l * 128));
     }
@@ -1172,6 +1173,7 @@ struct DwmmP {
     int so, out_f32;
     const void *add1;
     int s1, add1_f32;
+    int pf;  // L2 prefetches (l2_prefetch())
 };
 
 template <int NJ2>
@@ -1220,7 +1222,7 @@ __global__ void __launch_bounds__(128) k_dwmm(DwmmP p)
     load(0, 0);
     load(1, 1);
     constexpr int res = F32 ? 4 : 2;
-    if (p.add1)
+    if (p.add1 && p.pf)
 #pragma unroll
         for (int hh = 0; hh < 2; hh++)
             for (int l = tq; l * 128 < NJ2 * 16 * res; l += 4)
@@ -1352,6 +1354,7 @@ struct MlpP {
     int so, out_f32;
     const half *add1;
     int s1, add1_f32;
+    int pf;                // L2 prefetches (l2_prefetch())
     const float *lg, *lb;  // LN: gamma, beta [k]
     float eps;
     half *lo;              // or null: the LayerNorm (over the first n2 channels) of the output rows, fp16
@@ -1395,7 +1398,7 @@ __global__ void __launch_bounds__(NW * 32, 8 / NW) k_mlp(MlpP p)
 #pragma unroll
         for (int hh = 0; hh < 2; hh++) {
             const int r = hh ? r1 : r0;
-            if (r >= p.M) continue;
+            if (r >= p.M || !p.pf) continue;
             const char *ra = reinterpret_cast<const char *>(p.a) + (size_t)r * p.sa * (LN ? 4 : 2);
             for (int l = tq; l * 128 < KC1 * 16 * (LN ? 4 : 2); l += 4) asm volatile("prefetch.global.L2 [%0];" ::"l"(ra + l * 128));
             if (!p.add1) continue;
@@ -1691,6 +1694,17 @@ void tmat_release(TMat &m)
     m = TMat{};
 }
 
+// Whether the GEMM / MLP / depthwise-GEMM kernels prefetch their rows into L2 ahead of use (they only
+// pay where L2 holds them until then). AJI_NATIVE_L2PREFETCH=0 / 1 overrides.
+static int l2_prefetch()
+{
+    static const int env = [] {
+        const char *v = std::getenv("AJI_NATIVE_L2PREFETCH");
+        return v && *v ? std::atoi(v) : -1;
+    }();
+    return env >= 0 ? (env ? 1 : 0) : 1;
+}
+
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
 {
     if (g.sa % 8 || g.so % 2 || (g.add1 && g.s1 % 2) || (g.add2 && g.s2 % 2) || g.sa < w.Kpad || g.so < w.Npad ||
@@ -1699,6 +1713,7 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
             (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0, g.out_f32 ? 1 : 0, g.add1_f32 ? 1 : 0, g.add2scale};
     p.k = w.K;
+    p.pf = l2_prefetch();
     p.lng = g.ln_gamma;
     p.lnb = g.ln_beta;
     p.lneps = g.ln_eps;
@@ -1742,8 +1757,8 @@ cudaError_t tmlp(const TMat &w1, const TMat &w2, const TMlp &g, cudaStream_t s)
         (g.add1 && (g.s1 * (g.add1_f32 ? 4 : 2) % 16 || (uintptr_t)g.add1 % 16)) || g.sa < w1.Kpad || g.so < w2.Npad)
         return cudaErrorNotSupported;
     MlpP p{g.a, g.sa, g.M, w1.K, (const uint4 *)w1.frag, (const uint4 *)w2.frag, (const float *)w1.bias, (const float *)w2.bias,
-           w1.Npad / 16, (half *)g.out, g.so, g.out_f32 ? 1 : 0, (const half *)g.add1, g.s1, g.add1_f32 ? 1 : 0, g.ln_gamma, g.ln_beta,
-           g.ln_eps, (half *)g.lno, g.slno, w2.N, g.lno_gamma, g.lno_beta, g.lno_eps};
+           w1.Npad / 16, (half *)g.out, g.so, g.out_f32 ? 1 : 0, (const half *)g.add1, g.s1, g.add1_f32 ? 1 : 0, l2_prefetch(),
+           g.ln_gamma, g.ln_beta, g.ln_eps, (half *)g.lno, g.slno, w2.N, g.lno_gamma, g.lno_beta, g.lno_eps};
     const int kc1 = w1.Kpad / 16, nj2 = w2.Npad / 16;
     if (kc1 == 12 && nj2 == 12) return ln ? launch_mlp<12, 12, 4, true>(p, s) : launch_mlp<12, 12, 4, false>(p, s);
     return cudaErrorNotSupported;
@@ -1761,7 +1776,7 @@ cudaError_t tdwgemm(const TMat &w, const TDwGemm &g, cudaStream_t s)
         (g.add1 && (g.s1 * rs % 16 || g.s1 < w.Npad || (uintptr_t)g.add1 % 16)) || g.H < 1 || g.W < 1 || g.W % 64)
         return cudaErrorNotSupported;
     DwmmP p{(const half *)g.in, g.sin, g.H, g.W, g.H * g.W, dwc, g.dw, g.dwb, (const half *)g.mul, g.smul, (const uint4 *)w.frag,
-            (const float *)w.bias, w.Kpad / 16, g.out, g.so, g.out_f32 ? 1 : 0, g.add1, g.s1, g.add1_f32 ? 1 : 0};
+            (const float *)w.bias, w.Kpad / 16, g.out, g.so, g.out_f32 ? 1 : 0, g.add1, g.s1, g.add1_f32 ? 1 : 0, l2_prefetch()};
     // fp16 stream without a gate (FDAT) or fp32 stream with one (DAT)
     const bool gate = g.mul || g.dwb;
     if (g.out_f32 != g.add1_f32 && g.add1) return cudaErrorNotSupported;
