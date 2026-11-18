@@ -607,7 +607,7 @@ struct WinG {
 // The Swin region (0..2 per axis) of rolled coordinate v on an axis of n with window w and shift s.
 __device__ __forceinline__ int swin_rid(int v, int n, int w, int s) { return v < n - w ? 0 : (v < n - s ? 1 : 2); }
 
-__global__ void __launch_bounds__(128) k_winattn_g(WinG P)
+__global__ void __launch_bounds__(512) k_winattn_g(WinG P)
 {
 #if TFM_OK
     const WinP &p = P.b;
@@ -619,7 +619,8 @@ __global__ void __launch_bounds__(128) k_winattn_g(WinG P)
     const int win = (int)(blockIdx.x / p.heads), h = (int)(blockIdx.x % p.heads), tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wy = win / p.nwx, wx = win % p.nwx;
     // keys and values of this head (dims padded to 32 with zeros; tokens outside the image zero)
-    for (int i = tid; i < Tk * 16; i += 128) {
+    const int nt = (int)blockDim.x;  // 32 per warp, a warp per 16-query block in turn
+    for (int i = tid; i < Tk * 16; i += nt) {
         const int t = i / 16, d2 = (i % 16) * 2;
         half2 k = __float2half2_rn(0.f), v = k;
         int pix = -1;
@@ -638,14 +639,14 @@ __global__ void __launch_bounds__(128) k_winattn_g(WinG P)
         *reinterpret_cast<half2 *>(sv + t * HP + d2) = v;
     }
     if (P.rtab)
-        for (int i = tid; i < P.tn; i += 128) stab[i] = P.rtab[(size_t)h * P.tn + i];
+        for (int i = tid; i < P.tn; i += nt) stab[i] = P.rtab[(size_t)h * P.tn + i];
     if (P.mask)
-        for (int t = tid; t < Tk; t += 128)
+        for (int t = tid; t < Tk; t += nt)
             sreg[t] = (signed char)(swin_rid(wy * p.wh + t / p.ww, p.Hp, p.wh, p.sy) * 3 + swin_rid(wx * p.ww + t % p.ww, p.Wp, p.ww, p.sx));
     __syncthreads();
     const int g = lane >> 2, tq = lane & 3;
     const float *bias = p.bias ? p.bias + (size_t)h * Tq * Tk : nullptr;
-    for (int qb = warp; qb * 16 < Tq; qb += 4) {
+    for (int qb = warp; qb * 16 < Tq; qb += nt / 32) {
         const int r0 = qb * 16 + g, r1 = r0 + 8;
         // q fragments: a0 (r0, 2tq), a1 (r1, 2tq), a2 (r0, 2tq + 8), a3 (r1, 2tq + 8) per 16-dim chunk
         uint32_t qa[2][4];
@@ -1429,7 +1430,22 @@ cudaError_t twinattn(const TWinAttn &a, cudaStream_t s)
             if (cudaFuncSetAttribute(k_winattn_g, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess) return cudaErrorInvalidValue;
             set = smem;
         }
-        k_winattn_g<<<(unsigned)(nwx * nwy) * (unsigned)a.heads, 128, smem, s>>>(g);
+        // Warps per CTA: as many as the registers allow with the CTAs the shared memory fits per SM
+        // (each CTA's warps take 16-query blocks in turn); AJI_NATIVE_WINWARPS overrides.
+        static const int smem_sm = [] {
+            int dev = 0, v = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+            return v;
+        }();
+        static const int force = [] {
+            const char *v = std::getenv("AJI_NATIVE_WINWARPS");
+            return v ? std::atoi(v) : 0;
+        }();
+        const int per_sm = std::max(1, smem_sm / (smem + 1024));
+        int nw = force > 0 ? force : per_sm >= 4 ? 4 : per_sm >= 2 ? 8 : 16;
+        nw = std::max(1, std::min({nw, 16, T / 16}));
+        k_winattn_g<<<(unsigned)(nwx * nwy) * (unsigned)a.heads, 32 * nw, smem, s>>>(g);
         return cudaGetLastError();
     }
     if (a.hd > 32 || a.hd % 2 || T % 16 || T > 256 || a.sq % 2 || a.so % 2) return cudaErrorInvalidValue;
