@@ -48,6 +48,7 @@ struct Block {
     float *dw = nullptr, *dwb = nullptr;             // the depthwise conv on v (C rounded up to 8)
     float *cw1 = nullptr, *cb1 = nullptr, *cw2 = nullptr, *cb2 = nullptr;  // channel gate: GAP -> C/8 -> C
     float *sw1 = nullptr, *sb1 = nullptr, *sw2 = nullptr, sb2 = 0.f;       // token gate: C -> C/16 -> 1
+    TMat *sg1 = nullptr;  // the token gate's first layer as a GEMM (C -> sr, bias; GELU applied by tgemm)
     int cr = 0, sr = 0;
     float *fdw = nullptr, *fdwb = nullptr;           // the SGFN's depthwise conv
 };
@@ -73,7 +74,7 @@ private:
     GOp first, after, cbu, up0[2], up2[2], last;
     TMat *ident = nullptr, foldm;
     float *identf = nullptr;
-    void *IN16 = nullptr, *XF = nullptr, *N1 = nullptr, *QKV = nullptr, *AT = nullptr, *CX = nullptr, *Z = nullptr, *H1 = nullptr;
+    void *IN16 = nullptr, *XF = nullptr, *N1 = nullptr, *QKV = nullptr, *AT = nullptr, *CX = nullptr, *Z = nullptr, *H1 = nullptr, *TG = nullptr;
     void *N2 = nullptr, *PR = nullptr, *S16 = nullptr, *TT = nullptr, *U0 = nullptr, *V1 = nullptr, *V2 = nullptr, *O16 = nullptr;
     float *S = nullptr, *GIN = nullptr, *sums = nullptr, *cg = nullptr, *tg = nullptr, *stats = nullptr, *attnb = nullptr, *fold = nullptr;
     float *wsp = nullptr;
@@ -279,6 +280,12 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
             bk.sr = (int)d[0];
             bk.sw1 = r.dfl(v, (size_t)bk.sr * C);
             bk.sb1 = r.dfl(b, bk.sr);
+            {
+                std::vector<float> vt((size_t)C * bk.sr);  // [sr][C] -> [C][sr]
+                for (int j = 0; j < bk.sr; j++)
+                    for (int c = 0; c < C; c++) vt[(size_t)c * bk.sr + j] = v[(size_t)j * C + c];
+                bk.sg1 = r.mat(vt, &b, C, bk.sr);
+            }
             if (!conv_w(s2, &v, &b, &d) || d.size() != 4 || d[0] != 1 || d[1] != bk.sr || d[2] != 1 || d[3] != 1 || b.size() != 1)
                 return refuse(why, where + ": token gate"), nullptr;
             bk.sw2 = r.dfl(v, bk.sr);
@@ -371,6 +378,7 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     lt.add(&f->CX, M * CP * 2, {{12, 14}});
     lt.add(&f->AT, M * CP * 2, {{13, 14}});
     lt.add(&f->Z, M * CP * 2, {{14, 15}});
+    lt.add(&f->TG, M * 16 * 2, {{13, 14}});  // the token gate's hidden layer
     lt.add(&f->H1, M * f->FS * 2, {{17, 19}});
     lt.add(&f->N2, M * CP * 2, {{18, 19}});
     lt.add(&f->PR, M * CP * 2, {{19, 20}});
@@ -447,6 +455,15 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         return tlayernorm2(x, xf32, sx, y, yf32, CP, M, C, CP, l.g, l.b, l.eps, s);
     };
     const uint16_t *q16 = (const uint16_t *)QKV;
+    // Z = the mix of AT and CX with the channel gate cg and the token gate from src: the gate's hidden layer
+    // as a GEMM (tensor cores, GELU, into TG), then the mix reading it (cudaErrorNotSupported: none of it ran)
+    auto token_gate_mix = [&](const Block &b, const void *src, int mode) -> cudaError_t {
+        TGemm g;
+        g.a = src; g.sa = CP; g.M = M; g.out = TG; g.so = 16; g.act = TAct::Gelu;
+        if (!b.sg1 || b.sg1->Npad != 16) return cudaErrorNotSupported;
+        CK(tgemm(*b.sg1, g, s));
+        return dat_mix_tg(AT, CX, CP, cg, TG, 16, b.sr, b.sw2, b.sb2, mode, Z, M, C, s);
+    };
 
     // Steps (the buffers' lifetimes in build()): 1 IN16, 2 XF, 3 S; per group 9 GIN; per block 10 N1,
     // 11 QKV, 12 CX, 13 AT, 14 Z, 15 S, 16 N1, 17 H1, 18 N2, 19 PR, 20 S; 21 S16, 22 S; then 30 N1,
@@ -483,9 +500,14 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 pr.mark(P_WIN);
                 // channel gate from the conv branch's average, token gate from the attention
                 K(chan_gate(sums, M, C, b.cr, b.cw1, b.cb1, b.cw2, b.cb2, 0, 1.f, cg, CP, s));
-                if (!collect && dat_gate_mix(AT, CX, CP, cg, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, 0, Z, s) == cudaErrorNotSupported) {
-                    CK(dat_token_gate(AT, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
-                    CK(dat_mix(AT, CX, CP, cg, tg, 0, Z, M, C, s));
+                if (!collect) {
+                    const cudaError_t eg = token_gate_mix(b, AT, 0);
+                    if (eg != cudaErrorNotSupported) {
+                        CK(eg);
+                    } else {
+                        CK(dat_token_gate(AT, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
+                        CK(dat_mix(AT, CX, CP, cg, tg, 0, Z, M, C, s));
+                    }
                 }
             } else {
                 if (!collect) {
@@ -502,9 +524,14 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 // channel gate from the attention's average, token gate from the conv branch
                 K(tcolsum(AT, CP, M, C, sums, s));
                 K(chan_gate(sums, M, C, b.cr, b.cw1, b.cb1, b.cw2, b.cb2, 0, 1.f, cg, CP, s));
-                if (!collect && dat_gate_mix(AT, CX, CP, cg, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, 1, Z, s) == cudaErrorNotSupported) {
-                    CK(dat_token_gate(CX, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
-                    CK(dat_mix(AT, CX, CP, cg, tg, 1, Z, M, C, s));
+                if (!collect) {
+                    const cudaError_t eg = token_gate_mix(b, CX, 1);
+                    if (eg != cudaErrorNotSupported) {
+                        CK(eg);
+                    } else {
+                        CK(dat_token_gate(CX, CP, M, C, b.sr, b.sw1, b.sb1, b.sw2, b.sb2, tg, s));
+                        CK(dat_mix(AT, CX, CP, cg, tg, 1, Z, M, C, s));
+                    }
                 }
             }
             pr.mark(P_GATE);
