@@ -57,10 +57,12 @@ struct TGemm {
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
 
 // The MLP out = epi(GELU(A W1 + b1) W2 + b2) in one kernel, the hidden kept on chip; the epilogue as
-// tgemm's (add1, then out; fp32 or fp16 each). Both biases required. cudaErrorNotSupported (nothing
-// launched) for the shapes without a fused kernel or with AJI_NATIVE_FMLP=0: run the two GEMMs then.
+// tgemm's (add1, then out; fp32 or fp16 each). Both biases required. With ln_gamma, A is an fp32 map
+// normalised on load (LayerNorm over W1's K channels, as tlayernorm2). cudaErrorNotSupported (nothing
+// launched) for the shapes without a fused kernel, or per AJI_NATIVE_FMLP (0: none, 1: not with the
+// LayerNorm): normalise / run the two GEMMs then.
 struct TMlp {
-    const void *a = nullptr;  // [M][sa] fp16
+    const void *a = nullptr;  // [M][sa] fp16, or fp32 with ln_gamma
     int sa = 0, M = 0;
     void *out = nullptr;
     int so = 0;
@@ -68,6 +70,14 @@ struct TMlp {
     const void *add1 = nullptr;
     int s1 = 0;
     bool add1_f32 = false;
+    const float *ln_gamma = nullptr, *ln_beta = nullptr;  // [K] device
+    float ln_eps = 1e-5f;
+    // Optional: the LayerNorm of the output rows (over W2's N channels; zeros up to Npad) as fp16 at
+    // lno [M][slno], e.g. the next block's input.
+    void *lno = nullptr;
+    int slno = 0;
+    const float *lno_gamma = nullptr, *lno_beta = nullptr;
+    float lno_eps = 1e-5f;
 };
 cudaError_t tmlp(const TMat &w1, const TMat &w2, const TMlp &g, cudaStream_t s);
 

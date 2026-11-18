@@ -1,7 +1,8 @@
 // aji_native_tfm_test: native/tfm.h kernels against CPU references (fp32 maths on the same fp16
 // inputs): GEMM with every epilogue, LayerNorm, window attention (bias, image sizes that are not
 // window multiples, a cyclic shift, 64- and 256-token windows), depthwise 3x3 with GELU, channel
-// sums and channel-attention statistics, the fused MLP. Skips (exit 0) without an sm_80+ GPU.
+// sums and channel-attention statistics, the fused MLP (with and without its LayerNorm). Skips
+// (exit 0) without an sm_80+ GPU.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -165,6 +166,84 @@ static void test_mlp(int M, int C, int hid, bool f32)
     tmat_release(m1);
     tmat_release(m2);
     cudaFree(da); cudaFree(dh); cudaFree(dr); cudaFree(o1); cudaFree(o2);
+}
+
+// The fused MLP with its LayerNorm (fp32 stream in place, as HAT's) against tlayernorm2 then the
+// fused MLP without it (the same maths in another order: a few hidden values may round the other way)
+// and against the CPU.
+static void test_mlp_ln(int M, int C, int hid)
+{
+    const int Cp = (C + 15) / 16 * 16, Hp = (hid + 15) / 16 * 16;
+    std::vector<float> w1((size_t)C * hid), b1(hid), w2((size_t)hid * C), b2(C), x((size_t)M * Cp, 0.f), gm(C), bt(C);
+    for (auto &v : w1) v = hf(hb(ur(0.15f)));
+    for (auto &v : w2) v = hf(hb(ur(0.1f)));
+    for (auto &v : b1) v = ur(0.5f);
+    for (auto &v : b2) v = ur(0.3f);
+    for (auto &v : gm) v = 0.5f + ur(0.4f);
+    for (auto &v : bt) v = ur(0.2f);
+    for (int m = 0; m < M; m++) {
+        const float off = ur(300.f), sc = 1.f + std::fabs(ur(200.f));  // a residual stream's spread
+        for (int n = 0; n < C; n++) x[(size_t)m * Cp + n] = off + sc * ur(1.f);
+    }
+    TMat m1, m2;
+    tmat_upload(m1, w1.data(), b1.data(), C, hid);
+    tmat_upload(m2, w2.data(), b2.data(), hid, C);
+    float *o1 = dev(x), *o2 = dev(x), *dg = dev(gm), *db = dev(bt);
+    uint16_t *dn = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
+    tlayernorm2(o1, true, Cp, dn, false, Cp, M, C, Cp, dg, db, 1e-5f, nullptr);
+    TMlp t;
+    t.a = dn; t.sa = Cp; t.M = M; t.out = o1; t.so = Cp; t.out_f32 = true; t.add1 = o1; t.s1 = Cp; t.add1_f32 = true;
+    const cudaError_t e1 = tmlp(m1, m2, t, nullptr);
+    t.a = o2; t.out = o2; t.add1 = o2; t.ln_gamma = dg; t.ln_beta = db; t.ln_eps = 1e-5f;
+    uint16_t *dlo = dev(std::vector<uint16_t>((size_t)M * Cp, 0x7c00)), *dlr = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
+    t.lno = dlo; t.slno = Cp; t.lno_gamma = db; t.lno_beta = dg; t.lno_eps = 1e-3f;  // the next LayerNorm (other parameters)
+    const cudaError_t e2 = tmlp(m1, m2, t, nullptr);
+    tlayernorm2(o2, true, Cp, dlr, false, Cp, M, C, Cp, db, dg, 1e-3f, nullptr);
+    cudaDeviceSynchronize();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "mlp+ln %dx%dx%d", M, C, hid);
+    checks++;
+    if (e1 != cudaSuccess || e2 != cudaSuccess) {
+        printf("FAIL %s: %s / %s\n", nm, cudaGetErrorString(e1), cudaGetErrorString(e2));
+        fails++;
+    } else {
+        auto h1 = host(o1, x.size()), h2 = host(o2, x.size());
+        double md = 0, me = 0;
+        std::vector<double> y(C);
+        std::vector<float> hv(hid);
+        for (int m = 0; m < M; m++) {
+            double mean = 0, var = 0;
+            for (int n = 0; n < C; n++) mean += x[(size_t)m * Cp + n];
+            mean /= C;
+            for (int n = 0; n < C; n++) var += (x[(size_t)m * Cp + n] - mean) * (x[(size_t)m * Cp + n] - mean);
+            const double rs = 1.0 / std::sqrt(var / C + 1e-5);
+            for (int n = 0; n < C; n++) y[n] = hf(hb((float)((x[(size_t)m * Cp + n] - mean) * rs * gm[n] + bt[n])));
+            for (int j = 0; j < hid; j++) {
+                double v = b1[j];
+                for (int k = 0; k < C; k++) v += y[k] * w1[(size_t)k * hid + j];
+                hv[j] = hf(hb(gelu((float)v)));
+            }
+            for (int c = 0; c < C; c++) {
+                double v = b2[c] + x[(size_t)m * Cp + c];
+                for (int j = 0; j < hid; j++) v += hv[j] * w2[(size_t)j * C + c];
+                const size_t i = (size_t)m * Cp + c;
+                me = std::max(me, std::fabs(v - h2[i]) / std::max(1.0, std::fabs(v) * 1e-3));
+                md = std::max(md, (double)std::fabs(h1[i] - h2[i]) / std::max(1.0, std::fabs((double)h1[i]) * 1e-3));
+            }
+        }
+        report(nm, me, 0.1);
+        char nb[120];
+        snprintf(nb, sizeof(nb), "%s vs layernorm + mlp", nm);
+        report(nb, md, 0.05);
+        auto l1 = host(dlo, (size_t)M * Cp), l2 = host(dlr, (size_t)M * Cp);
+        double le = 0;
+        for (size_t i = 0; i < l1.size(); i++) le = std::max(le, (double)std::fabs(hf(l1[i]) - hf(l2[i])));
+        snprintf(nb, sizeof(nb), "%s next layernorm vs tlayernorm2", nm);
+        report(nb, le, 0.01);
+    }
+    tmat_release(m1);
+    tmat_release(m2);
+    cudaFree(o1); cudaFree(o2); cudaFree(dg); cudaFree(db); cudaFree(dn); cudaFree(dlo); cudaFree(dlr);
 }
 
 static void test_ln(int M, int C)
@@ -366,6 +445,8 @@ int main()
     test_mlp(1000, 180, 360, true);  // HAT-L's MLP, a row tail
     test_mlp(77, 180, 360, false);
     test_mlp(4096, 180, 360, true);
+    test_mlp_ln(1000, 180, 360);
+    test_mlp_ln(70, 180, 360);
     test_ln(300, 120);
     test_ln(50, 180);
     test_win(16, 16, 4, 30, 8, 8, 0, 0, true);

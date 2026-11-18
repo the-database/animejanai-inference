@@ -192,7 +192,7 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
     lt.add(&f->XF, M * CP * 2, {{2, 31}});
     lt.add((void **)&f->S, M * CP * 4, {{3, 30}});
     lt.add((void **)&f->GIN, M * CP * 4, {{9, 28}});
-    lt.add(&f->N1, M * CP * 2, {{10, 14}, {17, 18}, {20, 21}, {24, 25}, {30, 31}});
+    lt.add(&f->N1, M * CP * 2, {{10, 14}, {17, 19}, {20, 21}, {24, 25}, {30, 31}});  // 19: the MLP makes the next LN1
     lt.add(&f->T60, M * f->crp * 2, {{11, 12}});
     lt.add(&f->Y, M * CP * 2, {{12, 16}});
     lt.add(&f->QKV, M * f->QS * 2, {{14, 15}, {21, 22}});
@@ -279,19 +279,32 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         }
         return twinattn(t, s);
     };
-    auto mlp_step = [&](const Ln &n2, const Mlp &m) -> cudaError_t {
+    // nxt: the next block's LN1, which the fused MLP also applies to its output (into N1); *made: whether it did
+    auto mlp_step = [&](const Ln &n2, const Mlp &m, const Ln *nxt, bool *made) -> cudaError_t {
+        *made = false;
+        if (collect) return cudaSuccess;
+        // S += fc2(GELU(fc1(LN2 S))) in one kernel where there is one (else the LayerNorm, the MLP
+        // kernel without it, or the two GEMMs)
+        TMlp t;
+        t.a = S; t.sa = CP; t.M = M; t.out = S; t.so = CP; t.out_f32 = true; t.add1 = S; t.s1 = CP; t.add1_f32 = true;
+        t.ln_gamma = n2.g; t.ln_beta = n2.b; t.ln_eps = n2.eps;
+        if (nxt) { t.lno = N1; t.slno = CP; t.lno_gamma = nxt->g; t.lno_beta = nxt->b; t.lno_eps = nxt->eps; }
+        cudaError_t e = tmlp(*m.fc1, *m.fc2, t, s);
+        if (e != cudaErrorNotSupported) {
+            CK(e);
+            *made = nxt != nullptr;
+            pr.mark(P_MLP);
+            return cudaSuccess;
+        }
+        t.lno = nullptr;
         CK(lnorm(n2, S, true, N1, false));
         pr.mark(P_LN);
-        if (!collect) {
-            // S += fc2(GELU(fc1(N1))) in one kernel where there is one for the shape
-            TMlp t;
-            t.a = N1; t.sa = CP; t.M = M; t.out = S; t.so = CP; t.out_f32 = true; t.add1 = S; t.s1 = CP; t.add1_f32 = true;
-            const cudaError_t e = tmlp(*m.fc1, *m.fc2, t, s);
-            if (e != cudaErrorNotSupported) {
-                CK(e);
-                pr.mark(P_MLP);
-                return cudaSuccess;
-            }
+        t.a = N1; t.ln_gamma = t.ln_beta = nullptr;
+        e = tmlp(*m.fc1, *m.fc2, t, s);
+        if (e != cudaErrorNotSupported) {
+            CK(e);
+            pr.mark(P_MLP);
+            return cudaSuccess;
         }
         CK(gemm(*m.fc1, N1, CP, H1, HS, TAct::Gelu, false));
         pr.mark(P_FC1);
@@ -311,8 +324,10 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
     pr.mark(P_CONV);
     for (Group &gr : groups) {
         K(cudaMemcpyAsync(GIN, S, (size_t)M * CP * 4, cudaMemcpyDeviceToDevice, s));
-        for (Hab &b : gr.habs) {
-            CK(lnorm(b.n1, S, true, N1, false));
+        bool n1_made = false;  // N1 = LN1(S) already, from the previous block's MLP
+        for (size_t bi = 0; bi < gr.habs.size(); bi++) {
+            Hab &b = gr.habs[bi];
+            if (!n1_made) CK(lnorm(b.n1, S, true, N1, false));
             pr.mark(P_LN);
             // CAB on the normalised map (its last conv carries the 0.01), its channel gate
             GConvArgs c0 = ga(N1, CP, h, w, T60, crp, h, w);
@@ -330,10 +345,10 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             pr.mark(P_WIN);
             CK(gemm(*b.at.proj, AT, CP, S, CP, TAct::None, true, Y, cm));  // S += proj(attn) + CAB * gate
             pr.mark(P_PROJ);
-            CK(mlp_step(b.n2, b.mlp));
+            CK(mlp_step(b.n2, b.mlp, bi + 1 < gr.habs.size() ? &gr.habs[bi + 1].n1 : &gr.oc.n1, &n1_made));
         }
         Ocab &o = gr.oc;
-        CK(lnorm(o.n1, S, true, N1, false));
+        if (!n1_made) CK(lnorm(o.n1, S, true, N1, false));
         pr.mark(P_LN);
         CK(gemm(*o.at.qkv, N1, CP, QKV, QS, TAct::None, false));
         pr.mark(P_QKV);
@@ -341,7 +356,7 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         pr.mark(P_WIN);
         CK(gemm(*o.at.proj, AT, CP, S, CP, TAct::None, true));
         pr.mark(P_PROJ);
-        CK(mlp_step(o.n2, o.mlp));
+        CK(mlp_step(o.n2, o.mlp, nullptr, &n1_made));
         // the group conv plus the group input, in fp32
         K(tconvert(S, true, CP, S16, false, CP, M, CP, s, kStreamScale));
         GConvArgs a = ga(S16, CP, h, w, S, CP, h, w);
