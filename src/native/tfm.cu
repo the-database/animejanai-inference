@@ -38,6 +38,11 @@ __device__ __forceinline__ void cp16(void *s, const void *g, int bytes)
     const uint32_t a = (uint32_t)__cvta_generic_to_shared(s);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(a), "l"(g), "r"(bytes));
 }
+__device__ __forceinline__ void cp4(void *s, const void *g, int bytes)
+{
+    const uint32_t a = (uint32_t)__cvta_generic_to_shared(s);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(a), "l"(g), "r"(bytes));
+}
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.commit_group;\ncp.async.wait_all;" ::: "memory"); }
 #else
 #define TFM_OK 0
@@ -615,34 +620,45 @@ __global__ void __launch_bounds__(512) k_winattn_g(WinG P)
     const int Tq = p.wh * p.ww, kw = P.kwh ? P.kww : p.ww, kh = P.kwh ? P.kwh : p.wh, Tk = kh * kw;
     half *sk = reinterpret_cast<half *>(smraw), *sv = sk + Tk * HP;
     float *stab = reinterpret_cast<float *>(sv + Tk * HP);
-    signed char *sreg = reinterpret_cast<signed char *>(stab + (P.rtab ? P.tn : 0));
+    // per key token: its pixel (the query window's own keys only: -1 outside the image), its offset
+    // into the bias table, its Swin region; computed once here instead of per element / score
+    int *spix = reinterpret_cast<int *>(stab + (P.rtab ? P.tn : 0));
+    short *skid = reinterpret_cast<short *>(spix + (P.kwh ? 0 : Tk));
+    signed char *sreg = reinterpret_cast<signed char *>(skid + (P.rtab ? Tk : 0));
     const int win = (int)(blockIdx.x / p.heads), h = (int)(blockIdx.x % p.heads), tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wy = win / p.nwx, wx = win % p.nwx;
-    // keys and values of this head (dims padded to 32 with zeros; tokens outside the image zero)
+    // keys and values of this head (dims padded to 32 with zeros; tokens outside the image zero), and
+    // the bias table: copies straight to shared memory, all in flight together (cp.async, 4 bytes:
+    // a head's dims start 4-byte aligned)
     const int nt = (int)blockDim.x;  // 32 per warp, a warp per 16-query block in turn
+    for (int t = tid; t < Tk; t += nt) {
+        if (!P.kwh) {
+            int px;
+            spix[t] = win_tok(p, win, t, &px) ? px : -1;
+        }
+        if (P.rtab) skid[t] = (short)((t / kw - P.kpad) * P.tw + (t % kw - P.kpad));
+        if (P.mask)
+            sreg[t] = (signed char)(swin_rid(wy * p.wh + t / p.ww, p.Hp, p.wh, p.sy) * 3 + swin_rid(wx * p.ww + t % p.ww, p.Wp, p.ww, p.sx));
+    }
+    __syncthreads();
     for (int i = tid; i < Tk * 16; i += nt) {
         const int t = i / 16, d2 = (i % 16) * 2;
-        half2 k = __float2half2_rn(0.f), v = k;
         int pix = -1;
         if (P.kwh) {
             const int y = wy * p.wh - P.kpad + t / kw, x = wx * p.ww - P.kpad + t % kw;
             if (y >= 0 && y < p.H && x >= 0 && x < p.W) pix = y * p.W + x;
-        } else if (!win_tok(p, win, t, &pix)) {
-            pix = -1;
+        } else {
+            pix = spix[t];
         }
-        if (d2 < p.hd && pix >= 0) {
-            const half *src = p.qkv + (size_t)pix * p.sq + h * p.hd + d2;
-            k = *reinterpret_cast<const half2 *>(src + p.ko);
-            v = *reinterpret_cast<const half2 *>(src + p.vo);
-        }
-        *reinterpret_cast<half2 *>(sk + t * HP + d2) = k;
-        *reinterpret_cast<half2 *>(sv + t * HP + d2) = v;
+        const bool ok = d2 < p.hd && pix >= 0;
+        const half *src = ok ? p.qkv + (size_t)pix * p.sq + h * p.hd + d2 : p.qkv;
+        cp4(sk + t * HP + d2, ok ? src + p.ko : src, ok ? 4 : 0);
+        cp4(sv + t * HP + d2, ok ? src + p.vo : src, ok ? 4 : 0);
     }
     if (P.rtab)
-        for (int i = tid; i < P.tn; i += nt) stab[i] = P.rtab[(size_t)h * P.tn + i];
-    if (P.mask)
-        for (int t = tid; t < Tk; t += nt)
-            sreg[t] = (signed char)(swin_rid(wy * p.wh + t / p.ww, p.Hp, p.wh, p.sy) * 3 + swin_rid(wx * p.ww + t % p.ww, p.Wp, p.ww, p.sx));
+        for (int i = tid; i < P.tn; i += nt) cp4(stab + i, P.rtab + (size_t)h * P.tn + i, 4);
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    asm volatile("cp.async.wait_all;" ::: "memory");
     __syncthreads();
     const int g = lane >> 2, tq = lane & 3;
     const float *bias = p.bias ? p.bias + (size_t)h * Tq * Tk : nullptr;
@@ -650,8 +666,15 @@ __global__ void __launch_bounds__(512) k_winattn_g(WinG P)
         const int r0 = qb * 16 + g, r1 = r0 + 8;
         // q fragments: a0 (r0, 2tq), a1 (r1, 2tq), a2 (r0, 2tq + 8), a3 (r1, 2tq + 8) per 16-dim chunk
         uint32_t qa[2][4];
-        int p0, p1;
-        const bool v0 = win_tok(p, win, r0, &p0), v1 = win_tok(p, win, r1, &p1);
+        int p0 = -1, p1 = -1;
+        if (P.kwh) {
+            if (!win_tok(p, win, r0, &p0)) p0 = -1;
+            if (!win_tok(p, win, r1, &p1)) p1 = -1;
+        } else {
+            p0 = r0 < Tq ? spix[r0] : -1;
+            p1 = r1 < Tq ? spix[r1] : -1;
+        }
+        const bool v0 = p0 >= 0, v1 = p1 >= 0;
 #pragma unroll
         for (int kc = 0; kc < 2; kc++)
 #pragma unroll
@@ -664,6 +687,7 @@ __global__ void __launch_bounds__(512) k_winattn_g(WinG P)
             }
         const int qy[2] = {r0 / p.ww, r1 / p.ww}, qx[2] = {r0 % p.ww, r1 % p.ww};
         int qreg[2] = {0, 0};
+        const int qoff[2] = {(P.offy - qy[0]) * P.tw + (P.offx - qx[0]), (P.offy - qy[1]) * P.tw + (P.offx - qx[1])};
         if (P.mask)
 #pragma unroll
             for (int i = 0; i < 2; i++)
@@ -701,8 +725,7 @@ __global__ void __launch_bounds__(512) k_winattn_g(WinG P)
                     const int ri = e >> 1, r = ri ? r1 : r0, cc = c + (e & 1);
                     float v = s[n][e] * p.scale;
                     if (P.rtab) {
-                        const int ky = cc / kw - P.kpad, kx = cc % kw - P.kpad;
-                        v += stab[(ky - qy[ri] + P.offy) * P.tw + (kx - qx[ri] + P.offx)];
+                        v += stab[skid[cc] + qoff[ri]];
                     } else if (bias) {
                         v += bias[(size_t)r * Tk + cc];
                     }
@@ -1424,7 +1447,7 @@ cudaError_t twinattn(const TWinAttn &a, cudaStream_t s)
         WinG g{{(const half *)a.qkv, a.sq, a.qo, a.ko, a.vo, a.H, a.W, a.heads, a.hd, a.wh, a.ww, a.shift_y, a.shift_x, nwx, Hp, Wp, a.scale,
                 a.bias, (half *)a.out, a.so},
                a.kwh, a.kww, a.kpad, a.mask ? 1 : 0, a.rtab, a.rt_w, a.rt_offy, a.rt_offx, tn};
-        const int smem = (Tk * HP * 2 * 2 + tn * 4 + (a.mask ? Tk : 0) + 15) / 16 * 16;
+        const int smem = (Tk * HP * 2 * 2 + tn * 4 + (a.kwh ? 0 : Tk * 4) + (a.rtab ? Tk * 2 : 0) + (a.mask ? Tk : 0) + 15) / 16 * 16;
         static int set = 0;
         if (smem > 48 * 1024 && smem > set) {
             if (cudaFuncSetAttribute(k_winattn_g, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess) return cudaErrorInvalidValue;
