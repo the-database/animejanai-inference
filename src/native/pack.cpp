@@ -28,6 +28,44 @@ std::vector<uint32_t> pack_fragments(const uint16_t *w, int taps, int cin, int c
     return v;
 }
 
+std::vector<uint32_t> pack_fragments8(const uint16_t *w, int taps, int cin, int cin_pad, int cout, int cout_pad)
+{
+    const int KC = cin_pad / 16, K8 = (cin_pad % 16) / 8, NT = cout_pad / 8, NJ = NT / 2, NO = NT % 2;
+    const int WK = NJ * 4 + NO * 2, WT = KC * WK + K8 * (NJ * 2 + NO);  // words per lane: per K chunk, per tap
+    std::vector<uint32_t> v((size_t)taps * WT * 32, 0u);
+    auto at = [&](int t, int k, int n) -> uint32_t {
+        return (k < cin && n < cout) ? w[((size_t)t * cin + k) * cout + n] : 0u;
+    };
+    auto pair = [&](int t, int k0, int n) { return at(t, k0, n) | (at(t, k0 + 1, n) << 16); };
+    for (int t = 0; t < taps; t++)
+        for (int lane = 0; lane < 32; lane++) {
+            const int g = lane / 4, tq = lane % 4;
+            for (int kc = 0; kc < KC; kc++) {
+                uint32_t *seg = &v[((size_t)t * WT + kc * WK) * 32];
+                const int k0 = kc * 16 + tq * 2;
+                for (int j = 0; j < NJ; j++)
+                    for (int h = 0; h < 2; h++) {
+                        const int n = (2 * j + h) * 8 + g;
+                        seg[(j * 32 + lane) * 4 + h * 2] = pair(t, k0, n);
+                        seg[(j * 32 + lane) * 4 + h * 2 + 1] = pair(t, k0 + 8, n);
+                    }
+                if (NO) {
+                    const int n = (NT - 1) * 8 + g;
+                    seg[NJ * 4 * 32 + lane * 2] = pair(t, k0, n);
+                    seg[NJ * 4 * 32 + lane * 2 + 1] = pair(t, k0 + 8, n);
+                }
+            }
+            if (K8) {
+                uint32_t *seg = &v[((size_t)t * WT + KC * WK) * 32];
+                const int k0 = KC * 16 + tq * 2;
+                for (int j = 0; j < NJ; j++)
+                    for (int h = 0; h < 2; h++) seg[(j * 32 + lane) * 2 + h] = pair(t, k0, (2 * j + h) * 8 + g);
+                if (NO) seg[NJ * 2 * 32 + lane] = pair(t, k0, (NT - 1) * 8 + g);
+            }
+        }
+    return v;
+}
+
 uint16_t float_to_half_bits(float f)
 {
     uint32_t x;

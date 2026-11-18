@@ -19,6 +19,12 @@ namespace ajinative {
 // words; entries with k >= cin or n >= cout are zero. cin_pad, cout_pad: multiples of 16.
 std::vector<uint32_t> pack_fragments(const uint16_t *w, int taps, int cin, int cin_pad, int cout, int cout_pad);
 
+// The same for channel counts that are multiples of 8 (k_conv3x3's 24-channel shapes): per tap,
+// each full 16-row K chunk holds its uint4 pairs as above, then {b0, b1} (uint2) of a last odd
+// n8 tile; an 8-row K tail (m16n8k8: b0 = {B[2t][g], B[2t+1][g]}) follows as uint2 pairs of b0
+// and the odd tile's b0. With multiples of 16 the layout is pack_fragments'.
+std::vector<uint32_t> pack_fragments8(const uint16_t *w, int taps, int cin, int cin_pad, int cout, int cout_pad);
+
 // fp32 -> fp16 bits, round to nearest even (host side; bias and slope uploads, tests).
 uint16_t float_to_half_bits(float f);
 float half_bits_to_float(uint16_t h);

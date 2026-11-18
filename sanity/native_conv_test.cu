@@ -266,6 +266,18 @@ int main()
                 CHECK(run_case(Input::NHWC, Act::None, Gate::None, o, C, sz[0], sz[1], &checked) == 0);
             for (int ns : {2, 3, 4}) CHECK(run_concat(C, ns, 1237, &checked) == 0);
         }
+    // 24 channels (SuperUltraCompact): an 8-channel K tail and an odd n8 tile; no tanh gate, no concat
+    for (const auto &sz : sizes) {
+        for (Act a : {Act::None, Act::Relu, Act::PRelu, Act::SiLU})
+            CHECK(run_case(Input::NHWC, a, Gate::None, Output::NHWC, 24, sz[0], sz[1], &checked) == 0);
+        for (Gate g : {Gate::Residual, Gate::SigmoidHalf})
+            CHECK(run_case(Input::NHWC, Act::None, g, Output::NHWC, 24, sz[0], sz[1], &checked) == 0);
+        for (Input in : {Input::NCHW3, Input::NCHW3Unshuffle2})
+            for (Act a : {Act::None, Act::Relu, Act::PRelu})
+                CHECK(run_case(in, a, Gate::None, Output::NHWC, 24, sz[0], sz[1], &checked) == 0);
+        for (Output o : {Output::DepthToSpace2, Output::DepthToSpace4})
+            CHECK(run_case(Input::NHWC, Act::None, Gate::None, o, 24, sz[0], sz[1], &checked) == 0);
+    }
 
     // refusals
     Weights w;
