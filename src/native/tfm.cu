@@ -970,6 +970,108 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
 #endif
 }
 
+// ---- GEMM without adds, row-stationary (the fused MLP's fc1 half): a warp owns 16 rows and keeps
+// their A fragments in registers for the whole K; the CTA walks every 16-column chunk of W, two
+// chunks per cp.async stage through shared memory (two stages), and writes each 16x16 result as it
+// is done. No accumulator lives across chunks, so it runs at ~100 registers and 4 CTAs per SM, and
+// W is read once per 64 rows instead of once per 64x64 tile. Same sums as k_gemm.
+template <int KC1>
+__global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)
+{
+#if TFM_OK
+    constexpr int CH = KC1 * 32, NT = 128;  // uint4 per chunk slice
+    static_assert(CH % NT == 0, "a chunk's weights split evenly over the threads");
+    extern __shared__ __align__(16) uint4 smw[];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tq = lane & 3;
+    const int nch = p.njt, npair = (nch + 1) / 2, r0 = (int)blockIdx.x * 64 + warp * 16 + g, r1 = r0 + 8;
+    auto load_pair = [&](int c0, int st) {
+#pragma unroll
+        for (int k = 0; k < 2 * CH / NT; k++) {
+            const int c = c0 + k / (CH / NT), sl = warp + (k % (CH / NT)) * 4;
+            if (c < nch) cp16(smw + (size_t)st * 2 * CH + k * NT + tid, p.w + ((size_t)sl * nch + c) * 32 + lane, 16);
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    load_pair(0, 0);
+#pragma unroll
+    for (int hh = 0; hh < 2; hh++) {
+        const int r = hh ? r1 : r0;
+        if (r >= p.M) continue;
+        const char *ra = reinterpret_cast<const char *>(p.a + (size_t)r * p.sa);
+        for (int l = tq; l * 128 < KC1 * 32; l += 4) asm volatile("prefetch.global.L2 [%0];" ::"l"(ra + l * 128));
+    }
+    uint32_t a[KC1][4];
+#pragma unroll
+    for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int r = (j & 1) ? r1 : r0, c = kc * 16 + 2 * tq + (j >> 1) * 8;
+            half2 v = __float2half2_rn(0.f);
+            if (r < p.M && c < p.k) v = *reinterpret_cast<const half2 *>(p.a + (size_t)r * p.sa + c);
+            a[kc][j] = h2u(v);
+        }
+    for (int pp = 0; pp < npair; pp++) {
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        __syncthreads();
+        if (pp + 1 < npair) load_pair(2 * pp + 2, (pp + 1) & 1);
+        const uint4 *sw = smw + (size_t)(pp & 1) * 2 * CH;
+        const bool two = 2 * pp + 1 < nch;
+        float h[2][2][4];
+#pragma unroll
+        for (int c = 0; c < 2; c++)
+#pragma unroll
+            for (int n = 0; n < 2; n++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) h[c][n][e] = 0.f;
+#pragma unroll
+        for (int kc = 0; kc < KC1; kc++) {
+            const uint4 b0 = sw[kc * 32 + lane];
+            mma32(h[0][0], a[kc], b0.x, b0.y);
+            mma32(h[0][1], a[kc], b0.z, b0.w);
+            if (two) {
+                const uint4 b1 = sw[CH + kc * 32 + lane];
+                mma32(h[1][0], a[kc], b1.x, b1.y);
+                mma32(h[1][1], a[kc], b1.z, b1.w);
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            if (c && !two) break;
+#pragma unroll
+            for (int n = 0; n < 2; n++) {
+                const int col = (2 * pp + c) * 16 + n * 8 + 2 * tq;
+                float2 bb = make_float2(0.f, 0.f), cs = make_float2(1.f, 1.f);
+                if (p.bias) bb = __ldg(reinterpret_cast<const float2 *>(p.bias + col));
+                if (p.colscale) cs = __ldg(reinterpret_cast<const float2 *>(p.colscale + col));
+#pragma unroll
+                for (int hh = 0; hh < 2; hh++) {
+                    const int r = hh ? r1 : r0;
+                    float v0 = h[c][n][2 * hh] + bb.x, v1 = h[c][n][2 * hh + 1] + bb.y;
+                    if (p.act == 1) {
+                        v0 = gelu(v0);
+                        v1 = gelu(v1);
+                    } else if (p.act == 2) {
+                        v0 = v0 < 0.f ? v0 * p.slope : v0;
+                        v1 = v1 < 0.f ? v1 * p.slope : v1;
+                    }
+                    if (p.colscale) {
+                        v0 *= cs.x;
+                        v1 *= cs.y;
+                    }
+                    if (r >= p.M) continue;
+                    if (p.out_f32)
+                        *reinterpret_cast<float2 *>(reinterpret_cast<float *>(p.out) + (size_t)r * p.so + col) = make_float2(v0, v1);
+                    else
+                        *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + col) = __floats2half2_rn(v0, v1);
+                }
+            }
+        }
+    }
+#else
+    __trap();
+#endif
+}
+
 // ---- fused MLP: out = epi(act(A W1 + b1) W2 + b2), the hidden kept on chip (flash-attention style).
 // A warp owns 16 rows: their A fragments stay in registers for the whole K, and the fc2 accumulators
 // (16 x N2) too. Per 16-column hidden chunk: fc1 into a 16x16 fragment, bias and GELU, rounded to fp16
@@ -1333,6 +1435,16 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
             (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0, g.out_f32 ? 1 : 0, g.add1_f32 ? 1 : 0, g.add2scale};
     p.k = w.K;
+    // without adds, K = 192 (a 180-channel transformer's qkv / fc1): the row-stationary kernel
+    // (AJI_NATIVE_GEMM_RS=0: k_gemm)
+    static const bool rs = [] {
+        const char *v = std::getenv("AJI_NATIVE_GEMM_RS");
+        return !v || std::atoi(v) != 0;
+    }();
+    if (rs && !g.add1 && !g.add2 && !g.act_last && w.Kpad == 192) {
+        k_gemm_rs<12><<<(unsigned)((g.M + 63) / 64), 128, 4 * 12 * 32 * 16, s>>>(p);
+        return cudaGetLastError();
+    }
     const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);
     if (g.add1 || g.add2)
         k_gemm<true><<<grid, 128, 0, s>>>(p);
