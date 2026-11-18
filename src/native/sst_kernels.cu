@@ -65,9 +65,13 @@ __global__ void __launch_bounds__(128) k_ribattn(RibP p)
 #if SST_OK
     constexpr int KP = DK + 8, KC = DK / 16, RP = DK - 32, QCH = 4 + RP / 8;  // QCH: 16-byte chunks per q / k row
     extern __shared__ __align__(16) unsigned char smraw[];
-    half *sq = reinterpret_cast<half *>(smraw);  // [BQ][KP]
-    half *sk = sq + BQ * KP;                     // [2][BK][KP]
+    // the queries pass through the K/V buffers' space (read once into registers, before the first key
+    // block lands): 29-41 KB per CTA, 3 CTAs per SM
+    half *sk = reinterpret_cast<half *>(smraw);  // [2][BK][KP]
     half *sv = sk + 2 * BK * KP;                 // [2][BK][VP]
+    half *sq = sk;                               // [BQ][KP], before the first key block
+    static_assert(BQ * KP <= 2 * BK * (KP + VP), "the queries fit in the K/V buffers");
+    int *spx = reinterpret_cast<int *>(sv + 2 * BK * VP);  // [2][BK]: pixel of each key row of a block
     const int T = p.ws * p.ws;
     const int qb = (int)(blockIdx.x % p.nqb), wh = (int)(blockIdx.x / p.nqb), h = wh % p.heads, win = wh / p.heads;
     const int wy0 = (win / p.nwx) * p.ws, wx0 = (win % p.nwx) * p.ws;
@@ -84,16 +88,24 @@ __global__ void __launch_bounds__(128) k_ribattn(RibP p)
         const int r = i / QCH, c = i % QCH, t = qtok(qb * BQ + r);
         cp16(sq + r * KP + c * 8, c < 4 ? p.qkv + pix(t) * p.sq + h * 32 + c * 8 : qtab + (size_t)t * RP + (c - 4) * 8);
     }
+    // A key block's rows: their pixels come from spx[buf] (computed a block ahead, once per row, instead
+    // of a division and modulo by the window size per 16-byte chunk)
     auto load_kv = [&](int kb, int buf) {
         half *dk = sk + buf * BK * KP, *dv = sv + buf * BK * VP;
+        const int *px = spx + buf * BK;
         for (int i = tid; i < BK * (QCH + 4); i += 128) {
             const int r = i / (QCH + 4), c = i % (QCH + 4), t = kb + r;
-            if (c < 4) cp16(dk + r * KP + c * 8, p.qkv + pix(t) * p.sq + p.kq + h * 32 + c * 8);
+            const half *row = p.qkv + (size_t)px[r] * p.sq + h * 32;
+            if (c < 4) cp16(dk + r * KP + c * 8, row + p.kq + c * 8);
             else if (c < QCH) cp16(dk + r * KP + c * 8, ktab + (size_t)t * RP + (c - 4) * 8);
-            else cp16(dv + r * VP + (c - QCH) * 8, p.qkv + pix(t) * p.sq + p.vq + h * 32 + (c - QCH) * 8);
+            else cp16(dv + r * VP + (c - QCH) * 8, row + p.vq + (c - QCH) * 8);
         }
     };
-    load_kv(0, 0);
+    const int nkb = T / BK;
+    if (tid < BK) {
+        spx[tid] = (int)pix(tid);
+        if (nkb > 1) spx[BK + tid] = (int)pix(BK + tid);
+    }
     cp_commit();
     cp_wait<0>();
     __syncthreads();
@@ -102,6 +114,9 @@ __global__ void __launch_bounds__(128) k_ribattn(RibP p)
     for (int mt = 0; mt < 2; mt++)
 #pragma unroll
         for (int kc = 0; kc < KC; kc++) ldsm_x4(qa[mt][kc], sq + (warp * 32 + mt * 16 + (lane & 15)) * KP + kc * 16 + (lane >> 4) * 8);
+    __syncthreads();  // every warp has its queries: the buffers take keys now
+    load_kv(0, 0);
+    cp_commit();
     float o[2][4][4], mrow[2][2], lrow[2][2];
 #pragma unroll
     for (int mt = 0; mt < 2; mt++) {
@@ -112,7 +127,6 @@ __global__ void __launch_bounds__(128) k_ribattn(RibP p)
 #pragma unroll
             for (int e = 0; e < 4; e++) o[mt][n][e] = 0.f;
     }
-    const int nkb = T / BK;
     for (int kbi = 0; kbi < nkb; kbi++) {
         const int buf = kbi & 1;
         if (kbi + 1 < nkb) load_kv((kbi + 1) * BK, buf ^ 1);
@@ -120,6 +134,8 @@ __global__ void __launch_bounds__(128) k_ribattn(RibP p)
         cp_wait<1>();
         __syncthreads();
         const half *ck = sk + buf * BK * KP, *cv = sv + buf * BK * VP;
+        // block kbi + 2's pixels into spx[buf] (block kbi's, whose copies were issued last iteration)
+        if (tid < BK && kbi + 2 < nkb) spx[buf * BK + tid] = (int)pix((kbi + 2) * BK + tid);
         float s[2][8][4];
 #pragma unroll
         for (int mt = 0; mt < 2; mt++)
@@ -332,7 +348,7 @@ cudaError_t tribattn(const TRibAttn &a, cudaStream_t s)
     const unsigned grid = (unsigned)(nwy * nwx) * (unsigned)a.heads * (unsigned)(T / BQ);
     auto launch = [&](auto dk) -> cudaError_t {
         constexpr int DK = decltype(dk)::value, KP = DK + 8;
-        const int smem = (BQ * KP + 2 * BK * KP + 2 * BK * VP) * 2;
+        const int smem = (2 * BK * KP + 2 * BK * VP) * 2 + 2 * BK * 4;
         if (smem > 48 * 1024) {
             static bool set = false;
             if (!set && cudaFuncSetAttribute(k_ribattn<DK>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess) return cudaErrorInvalidValue;
