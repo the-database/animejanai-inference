@@ -1178,9 +1178,6 @@ template <int NJ2>
 struct DwmmSmem {
     // uint4: W slice, taps, biases, halo (3 x 66 tokens x 32 bytes), gate (64 tokens x 32 bytes)
     static constexpr int cw = NJ2 * 32, ct = 36, cb = 4, chalo = 3 * 66 * 2, cm = 64 * 2;
-    static constexpr int chunk = cw + ct + cb + chalo + cm;
-    static constexpr int stages = 3 * chunk * 16, res = 64 * NJ2 * 16 * 4;  // the residual tile at fp32
-    static constexpr int bytes = stages > res ? stages : res;
 };
 
 // F32: out and add1 fp32 (else fp16); GATE: the depthwise bias and the gate (else neither)

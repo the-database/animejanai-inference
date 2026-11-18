@@ -106,7 +106,12 @@ static void run(const Case &c, int variant, bool split)
     a.R = c.R;
     a.up2 = c.up2;
     a.acc32 = c.acc32;
-    float *dws = nullptr;
+    float *dws = nullptr, *dsums = nullptr;
+    if (!c.R) {  // the epilogue's channel sums, checked against the stored output below
+        cudaMalloc(&dsums, (size_t)cout_pad * 4);
+        cudaMemset(dsums, 0, (size_t)cout_pad * 4);
+        a.sums = dsums;
+    }
     if (split) {
         a.ws_floats = gworkspace(gw, a);
         if (a.ws_floats) cudaMalloc(&dws, a.ws_floats * 4);
@@ -182,18 +187,34 @@ static void run(const Case &c, int variant, bool split)
             for (int k = 0; k < dstride; k++)
                 if ((k < c.dst_off || k >= c.dst_off + cout_pad) && out[(size_t)p * dstride + k] != h(7.f)) clobber = true;
     const double rms = std::sqrt(se / std::max(n, 1L));
-    const bool ok = maxx < 0.03 && rms < 0.004 && !clobber;
+    bool sums_ok = true;
+    if (dsums) {
+        std::vector<float> gs(cout_pad);
+        cudaMemcpy(gs.data(), dsums, (size_t)cout_pad * 4, cudaMemcpyDeviceToHost);
+        for (int o = 0; o < cout_pad; o++) {
+            double ref = 0, mag = 0;
+            for (int px = 0; px < OH * OW; px++) {
+                const double v = f(out[(size_t)px * dstride + c.dst_off + o]);
+                ref += v;
+                mag += std::fabs(v);
+            }
+            if (std::fabs(gs[o] - ref) > 1e-4 * mag + 1e-3) sums_ok = false;
+        }
+    }
+    const bool ok = maxx < 0.03 && rms < 0.004 && !clobber && sums_ok;
     checks++;
     worst = std::max(worst, maxe);
     if (!ok) {
         fails++;
-        printf("FAIL %s v%d %dx%d: max %.4f rms %.5f%s\n", c.name, variant, c.IW, c.IH, maxe, rms, clobber ? " (wrote outside its slice)" : "");
+        printf("FAIL %s v%d %dx%d: max %.4f rms %.5f%s%s\n", c.name, variant, c.IW, c.IH, maxe, rms, clobber ? " (wrote outside its slice)" : "",
+               sums_ok ? "" : " (channel sums)");
     }
     cudaFree(dsrc);
     cudaFree(ddst);
     cudaFree(dr1);
     cudaFree(dr2);
     cudaFree(dws);
+    cudaFree(dsums);
     grelease(gw);
 }
 
