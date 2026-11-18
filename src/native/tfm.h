@@ -61,6 +61,13 @@ struct TGemm {
 };
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
 
+// out = dwconv3x3(in) W + bias + add1 (fp16; FDAT's smix then fc2) in one kernel: the depthwise 3x3
+// (zero padding, no bias; dw: [W's K][9] floats) over the H x W map in (W's K channels, stride sin) as
+// tdwconv computes and rounds it, never stored. add1 may be out. W a multiple of 64. cudaErrorNotSupported
+// (nothing launched) for other shapes or AJI_NATIVE_DWMM=0: tdwconv then tgemm.
+cudaError_t tdwgemm(const TMat &w, const void *in, int sin, int H, int W, const float *dw, void *out, int so, const void *add1, int s1,
+                    cudaStream_t s);
+
 // The MLP out = epi(GELU(A W1 + b1) W2 + b2) in one kernel, the hidden kept on chip; the epilogue as
 // tgemm's (add1, then out; fp32 or fp16 each). Both biases required. With ln_gamma, A is an fp32 map
 // normalised on load (LayerNorm over W1's K channels, as tlayernorm2). cudaErrorNotSupported (nothing

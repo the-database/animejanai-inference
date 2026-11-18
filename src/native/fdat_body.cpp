@@ -280,12 +280,19 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
             }
             CK(e1);
             mark(P_FC1);
-            CK(tdwconv(H1, HS, H2, HS, bh, bw, 2 * C, b.smix, false, s));
-            mark(P_SMIX);
-            TGemm f2;
-            f2.a = H2; f2.sa = HS; f2.M = M; f2.out = X; f2.so = CP; f2.add1 = X; f2.s1 = CP;
-            CK(tgemm(*b.fc2, f2, s));
-            mark(P_FC2);
+            // X += smix(H1) fc2 in one kernel where there is one (else the depthwise conv, then the GEMM)
+            const cudaError_t e2 = tdwgemm(*b.fc2, H1, HS, bh, bw, b.smix, X, CP, X, CP, s);
+            if (e2 != cudaErrorNotSupported) {
+                CK(e2);
+                mark(P_FC2);
+            } else {
+                CK(tdwconv(H1, HS, H2, HS, bh, bw, 2 * C, b.smix, false, s));
+                mark(P_SMIX);
+                TGemm f2;
+                f2.a = H2; f2.sa = HS; f2.M = M; f2.out = X; f2.so = CP; f2.add1 = X; f2.s1 = CP;
+                CK(tgemm(*b.fc2, f2, s));
+                mark(P_FC2);
+            }
         }
         GConvArgs a = ga(X, CP, bh, bw, G, CP, bh, bw);  // G = conv(X) + G
         a.r1 = G;

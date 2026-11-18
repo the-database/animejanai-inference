@@ -287,6 +287,44 @@ static void test_gemm_ln(int M, int K, int N)
     cudaFree(da); cudaFree(dn); cudaFree(o1); cudaFree(o2); cudaFree(dg); cudaFree(db);
 }
 
+// tdwgemm (FDAT's smix then fc2, in place on the stream) against tdwconv then tgemm: the same values.
+static void test_dwgemm(int H, int W, int K, int N)
+{
+    const int Kp = (K + 15) / 16 * 16, Np = (N + 15) / 16 * 16, M = H * W;
+    std::vector<uint16_t> h((size_t)M * Kp, 0), x((size_t)M * Np, 0);
+    for (int m = 0; m < M; m++) {
+        for (int k = 0; k < K; k++) h[(size_t)m * Kp + k] = hb(ur(2.f));
+        for (int n = 0; n < N; n++) x[(size_t)m * Np + n] = hb(ur(8.f));
+    }
+    std::vector<float> w((size_t)K * N), dw((size_t)K * 9);
+    for (auto &v : w) v = hf(hb(ur(0.1f)));
+    for (auto &v : dw) v = ur(0.4f);
+    TMat tm;
+    tmat_upload(tm, w.data(), nullptr, K, N);
+    uint16_t *dh = dev(h), *d2 = dev(std::vector<uint16_t>((size_t)M * Kp, 0)), *o1 = dev(x), *o2 = dev(x);
+    float *ddw = dev(dw);
+    tdwconv(dh, Kp, d2, Kp, H, W, K, ddw, false, nullptr);
+    TGemm g;
+    g.a = d2; g.sa = Kp; g.M = M; g.out = o1; g.so = Np; g.add1 = o1; g.s1 = Np;
+    tgemm(tm, g, nullptr);
+    const cudaError_t e = tdwgemm(tm, dh, Kp, H, W, ddw, o2, Np, o2, Np, nullptr);
+    cudaDeviceSynchronize();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "dwgemm %dx%d %d->%d vs dwconv + gemm (values differing)", H, W, K, N);
+    if (e != cudaSuccess) {
+        printf("FAIL %s: %s\n", nm, cudaGetErrorString(e));
+        fails++;
+        checks++;
+    } else {
+        auto h1 = host(o1, (size_t)M * Np), h2 = host(o2, (size_t)M * Np);
+        size_t diff = 0;
+        for (size_t i = 0; i < h1.size(); i++) diff += h1[i] != h2[i];
+        report(nm, (double)diff, 0);
+    }
+    tmat_release(tm);
+    cudaFree(dh); cudaFree(d2); cudaFree(o1); cudaFree(o2); cudaFree(ddw);
+}
+
 static void test_ln(int M, int C)
 {
     const int cp = (C + 15) / 16 * 16 + 8;
@@ -489,6 +527,8 @@ int main()
     test_gemm(90, 256, 128, true, false, false, false, false);
     test_gemm_ln(1000, 180, 360);  // FDAT-XL's LN2 + fc1
     test_gemm_ln(77, 120, 240);    // FDAT-M's
+    test_dwgemm(40, 64, 360, 180);  // FDAT-XL's smix + fc2
+    test_dwgemm(9, 128, 240, 120);  // FDAT-M's
     test_gemm(90, 120, 120, true, false, false, true, false, true);
     test_mlp(1000, 180, 360, true);  // HAT-L's MLP, a row tail
     test_mlp(77, 180, 360, false);
