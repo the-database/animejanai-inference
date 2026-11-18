@@ -65,7 +65,7 @@ struct GemmP {
     int k;  // A's real columns: those from k up to kpad load as zeros (A may be a slice whose row ends sooner)
 };
 
-// RES: the tile has adds (prefetched, and the epilogue in two passes; see below), else one pass.
+// RES: out is one of the adds, an fp32 stream (prefetched, the epilogue in two passes; see below).
 template <bool RES>
 __global__ void __launch_bounds__(128) k_gemm(GemmP p)
 {
@@ -117,8 +117,8 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
         }
         __syncthreads();
     }
-    // With adds, the epilogue in two passes, every load then every store: out is often one of the adds
-    // (the stream in place), and one pass would order each load after the previous store.
+    // In place (out is one of the adds: a residual stream), the epilogue in two passes, every load then
+    // every store: one pass would order each load after the previous store.
     const int g = lane >> 2, tq = lane & 3;
 #pragma unroll
     for (int n = 0; n < 8; n++) {
@@ -1446,7 +1446,8 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
         return cudaGetLastError();
     }
     const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);
-    if (g.add1 || g.add2)
+    // an fp32 stream in place: see k_gemm's epilogue (with fp16 streams, as FDAT's, one pass is faster)
+    if (g.out_f32 && ((g.add1 && g.add1 == g.out) || (g.add2 && g.add2 == g.out)))
         k_gemm<true><<<grid, 128, 0, s>>>(p);
     else
         k_gemm<false><<<grid, 128, 0, s>>>(p);
