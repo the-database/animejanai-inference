@@ -1,9 +1,11 @@
 // aji_native_tfm_test: native/tfm.h kernels against CPU references (fp32 maths on the same fp16
 // inputs): GEMM with every epilogue, LayerNorm, window attention (bias, image sizes that are not
 // window multiples, a cyclic shift, 64- and 256-token windows), depthwise 3x3 with GELU, channel
-// sums and channel-attention statistics. Skips (exit 0) without an sm_80+ GPU.
+// sums and channel-attention statistics, the fused MLP (with and without its LayerNorm). Skips
+// (exit 0) without an sm_80+ GPU.
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -86,6 +88,162 @@ static void test_gemm(int M, int K, int N, bool bias, bool gelu_, bool scale, bo
     report(nm, me, 0.02);
     tmat_release(tm);
     cudaFree(da); cudaFree(d1); cudaFree(d2); cudaFree(dout); cudaFree(dcs);
+}
+
+// The fused MLP against the two GEMMs it replaces (fc1 + GELU to an fp16 hidden, then fc2 with the
+// residual): the same values bit for bit, fp32 stream in place or fp16 out; and against the CPU.
+static void test_mlp(int M, int C, int hid, bool f32)
+{
+    const int Cp = (C + 15) / 16 * 16, Hp = (hid + 15) / 16 * 16;
+    std::vector<uint16_t> a((size_t)M * Cp, 0);
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < C; k++) a[(size_t)m * Cp + k] = hb(ur(2.f));
+    std::vector<float> w1((size_t)C * hid), b1(hid), w2((size_t)hid * C), b2(C), res((size_t)M * Cp, 0.f);
+    for (auto &v : w1) v = hf(hb(ur(0.15f)));
+    for (auto &v : w2) v = hf(hb(ur(0.1f)));
+    for (auto &v : b1) v = ur(0.5f);
+    for (auto &v : b2) v = ur(0.3f);
+    for (int m = 0; m < M; m++)
+        for (int n = 0; n < C; n++) res[(size_t)m * Cp + n] = f32 ? ur(1000.f) : hf(hb(ur(4.f)));
+    TMat m1, m2;
+    tmat_upload(m1, w1.data(), b1.data(), C, hid);
+    tmat_upload(m2, w2.data(), b2.data(), hid, C);
+    std::vector<uint16_t> res16(res.size());
+    for (size_t i = 0; i < res.size(); i++) res16[i] = hb(res[i]);
+    const size_t es = f32 ? 4 : 2, n = (size_t)M * Cp;
+    uint16_t *da = dev(a), *dh = dev(std::vector<uint16_t>((size_t)M * Hp, 0));
+    void *dr = f32 ? (void *)dev(res) : (void *)dev(res16), *o1 = nullptr, *o2 = nullptr;
+    cudaMalloc(&o1, n * es);
+    cudaMalloc(&o2, n * es);
+    cudaMemcpy(o1, dr, n * es, cudaMemcpyDeviceToDevice);  // fp32: in place, as HAT's stream
+    cudaMemcpy(o2, dr, n * es, cudaMemcpyDeviceToDevice);
+    TGemm g1;
+    g1.a = da; g1.sa = Cp; g1.M = M; g1.out = dh; g1.so = Hp; g1.act = TAct::Gelu;
+    TGemm g2;
+    g2.a = dh; g2.sa = Hp; g2.M = M; g2.out = o1; g2.so = Cp; g2.out_f32 = f32;
+    g2.add1 = f32 ? o1 : dr; g2.s1 = Cp; g2.add1_f32 = f32;
+    tgemm(m1, g1, nullptr);
+    tgemm(m2, g2, nullptr);
+    TMlp t;
+    t.a = da; t.sa = Cp; t.M = M; t.out = o2; t.so = Cp; t.out_f32 = f32;
+    t.add1 = f32 ? o2 : dr; t.s1 = Cp; t.add1_f32 = f32;
+    const cudaError_t e = tmlp(m1, m2, t, nullptr);
+    cudaDeviceSynchronize();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "mlp %dx%dx%d%s", M, C, hid, f32 ? " f32" : "");
+    if (e != cudaSuccess) {
+        printf("FAIL %s: %s\n", nm, cudaGetErrorString(e));
+        fails++;
+        checks++;
+    } else {
+        std::vector<uint8_t> h1(n * es), h2(n * es);
+        cudaMemcpy(h1.data(), o1, n * es, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h2.data(), o2, n * es, cudaMemcpyDeviceToHost);
+        size_t diff = 0;
+        for (size_t i = 0; i < h1.size(); i += es) diff += memcmp(&h1[i], &h2[i], es) != 0;
+        char nb[120];
+        snprintf(nb, sizeof(nb), "%s vs gemm+gemm (values differing)", nm);
+        report(nb, (double)diff, 0);
+        double me = 0;
+        std::vector<float> hv(Hp);
+        for (int m = 0; m < M; m++) {
+            for (int j = 0; j < hid; j++) {
+                double v = b1[j];
+                for (int k = 0; k < C; k++) v += hf(a[(size_t)m * Cp + k]) * w1[(size_t)k * hid + j];
+                hv[j] = hf(hb(gelu((float)v)));
+            }
+            for (int c = 0; c < C; c++) {
+                double v = b2[c] + res[(size_t)m * Cp + c];
+                for (int j = 0; j < hid; j++) v += hv[j] * w2[(size_t)j * C + c];
+                const size_t i = (size_t)m * Cp + c;
+                const double got = f32 ? (double)reinterpret_cast<const float *>(h2.data())[i]
+                                       : (double)hf(reinterpret_cast<const uint16_t *>(h2.data())[i]);
+                me = std::max(me, std::fabs(v - got) / (f32 ? 1.0 : std::max(1.0, std::fabs(v))));
+            }
+        }
+        report(nm, me, f32 ? 2e-3 : 4e-3);
+    }
+    tmat_release(m1);
+    tmat_release(m2);
+    cudaFree(da); cudaFree(dh); cudaFree(dr); cudaFree(o1); cudaFree(o2);
+}
+
+// The fused MLP with its LayerNorm (fp32 stream in place, as HAT's) against tlayernorm2 then the
+// fused MLP without it (the same maths in another order: a few hidden values may round the other way)
+// and against the CPU.
+static void test_mlp_ln(int M, int C, int hid)
+{
+    const int Cp = (C + 15) / 16 * 16, Hp = (hid + 15) / 16 * 16;
+    std::vector<float> w1((size_t)C * hid), b1(hid), w2((size_t)hid * C), b2(C), x((size_t)M * Cp, 0.f), gm(C), bt(C);
+    for (auto &v : w1) v = hf(hb(ur(0.15f)));
+    for (auto &v : w2) v = hf(hb(ur(0.1f)));
+    for (auto &v : b1) v = ur(0.5f);
+    for (auto &v : b2) v = ur(0.3f);
+    for (auto &v : gm) v = 0.5f + ur(0.4f);
+    for (auto &v : bt) v = ur(0.2f);
+    for (int m = 0; m < M; m++) {
+        const float off = ur(300.f), sc = 1.f + std::fabs(ur(200.f));  // a residual stream's spread
+        for (int n = 0; n < C; n++) x[(size_t)m * Cp + n] = off + sc * ur(1.f);
+    }
+    TMat m1, m2;
+    tmat_upload(m1, w1.data(), b1.data(), C, hid);
+    tmat_upload(m2, w2.data(), b2.data(), hid, C);
+    float *o1 = dev(x), *o2 = dev(x), *dg = dev(gm), *db = dev(bt);
+    uint16_t *dn = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
+    tlayernorm2(o1, true, Cp, dn, false, Cp, M, C, Cp, dg, db, 1e-5f, nullptr);
+    TMlp t;
+    t.a = dn; t.sa = Cp; t.M = M; t.out = o1; t.so = Cp; t.out_f32 = true; t.add1 = o1; t.s1 = Cp; t.add1_f32 = true;
+    const cudaError_t e1 = tmlp(m1, m2, t, nullptr);
+    t.a = o2; t.out = o2; t.add1 = o2; t.ln_gamma = dg; t.ln_beta = db; t.ln_eps = 1e-5f;
+    uint16_t *dlo = dev(std::vector<uint16_t>((size_t)M * Cp, 0x7c00)), *dlr = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
+    t.lno = dlo; t.slno = Cp; t.lno_gamma = db; t.lno_beta = dg; t.lno_eps = 1e-3f;  // the next LayerNorm (other parameters)
+    const cudaError_t e2 = tmlp(m1, m2, t, nullptr);
+    tlayernorm2(o2, true, Cp, dlr, false, Cp, M, C, Cp, db, dg, 1e-3f, nullptr);
+    cudaDeviceSynchronize();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "mlp+ln %dx%dx%d", M, C, hid);
+    checks++;
+    if (e1 != cudaSuccess || e2 != cudaSuccess) {
+        printf("FAIL %s: %s / %s\n", nm, cudaGetErrorString(e1), cudaGetErrorString(e2));
+        fails++;
+    } else {
+        auto h1 = host(o1, x.size()), h2 = host(o2, x.size());
+        double md = 0, me = 0;
+        std::vector<double> y(C);
+        std::vector<float> hv(hid);
+        for (int m = 0; m < M; m++) {
+            double mean = 0, var = 0;
+            for (int n = 0; n < C; n++) mean += x[(size_t)m * Cp + n];
+            mean /= C;
+            for (int n = 0; n < C; n++) var += (x[(size_t)m * Cp + n] - mean) * (x[(size_t)m * Cp + n] - mean);
+            const double rs = 1.0 / std::sqrt(var / C + 1e-5);
+            for (int n = 0; n < C; n++) y[n] = hf(hb((float)((x[(size_t)m * Cp + n] - mean) * rs * gm[n] + bt[n])));
+            for (int j = 0; j < hid; j++) {
+                double v = b1[j];
+                for (int k = 0; k < C; k++) v += y[k] * w1[(size_t)k * hid + j];
+                hv[j] = hf(hb(gelu((float)v)));
+            }
+            for (int c = 0; c < C; c++) {
+                double v = b2[c] + x[(size_t)m * Cp + c];
+                for (int j = 0; j < hid; j++) v += hv[j] * w2[(size_t)j * C + c];
+                const size_t i = (size_t)m * Cp + c;
+                me = std::max(me, std::fabs(v - h2[i]) / std::max(1.0, std::fabs(v) * 1e-3));
+                md = std::max(md, (double)std::fabs(h1[i] - h2[i]) / std::max(1.0, std::fabs((double)h1[i]) * 1e-3));
+            }
+        }
+        report(nm, me, 0.1);
+        char nb[120];
+        snprintf(nb, sizeof(nb), "%s vs layernorm + mlp", nm);
+        report(nb, md, 0.05);
+        auto l1 = host(dlo, (size_t)M * Cp), l2 = host(dlr, (size_t)M * Cp);
+        double le = 0;
+        for (size_t i = 0; i < l1.size(); i++) le = std::max(le, (double)std::fabs(hf(l1[i]) - hf(l2[i])));
+        snprintf(nb, sizeof(nb), "%s next layernorm vs tlayernorm2", nm);
+        report(nb, le, 0.01);
+    }
+    tmat_release(m1);
+    tmat_release(m2);
+    cudaFree(o1); cudaFree(o2); cudaFree(dg); cudaFree(db); cudaFree(dn); cudaFree(dlo); cudaFree(dlr);
 }
 
 static void test_ln(int M, int C)
@@ -283,7 +441,15 @@ int main()
     test_gemm(77, 120, 240, false, true, false, false, false);
     test_gemm(64, 240, 120, false, false, false, true, false);
     test_gemm(100, 180, 540, true, true, false, false, false);
+    test_gemm(333, 192, 544, true, false, true, false, false);  // K = 192 without adds: the row-stationary kernel
+    test_gemm(77, 180, 360, false, true, false, false, false);
+    test_gemm(200, 224, 672, true, false, false, false, false);  // K = 224 (SST-XL+)
     test_gemm(90, 120, 120, true, false, false, true, false, true);
+    test_mlp(1000, 180, 360, true);  // HAT-L's MLP, a row tail
+    test_mlp(77, 180, 360, false);
+    test_mlp(4096, 180, 360, true);
+    test_mlp_ln(1000, 180, 360);
+    test_mlp_ln(70, 180, 360);
     test_ln(300, 120);
     test_ln(50, 180);
     test_win(16, 16, 4, 30, 8, 8, 0, 0, true);

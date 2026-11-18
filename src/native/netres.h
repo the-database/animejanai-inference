@@ -245,7 +245,7 @@ inline size_t gworkspace_max(const std::vector<std::pair<GOp *, GConvArgs>> &ops
 // AJI_NATIVE_PROFILE: GPU time per step kind, from events between steps (printed to stderr).
 enum ProfKind {
     P_IO, P_CONV, P_LN, P_QKV, P_DW, P_WIN, P_GATE, P_PROJ, P_CSTATS, P_CFOLD, P_CPROJ, P_FC1, P_SMIX, P_FC2,
-    P_ENC, P_FLOW, P_WARP, P_ALIGN, P_FUSE, P_UP, P_NKINDS
+    P_ENC, P_FLOW, P_WARP, P_ALIGN, P_FUSE, P_UP, P_MLP, P_NKINDS
 };
 class StepProf {
 public:
@@ -269,7 +269,7 @@ public:
         cudaStreamSynchronize(s);
         static const char *const names[P_NKINDS] = {"io",   "conv3x3", "layernorm", "qkv",  "dwconv", "winattn", "gate",
                                                     "proj", "chanstats", "chanfold", "chanproj", "fc1", "smix", "fc2",
-                                                    "encoder", "flow", "warp", "align", "fusion", "upsample"};
+                                                    "encoder", "flow", "warp", "align", "fusion", "upsample", "mlp"};
         double t[P_NKINDS] = {}, total = 0;
         for (size_t i = 1; i < evs.size(); i++) {
             float ms = 0;

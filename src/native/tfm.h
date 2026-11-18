@@ -5,6 +5,7 @@
  *   - LayerNorm over the first C channels of each token (padded channels written zero);
  *   - GEMM: out = epi(A[M][K] x W[K][N]), W packed in mma fragment order, fp32 accumulation; the
  *     epilogue adds a bias, applies GELU, scales by a per-column vector, adds up to two tensors;
+ *   - the MLP fc1 -> GELU -> fc2 (plus residual) in one kernel, the hidden kept on chip;
  *   - window attention: per (window, head), softmax(q k^T * scale + bias) v, flash style (online
  *     softmax over 64-key blocks), windows of any shape over the image with an optional cyclic
  *     shift, tokens outside the image treated as zero (zero padding before attention);
@@ -54,6 +55,31 @@ struct TGemm {
     const float *add2scale = nullptr;  // [Npad] device: add2 scaled per column before it is added, or null
 };
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
+
+// The MLP out = epi(GELU(A W1 + b1) W2 + b2) in one kernel, the hidden kept on chip; the epilogue as
+// tgemm's (add1, then out; fp32 or fp16 each). Both biases required. With ln_gamma, A is an fp32 map
+// normalised on load (LayerNorm over W1's K channels, as tlayernorm2). cudaErrorNotSupported (nothing
+// launched) for the shapes without a fused kernel, or per AJI_NATIVE_FMLP (0: none, 1: not with the
+// LayerNorm): normalise / run the two GEMMs then.
+struct TMlp {
+    const void *a = nullptr;  // [M][sa] fp16, or fp32 with ln_gamma
+    int sa = 0, M = 0;
+    void *out = nullptr;
+    int so = 0;
+    bool out_f32 = false;
+    const void *add1 = nullptr;
+    int s1 = 0;
+    bool add1_f32 = false;
+    const float *ln_gamma = nullptr, *ln_beta = nullptr;  // [K] device
+    float ln_eps = 1e-5f;
+    // Optional: the LayerNorm of the output rows (over W2's N channels; zeros up to Npad) as fp16 at
+    // lno [M][slno], e.g. the next block's input.
+    void *lno = nullptr;
+    int slno = 0;
+    const float *lno_gamma = nullptr, *lno_beta = nullptr;
+    float lno_eps = 1e-5f;
+};
+cudaError_t tmlp(const TMat &w1, const TMat &w2, const TMlp &g, cudaStream_t s);
 
 // LayerNorm of the first C channels (gamma, beta: C floats in device memory), zeros to pad.
 cudaError_t tlayernorm(const void *in, int sin, void *out, int sout, int M, int C, int cpad, const float *gamma,

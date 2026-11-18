@@ -77,15 +77,16 @@ __global__ void k_aim_sg(const half *attn, const half *conv, const float *wsg, h
     for (int c = lane; c < C; c += 32) xo[c] = __float2half(__half2float(xo[c]) + __half2float(a[c]) + __half2float(cv[c]) * g);
 }
 
-// The same with L lanes per token, each one uint4 of channels (C <= 8 L, strides multiples of 8).
+// The same with L lanes per token, each one uint4 of channels (C <= 8 L, even; strides multiples of
+// 8): a lane whose 8 channels pass C (C % 8 != 0, e.g. 180) takes its valid pairs one by one.
 template <int L>
 __global__ void __launch_bounds__(256) k_aim_sg8(const half *attn, const half *conv, const float *wsg, half *x, int st, int M, int C)
 {
     const int sub = threadIdx.x % L, t = (blockIdx.x * blockDim.x + threadIdx.x) / L, c = sub * 8;
-    const bool live = t < M && c < C;
+    const bool live = t < M && c < C, full = c + 8 <= C;
     float a[8] = {}, cv[8] = {}, xv[8] = {};
     const size_t o = (size_t)t * st + c;
-    if (live) {
+    if (live && full) {
         const uint4 ua = *reinterpret_cast<const uint4 *>(attn + o), uc = *reinterpret_cast<const uint4 *>(conv + o),
                     ux = *reinterpret_cast<const uint4 *>(x + o);
         const half2 *ha = reinterpret_cast<const half2 *>(&ua), *hc = reinterpret_cast<const half2 *>(&uc),
@@ -97,6 +98,17 @@ __global__ void __launch_bounds__(256) k_aim_sg8(const half *attn, const half *c
             cv[2 * j] = fc.x; cv[2 * j + 1] = fc.y;
             xv[2 * j] = fx.x; xv[2 * j + 1] = fx.y;
         }
+    } else if (live) {
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            if (c + 2 * j < C) {
+                const float2 fa = __half22float2(*reinterpret_cast<const half2 *>(attn + o + 2 * j)),
+                             fc = __half22float2(*reinterpret_cast<const half2 *>(conv + o + 2 * j)),
+                             fx = __half22float2(*reinterpret_cast<const half2 *>(x + o + 2 * j));
+                a[2 * j] = fa.x; a[2 * j + 1] = fa.y;
+                cv[2 * j] = fc.x; cv[2 * j + 1] = fc.y;
+                xv[2 * j] = fx.x; xv[2 * j + 1] = fx.y;
+            }
     }
     float s = 0.f;
 #pragma unroll
@@ -113,7 +125,13 @@ __global__ void __launch_bounds__(256) k_aim_sg8(const half *attn, const half *c
         half2 h = __floats2half2_rn(xv[2 * j] + a[2 * j] + cv[2 * j] * g, xv[2 * j + 1] + a[2 * j + 1] + cv[2 * j + 1] * g);
         pu[j] = *reinterpret_cast<uint32_t *>(&h);
     }
-    *reinterpret_cast<uint4 *>(x + o) = u;
+    if (full) {
+        *reinterpret_cast<uint4 *>(x + o) = u;
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            if (c + 2 * j < C) *reinterpret_cast<uint32_t *>(x + o + 2 * j) = pu[j];
+    }
 }
 
 __global__ void k_chan_gate(const float *sums, int M, int C, int r, const float *w1, const float *b1, const float *w2, const float *b2,
@@ -184,7 +202,7 @@ cudaError_t fdat_aim_cg(const float *sums, int M, int C, int r, const float *w1,
 
 cudaError_t fdat_aim_sg(const void *attn, const void *conv, const float *wsg, void *x, int st, int M, int C, cudaStream_t s)
 {
-    const bool vec = C % 8 == 0 && st % 8 == 0 && C <= 256 && ((uintptr_t)attn | (uintptr_t)conv | (uintptr_t)x) % 16 == 0;
+    const bool vec = C % 2 == 0 && st % 8 == 0 && C <= 256 && ((uintptr_t)attn | (uintptr_t)conv | (uintptr_t)x) % 16 == 0;
     if (vec && C <= 128)
         k_aim_sg8<16><<<(M + 15) / 16, 256, 0, s>>>((const half *)attn, (const half *)conv, wsg, (half *)x, st, M, C);
     else if (vec)
