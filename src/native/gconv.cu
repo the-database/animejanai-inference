@@ -226,17 +226,19 @@ int gvariant_for(const GWeights &w, const GConvArgs &a)
         return n >= 0 && n < kGVariants ? n : -1;
     }();
     if (env >= 0) return env;
-    // RTX 5090 (170 SMs), whole models at 256-768 tiles and the video cases: 8 warps win from ~7 CTAs
-    // per SM (ESRGAN 4x at 512: 383.6 vs 396.5 ms with 4) and when both would split K (ESRGAN 2x at 256:
-    // 482 vs 512); 4 win at ~3 CTAs per SM (ESRGAN 2x at 512: 138 vs 152, 4x at 256: 962 vs 1056),
-    // where 4 avoid the split 8 would need (ESRGAN 2x at 384: 225 vs 240, FDAT-M 2x at 256: 241 vs 250)
-    // and on maps under half a CTA per SM (TFix DVD 2.02 -> 1.95 ms per frame).
+    // The busiest SM runs ceil(ctas / SMs) CTAs, each ~(warps + 0.8) rows' worth of work (the 2 halo rows
+    // cost ~0.4 of a row each): the fewer of those, the sooner the conv ends. Fits whole models on an
+    // RTX 5090 (170 SMs) and 4090 (128): ESRGAN 2x at 512 tiles (256x256 maps, 512 CTAs on 8 warps)
+    // 138 vs 152 ms on 4 warps on the 5090 but 3.5% slower on 4 on the 4090; ESRGAN 4x at 512 and
+    // HAT / DAT / FDAT on 8. Two cases measured apart from that: 4 warps where they avoid the K split 8
+    // would need (ESRGAN 2x at 384: 225 vs 240 ms, FDAT-M 2x at 256: 241 vs 250), and on maps under half
+    // a CTA per SM, where both split (TFix DVD 2.02 -> 1.95 ms per frame); otherwise 8 when both split.
     const long chunks = w.coutp ? w.cout_pad / w.coutp : 1, cols = (a.W + gdev::TW - 1) / gdev::TW;
     const long c8 = cols * ((a.H + 7) / 8) * chunks, c4 = cols * ((a.H + 3) / 4) * chunks, sm = sm_count();
-    if (c8 >= 5 * sm) return 0;
-    if (c4 >= 2 * sm) return 1;  // ksplit_for's threshold: no split
-    if (2 * c8 < sm) return 1;   // tiny maps (TFix's 24x18 .. 96x72): both split, 4 warps a little faster
-    return 0;
+    if (c4 < 2 * sm) return 2 * c8 < sm ? 1 : 0;  // both split (ksplit_for's threshold)
+    if (c8 < 2 * sm) return 1;                     // only 8 would split
+    const double t8 = (double)((c8 + sm - 1) / sm) * 8.8, t4 = (double)((c4 + sm - 1) / sm) * 4.8;
+    return t4 < t8 ? 1 : 0;
 }
 
 size_t gworkspace(const GWeights &w, const GConvArgs &a)
