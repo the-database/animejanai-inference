@@ -13,11 +13,11 @@ using GFn = cudaError_t (*)(const gdev::GParams &, int, cudaStream_t);
 constexpr int kGVariants = 3;
 constexpr int kWarps[kGVariants] = {8, 4, 2};
 
-template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0>
+template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0, int SUMS = 0>
 cudaError_t run_g(const gdev::GParams &p, int zdim, cudaStream_t s)
 {
     constexpr int smem = gdev::gconv_smem_bytes<KCH, COUTP, S, WARPS>();
-    auto k = gdev::k_gconv<KCH, COUTP, S, IN, OUT, WARPS, ACC>;
+    auto k = gdev::k_gconv<KCH, COUTP, S, IN, OUT, WARPS, ACC, SUMS>;
     if constexpr (smem > 48 * 1024) {
         static bool set = false;
         if (!set) {
@@ -32,10 +32,10 @@ cudaError_t run_g(const gdev::GParams &p, int zdim, cudaStream_t s)
 }
 
 struct GKey {
-    int kch, coutp, s, in, out, acc;
+    int kch, coutp, s, in, out, acc, sums = 0;
     bool operator==(const GKey &o) const
     {
-        return kch == o.kch && coutp == o.coutp && s == o.s && in == o.in && out == o.out && acc == o.acc;
+        return kch == o.kch && coutp == o.coutp && s == o.s && in == o.in && out == o.out && acc == o.acc && sums == o.sums;
     }
 };
 struct GEntry {
@@ -46,6 +46,8 @@ struct GEntry {
 #define AJI_G(K, C, S, IN, OUT) {{K, C, S, IN, OUT, 0}, {&run_g<K, C, S, IN, OUT, 8>, &run_g<K, C, S, IN, OUT, 4>, &run_g<K, C, S, IN, OUT, 2>}}
 #define AJI_G32(K, C) {{K, C, 1, 0, 0, 1}, {&run_g<K, C, 1, 0, 0, 8, 1>, &run_g<K, C, 1, 0, 0, 4, 1>, &run_g<K, C, 1, 0, 0, 2, 1>}}
 #define AJI_G32_COUT(K) AJI_G32(K, 16), AJI_G32(K, 32), AJI_G32(K, 48), AJI_G32(K, 64)
+// with the channel sums (HAT's CAB: 64 -> 192 channels)
+#define AJI_GS(K, C) {{K, C, 1, 0, 0, 0, 1}, {&run_g<K, C, 1, 0, 0, 8, 0, 1>, &run_g<K, C, 1, 0, 0, 4, 0, 1>, &run_g<K, C, 1, 0, 0, 2, 0, 1>}}
 #define AJI_G_COUT(K, S, IN, OUT) AJI_G(K, 16, S, IN, OUT), AJI_G(K, 32, S, IN, OUT), AJI_G(K, 48, S, IN, OUT), AJI_G(K, 64, S, IN, OUT)
 
 const GEntry kG[] = {
@@ -57,6 +59,8 @@ const GEntry kG[] = {
     AJI_G_COUT(16, 2, 0, 0), AJI_G_COUT(32, 2, 0, 0), AJI_G_COUT(16, 2, 1, 0),
     // stride 1, NHWC, fp32 accumulation
     AJI_G32_COUT(16), AJI_G32_COUT(32), AJI_G32_COUT(64),
+    // stride 1, NHWC, with the channel sums
+    AJI_GS(64, 64),
 };
 
 bool gfail(std::string *why, const char *m)
@@ -90,7 +94,7 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
     if (a.acc32 && (a.stride != 1 || a.nchw || a.R)) return gfail(why, "fp32 accumulation: stride 1, NHWC in and out"), nullptr;
     if (a.out_f32 && (!a.acc32 || a.r1 || a.r2 || a.act == GAct::Gelu)) return gfail(why, "fp32 output: fp32 accumulation, r1f only, no GELU"), nullptr;
     if (a.sums && (a.out_f32 || a.R)) return gfail(why, "channel sums: fp16 NHWC output"), nullptr;
-    const GKey k{kch_for(w, a), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0};
+    const GKey k{kch_for(w, a), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0, a.sums ? 1 : 0};
     if (!k.kch) return gfail(why, "input channels"), nullptr;
     for (const GEntry &e : kG)
         if (e.key == k) return &e;
