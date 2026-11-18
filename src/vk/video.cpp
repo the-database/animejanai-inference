@@ -19,6 +19,9 @@ constexpr int AJI_TEMPORAL_MAX_FRAMES = 15;  // kernels.h's AJI_TEMPORAL_MAX (th
 
 namespace {
 
+// Two aji_vk_images of one VkImage (one wrapper twice, or two wrappers of it)
+bool same_image(const aji_vk_image *a, const aji_vk_image *b) { return a == b || a->image == b->image; }
+
 std::string fmt_num(double v)
 {
     if (v >= 1e300) return "inf";
@@ -358,9 +361,12 @@ int VkVideo::infer_rife(const aji_frame *a, const aji_frame *b, double t, const 
         fail("aji_infer_rife: an earlier Vulkan submit has not finished after 10 s");
         return AJI_ERR;
     }
+    // a and b can be one frame (a held frame repeated, a clip's last frame twice), through one
+    // aji_vk_image or two: each image is transitioned once, each semaphore waited and signalled once
     aji_vk_image *in2[2] = {ia, ib};
+    const bool one_image = same_image(ia, ib), one_sem = ia->semaphore == ib->semaphore;
     for (int i = 0; i < 2; i++) {
-        barrier_image(cb, in2[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, false);
+        if (i == 0 || !one_image) barrier_image(cb, in2[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, false);
         vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(in2[i]->image), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.io[i]->in_y().buf, 1, &ry);
         vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(in2[i]->image), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.io[i]->in_uv().buf, 1, &ruv);
     }
@@ -383,17 +389,22 @@ int VkVideo::infer_rife(const aji_frame *a, const aji_frame *b, double t, const 
         mem_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
     }
     {
-        const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ia->semaphore), ia->value}, {static_cast<VkSemaphore>(ib->semaphore), ib->value}};
+        // one semaphore: its later value of the two (both wrappers then record the one signal)
+        const uint64_t va = one_sem ? std::max(ia->value, ib->value) : ia->value, vb = one_sem ? va : ib->value;
+        const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ia->semaphore), va}, {static_cast<VkSemaphore>(ib->semaphore), vb}};
         const uint64_t tk = ticket_ + 1;
         const Device::SemValue sig[3] = {
-            {tl_, tk}, {static_cast<VkSemaphore>(ia->semaphore), ia->value + 1}, {static_cast<VkSemaphore>(ib->semaphore), ib->value + 1}};
-        if (!dev_->frame_submit(slot, waits, 2, sig, 3, &why)) {
+            {tl_, tk}, {static_cast<VkSemaphore>(ia->semaphore), va + 1}, {static_cast<VkSemaphore>(ib->semaphore), vb + 1}};
+        const uint32_t nsem = one_sem ? 1 : 2;
+        if (!dev_->frame_submit(slot, waits, nsem, sig, 1 + nsem, &why)) {
             fail("aji_infer_rife: %s", why.c_str());
             return AJI_ERR;
         }
         ticket_ = tk;
-        for (aji_vk_image *im : in2) {
-            im->value += 1;
+        const uint64_t done[2] = {va + 1, vb + 1};
+        for (int i = 0; i < 2; i++) {
+            aji_vk_image *im = in2[i];
+            im->value = done[i];
             im->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             im->access = VK_ACCESS_2_TRANSFER_READ_BIT;
             im->queue_family = dev_->queue_family();
@@ -747,6 +758,10 @@ int VkVideo::infer(const aji_frame *in, const aji_frame *out)
         }
     auto *ii = static_cast<aji_vk_image *>(in->plane[0]);
     auto *oi = static_cast<aji_vk_image *>(out->plane[0]);
+    if (same_image(ii, oi)) {  // the output is discarded before the input is read
+        fail("aji_infer: the input and output must be different images");
+        return AJI_ERR;
+    }
     const FrameFormat fi{in->format, in->matrix, in->range, in->siting}, fo{out->format, out->matrix, out->range, AJI_SITING_LEFT};
     std::string why;
     if (!io_ || !(io_->in_format() == fi) || !(io_->out_format() == fo)) {
@@ -1405,7 +1420,8 @@ int VkVideo::frame_diff(const aji_frame *a, const aji_frame *b, aji_frame_diff_r
         fail("aji_frame_diff dims %dx%d vs %dx%d", a->width, a->height, b->width, b->height);
         return AJI_ERR_SHAPE;
     }
-    if (a->plane[0] == b->plane[0]) {  // one image: no difference (and no second transition of it)
+    if (same_image(static_cast<const aji_vk_image *>(a->plane[0]), static_cast<const aji_vk_image *>(b->plane[0]))) {
+        // one image: no difference (and no second transition of it)
         *out = aji_frame_diff_result{};
         return AJI_OK;
     }
@@ -1512,6 +1528,10 @@ int VkVideo::resize(const aji_frame *in, const aji_frame *out)
     }
     auto *ii = static_cast<aji_vk_image *>(in->plane[0]);
     auto *oi = static_cast<aji_vk_image *>(out->plane[0]);
+    if (same_image(ii, oi)) {
+        fail("aji_resize: the input and output must be different images");
+        return AJI_ERR;
+    }
     int slot = 0;
     VkCommandBuffer cb = dev_->frame_begin(&slot);
     if (!cb) {
@@ -1562,7 +1582,7 @@ int VkVideo::copy_frame(const aji_frame *in, const aji_frame *out)
     }
     auto *ii = static_cast<aji_vk_image *>(in->plane[0]);
     auto *oi = static_cast<aji_vk_image *>(out->plane[0]);
-    if (ii == oi) return AJI_OK;
+    if (same_image(ii, oi)) return AJI_OK;
     int slot = 0;
     VkCommandBuffer cb = dev_->frame_begin(&slot);
     if (!cb) {

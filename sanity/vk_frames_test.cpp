@@ -7,7 +7,7 @@
  *
  *   aji_vk_frames_test --conf C --model-dir D --slot N --input in.raw --width W --height H
  *                      [--frames N] [--output out.raw] [--format nv12|p010] [--out-format nv12|p010]
- *                      [--no-coopmat] [--rife --rife-model-dir R]
+ *                      [--no-coopmat] [--rife --rife-model-dir R [--rife-same]]
  *
  * --no-coopmat tells libaji the device was created without cooperative matrices (they are left
  * out of the features chain and the extension list): the family it then picks is the one a
@@ -22,6 +22,8 @@
  *
  * --rife: aji_harness_dml --rife's interpolation-only loop (a scale-free 2/1 RIFE chain): writes
  * f0, i01, f1, i12, ..., the left frame in place of an interpolated one on a scene change.
+ * --rife-same also interpolates each frame with itself, through one aji_vk_image and through two
+ * of the same image (a held frame), and checks the semaphore reached the value the frames record.
  */
 #include <chrono>
 #include <cstdio>
@@ -135,7 +137,31 @@ bool transfer(Device &dev, Image &im, const Buffer &stage, int w, int h, int bps
 }
 
 // aji_harness_dml --rife's loop on Vulkan frames
-bool run_rife(Device &dev, aji_ctx *c, const char *input, const char *output, int w, int h, int frames, bool p010)
+// aji_infer_rife with a and b one image: the frames' records must match the semaphore afterwards
+bool rife_same(Device &dev, aji_ctx *c, Image &im, const aji_frame &f, aji_frame &out)
+{
+    aji_vk_image alias = im.d;  // a second wrapper of the same image
+    aji_frame fa = f;
+    fa.plane[0] = &alias;
+    for (int k = 0; k < 2; k++) {
+        const char *how = k ? ", two wrappers" : "";
+        const int ret = aji_infer_rife_with_scene(c, &f, k == 0 ? &f : &fa, 0.5, &out, nullptr, -1);
+        if (ret != AJI_OK) {
+            std::fprintf(stderr, "aji_infer_rife (one frame twice%s): %d: %s\n", how, ret, aji_last_error(c));
+            return false;
+        }
+        uint64_t v = 0;
+        if (vkGetSemaphoreCounterValue(dev.device(), im.sem, &v) != VK_SUCCESS || v != im.d.value || (k == 1 && alias.value != im.d.value)) {
+            std::fprintf(stderr, "aji_infer_rife (one frame twice%s): semaphore at %llu, frames record %llu / %llu\n", how,
+                         (unsigned long long)v, (unsigned long long)im.d.value, (unsigned long long)alias.value);
+            return false;
+        }
+        alias = im.d;
+    }
+    return true;
+}
+
+bool run_rife(Device &dev, aji_ctx *c, const char *input, const char *output, int w, int h, int frames, bool p010, bool same)
 {
     int rn = 0, rd = 0;
     if (!aji_rife_factor(c, &rn, &rd) || rn != 2 * rd) {
@@ -168,7 +194,7 @@ bool run_rife(Device &dev, aji_ctx *c, const char *input, const char *output, in
     std::ofstream fo;
     if (output) fo.open(output, std::ios::binary);
     std::vector<char> raw(fb);
-    int prev = -1, cur = 0, n = 0, interp = 0, scenes = 0, timed = 0;
+    int prev = -1, cur = 0, n = 0, interp = 0, scenes = 0, timed = 0, sames = 0;
     double ms = 0;
     while (n < frames && fi.read(raw.data(), (std::streamsize)fb)) {
         std::memcpy(st.map, raw.data(), fb);
@@ -187,6 +213,10 @@ bool run_rife(Device &dev, aji_ctx *c, const char *input, const char *output, in
             }
             if (!transfer(dev, fr[emit], st, w, h, bps, false, &why)) return false;
             if (fo) fo.write(static_cast<const char *>(st.map), (std::streamsize)fb);
+            if (same) {
+                if (!rife_same(dev, c, fr[cur], fd[cur], fd[2])) return false;
+                sames++;
+            }
         }
         if (fo) fo.write(raw.data(), (std::streamsize)fb);
         if (prev < 0) prev = cur, cur = 1;
@@ -195,6 +225,7 @@ bool run_rife(Device &dev, aji_ctx *c, const char *input, const char *output, in
     }
     std::printf("rife: %d source frames, %d interpolated, %d scene skips, %.1f ms/interp avg (%d timed)\n", n, interp, scenes,
                 timed ? ms / timed : 0.0, timed);
+    if (same) std::printf("rife: %d frames interpolated with themselves (one and two wrappers), semaphores as recorded\n", sames);
     aji_destroy(&c);
     dev.destroy(st);
     for (Image &im : fr) {
@@ -336,7 +367,7 @@ int main(int argc, char **argv)
 {
     const char *conf = nullptr, *model_dir = nullptr, *input = nullptr, *output = nullptr, *rife_dir = nullptr;
     int w = 0, h = 0, frames = 1 << 30, slot = 1, reset_at = -1;
-    bool p010 = false, out_p010 = false, no_cm = false, rife = false, diff = false;
+    bool p010 = false, out_p010 = false, no_cm = false, rife = false, rife_same = false, diff = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
         if (!std::strcmp(a, "--no-coopmat")) {
@@ -345,6 +376,10 @@ int main(int argc, char **argv)
         }
         if (!std::strcmp(a, "--rife")) {
             rife = true;
+            continue;
+        }
+        if (!std::strcmp(a, "--rife-same")) {
+            rife = rife_same = true;
             continue;
         }
         if (!std::strcmp(a, "--diff")) {
@@ -420,7 +455,7 @@ int main(int argc, char **argv)
     int ow = 0, oh = 0;
     const int act = aji_configure(c, w, h, 23.976, &ow, &oh);
     std::printf("%s", aji_current_log(c));
-    if (rife) return run_rife(*dev, c, input, output, w, h, frames, p010) ? 0 : 1;
+    if (rife) return run_rife(*dev, c, input, output, w, h, frames, p010, rife_same) ? 0 : 1;
     if (diff) {
         const bool ok = run_diff(*dev, c, input, w, h, frames, p010);
         aji_destroy(&c);
