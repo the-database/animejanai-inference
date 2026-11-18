@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 #include <cuda_fp16.h>
 
@@ -59,6 +60,8 @@ struct GemmP {
     int k;  // A's real columns: those from k up to kpad load as zeros (A may be a slice whose row ends sooner)
 };
 
+// RES: the tile has adds (prefetched, and the epilogue in two passes; see below), else one pass.
+template <bool RES>
 __global__ void __launch_bounds__(128) k_gemm(GemmP p)
 {
 #if TFM_OK
@@ -72,6 +75,19 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
     for (int n = 0; n < 8; n++)
 #pragma unroll
         for (int k = 0; k < 4; k++) acc[n][k] = 0.f;
+    // the tile's residual rows into L2 now, so the epilogue's reads don't wait on DRAM
+    if (RES) {
+        const int cols = min(64, p.njt * 16 - j0 * 16);
+        const int b1 = p.add1 ? cols * (p.add1_f32 ? 4 : 2) : 0, b2 = p.add2 ? cols * 2 : 0;
+        const int l1 = (b1 + 127) / 128, l2 = (b2 + 127) / 128;
+        for (int i = tid; i < BM * (l1 + l2); i += 128) {
+            const int r = m0 + i / (l1 + l2), l = i % (l1 + l2);
+            if (r >= p.M) break;
+            const char *a = l < l1 ? reinterpret_cast<const char *>(p.add1) + ((size_t)r * p.s1 + j0 * 16) * (p.add1_f32 ? 4 : 2) + l * 128
+                                   : reinterpret_cast<const char *>(p.add2 + (size_t)r * p.s2 + j0 * 16) + (l - l1) * 128;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(a));
+        }
+    }
     for (int k0 = 0; k0 < p.kpad; k0 += KC) {
         const int kn = min(KC, p.kpad - k0);
         for (int i = tid; i < BM * (KC / 8); i += 128) {
@@ -96,6 +112,8 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
         }
         __syncthreads();
     }
+    // With adds, the epilogue in two passes, every load then every store: out is often one of the adds
+    // (the stream in place), and one pass would order each load after the previous store.
     const int g = lane >> 2, tq = lane & 3;
 #pragma unroll
     for (int n = 0; n < 8; n++) {
@@ -147,10 +165,29 @@ __global__ void __launch_bounds__(128) k_gemm(GemmP p)
                     v1 = v1 < 0.f ? v1 * p.slope : v1;
                 }
             }
+            if (!RES) {
+                if (p.out_f32)
+                    *reinterpret_cast<float2 *>(reinterpret_cast<float *>(p.out) + (size_t)r * p.so + c) = make_float2(v0, v1);
+                else
+                    *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + c) = __floats2half2_rn(v0, v1);
+            }
+            acc[n][2 * h] = v0;
+            acc[n][2 * h + 1] = v1;
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < 8; n++) {
+        if (!RES) break;
+        const int c = (j0 * 2 + n) * 8 + tq * 2;
+        if (c >= p.njt * 16) break;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int r = m0 + warp * 16 + g + h * 8;
+            if (r >= p.M) continue;
             if (p.out_f32)
-                *reinterpret_cast<float2 *>(reinterpret_cast<float *>(p.out) + (size_t)r * p.so + c) = make_float2(v0, v1);
+                *reinterpret_cast<float2 *>(reinterpret_cast<float *>(p.out) + (size_t)r * p.so + c) = make_float2(acc[n][2 * h], acc[n][2 * h + 1]);
             else
-                *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + c) = __floats2half2_rn(v0, v1);
+                *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + c) = __floats2half2_rn(acc[n][2 * h], acc[n][2 * h + 1]);
         }
     }
 #else
@@ -909,6 +946,175 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
 #endif
 }
 
+// ---- fused MLP: out = epi(act(A W1 + b1) W2 + b2), the hidden kept on chip (flash-attention style).
+// A warp owns 16 rows: their A fragments stay in registers for the whole K, and the fc2 accumulators
+// (16 x N2) too. Per 16-column hidden chunk: fc1 into a 16x16 fragment, bias and GELU, rounded to fp16
+// and reused in registers as fc2's A fragment (as P in attention). The weight slices of each chunk (W1:
+// its 16 columns over K, W2: its 16 rows over N2) go through shared memory, two chunks per stage, two
+// stages, shared by the CTA's warps. Same accumulation order and roundings as k_gemm fc1 then fc2.
+struct MlpP {
+    const half *a;
+    int sa, M, k;  // k: A's real columns (zeros from k on)
+    const uint4 *w1, *w2;
+    const float *b1, *b2;
+    int nh;  // hidden 16-column chunks (W1's Npad / 16 = W2's Kpad / 16)
+    half *out;
+    int so, out_f32;
+    const half *add1;
+    int s1, add1_f32;
+};
+
+template <int KC1, int NJ2>
+struct MlpSmem {
+    static constexpr int chunk = (KC1 + NJ2) * 32;  // uint4 per hidden chunk: W1 slice, then W2 slice
+    static constexpr int bytes = 4 * chunk * 16;    // two stages of two chunks
+};
+
+template <int KC1, int NJ2, int NW>
+__global__ void __launch_bounds__(NW * 32, 8 / NW) k_mlp(MlpP p)
+{
+#if TFM_OK
+    constexpr int CH = MlpSmem<KC1, NJ2>::chunk, NT = NW * 32, BM = 16 * NW;
+    static_assert(CH % NT == 0, "a chunk's weights split evenly over the threads");
+    extern __shared__ __align__(16) uint4 smw[];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tq = lane & 3;
+    const int npair = (p.nh + 1) / 2, r0 = (int)blockIdx.x * BM + warp * 16 + g, r1 = r0 + 8;
+    // the weights of hidden chunks c0, c0 + 1 into stage st (slice row sl = 32 uint4: W1 rows, then W2's)
+    auto load_pair = [&](int c0, int st) {
+#pragma unroll
+        for (int k = 0; k < 2 * CH / NT; k++) {
+            const int c = c0 + k / (CH / NT), sl = warp + (k % (CH / NT)) * NW;
+            if (c < p.nh) {
+                const uint4 *src = sl < KC1 ? p.w1 + ((size_t)sl * p.nh + c) * 32 + lane : p.w2 + ((size_t)c * NJ2 + (sl - KC1)) * 32 + lane;
+                cp16(smw + (size_t)st * 2 * CH + k * NT + tid, src, 16);
+            }
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    load_pair(0, 0);
+    // this thread's two rows of A and of the residual into L2 first: the A fragment loads below then
+    // wait less, and the epilogue's residual reads (after the whole K) don't wait on DRAM
+    {
+        const int res = p.add1_f32 ? 4 : 2;
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            const int r = hh ? r1 : r0;
+            if (r >= p.M) continue;
+            const char *ra = reinterpret_cast<const char *>(p.a + (size_t)r * p.sa);
+            for (int l = tq; l * 128 < KC1 * 32; l += 4) asm volatile("prefetch.global.L2 [%0];" ::"l"(ra + l * 128));
+            if (!p.add1) continue;
+            const char *rr = reinterpret_cast<const char *>(p.add1) + (size_t)r * p.s1 * res;
+            for (int l = tq; l * 128 < NJ2 * 16 * res; l += 4) asm volatile("prefetch.global.L2 [%0];" ::"l"(rr + l * 128));
+        }
+    }
+    // A fragments: a0 (r0, 2tq), a1 (r1, 2tq), a2 (r0, 2tq + 8), a3 (r1, 2tq + 8) per k16 chunk
+    uint32_t a[KC1][4];
+#pragma unroll
+    for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int r = (j & 1) ? r1 : r0, c = kc * 16 + 2 * tq + (j >> 1) * 8;
+            half2 v = __float2half2_rn(0.f);
+            if (r < p.M && c < p.k) v = *reinterpret_cast<const half2 *>(p.a + (size_t)r * p.sa + c);
+            a[kc][j] = h2u(v);
+        }
+    float acc[NJ2 * 2][4];
+#pragma unroll
+    for (int n = 0; n < NJ2 * 2; n++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) acc[n][e] = 0.f;
+    for (int pp = 0; pp < npair; pp++) {
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        __syncthreads();  // this pair's weights are in; every warp is done with the other stage
+        if (pp + 1 < npair) load_pair(2 * pp + 2, (pp + 1) & 1);
+        const uint4 *sw = smw + (size_t)(pp & 1) * 2 * CH;
+        const bool two = 2 * pp + 1 < p.nh;
+        float h[2][2][4];
+#pragma unroll
+        for (int c = 0; c < 2; c++)
+#pragma unroll
+            for (int n = 0; n < 2; n++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) h[c][n][e] = 0.f;
+#pragma unroll
+        for (int kc = 0; kc < KC1; kc++) {
+            const uint4 b0 = sw[kc * 32 + lane];
+            mma32(h[0][0], a[kc], b0.x, b0.y);
+            mma32(h[0][1], a[kc], b0.z, b0.w);
+            if (two) {
+                const uint4 b1 = sw[CH + kc * 32 + lane];
+                mma32(h[1][0], a[kc], b1.x, b1.y);
+                mma32(h[1][1], a[kc], b1.z, b1.w);
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            if (c && !two) break;
+            const int col = (2 * pp + c) * 16 + 2 * tq;
+            const float bb[4] = {p.b1[col], p.b1[col + 1], p.b1[col + 8], p.b1[col + 9]};
+            uint32_t pa[4];  // C fragment -> A fragment: pa[2n + hh] = (row g + 8hh, columns 8n + 2tq, +1)
+#pragma unroll
+            for (int n = 0; n < 2; n++)
+#pragma unroll
+                for (int hh = 0; hh < 2; hh++)
+                    pa[n * 2 + hh] = h2u(__floats2half2_rn(gelu(h[c][n][2 * hh] + bb[2 * n]), gelu(h[c][n][2 * hh + 1] + bb[2 * n + 1])));
+            const uint4 *s2 = sw + c * CH + KC1 * 32;
+#pragma unroll
+            for (int n = 0; n < NJ2; n++) {
+                const uint4 b = s2[n * 32 + lane];
+                mma32(acc[2 * n], pa, b.x, b.y);
+                mma32(acc[2 * n + 1], pa, b.z, b.w);
+            }
+        }
+    }
+    // Epilogue in two passes: every residual load, then every store. out and add1 are usually the
+    // same stream (in place), so one pass would order each load after the previous store.
+#pragma unroll
+    for (int n = 0; n < NJ2 * 2; n++) {
+        const int c = n * 8 + tq * 2;
+        const float2 bb = *reinterpret_cast<const float2 *>(p.b2 + c);
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            const int r = hh ? r1 : r0;
+            float v0 = acc[n][2 * hh] + bb.x, v1 = acc[n][2 * hh + 1] + bb.y;
+            if (p.add1 && r < p.M) {
+                const float2 f = p.add1_f32 ? *reinterpret_cast<const float2 *>(reinterpret_cast<const float *>(p.add1) + (size_t)r * p.s1 + c)
+                                            : __half22float2(*reinterpret_cast<const half2 *>(p.add1 + (size_t)r * p.s1 + c));
+                v0 += f.x;
+                v1 += f.y;
+            }
+            acc[n][2 * hh] = v0;
+            acc[n][2 * hh + 1] = v1;
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < NJ2 * 2; n++) {
+        const int c = n * 8 + tq * 2;
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            const int r = hh ? r1 : r0;
+            if (r >= p.M) continue;
+            if (p.out_f32)
+                *reinterpret_cast<float2 *>(reinterpret_cast<float *>(p.out) + (size_t)r * p.so + c) = make_float2(acc[n][2 * hh], acc[n][2 * hh + 1]);
+            else
+                *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + c) = __floats2half2_rn(acc[n][2 * hh], acc[n][2 * hh + 1]);
+        }
+    }
+#else
+    __trap();
+#endif
+}
+
+template <int KC1, int NJ2, int NW>
+cudaError_t launch_mlp(const MlpP &p, cudaStream_t s)
+{
+    constexpr int sm = MlpSmem<KC1, NJ2>::bytes;
+    static const cudaError_t attr = cudaFuncSetAttribute(k_mlp<KC1, NJ2, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    if (attr != cudaSuccess) return attr;
+    k_mlp<KC1, NJ2, NW><<<(unsigned)((p.M + 16 * NW - 1) / (16 * NW)), NW * 32, sm, s>>>(p);
+    return cudaGetLastError();
+}
+
 // pack.h's layout: per (k16 chunk kc, n16 chunk j, lane) one uint4 = {b0, b1} of n-tile 2j, then of
 // 2j + 1; b0 = {B[2t][g], B[2t+1][g]}, b1 = {B[2t+8][g], B[2t+9][g]}, lane = g*4 + t.
 __global__ void k_pack(const float *w, int K, int N, int Kpad, int Npad, half *frag)
@@ -987,8 +1193,28 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
             (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0, g.out_f32 ? 1 : 0, g.add1_f32 ? 1 : 0, g.add2scale};
     p.k = w.K;
     const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);
-    k_gemm<<<grid, 128, 0, s>>>(p);
+    if (g.add1 || g.add2)
+        k_gemm<true><<<grid, 128, 0, s>>>(p);
+    else
+        k_gemm<false><<<grid, 128, 0, s>>>(p);
     return cudaGetLastError();
+}
+
+cudaError_t tmlp(const TMat &w1, const TMat &w2, const TMlp &g, cudaStream_t s)
+{
+    // AJI_NATIVE_FMLP: 0 runs the two GEMMs instead, 8 the 8-warp CTA (default 4)
+    static const int mode = [] {
+        const char *v = std::getenv("AJI_NATIVE_FMLP");
+        return v && *v ? std::atoi(v) : 4;
+    }();
+    if (!mode || !w1.bias || !w2.bias || w2.Kpad != w1.Npad || w1.K % 2 || g.sa % 2 || g.so % 2 || (g.add1 && g.s1 % 2) ||
+        g.sa < w1.Kpad || g.so < w2.Npad)
+        return cudaErrorNotSupported;
+    MlpP p{(const half *)g.a, g.sa, g.M, w1.K, (const uint4 *)w1.frag, (const uint4 *)w2.frag, (const float *)w1.bias,
+           (const float *)w2.bias, w1.Npad / 16, (half *)g.out, g.so, g.out_f32 ? 1 : 0, (const half *)g.add1, g.s1, g.add1_f32 ? 1 : 0};
+    const int kc1 = w1.Kpad / 16, nj2 = w2.Npad / 16;
+    if (kc1 == 12 && nj2 == 12) return mode == 8 ? launch_mlp<12, 12, 8>(p, s) : launch_mlp<12, 12, 4>(p, s);
+    return cudaErrorNotSupported;
 }
 
 cudaError_t tlayernorm(const void *in, int sin, void *out, int sout, int M, int C, int cpad, const float *gamma, const float *beta,

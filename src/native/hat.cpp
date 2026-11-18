@@ -282,6 +282,17 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
     auto mlp_step = [&](const Ln &n2, const Mlp &m) -> cudaError_t {
         CK(lnorm(n2, S, true, N1, false));
         pr.mark(P_LN);
+        if (!collect) {
+            // S += fc2(GELU(fc1(N1))) in one kernel where there is one for the shape
+            TMlp t;
+            t.a = N1; t.sa = CP; t.M = M; t.out = S; t.so = CP; t.out_f32 = true; t.add1 = S; t.s1 = CP; t.add1_f32 = true;
+            const cudaError_t e = tmlp(*m.fc1, *m.fc2, t, s);
+            if (e != cudaErrorNotSupported) {
+                CK(e);
+                pr.mark(P_MLP);
+                return cudaSuccess;
+            }
+        }
         CK(gemm(*m.fc1, N1, CP, H1, HS, TAct::Gelu, false));
         pr.mark(P_FC1);
         CK(gemm(*m.fc2, H1, HS, S, CP, TAct::None, true));
