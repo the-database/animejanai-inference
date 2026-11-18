@@ -805,6 +805,9 @@ __global__ void __launch_bounds__(512) k_winattn_g(WinG P)
 // Depthwise 3x3, one thread per (8 channels, column, strip of DW_R rows): the 3x3 window slides down
 // the strip so each output row loads one new input row (3 pixels), weights held in registers.
 constexpr int DW_R = 8;
+// C may stop inside the last group of 8 (C even; the rows are read 8 channels wide, so the strides
+// cover the rounded-up width): the channels past C get zero weights and are neither stored nor summed
+// (depthwise, so nothing of them reaches a real channel).
 __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out, int sout, int H, int W, int C, const float *w, int gelu_,
                                               float *sums, const float *bias = nullptr, const half *mul = nullptr, int smul = 0)
 {
@@ -813,17 +816,18 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
         for (int i = threadIdx.x; i < C; i += blockDim.x) ss[i] = 0.f;
         __syncthreads();
     }
-    const int G = C / 8, strips = (H + DW_R - 1) / DW_R;
+    const int G = (C + 7) / 8, strips = (H + DW_R - 1) / DW_R;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const bool live = i < G * W * strips;
     const int g = i % G, rest = i / G, x = rest % W, y0 = (rest / W) * DW_R, c = g * 8;
     float part[8] = {};
+    const bool full = c + 8 <= C;
     if (live) {
         float wr[9][8];
 #pragma unroll
         for (int k = 0; k < 9; k++)
 #pragma unroll
-            for (int j = 0; j < 8; j++) wr[k][j] = __ldg(w + (c + j) * 9 + k);
+            for (int j = 0; j < 8; j++) wr[k][j] = c + j < C ? __ldg(w + (c + j) * 9 + k) : 0.f;
         auto row = [&](int y, uint4 (&r)[3]) {
 #pragma unroll
             for (int dx = 0; dx < 3; dx++) {
@@ -854,7 +858,7 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
             }
             if (bias)
 #pragma unroll
-                for (int j = 0; j < 8; j++) a[j] += __ldg(bias + c + j);
+                for (int j = 0; j < 8; j++) a[j] += c + j < C ? __ldg(bias + c + j) : 0.f;
             if (gelu_)
 #pragma unroll
                 for (int j = 0; j < 8; j++) a[j] = gelu(a[j]);
@@ -864,9 +868,17 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
 #pragma unroll
                 for (int j = 0; j < 8; j++) a[j] *= m[j];
             }
-            *reinterpret_cast<uint4 *>(out + ((size_t)y * W + x) * sout + c) = pack8(a);
+            const uint4 pk = pack8(a);
+            if (full) {
+                *reinterpret_cast<uint4 *>(out + ((size_t)y * W + x) * sout + c) = pk;
+            } else {
+                const uint32_t *pw = reinterpret_cast<const uint32_t *>(&pk);
 #pragma unroll
-            for (int j = 0; j < 8; j++) part[j] += a[j];
+                for (int j = 0; j < 4; j++)
+                    if (c + 2 * j < C) *reinterpret_cast<uint32_t *>(out + ((size_t)y * W + x) * sout + c + 2 * j) = pw[j];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j++) part[j] += c + j < C ? a[j] : 0.f;
 #pragma unroll
             for (int dx = 0; dx < 3; dx++) {
                 r0[dx] = r1[dx];
@@ -877,7 +889,8 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
     if (sums) {
         if (live)
 #pragma unroll
-            for (int j = 0; j < 8; j++) atomicAdd(ss + c + j, part[j]);
+            for (int j = 0; j < 8; j++)
+                if (c + j < C) atomicAdd(ss + c + j, part[j]);
         __syncthreads();
         for (int k = threadIdx.x; k < C; k += blockDim.x) atomicAdd(sums + k, ss[k]);
     }
@@ -1603,9 +1616,11 @@ cudaError_t twinattn(const TWinAttn &a, cudaStream_t s)
 cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, float *sums,
                     cudaStream_t s)
 {
-    const bool vec = C % 8 == 0 && C <= 1024 && sin % 8 == 0 && sout % 8 == 0 && ((uintptr_t)in | (uintptr_t)out) % 16 == 0;
+    const int C8 = (C + 7) / 8 * 8;  // k_dw8s reads (not writes) the rows this wide
+    const bool vec = C % 2 == 0 && C <= 1024 && sin % 8 == 0 && sout % 8 == 0 && sin >= C8 && sout >= C8 &&
+                     ((uintptr_t)in | (uintptr_t)out) % 16 == 0;
     if (vec) {
-        const long long n = (long long)(C / 8) * W * ((H + DW_R - 1) / DW_R);
+        const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
         if (n < (1ll << 31)) {
             k_dw8s<<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums);
             return cudaGetLastError();
@@ -1621,9 +1636,11 @@ cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, 
 cudaError_t tdwconv2(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, const float *bias, bool gelu_,
                      const void *mul, int smul, float *sums, cudaStream_t s)
 {
-    if (C % 8 || C > 1024 || sin % 8 || sout % 8 || (mul && smul % 8) || ((uintptr_t)in | (uintptr_t)out | (uintptr_t)mul) % 16)
+    const int C8 = (C + 7) / 8 * 8;
+    if (C % 2 || C > 1024 || sin % 8 || sout % 8 || sin < C8 || sout < C8 || (mul && (smul % 8 || smul < C8)) ||
+        ((uintptr_t)in | (uintptr_t)out | (uintptr_t)mul) % 16)
         return cudaErrorInvalidValue;
-    const long long n = (long long)(C / 8) * W * ((H + DW_R - 1) / DW_R);
+    const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
     k_dw8s<<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, bias,
                                                       (const half *)mul, smul);
     return cudaGetLastError();
