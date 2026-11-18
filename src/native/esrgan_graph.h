@@ -141,7 +141,7 @@ public:
             } else if (n->op == "Clip" && clip01(n)) {
                 e.clamp = true;
                 o = n->out[0];
-            } else if (n->op == "Cast" || n->op == "Identity") {
+            } else if (pass(n)) {
                 o = n->out[0];
             } else {
                 return refuse(why, "ESRGAN output: unsupported " + n->op);
@@ -169,14 +169,16 @@ private:
         auto it = rd.prod.find(t);
         return it == rd.prod.end() ? nullptr : it->second;
     }
-    // the only data user of t that is an `op` (Cast / Identity followed through)
+    // an op the data passes through unchanged: Identity, a Cast between float types
+    static bool pass(const OnnxNode *n) { return n->op == "Identity" || float_cast(*n); }
+    // the only data user of t that is an `op` (pass() ops followed through)
     const OnnxNode *sole_user(std::string t, const char *op)
     {
         for (int guard = 0; guard < 4; guard++) {
             const std::vector<const OnnxNode *> &u = users(t);
             if (u.size() != 1) return nullptr;
             if (u[0]->op == op) return u[0];
-            if (u[0]->op != "Cast" && u[0]->op != "Identity") return nullptr;
+            if (!pass(u[0])) return nullptr;
             t = u[0]->out[0];
         }
         return nullptr;
@@ -192,7 +194,7 @@ private:
     {
         for (int guard = 0; guard < 4; guard++) {
             const OnnxNode *p = producer(t);
-            if (!p || (p->op != "Cast" && p->op != "Identity")) break;
+            if (!p || !pass(p)) break;
             t = p->in[0];
         }
         return t;
@@ -232,7 +234,7 @@ private:
     }
     bool nearest2x(const OnnxNode *rz) const
     {
-        if (rz->attr_s("mode", "nearest") != "nearest") return false;
+        if (!nearest_replicates(*rz, 2)) return false;
         std::vector<float> sc;
         if (rz->in.size() > 2 && !rz->in[2].empty() && rd.floats(rz->in[2], &sc) && sc.size() == 4)
             return sc[0] == 1.f && sc[1] == 1.f && sc[2] == 2.f && sc[3] == 2.f;
@@ -282,7 +284,7 @@ private:
                 if (!perm || (perm->ints != std::vector<int64_t>{0, 1, 3, 5, 2, 4} &&
                               perm->ints != std::vector<int64_t>{0, 1, 2, 4, 6, 3, 5}))
                     return refuse(why, "ESRGAN input: a transpose that is not a pixel-unshuffle");
-            } else if (p->op != "Reshape" && p->op != "Unsqueeze" && p->op != "Squeeze" && p->op != "Cast" && p->op != "Identity") {
+            } else if (p->op != "Reshape" && p->op != "Unsqueeze" && p->op != "Squeeze" && !pass(p)) {
                 return refuse(why, "not an ESRGAN graph (" + p->op + " before the first conv)");
             }
             any = true;

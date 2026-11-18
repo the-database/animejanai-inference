@@ -249,6 +249,7 @@ struct Lowerer {
     // amounts are computed (from Shape) or are zero / open-ended; anything else is a real crop.
     bool pass_through_ok(const OnnxNode &n)
     {
+        if (n.op == "Cast" && !float_cast(n)) return fail("Cast to a non-float type on the data path");
         if (n.op == "Pad") {
             if (n.in.size() < 2 || n.in[1].empty()) {
                 const OnnxAttr *p = n.attr("pads");  // opset < 11
@@ -516,10 +517,19 @@ struct Lowerer {
                     if (z.empty() || pz == prod.end() || node(pz->second).op != "Resize")
                         return fail("the output adds something other than the upsampled input");
                     const OnnxNode &rz = node(pz->second);
-                    const std::string ct = rz.attr_s("coordinate_transformation_mode", "half_pixel");
-                    if (canon(rz.in[0]) != X || rz.attr_s("mode", "nearest") != "nearest" ||
-                        (ct != "asymmetric" && ct != "half_pixel"))
-                        return fail("the output adds an input upsampled other than nearest");
+                    if (canon(rz.in[0]) != X || !nearest_replicates(rz, r))
+                        return fail("the output adds an input upsampled other than nearest by pixel replication");
+                    // constant scales (opset 10: input 1, else 2): exactly r on H and W (sizes: the Add's
+                    // shapes make them r times the input's)
+                    const std::string sn = rz.in.size() == 2 ? rz.in[1] : rz.in.size() > 2 ? rz.in[2] : std::string();
+                    std::vector<float> sc;
+                    if (const OnnxTensor *t = sn.empty() ? nullptr : constant(sn)) {
+                        if (!t->floats(&sc)) return fail("Resize scales are not floats");
+                        const size_t ns = sc.size();
+                        bool ok = ns == 0 || (ns >= 2 && sc[ns - 1] == (float)r && sc[ns - 2] == (float)r);
+                        for (size_t k = 0; ok && ns > 2 && k + 2 < ns; k++) ok = sc[k] == 1.f;
+                        if (!ok) return fail("the output adds an input upsampled by other than the model's scale");
+                    }
                     used[pz->second] = true;
                 }
                 if (plan.in_norm) return fail("the output adds the input, which the model normalizes");

@@ -57,6 +57,30 @@ struct OnnxNode {
     }
 };
 
+// A Cast between floating-point types (float, float16, double, bfloat16): on the data path only a
+// precision change, which the kernels' own precision stands in for. A Cast to an integer or bool
+// type changes the values.
+inline bool float_cast(const OnnxNode &n)
+{
+    const int64_t to = n.attr_i("to", 0);
+    return n.op == "Cast" && (to == 1 || to == 10 || to == 11 || to == 16);
+}
+
+// A nearest Resize by the integer factor r that is pixel replication (output x reads input x / r),
+// the only kind the native kernels fold. For x = r i + j, ONNX samples i + (j + 0.5) / r - 0.5
+// (half_pixel, pytorch_half_pixel), which rounding to nearest takes to i and floor / ceil do not, or
+// i + j / r (asymmetric: the torch exporters' nearest), which floor takes to i and round_prefer_floor
+// only up to r = 2.
+inline bool nearest_replicates(const OnnxNode &rz, int r)
+{
+    if (rz.op != "Resize" || rz.attr_s("mode", "nearest") != "nearest" || r < 1) return false;
+    const std::string ct = rz.attr_s("coordinate_transformation_mode", "half_pixel");
+    const std::string nm = rz.attr_s("nearest_mode", "round_prefer_floor");
+    if (ct == "half_pixel" || ct == "pytorch_half_pixel") return nm == "round_prefer_floor" || nm == "round_prefer_ceil";
+    if (ct == "asymmetric") return nm == "floor" || (nm == "round_prefer_floor" && r <= 2);
+    return false;
+}
+
 struct OnnxGraph {
     std::vector<OnnxNode> nodes;               // in file order (topological for valid models)
     std::map<std::string, OnnxTensor> inits;   // initializers by name

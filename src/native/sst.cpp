@@ -301,7 +301,9 @@ std::unique_ptr<ImgNet> Sst::build(const OnnxGraph &g, int max_w, int max_h, cud
         f->up[sy].w = r.gup(wt, bt, F, FP, 4 * FS, 4 * FS);
     }
     if (!rd.conv("/upsampler/final_conv/Conv", &c, why)) return nullptr;
-    if (c.cin != F || c.cout != 3 || !rd.node("/upsampler/Resize")) return refuse(why, "SST final conv"), nullptr;
+    const OnnxNode *rz = rd.node("/upsampler/Resize");
+    if (c.cin != F || c.cout != 3 || !rz) return refuse(why, "SST final conv"), nullptr;
+    if (!nearest_replicates(*rz, 4)) return refuse(why, "SST input skip is not a nearest 4x replication"), nullptr;
     f->last.w = r.gup(conv_taps(c, nullptr), c.b, F, FP, 3, 16);
     if (r.failed) return refuse(why, "weight upload failed"), nullptr;
 

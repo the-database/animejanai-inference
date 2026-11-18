@@ -15,9 +15,10 @@
  *     SpaceToDepth), into the first conv: the normalization is applied where that conv loads
  *     the input, so its zero padding stays zero in normalized space;
  *   - DepthToSpace (CRD or DCR, by 1 to 4, or a last conv of 3 channels as the output itself)
- *     after the last conv, optionally plus the nearest-upsampled model input (SRVGG's skip) and
- *     a final Clip(0, 1), into the output.
- * Cast / Identity / Dropout, and Pad / Slice used to align the input to the unshuffle factor
+ *     after the last conv, optionally plus the nearest-upsampled model input (SRVGG's skip: a
+ *     Resize that is pixel replication, nearest_replicates in onnx_graph.h) and a final
+ *     Clip(0, 1), into the output.
+ * Casts between float types, Identity / Dropout, and Pad / Slice used to align the input to the unshuffle factor
  * and crop the output back, pass through (the executor then requires aligned sizes). Any other
  * op on the data path refuses the model. Host only.
  */
