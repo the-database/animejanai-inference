@@ -266,11 +266,19 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
                 CK(fdat_aim_sg(AT, CF, b.sg, X, CP, M, C, s));
                 mark(P_GATE);
             }
-            CK(tlayernorm(X, CP, N1, CP, M, C, CP, b.ln2g, b.ln2b, b.eps2, s));
-            mark(P_LN);
+            // fc1 with LN2 applied on its A load where tgemm can (else the LayerNorm first)
             TGemm f1;
-            f1.a = N1; f1.sa = CP; f1.M = M; f1.out = H1; f1.so = HS; f1.act = TAct::Gelu;
-            CK(tgemm(*b.fc1, f1, s));
+            f1.a = X; f1.sa = CP; f1.M = M; f1.out = H1; f1.so = HS; f1.act = TAct::Gelu;
+            f1.ln_gamma = b.ln2g; f1.ln_beta = b.ln2b; f1.ln_eps = b.eps2;
+            cudaError_t e1 = tgemm(*b.fc1, f1, s);
+            if (e1 == cudaErrorNotSupported) {
+                CK(tlayernorm(X, CP, N1, CP, M, C, CP, b.ln2g, b.ln2b, b.eps2, s));
+                mark(P_LN);
+                f1.a = N1;
+                f1.ln_gamma = f1.ln_beta = nullptr;
+                e1 = tgemm(*b.fc1, f1, s);
+            }
+            CK(e1);
             mark(P_FC1);
             CK(tdwconv(H1, HS, H2, HS, bh, bw, 2 * C, b.smix, false, s));
             mark(P_SMIX);

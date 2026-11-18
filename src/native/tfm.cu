@@ -63,6 +63,8 @@ struct GemmP {
     int act_last, out_f32, add1_f32;
     const float *add2scale;
     int k;  // A's real columns: those from k up to kpad load as zeros (A may be a slice whose row ends sooner)
+    const float *lng, *lnb;  // k_gemm_rs only: A LayerNorm'd over its k channels on load, or null
+    float lneps;
 };
 
 // RES: out is one of the adds, an fp32 stream (prefetched, the epilogue in two passes; see below).
@@ -989,7 +991,7 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
 // is done. No accumulator lives across chunks, so it runs at ~100 registers and 4 CTAs per SM, and
 // W is read once per 64 rows instead of once per 64x64 tile. Same sums as k_gemm.
 template <int KC1>
-__global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)
+__global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerNorm of A's rows on load (see below)
 {
 #if TFM_OK
     constexpr int CH = KC1 * 32, NT = 128;  // uint4 per chunk slice
@@ -1022,6 +1024,52 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)
             if (r < p.M && c < p.k) v = *reinterpret_cast<const half2 *>(p.a + (size_t)r * p.sa + c);
             a[kc][j] = h2u(v);
         }
+    if (p.lng) {
+        // the rows' LayerNorm over their k channels, in place on the raw fp16 fragments (as tlayernorm):
+        // a row's channels sit in its lane quad, so the sums take two shuffles
+        float s[2] = {0.f, 0.f}, q[2] = {0.f, 0.f}, mean[2], rs[2];
+#pragma unroll
+        for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
+                s[j & 1] += v.x + v.y;
+            }
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            s[i] += __shfl_xor_sync(0xffffffffu, s[i], 1);
+            s[i] += __shfl_xor_sync(0xffffffffu, s[i], 2);
+            mean[i] = s[i] / p.k;
+        }
+#pragma unroll
+        for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+                if (kc * 16 + 2 * tq + (j >> 1) * 8 < p.k) {
+                    const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
+                    const float d0 = v.x - mean[j & 1], d1 = v.y - mean[j & 1];
+                    q[j & 1] += d0 * d0 + d1 * d1;
+                }
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            q[i] += __shfl_xor_sync(0xffffffffu, q[i], 1);
+            q[i] += __shfl_xor_sync(0xffffffffu, q[i], 2);
+            rs[i] = rsqrtf(q[i] / p.k + p.lneps);
+        }
+#pragma unroll
+        for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int c = kc * 16 + 2 * tq + (j >> 1) * 8, i = j & 1;
+                half2 y = __float2half2_rn(0.f);
+                if (c < p.k) {
+                    const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
+                    const float2 gm = __ldg(reinterpret_cast<const float2 *>(p.lng + c)), bt = __ldg(reinterpret_cast<const float2 *>(p.lnb + c));
+                    y = __floats2half2_rn((v.x - mean[i]) * rs[i] * gm.x + bt.x, (v.y - mean[i]) * rs[i] * gm.y + bt.y);
+                }
+                a[kc][j] = h2u(y);
+            }
+    }
     for (int pp = 0; pp < npair; pp++) {
         asm volatile("cp.async.wait_all;" ::: "memory");
         __syncthreads();
@@ -1447,13 +1495,18 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
             (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0, g.out_f32 ? 1 : 0, g.add1_f32 ? 1 : 0, g.add2scale};
     p.k = w.K;
+    p.lng = g.ln_gamma;
+    p.lnb = g.ln_beta;
+    p.lneps = g.ln_eps;
+    if (g.ln_gamma && (g.add1 || g.add2 || g.act_last || w.K % 2 || !g.ln_beta || !(w.Kpad == 128 || w.Kpad == 192 || w.Kpad == 224 || w.Kpad == 256)))
+        return cudaErrorNotSupported;
     // without adds, K = 128 / 192 / 224 / 256 (the transformers' qkv / fc1): the row-stationary kernel
     // (AJI_NATIVE_GEMM_RS=0: k_gemm)
     static const bool rs = [] {
         const char *v = std::getenv("AJI_NATIVE_GEMM_RS");
         return !v || std::atoi(v) != 0;
     }();
-    if (rs && !g.add1 && !g.add2 && !g.act_last && (w.Kpad == 128 || w.Kpad == 192 || w.Kpad == 224 || w.Kpad == 256)) {
+    if ((rs || g.ln_gamma) && !g.add1 && !g.add2 && !g.act_last && (w.Kpad == 128 || w.Kpad == 192 || w.Kpad == 224 || w.Kpad == 256)) {
         const unsigned grid = (unsigned)((g.M + 63) / 64);
         switch (w.Kpad) {
         case 128: k_gemm_rs<8><<<grid, 128, 4 * 8 * 32 * 16, s>>>(p); break;

@@ -53,6 +53,11 @@ struct TGemm {
     // fp32 residual streams (bf16-trained models whose stream outgrows fp16): out and/or add1 as float
     bool out_f32 = false, add1_f32 = false;
     const float *add2scale = nullptr;  // [Npad] device: add2 scaled per column before it is added, or null
+    // LayerNorm of A's rows over the first K channels (gamma, beta: K floats, device) applied on load, as
+    // tlayernorm; only without adds and for K padded to 128 / 192 / 224 / 256 (cudaErrorNotSupported
+    // otherwise, nothing launched: normalise first then)
+    const float *ln_gamma = nullptr, *ln_beta = nullptr;
+    float ln_eps = 1e-5f;
 };
 cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s);
 
