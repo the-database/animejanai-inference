@@ -1447,17 +1447,20 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
             (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0, g.out_f32 ? 1 : 0, g.add1_f32 ? 1 : 0, g.add2scale};
     p.k = w.K;
-    // without adds, K = 192 or 224 (180/192- and 224-channel transformers' qkv / fc1): the row-stationary kernel
+    // without adds, K = 128 / 192 / 224 / 256 (the transformers' qkv / fc1): the row-stationary kernel
     // (AJI_NATIVE_GEMM_RS=0: k_gemm)
     static const bool rs = [] {
         const char *v = std::getenv("AJI_NATIVE_GEMM_RS");
         return !v || std::atoi(v) != 0;
     }();
-    if (rs && !g.add1 && !g.add2 && !g.act_last && (w.Kpad == 192 || w.Kpad == 224)) {
-        if (w.Kpad == 192)
-            k_gemm_rs<12><<<(unsigned)((g.M + 63) / 64), 128, 4 * 12 * 32 * 16, s>>>(p);
-        else
-            k_gemm_rs<14><<<(unsigned)((g.M + 63) / 64), 128, 4 * 14 * 32 * 16, s>>>(p);
+    if (rs && !g.add1 && !g.add2 && !g.act_last && (w.Kpad == 128 || w.Kpad == 192 || w.Kpad == 224 || w.Kpad == 256)) {
+        const unsigned grid = (unsigned)((g.M + 63) / 64);
+        switch (w.Kpad) {
+        case 128: k_gemm_rs<8><<<grid, 128, 4 * 8 * 32 * 16, s>>>(p); break;
+        case 192: k_gemm_rs<12><<<grid, 128, 4 * 12 * 32 * 16, s>>>(p); break;
+        case 224: k_gemm_rs<14><<<grid, 128, 4 * 14 * 32 * 16, s>>>(p); break;
+        default: k_gemm_rs<16><<<grid, 128, 4 * 16 * 32 * 16, s>>>(p); break;
+        }
         return cudaGetLastError();
     }
     const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);
