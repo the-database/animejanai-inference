@@ -993,15 +993,14 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)
 {
 #if TFM_OK
     constexpr int CH = KC1 * 32, NT = 128;  // uint4 per chunk slice
-    static_assert(CH % NT == 0, "a chunk's weights split evenly over the threads");
     extern __shared__ __align__(16) uint4 smw[];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tq = lane & 3;
     const int nch = p.njt, npair = (nch + 1) / 2, r0 = (int)blockIdx.x * 64 + warp * 16 + g, r1 = r0 + 8;
-    auto load_pair = [&](int c0, int st) {
+    auto load_pair = [&](int c0, int st) {  // slice row q = idx / 32 of the pair: chunk q / KC1, k16 row q % KC1
 #pragma unroll
-        for (int k = 0; k < 2 * CH / NT; k++) {
-            const int c = c0 + k / (CH / NT), sl = warp + (k % (CH / NT)) * 4;
-            if (c < nch) cp16(smw + (size_t)st * 2 * CH + k * NT + tid, p.w + ((size_t)sl * nch + c) * 32 + lane, 16);
+        for (int k = 0; k < (2 * CH + NT - 1) / NT; k++) {
+            const int idx = k * NT + tid, q = idx >> 5, c = c0 + q / KC1, sl = q % KC1;
+            if (idx < 2 * CH && c < nch) cp16(smw + (size_t)st * 2 * CH + idx, p.w + ((size_t)sl * nch + c) * 32 + lane, 16);
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
@@ -1448,14 +1447,17 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     GemmP p{(const half *)g.a, g.sa, g.M, w.Kpad, (const uint4 *)w.frag, w.Npad / 16, (const float *)w.bias, g.colscale,
             (half *)g.out, g.so, (const half *)g.add1, (const half *)g.add2, g.s1, g.s2, (int)g.act, g.slope, g.act_last ? 1 : 0, g.out_f32 ? 1 : 0, g.add1_f32 ? 1 : 0, g.add2scale};
     p.k = w.K;
-    // without adds, K = 192 (a 180-channel transformer's qkv / fc1): the row-stationary kernel
+    // without adds, K = 192 or 224 (180/192- and 224-channel transformers' qkv / fc1): the row-stationary kernel
     // (AJI_NATIVE_GEMM_RS=0: k_gemm)
     static const bool rs = [] {
         const char *v = std::getenv("AJI_NATIVE_GEMM_RS");
         return !v || std::atoi(v) != 0;
     }();
-    if (rs && !g.add1 && !g.add2 && !g.act_last && w.Kpad == 192) {
-        k_gemm_rs<12><<<(unsigned)((g.M + 63) / 64), 128, 4 * 12 * 32 * 16, s>>>(p);
+    if (rs && !g.add1 && !g.add2 && !g.act_last && (w.Kpad == 192 || w.Kpad == 224)) {
+        if (w.Kpad == 192)
+            k_gemm_rs<12><<<(unsigned)((g.M + 63) / 64), 128, 4 * 12 * 32 * 16, s>>>(p);
+        else
+            k_gemm_rs<14><<<(unsigned)((g.M + 63) / 64), 128, 4 * 14 * 32 * 16, s>>>(p);
         return cudaGetLastError();
     }
     const unsigned grid = (unsigned)((g.M + 63) / 64) * (unsigned)((w.Npad / 16 + 3) / 4);

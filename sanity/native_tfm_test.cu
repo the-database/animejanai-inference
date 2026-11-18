@@ -443,6 +443,7 @@ int main()
     test_gemm(100, 180, 540, true, true, false, false, false);
     test_gemm(333, 192, 544, true, false, true, false, false);  // K = 192 without adds: the row-stationary kernel
     test_gemm(77, 180, 360, false, true, false, false, false);
+    test_gemm(200, 224, 672, true, false, false, false, false);  // K = 224 (SST-XL+)
     test_gemm(90, 120, 120, true, false, false, true, false, true);
     test_mlp(1000, 180, 360, true);  // HAT-L's MLP, a row tail
     test_mlp(77, 180, 360, false);
