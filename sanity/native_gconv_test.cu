@@ -38,6 +38,14 @@ struct Case {
 static int fails = 0, checks = 0;
 static double worst = 0;
 
+// NaN-safe: a non-finite result or reference is an infinite error, which no tolerance accepts
+static double err(double got, double ref)
+{
+    const double d = std::fabs(got - ref);
+    return std::isfinite(d) ? d : INFINITY;
+}
+static bool sum_ok(double got, double ref, double mag) { return err(got, ref) <= 1e-4 * mag + 1e-3; }
+
 static void run(const Case &c, int variant, bool split)
 {
     const int cin_pad = (c.cin + 15) / 16 * 16;
@@ -171,7 +179,7 @@ static void run(const Case &c, int variant, bool split)
                     // uses the same weights for every sy, so row phase sy repeats the conv
                     for (int s2 = 0; s2 < c.R; s2++) {
                         idx = ((size_t)(c.R * y + s2) * DW + c.R * x + sx) * dstride + c.dst_off + ch;
-                        const double d = std::fabs(f(out[idx]) - v);
+                        const double d = err(f(out[idx]), v);
                         maxe = std::max(maxe, d);
                         maxx = std::max(maxx, d - tol_rel * std::fabs(v));
                         se += d * d;
@@ -180,7 +188,7 @@ static void run(const Case &c, int variant, bool split)
                     continue;
                 }
                 idx = ((size_t)y * OW + x) * dstride + c.dst_off + o;
-                const double d = std::fabs(f(out[idx]) - v);
+                const double d = err(f(out[idx]), v);
                 maxe = std::max(maxe, d);
                 maxx = std::max(maxx, d - tol_rel * std::fabs(v));
                 se += d * d;
@@ -195,15 +203,15 @@ static void run(const Case &c, int variant, bool split)
     bool sums_ok = true;
     if (dsums) {
         std::vector<float> gs(cout_pad);
-        cudaMemcpy(gs.data(), dsums, (size_t)cout_pad * 4, cudaMemcpyDeviceToHost);
-        for (int o = 0; o < cout_pad; o++) {
+        if (cudaMemcpy(gs.data(), dsums, (size_t)cout_pad * 4, cudaMemcpyDeviceToHost) != cudaSuccess) sums_ok = false;
+        for (int o = 0; sums_ok && o < cout_pad; o++) {
             double ref = 0, mag = 0;
             for (int px = 0; px < OH * OW; px++) {
                 const double v = f(out[(size_t)px * dstride + c.dst_off + o]);
                 ref += v;
                 mag += std::fabs(v);
             }
-            if (std::fabs(gs[o] - ref) > 1e-4 * mag + 1e-3) sums_ok = false;
+            if (!sum_ok(gs[o], ref, mag)) sums_ok = false;
         }
     }
     const bool ok = maxx < 0.03 && rms < 0.004 && !clobber && sums_ok;
@@ -230,6 +238,12 @@ int main()
     if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess || p.major < 8) {
         printf("native gconv: SKIP (no sm_80+ GPU)\n");
         return 0;
+    }
+    // the checker itself: NaNs and infinities never pass
+    if (!sum_ok(1.0, 1.0, 1.0) || sum_ok(NAN, 1.0, 1.0) || sum_ok(1.0, NAN, 1.0) || sum_ok(INFINITY, INFINITY, 1.0) ||
+        sum_ok(1.0, 1.0, NAN) || !(err(NAN, 0.0) > 1.0) || !(err(0.0, INFINITY) > 1.0)) {
+        printf("FAIL the checker accepts non-finite values\n");
+        fails++;
     }
     const Case cases[] = {
         {"s1 32->32 relu", 32, 32, 1, 0, 0, false, 0, 0, 0, 0, GAct::Relu, 0},
