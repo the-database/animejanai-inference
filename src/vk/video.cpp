@@ -35,6 +35,34 @@ void set_owner(VkImageMemoryBarrier &b, const aji_vk_image *im, uint32_t ours, b
 // the owner to write back: libaji's family, unless the image had none (it keeps none)
 uint32_t owner_after(const aji_vk_image *im, uint32_t ours) { return im->queue_family == VK_QUEUE_FAMILY_IGNORED ? VK_QUEUE_FAMILY_IGNORED : ours; }
 
+// One submit's frame semaphores (AVVkFrame's rule: wait for value, signal value + 1) after libaji's
+// own timeline at sig[0]. Frames on one timeline semaphore (a frame twice, or two images that share
+// it) wait once for the later value and signal it once: Vulkan forbids signalling a semaphore twice
+// in a submission. commit() writes each frame's new value back.
+struct FrameSems {
+    Device::SemValue waits[2], sig[3];
+    uint32_t nwait = 0;
+    FrameSems(VkSemaphore tl, uint64_t ticket, aji_vk_image *const *im, int n)
+    {
+        sig[0] = {tl, ticket};
+        for (int i = 0; i < n; i++) {
+            const VkSemaphore s = static_cast<VkSemaphore>(im[i]->semaphore);
+            uint32_t j = 0;
+            while (j < nwait && waits[j].sem != s) j++;
+            if (j == nwait) waits[nwait++] = {s, im[i]->value};
+            else waits[j].value = std::max(waits[j].value, im[i]->value);
+        }
+        for (uint32_t j = 0; j < nwait; j++) sig[1 + j] = {waits[j].sem, waits[j].value + 1};
+    }
+    uint32_t nsig() const { return 1 + nwait; }
+    void commit(aji_vk_image *const *im, int n) const
+    {
+        for (int i = 0; i < n; i++)
+            for (uint32_t j = 0; j < nwait; j++)
+                if (sig[1 + j].sem == static_cast<VkSemaphore>(im[i]->semaphore)) im[i]->value = sig[1 + j].value;
+    }
+};
+
 std::string fmt_num(double v)
 {
     if (v >= 1e300) return "inf";
@@ -377,7 +405,7 @@ int VkVideo::infer_rife(const aji_frame *a, const aji_frame *b, double t, const 
     // a and b can be one frame (a held frame repeated, a clip's last frame twice), through one
     // aji_vk_image or two: each image is transitioned once, each semaphore waited and signalled once
     aji_vk_image *in2[2] = {ia, ib};
-    const bool one_image = same_image(ia, ib), one_sem = ia->semaphore == ib->semaphore;
+    const bool one_image = same_image(ia, ib);
     for (int i = 0; i < 2; i++) {
         if (i == 0 || !one_image) barrier_image(cb, in2[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, false);
         vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(in2[i]->image), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, R.io[i]->in_y().buf, 1, &ry);
@@ -402,22 +430,16 @@ int VkVideo::infer_rife(const aji_frame *a, const aji_frame *b, double t, const 
         mem_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
     }
     {
-        // one semaphore: its later value of the two (both wrappers then record the one signal)
-        const uint64_t va = one_sem ? std::max(ia->value, ib->value) : ia->value, vb = one_sem ? va : ib->value;
-        const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ia->semaphore), va}, {static_cast<VkSemaphore>(ib->semaphore), vb}};
         const uint64_t tk = ticket_ + 1;
-        const Device::SemValue sig[3] = {
-            {tl_, tk}, {static_cast<VkSemaphore>(ia->semaphore), va + 1}, {static_cast<VkSemaphore>(ib->semaphore), vb + 1}};
-        const uint32_t nsem = one_sem ? 1 : 2;
-        if (!dev_->frame_submit(slot, waits, nsem, sig, 1 + nsem, &why)) {
+        const FrameSems fs(tl_, tk, in2, 2);
+        if (!dev_->frame_submit(slot, fs.waits, fs.nwait, fs.sig, fs.nsig(), &why)) {
             fail("aji_infer_rife: %s", why.c_str());
             return AJI_ERR;
         }
         ticket_ = tk;
-        const uint64_t done[2] = {va + 1, vb + 1};
+        fs.commit(in2, 2);
         for (int i = 0; i < 2; i++) {
             aji_vk_image *im = in2[i];
-            im->value = done[i];
             im->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             im->access = VK_ACCESS_2_TRANSFER_READ_BIT;
             im->queue_family = owner_after(im, dev_->queue_family());
@@ -845,22 +867,19 @@ int VkVideo::infer(const aji_frame *in, const aji_frame *out)
     const VkBufferImageCopy ouv = region(io_->out_pitch() / (2 * obps), VK_IMAGE_ASPECT_PLANE_1_BIT, out_w_ / 2, out_h_ / 2);
     vkCmdCopyBufferToImage(cb, io_->out_y().buf, ib[1].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &oy);
     vkCmdCopyBufferToImage(cb, io_->out_uv().buf, ib[1].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ouv);
-    // the images' semaphores (AVVkFrame's rule: wait for value, signal value + 1) and the ticket
-    const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ii->semaphore), ii->value},
-                                       {static_cast<VkSemaphore>(oi->semaphore), oi->value}};
+    // the images' semaphores and the ticket (FrameSems: one signal for an input and output on one timeline)
+    aji_vk_image *const both[2] = {ii, oi};
     const uint64_t t = ticket_ + 1;
-    const Device::SemValue signals[3] = {
-        {tl_, t}, {static_cast<VkSemaphore>(ii->semaphore), ii->value + 1}, {static_cast<VkSemaphore>(oi->semaphore), oi->value + 1}};
-    if (!dev_->frame_submit(slot, waits, 2, signals, 3, &why)) {
+    const FrameSems fs(tl_, t, both, 2);
+    if (!dev_->frame_submit(slot, fs.waits, fs.nwait, fs.sig, fs.nsig(), &why)) {
         fail("aji_infer: %s", why.c_str());
         return AJI_ERR;
     }
     ticket_ = t;
-    ii->value += 1;
+    fs.commit(both, 2);
     ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
     ii->queue_family = owner_after(ii, dev_->queue_family());
-    oi->value += 1;
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     oi->queue_family = owner_after(oi, dev_->queue_family());
@@ -1473,19 +1492,14 @@ int VkVideo::frame_diff(const aji_frame *a, const aji_frame *b, aji_frame_diff_r
     const VkBufferCopy c{0, 0, 33 * 4};
     vkCmdCopyBuffer(cb, D.acc.buf, D.read.buf, 1, &c);
     mem_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
-    Device::SemValue waits[2], sig[3];
-    sig[0] = {tl_, ticket_ + 1};
-    for (int i = 0; i < nimg; i++) {
-        waits[i] = {static_cast<VkSemaphore>(im[i]->semaphore), im[i]->value};
-        sig[1 + i] = {static_cast<VkSemaphore>(im[i]->semaphore), im[i]->value + 1};
-    }
-    if (!dev_->frame_submit(slot, waits, (uint32_t)nimg, sig, (uint32_t)(1 + nimg), &why)) {
+    const FrameSems fs(tl_, ticket_ + 1, im, nimg);
+    if (!dev_->frame_submit(slot, fs.waits, fs.nwait, fs.sig, fs.nsig(), &why)) {
         fail("aji_frame_diff: %s", why.c_str());
         return AJI_ERR;
     }
     ticket_++;
+    fs.commit(im, nimg);
     for (int i = 0; i < nimg; i++) {
-        im[i]->value += 1;
         im[i]->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         im[i]->access = VK_ACCESS_2_TRANSFER_READ_BIT;
         im[i]->queue_family = owner_after(im[i], dev_->queue_family());
@@ -1563,21 +1577,19 @@ int VkVideo::resize(const aji_frame *in, const aji_frame *out)
     P.io->record_post(cb);
     mem_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     copy_planes(cb, oi, P.io->out_y().buf, P.io->out_uv().buf, P.io->out_pitch(), P.ww, P.wh, bps, false, dev_->queue_family());
-    const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ii->semaphore), ii->value},
-                                       {static_cast<VkSemaphore>(oi->semaphore), oi->value}};
+    // the images' semaphores and the ticket (FrameSems: one signal for an input and output on one timeline)
+    aji_vk_image *const both[2] = {ii, oi};
     const uint64_t t = ticket_ + 1;
-    const Device::SemValue sig[3] = {
-        {tl_, t}, {static_cast<VkSemaphore>(ii->semaphore), ii->value + 1}, {static_cast<VkSemaphore>(oi->semaphore), oi->value + 1}};
-    if (!dev_->frame_submit(slot, waits, 2, sig, 3, &why)) {
+    const FrameSems fs(tl_, t, both, 2);
+    if (!dev_->frame_submit(slot, fs.waits, fs.nwait, fs.sig, fs.nsig(), &why)) {
         fail("aji_resize: %s", why.c_str());
         return AJI_ERR;
     }
     ticket_ = t;
-    ii->value += 1;
+    fs.commit(both, 2);
     ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
     ii->queue_family = owner_after(ii, dev_->queue_family());
-    oi->value += 1;
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     oi->queue_family = owner_after(oi, dev_->queue_family());
@@ -1627,22 +1639,20 @@ int VkVideo::copy_frame(const aji_frame *in, const aji_frame *out)
         r[p].extent = {(uint32_t)(p ? in->width / 2 : in->width), (uint32_t)(p ? in->height / 2 : in->height), 1};
     }
     vkCmdCopyImage(cb, ib[0].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ib[1].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, r);
-    const Device::SemValue waits[2] = {{static_cast<VkSemaphore>(ii->semaphore), ii->value},
-                                       {static_cast<VkSemaphore>(oi->semaphore), oi->value}};
+    // the images' semaphores and the ticket (FrameSems: one signal for an input and output on one timeline)
+    aji_vk_image *const both[2] = {ii, oi};
     const uint64_t t = ticket_ + 1;
-    const Device::SemValue sig[3] = {
-        {tl_, t}, {static_cast<VkSemaphore>(ii->semaphore), ii->value + 1}, {static_cast<VkSemaphore>(oi->semaphore), oi->value + 1}};
+    const FrameSems fs(tl_, t, both, 2);
     std::string why;
-    if (!dev_->frame_submit(slot, waits, 2, sig, 3, &why)) {
+    if (!dev_->frame_submit(slot, fs.waits, fs.nwait, fs.sig, fs.nsig(), &why)) {
         fail("aji_copy_frame: %s", why.c_str());
         return AJI_ERR;
     }
     ticket_ = t;
-    ii->value += 1;
+    fs.commit(both, 2);
     ii->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     ii->access = VK_ACCESS_2_TRANSFER_READ_BIT;
     ii->queue_family = owner_after(ii, dev_->queue_family());
-    oi->value += 1;
     oi->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     oi->access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     oi->queue_family = owner_after(oi, dev_->queue_family());

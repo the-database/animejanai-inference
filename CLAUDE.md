@@ -453,7 +453,9 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   family owner written back: none for the images as created, the device's with `--owned`. A
   temporal chain runs aji_harness_dml's ingest loop (`--reset-at K`): TFDAT 2x 720x480 within 2
   levels of the D3D12 path, TemporalFix 62.9 dB (5.4 ms a frame). `--diff` prints aji_frame_diff
-  of consecutive frames (exact against frame_diff.h's arithmetic; 1.8 ms a pair at 720x480).
+  of consecutive frames (exact against frame_diff.h's arithmetic; 1.8 ms a pair at 720x480);
+  `--shared-sem` puts both images on one timeline semaphore, the older one's wrapper a value
+  behind (every two-frame submit waits and signals a shared semaphore once: `FrameSems`).
 - **`aji_img_vk.cpp`: the image ABI on Vulkan (`AJI_IMG_VULKAN`, `aji_image --backend vulkan`).**
   A `core/tiling` `TileModel` over the executor at the model's tile: the same cover, reflect pad
   and blend as the other backends. Every model must lower; one that doesn't is refused with the

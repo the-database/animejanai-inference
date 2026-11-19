@@ -7,7 +7,7 @@
  *
  *   aji_vk_frames_test --conf C --model-dir D --slot N --input in.raw --width W --height H
  *                      [--frames N] [--output out.raw] [--format nv12|p010] [--out-format nv12|p010]
- *                      [--no-coopmat] [--owned] [--rife --rife-model-dir R [--rife-same]]
+ *                      [--no-coopmat] [--owned] [--rife --rife-model-dir R [--rife-same]] [--diff [--shared-sem]]
  *
  * --no-coopmat tells libaji the device was created without cooperative matrices (they are left
  * out of the features chain and the extension list): the family it then picks is the one a
@@ -20,7 +20,9 @@
  * r ahead of the one upscaled (aji_ingest, aji_infer_seq), --reset-at K resetting before frame K.
  *
  * --diff: aji_frame_diff of each frame against the one before, one line each: the pair, max_tile
- * and the 16 region means (%.9g), for an exact comparison with a reference.
+ * and the 16 region means (%.9g), for an exact comparison with a reference. --shared-sem: the two
+ * images share one timeline semaphore, the older frame's wrapper recording a value behind it;
+ * the semaphore must reach the one value both frames record afterwards (one wait, one signal).
  *
  * --rife: aji_harness_dml --rife's interpolation-only loop (a scale-free 2/1 RIFE chain): writes
  * f0, i01, f1, i12, ..., the left frame in place of an interpolated one on a scene change.
@@ -316,7 +318,7 @@ bool run_temporal(Device &dev, aji_ctx *c, Image &in, Image &out, Buffer &sin, B
 }
 
 // aji_frame_diff of consecutive frames
-bool run_diff(Device &dev, aji_ctx *c, const char *input, int w, int h, int frames, bool p010)
+bool run_diff(Device &dev, aji_ctx *c, const char *input, int w, int h, int frames, bool p010, bool shared)
 {
     std::string why;
     const int bps = p010 ? 2 : 1;
@@ -325,6 +327,11 @@ bool run_diff(Device &dev, aji_ctx *c, const char *input, int w, int h, int fram
     Buffer st;
     for (Image &i : im)
         if (!make_image(dev, w, h, p010, &i, &why)) return false;
+    if (shared) {  // both on the first image's timeline
+        vkDestroySemaphore(dev.device(), im[1].sem, nullptr);
+        im[1].sem = im[0].sem;
+        im[1].d.semaphore = im[0].sem;
+    }
     if (!dev.make_buffer(&st, fb, true, &why)) return false;
     std::ifstream fi(input, std::ios::binary);
     std::vector<char> raw(fb);
@@ -351,6 +358,7 @@ bool run_diff(Device &dev, aji_ctx *c, const char *input, int w, int h, int fram
         wi.pSemaphores = &im[n % 2].sem;
         wi.pValues = &im[n % 2].d.value;
         vkWaitSemaphores(dev.device(), &wi, 10ull * 1000 * 1000 * 1000);
+        if (shared) im[(n + 1) % 2].d.value = im[n % 2].d.value - (n > 0 ? 1 : 0);  // the older wrapper: a value behind
         if (n > 0) {
             aji_frame_diff_result r{};
             const auto t0 = std::chrono::steady_clock::now();
@@ -361,6 +369,16 @@ bool run_diff(Device &dev, aji_ctx *c, const char *input, int w, int h, int fram
                 return false;
             }
             if (!owner_kept(im[0], "aji_frame_diff") || !owner_kept(im[1], "aji_frame_diff")) return false;
+            uint64_t v = 0;
+            if (shared) {
+                vkWaitSemaphores(dev.device(), &wi, 10ull * 1000 * 1000 * 1000);  // wi: the timeline, at the value this frame now records
+                vkGetSemaphoreCounterValue(dev.device(), im[0].sem, &v);
+            }
+            if (shared && (im[0].d.value != im[1].d.value || v != im[0].d.value)) {
+                std::fprintf(stderr, "aji_frame_diff (one semaphore): at %llu, frames record %llu / %llu\n", (unsigned long long)v,
+                             (unsigned long long)im[0].d.value, (unsigned long long)im[1].d.value);
+                return false;
+            }
             std::printf("diff %d %d %.9g", n - 1, n, r.max_tile);
             for (float v : r.region_mean) std::printf(" %.9g", v);
             std::printf("\n");
@@ -370,7 +388,7 @@ bool run_diff(Device &dev, aji_ctx *c, const char *input, int w, int h, int fram
     std::printf("frame diff: %d pairs, %.3f ms a pair\n", n - 1, n > 1 ? ms / (n - 1) : 0.0);
     dev.destroy(st);
     for (Image &i : im) {
-        vkDestroySemaphore(dev.device(), i.sem, nullptr);
+        if (&i == &im[0] || !shared) vkDestroySemaphore(dev.device(), i.sem, nullptr);
         vkDestroyImage(dev.device(), i.img, nullptr);
         vkFreeMemory(dev.device(), i.mem, nullptr);
     }
@@ -383,7 +401,7 @@ int main(int argc, char **argv)
 {
     const char *conf = nullptr, *model_dir = nullptr, *input = nullptr, *output = nullptr, *rife_dir = nullptr;
     int w = 0, h = 0, frames = 1 << 30, slot = 1, reset_at = -1;
-    bool p010 = false, out_p010 = false, no_cm = false, rife = false, rife_same = false, diff = false, owned = false;
+    bool p010 = false, out_p010 = false, no_cm = false, rife = false, rife_same = false, diff = false, owned = false, shared_sem = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
         if (!std::strcmp(a, "--no-coopmat")) {
@@ -400,6 +418,10 @@ int main(int argc, char **argv)
         }
         if (!std::strcmp(a, "--diff")) {
             diff = true;
+            continue;
+        }
+        if (!std::strcmp(a, "--shared-sem")) {
+            diff = shared_sem = true;
             continue;
         }
         if (!std::strcmp(a, "--owned")) {
@@ -478,7 +500,7 @@ int main(int argc, char **argv)
     std::printf("%s", aji_current_log(c));
     if (rife) return run_rife(*dev, c, input, output, w, h, frames, p010, rife_same) ? 0 : 1;
     if (diff) {
-        const bool ok = run_diff(*dev, c, input, w, h, frames, p010);
+        const bool ok = run_diff(*dev, c, input, w, h, frames, p010, shared_sem);
         aji_destroy(&c);
         return ok ? 0 : 1;
     }
