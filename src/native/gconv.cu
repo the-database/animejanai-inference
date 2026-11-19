@@ -226,19 +226,24 @@ int gvariant_for(const GWeights &w, const GConvArgs &a)
         return n >= 0 && n < kGVariants ? n : -1;
     }();
     if (env >= 0) return env;
-    // The busiest SM runs ceil(ctas / SMs) CTAs, each ~(warps + 0.8) rows' worth of work (the 2 halo rows
-    // cost ~0.4 of a row each): the fewer of those, the sooner the conv ends. Fits whole models on an
-    // RTX 5090 (170 SMs) and 4090 (128): ESRGAN 2x at 512 tiles (256x256 maps, 512 CTAs on 8 warps)
-    // 138 vs 152 ms on 4 warps on the 5090 but 3.5% slower on 4 on the 4090; ESRGAN 4x at 512 and
-    // HAT / DAT / FDAT on 8. Two cases measured apart from that: 4 warps where they avoid the K split 8
-    // would need (ESRGAN 2x at 384: 225 vs 240 ms, FDAT-M 2x at 256: 241 vs 250), and on maps under half
-    // a CTA per SM, where both split (TFix DVD 2.02 -> 1.95 ms per frame); otherwise 8 when both split.
-    const long chunks = w.coutp ? w.cout_pad / w.coutp : 1, cols = (a.W + gdev::TW - 1) / gdev::TW;
-    const long c8 = cols * ((a.H + 7) / 8) * chunks, c4 = cols * ((a.H + 3) / 4) * chunks, sm = sm_count();
-    if (c4 < 2 * sm) return 2 * c8 < sm ? 1 : 0;  // both split (ksplit_for's threshold)
-    if (c8 < 2 * sm) return 1;                     // only 8 would split
-    const double t8 = (double)((c8 + sm - 1) / sm) * 8.8, t4 = (double)((c4 + sm - 1) / sm) * 4.8;
-    return t4 < t8 ? 1 : 0;
+    const GEntry *e = gfind(w, a, nullptr);
+    if (!e) return 1;
+    const GKey &k = e->key;
+    // One choice per kernel class, the one with the smallest worst-case loss over whole models (ESRGAN 2x / 4x
+    // at 256 and 512 tiles, FDAT-M, RIFE, TFix, TFDAT) on an RTX 5090 and 4090, each class moved alone. The
+    // best warp count per class differs between GPUs in ways their occupancy does not predict (ESRGAN's
+    // 32 -> 32 growth convs: 8 warps 11% slower overall on the 5090, 4 warps up to 8% on the 4090; its
+    // 64 -> 64 convs: 8 warps 12% slower on the 4090), so nothing here depends on the GPU.
+    // 192+ output channels (HAT / DAT / FDAT-XL, 3+ chunks of 64): 8 warps, HAT-L 0.9% faster on the 5090, the same on the 4090
+    if (w.coutp && w.cout_pad / w.coutp >= 3) return 0;
+    if (k.s == 1 && k.in == 0 && k.out == 0 && k.coutp == 32) {
+        if (k.kch == 64) return 0;  // 8 warps: best or tied on both
+        if (k.kch == 32) {          // 8 warps where they would split K (small maps), else 4
+            const long c8 = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + 7) / 8) * (w.coutp ? w.cout_pad / w.coutp : 1);
+            return c8 < 2L * sm_count() ? 0 : 1;
+        }
+    }
+    return 1;  // 4 warps: the rest within ~1% either way, 64 -> 64 well ahead of 8 on the 4090
 }
 
 size_t gworkspace(const GWeights &w, const GConvArgs &a)
