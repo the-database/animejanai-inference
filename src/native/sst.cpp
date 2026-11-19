@@ -19,6 +19,7 @@
 #include "native/imgnet.h"
 #include "native/netres.h"
 #include "native/sst_kernels.h"
+#include "native/static_eval.h"
 
 namespace ajinative {
 namespace {
@@ -303,7 +304,9 @@ std::unique_ptr<ImgNet> Sst::build(const OnnxGraph &g, int max_w, int max_h, cud
     if (!rd.conv("/upsampler/final_conv/Conv", &c, why)) return nullptr;
     const OnnxNode *rz = rd.node("/upsampler/Resize");
     if (c.cin != F || c.cout != 3 || !rz) return refuse(why, "SST final conv"), nullptr;
-    if (!nearest_replicates(*rz, 4)) return refuse(why, "SST input skip is not a nearest 4x replication"), nullptr;
+    if (!nearest_replicates(*rz, 4) || rz->in.empty() || rz->in[0] != g.inputs[0] ||
+        !static_eval::resize_by(rd, *rz, 4, 3, [&](const std::string &t) { return t == g.inputs[0]; }))
+        return refuse(why, "SST input skip is not a nearest 4x replication of the input"), nullptr;
     f->last.w = r.gup(conv_taps(c, nullptr), c.b, F, FP, 3, 16);
     if (r.failed) return refuse(why, "weight upload failed"), nullptr;
 

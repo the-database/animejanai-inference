@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "native/onnx_read.h"
+#include "native/static_eval.h"
 
 namespace ajinative {
 namespace onnxread {
@@ -232,13 +233,12 @@ private:
         *out = ua[0]->out[0];
         return true;
     }
+    // a nearest 2x of the nf-channel features at every input size (static_eval::resize_by)
     bool nearest2x(const OnnxNode *rz) const
     {
         if (!nearest_replicates(*rz, 2)) return false;
-        std::vector<float> sc;
-        if (rz->in.size() > 2 && !rz->in[2].empty() && rd.floats(rz->in[2], &sc) && sc.size() == 4)
-            return sc[0] == 1.f && sc[1] == 1.f && sc[2] == 2.f && sc[3] == 2.f;
-        return rz->in.size() > 3 && !rz->in[3].empty();  // by output sizes (computed): trust the 2x structure
+        const std::string src = through(rz->in[0]);
+        return static_eval::resize_by(rd, *rz, 2, e.nf, [&](const std::string &t) { return through(t) == src; });
     }
     bool crop_from_zero(const OnnxNode *n) const
     {
