@@ -441,7 +441,10 @@ Linux and Android). Plan, phases and measurements: animejan.ai-site
   `aji_vk_frames_test` plays the player (a device of its own, NV12 / P010 images, `--no-coopmat`
   reports a device without cooperative matrices): SPANF3 720x480 0.64 ms a frame on the 5090,
   within 1 level of the D3D12 path. `--rife --rife-model-dir` is aji_harness_dml `--rife`'s loop:
-  rife_v4.14 1080p 4.3 ms, 74.6 dB against the D3D12 path; same scene skips on cut clips. A
+  rife_v4.14 1080p 4.3 ms, 74.6 dB against the D3D12 path; same scene skips on cut clips
+  (`--rife-same` also interpolates each frame with itself, through one `aji_vk_image` and two of
+  one image, and checks the semaphore against the recorded values). Every mode checks the queue
+  family owner written back: none for the images as created, the device's with `--owned`. A
   temporal chain runs aji_harness_dml's ingest loop (`--reset-at K`): TFDAT 2x 720x480 within 2
   levels of the D3D12 path, TemporalFix 62.9 dB (5.4 ms a frame). `--diff` prints aji_frame_diff
   of consecutive frames (exact against frame_diff.h's arithmetic; 1.8 ms a pair at 720x480).

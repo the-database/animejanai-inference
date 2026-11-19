@@ -67,8 +67,18 @@ std::string spanf3(int c, int blocks, bool space_to_depth)
     return g.bytes("input", "output");
 }
 
-// SRVGG Compact 2x: conv+PReLU stack, depth-to-space 2, + nearest-upsampled input
-std::string compact(int c, int body, bool leaky)
+// The Compact skip's Resize: its factor, sampling attributes (nullptr: the ONNX default), scales,
+// the Cast types around it, and a Cast pair on the body's data path.
+struct Skip {
+    int r = 2;
+    const char *ct = "asymmetric", *nm = nullptr;
+    float scale = 0.f;  // 0: r
+    int64_t cast_to = 1;
+    int64_t body_cast = 0;  // a Cast to this type and back to fp16 after the first conv (0: none)
+};
+
+// SRVGG Compact: conv+PReLU stack, depth-to-space r, + nearest-upsampled input
+std::string compact(int c, int body, bool leaky, const Skip &sk = Skip())
 {
     G g;
     auto act = [&](const std::string &x) {
@@ -78,11 +88,18 @@ std::string compact(int c, int body, bool leaky)
         return g.op2("PRelu", x, s);
     };
     std::string x = act(g.conv("input", 3, c, 3));
+    if (sk.body_cast) {
+        const std::string t = g.op1("Cast", x, {attr_i("to", sk.body_cast)});
+        x = g.op1("Cast", t, {attr_i("to", 10)});
+    }
     for (int i = 0; i < body; i++) x = act(g.conv(x, c, c, 3));
-    const std::string d = g.op1("DepthToSpace", g.conv(x, c, 12, 3), {attr_i("blocksize", 2), attr_s("mode", "CRD")});
-    g.init(tensor("scales", {4}, 1, 2.f));
-    g.node("Cast", {"input"}, {"in32"}, {attr_i("to", 1)});
-    g.node("Resize", {"in32", "", "scales"}, {"up32"}, {attr_s("mode", "nearest"), attr_s("coordinate_transformation_mode", "asymmetric")});
+    const std::string d = g.op1("DepthToSpace", g.conv(x, c, 3 * sk.r * sk.r, 3), {attr_i("blocksize", sk.r), attr_s("mode", "CRD")});
+    const float s = sk.scale > 0.f ? sk.scale : (float)sk.r;
+    g.init(tensor_v("scales", {4}, {1.f, 1.f, s, s}));
+    g.node("Cast", {"input"}, {"in32"}, {attr_i("to", sk.cast_to)});
+    std::vector<Pb> ra = {attr_s("mode", "nearest"), attr_s("coordinate_transformation_mode", sk.ct)};
+    if (sk.nm) ra.push_back(attr_s("nearest_mode", sk.nm));
+    g.node("Resize", {"in32", "", "scales"}, {"up32"}, ra);
     g.node("Cast", {"up32"}, {"up"}, {attr_i("to", 10)});
     g.node("Add", {d, "up"}, {"output"});
     return g.bytes("input", "output");
@@ -154,6 +171,53 @@ int main()
         CHECK(p.steps[0].in == 1 && p.steps[0].act == 2 && !p.steps[0].w.slope.empty());
         CHECK(p.steps.back().out == 1 && p.steps.back().resid == kModelInput);
         if (leaky) CHECK(p.steps[5].w.slope[3] == 0.1f);
+    }
+    // the skip's Resize: only the forms that sample by pixel replication (out x reads in x / r)
+    {
+        struct Form {
+            int r;
+            const char *ct, *nm;
+            bool ok;
+        };
+        const Form forms[] = {
+            {2, "asymmetric", nullptr, true},  // the default nearest_mode, round_prefer_floor: replication at 2x
+            {2, "asymmetric", "floor", true},  // the torch exporters'
+            {4, "asymmetric", "floor", true},
+            {4, "asymmetric", nullptr, false},  // round_prefer_floor at 4x: x = 4i + 3 reads i + 1
+            {2, "asymmetric", "ceil", false},
+            {2, "asymmetric", "round_prefer_ceil", false},
+            {2, "half_pixel", nullptr, true},
+            {4, "half_pixel", "round_prefer_ceil", true},
+            {3, "pytorch_half_pixel", nullptr, true},
+            {2, "half_pixel", "floor", false},  // x = 2i reads i - 1
+            {2, "half_pixel", "ceil", false},
+            {2, "align_corners", nullptr, false},
+            {2, "tf_half_pixel_for_nn", nullptr, false},
+        };
+        for (const Form &f : forms) {
+            Skip sk;
+            sk.r = f.r;
+            sk.ct = f.ct;
+            sk.nm = f.nm;
+            const bool ok = lower_bytes(compact(16, 2, true, sk), &p, &why);
+            if (ok != f.ok) std::fprintf(stderr, "Resize %dx %s / %s: %s\n", f.r, f.ct, f.nm ? f.nm : "default", ok ? "lowered" : why.c_str());
+            CHECK(ok == f.ok);
+            if (ok) CHECK(p.depth_to_space == f.r && p.steps.back().resid == kModelInput);
+        }
+        Skip sk;
+        sk.scale = 2.5f;  // scales other than the depth-to-space factor
+        CHECK(!lower_bytes(compact(16, 2, true, sk), &p, &why) && why.find("scale") != std::string::npos);
+    }
+    // Casts on the data path: float types pass through, others change the values (refused)
+    for (int64_t to : {1, 10, 11, 16, 6, 7, 9, 2}) {
+        Skip sk;
+        sk.body_cast = to;
+        const bool fl = to == 1 || to == 10 || to == 11 || to == 16;
+        CHECK(lower_bytes(compact(16, 2, true, sk), &p, &why) == fl);
+        if (!fl) CHECK(why.find("Cast") != std::string::npos);
+        sk = Skip();
+        sk.cast_to = to;  // around the skip's Resize
+        CHECK(lower_bytes(compact(16, 2, true, sk), &p, &why) == fl);
     }
 
     CHECK(lower_bytes(span_s(48, 6), &p, &why));
