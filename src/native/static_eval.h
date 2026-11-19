@@ -45,6 +45,11 @@ public:
     // The dims of the data tensor a Shape reads (resize_by()'s probes); unset or false: a Shape
     // does not evaluate.
     std::function<bool(const std::string &, std::vector<int64_t> *)> shape_of;
+    // Casts as ONNX computes them (resize_by()): to float rounds to fp32, to int32 / int64 truncates
+    // (in range, finite), any other target type does not evaluate; constants are only initializers
+    // and Constant nodes (Reader::tensor folds a Cast of one as the identity). Off: a Cast is the
+    // identity (the constant subgraphs' precision changes).
+    bool exact_casts = false;
     bool eval(const std::string &name, HT *out, int depth = 0)
     {
         auto it = memo.find(name);
@@ -53,7 +58,7 @@ public:
             return true;
         }
         HT t;
-        if (const OnnxTensor *c = rd.tensor(name)) {
+        if (const OnnxTensor *c = exact_casts && !literal(name) ? nullptr : rd.tensor(name)) {
             t.dims = c->dims;
             std::vector<float> f;
             std::vector<int64_t> i;
@@ -81,6 +86,34 @@ public:
 private:
     const Reader &rd;
     std::map<std::string, HT> memo;
+
+public:
+    // an initializer or a Constant node's output, as stored
+    bool literal(const std::string &name) const
+    {
+        if (rd.g.inits.count(name)) return true;
+        auto p = rd.prod.find(name);
+        return p != rd.prod.end() && p->second->op == "Constant";
+    }
+
+private:
+    bool cast(const OnnxNode &n, HT *o) const
+    {
+        if (!exact_casts) return true;
+        const int64_t to = n.attr_i("to", 0);
+        for (double &x : o->v) {
+            if (to == ONNX_FLOAT) x = (double)(float)x;
+            else if (to == ONNX_DOUBLE) continue;
+            else if (to == ONNX_INT64 || to == ONNX_INT32) {
+                const double lim = to == ONNX_INT32 ? 2147483647.0 : 9.0e15;
+                if (!(std::fabs(x) <= lim)) return false;
+                x = std::trunc(x);
+            } else {
+                return false;  // bool, narrower integers, fp16 / bf16: not shape arithmetic resize_by() evaluates
+            }
+        }
+        return true;
+    }
 
     // Shape (opset 15's start / end clamp to the rank)
     bool shape(const OnnxNode &n, HT *o) const
@@ -131,6 +164,7 @@ private:
         } else if (n.op == "Cast" || n.op == "Identity") {
             if (!need(1)) return false;
             *o = in[0];
+            if (n.op == "Cast" && !cast(n, o)) return false;
         } else if (n.op == "Floor" || n.op == "Ceil") {
             if (!need(1)) return false;
             *o = in[0];
@@ -446,7 +480,8 @@ private:
 // Whether the Resize rz scales its data input by r on H and W and keeps N and C, for every input
 // size: constant scales of [1, 1, r, r] (opset 10: input 1, else input 2; opset 18's axes [2, 3]:
 // [r, r]), or output sizes (input 3) that are shape arithmetic on Shape(src) alone and come to
-// [n, c, r h, r w] at every probe size. Constant sizes, sizes from any other tensor's shape and
+// [n, c, r h, r w] at every probe size, Casts evaluated as ONNX computes them (a Cast to bool or
+// to a narrower type is refused). Constant sizes, sizes from any other tensor's shape and
 // computed scales are refused: nothing ties those to the input the model runs at. is_src: whether a
 // Shape reads the Resize's data input (through the caller's pass-through aliases); c its channels.
 inline bool resize_by(const Reader &rd, const OnnxNode &rz, int r, int64_t c, const std::function<bool(const std::string &)> &is_src)
@@ -456,41 +491,50 @@ inline bool resize_by(const Reader &rd, const OnnxNode &rz, int r, int64_t c, co
     if (const OnnxAttr *a = rz.attr("axes")) axes = a->ints;
     for (int64_t &a : axes) a = a < 0 ? a + 4 : a;
     if (!axes.empty() && axes != std::vector<int64_t>{2, 3}) return false;
+    // only shape arithmetic the evaluator computes as ONNX does (exact_casts), whose leaves are
+    // initializers, Constant nodes or (sizes) Shape(src): whether a Shape(src) was reached
+    auto arithmetic = [&](const std::string &root, bool shapes, bool *from_src) {
+        static const char *const kOps[] = {"Gather", "Slice", "Concat", "Unsqueeze", "Squeeze", "Cast", "Identity", "Mul", "Floor", "Ceil"};
+        StaticEval lit(rd);
+        std::vector<std::string> todo{root};
+        std::map<std::string, bool> seen;
+        *from_src = false;
+        while (!todo.empty()) {
+            const std::string t = todo.back();
+            todo.pop_back();
+            if (t.empty() || seen[t] || lit.literal(t)) continue;
+            seen[t] = true;
+            if (seen.size() > 64) return false;
+            auto p = rd.prod.find(t);
+            if (p == rd.prod.end()) return false;  // a graph input
+            const OnnxNode &n = *p->second;
+            if (n.op == "Shape") {
+                if (!shapes || n.in.empty() || !is_src(n.in[0])) return false;
+                *from_src = true;
+                continue;
+            }
+            if (std::none_of(std::begin(kOps), std::end(kOps), [&](const char *o) { return n.op == o; })) return false;
+            for (const std::string &i : n.in) todo.push_back(i);
+        }
+        return true;
+    };
+    bool from_src = false;
     const std::string sizes = rz.in.size() > 3 ? rz.in[3] : std::string();
     if (sizes.empty()) {
         const std::string sn = rz.in.size() == 2 ? rz.in[1] : rz.in.size() > 2 ? rz.in[2] : std::string();
-        StaticEval se(rd);  // constants, folded if the exporter left them unfolded; no Shape
+        if (sn.empty() || !arithmetic(sn, false, &from_src)) return false;
+        StaticEval se(rd);  // constants, folded if the exporter left them unfolded
+        se.exact_casts = true;
         HT s;
-        if (sn.empty() || !se.eval(sn, &s)) return false;
+        if (!se.eval(sn, &s)) return false;
         const std::vector<double> want = axes.empty() ? std::vector<double>{1.0, 1.0, (double)r, (double)r} : std::vector<double>{(double)r, (double)r};
         return s.v == want;
     }
-    // sizes: only shape arithmetic, whose leaves are constants or Shape(src)
-    static const char *const kOps[] = {"Gather", "Slice", "Concat", "Unsqueeze", "Squeeze", "Cast", "Identity", "Mul", "Floor", "Ceil"};
-    std::vector<std::string> todo{sizes};
-    std::map<std::string, bool> seen;
-    bool from_src = false;
-    while (!todo.empty()) {
-        const std::string t = todo.back();
-        todo.pop_back();
-        if (t.empty() || seen[t] || rd.tensor(t)) continue;
-        seen[t] = true;
-        if (seen.size() > 64) return false;
-        auto p = rd.prod.find(t);
-        if (p == rd.prod.end()) return false;  // a graph input
-        const OnnxNode &n = *p->second;
-        if (n.op == "Shape") {
-            if (n.in.empty() || !is_src(n.in[0])) return false;
-            from_src = true;
-            continue;
-        }
-        if (std::none_of(std::begin(kOps), std::end(kOps), [&](const char *o) { return n.op == o; })) return false;
-        for (const std::string &i : n.in) todo.push_back(i);
-    }
-    if (!from_src) return false;
+    if (!arithmetic(sizes, true, &from_src) || !from_src) return false;
     static const int64_t kProbe[][2] = {{1, 1}, {7, 13}, {36, 64}, {135, 241}, {1080, 1920}, {2161, 3839}};
     for (const auto &hw : kProbe) {
         StaticEval se(rd);
+        se.exact_casts = true;
         se.shape_of = [&](const std::string &t, std::vector<int64_t> *d) {
             if (!is_src(t)) return false;
             *d = {1, c, hw[0], hw[1]};

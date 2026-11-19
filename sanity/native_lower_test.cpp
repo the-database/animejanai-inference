@@ -75,7 +75,7 @@ struct Skip {
     float scale = 0.f;  // 0: r
     int64_t cast_to = 1;
     int64_t body_cast = 0;  // a Cast to this type and back to fp16 after the first conv (0: none)
-    enum Sizes { SCALES, SHAPE, SHAPE_ALL, CONST_BROADCAST, CONST_SIZES, SCALES_COMPUTED, SCALES_FOLDED, AXES } sizes = SCALES;
+    enum Sizes { SCALES, SHAPE, SHAPE_ALL, CONST_BROADCAST, CONST_SIZES, SCALES_COMPUTED, SCALES_FOLDED, AXES, SIZES_BOOL, SIZES_FP16, SCALES_BOOL } sizes = SCALES;
 };
 
 // SRVGG Compact: conv+PReLU stack, depth-to-space r, + nearest-upsampled input
@@ -138,6 +138,21 @@ std::string compact(int c, int body, bool leaky, const Skip &sk = Skip())
     case Skip::AXES:  // opset 18: scales for H and W alone
         g.init(tensor_v("scales", {2}, {s, s}));
         ra.push_back(attr_ints("axes", {2, 3}));
+        break;
+    case Skip::SIZES_BOOL:     // Cast<INT64>(Cast<BOOL>(Shape * [1, 1, r, r])): [1, 1, 1, 1] (the review's)
+    case Skip::SIZES_FP16: {   // the same through fp16: not shape arithmetic the check evaluates
+        g.node("Shape", {"input"}, {"shp"});
+        g.init(tensor_i("factors", {4}, {1, 1, (int64_t)s, (int64_t)s}));
+        const std::string m = g.op2("Mul", "shp", "factors");
+        const std::string t = g.op1("Cast", m, {attr_i("to", sk.sizes == Skip::SIZES_BOOL ? 9 : 10)});
+        g.node("Cast", {t}, {"sizes"}, {attr_i("to", 7)});
+        rin = {"in32", "", "", "sizes"};
+        break;
+    }
+    case Skip::SCALES_BOOL:  // Cast<FLOAT>(Cast<BOOL>([1, 1, r, r])) of constants: [1, 1, 1, 1]
+        g.init(tensor_v("sc0", {4}, {1.f, 1.f, s, s}));
+        g.node("Cast", {"sc0"}, {"scb"}, {attr_i("to", 9)});
+        g.node("Cast", {"scb"}, {"scales"}, {attr_i("to", 1)});
         break;
     }
     g.node("Resize", rin, {"up32"}, ra);
@@ -257,6 +272,7 @@ int main()
         const Sz szs[] = {
             {Skip::SHAPE, 2, true}, {Skip::SHAPE, 4, true}, {Skip::SHAPE_ALL, 2, false}, {Skip::CONST_BROADCAST, 2, false},
             {Skip::CONST_SIZES, 2, false}, {Skip::SCALES_COMPUTED, 2, false}, {Skip::SCALES_FOLDED, 2, true}, {Skip::AXES, 2, true},
+            {Skip::SIZES_BOOL, 2, false}, {Skip::SIZES_FP16, 2, false}, {Skip::SCALES_BOOL, 2, false},
         };
         for (const Sz &z : szs) {
             sk = Skip();
