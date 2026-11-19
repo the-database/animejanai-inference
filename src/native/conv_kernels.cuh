@@ -53,6 +53,16 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void *p)
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
+__device__ __forceinline__ void ldsm_x2(uint32_t (&r)[2], const void *p)
+{
+    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+}
+__device__ __forceinline__ void mma1688(uint32_t (&d)[2], const uint32_t (&a)[2], uint32_t b0)
+{
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3}, {%4}, {%0,%1};"
+                 : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(b0));
+}
 __device__ __forceinline__ void mma16816(uint32_t (&d)[2], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
 {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
@@ -74,13 +84,17 @@ __device__ __forceinline__ half2 tanh_h2(half2 x)
 #define AJI_NATIVE_ARCH_OK 0
 #endif
 
+// The shared-memory pixel stride for c channels (halfs): an odd number of 16-byte units, which
+// makes ldmatrix's eight row reads hit distinct banks (c + 8 for multiples of 16, c itself for 24).
+__host__ __device__ constexpr int smem_stride(int c) { return (c / 8) % 2 ? c : c + 8; }
+
 // Shared memory of a k_conv3x3 instance: max(halo tile, output staging tile).
 template <int CINP, int COUTP, int WARPS, int WR>
 __host__ __device__ constexpr int conv_smem_bytes()
 {
-    return (WARPS * WR + 2) * (TW + 2) * (CINP + 8) * 2 > WARPS * WR * TW * (COUTP + 8) * 2
-               ? (WARPS * WR + 2) * (TW + 2) * (CINP + 8) * 2
-               : WARPS * WR * TW * (COUTP + 8) * 2;
+    return (WARPS * WR + 2) * (TW + 2) * smem_stride(CINP) * 2 > WARPS * WR * TW * smem_stride(COUTP) * 2
+               ? (WARPS * WR + 2) * (TW + 2) * smem_stride(CINP) * 2
+               : WARPS * WR * TW * smem_stride(COUTP) * 2;
 }
 
 // IN/ACT/GATE/OUT take the integer values of Input/Act/Gate/Output.
@@ -88,9 +102,12 @@ template <int CINP, int COUTP, int WARPS, int WR, int IN, int ACT, int GATE, int
 __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
 {
 #if AJI_NATIVE_ARCH_OK
-    constexpr int TH = WARPS * WR, CP = CINP + 8, SP = COUTP + 8, KC = CINP / 16, NT = COUTP / 8, NJ = NT / 2;
+    constexpr int TH = WARPS * WR, CP = smem_stride(CINP), SP = smem_stride(COUTP), KC = CINP / 16, NT = COUTP / 8, NJ = NT / 2;
+    // 24-channel shapes: an 8-row K tail (m16n8k8) after the 16-row chunks, an odd last n8 tile
+    constexpr int K8 = (CINP % 16) / 8, NO = NT % 2, WK = NJ * 4 + NO * 2, WT = KC * WK + K8 * (NJ * 2 + NO);
     constexpr int HP = (TH + 2) * (TW + 2);
-    static_assert(CINP % 16 == 0 && COUTP % 16 == 0, "channel counts are multiples of 16");
+    static_assert(CINP % 8 == 0 && COUTP % 8 == 0 && NJ > 0, "channel counts are multiples of 8, at least 16");
+    static_assert(GATE != 2 || COUTP % 16 == 0, "the tanh gate's 1x1 conv takes 16-channel K chunks");
     static_assert(IN == 0 || CINP == 16, "NCHW inputs are padded to 16 channels");
     extern __shared__ __align__(16) unsigned char smraw[];
     half *sm = reinterpret_cast<half *>(smraw);
@@ -150,14 +167,23 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
 #pragma unroll
         for (int n = 0; n < NT; n++) acc[i][n][0] = acc[i][n][1] = 0u;
     const int row0 = warp * WR;
+    const uint32_t *wv = reinterpret_cast<const uint32_t *>(p.w);  // pack_fragments8's layout
 #pragma unroll 1
     for (int t = 0; t < 9; t++) {
         const int dy = t / 3, dx = t % 3;
 #pragma unroll
         for (int kc = 0; kc < KC; kc++) {
             uint4 b[NJ];
+            [[maybe_unused]] uint2 bo;
+            if constexpr (K8 || NO) {
+                const uint32_t *seg = wv + (t * WT + kc * WK) * 32;
 #pragma unroll
-            for (int j = 0; j < NJ; j++) b[j] = __ldg(p.w + ((t * KC + kc) * NJ + j) * 32 + lane);
+                for (int j = 0; j < NJ; j++) b[j] = __ldg(reinterpret_cast<const uint4 *>(seg) + j * 32 + lane);
+                if constexpr (NO) bo = __ldg(reinterpret_cast<const uint2 *>(seg + NJ * 4 * 32) + lane);
+            } else {  // multiples of 16: pack_fragments' layout, addressed as it always was
+#pragma unroll
+                for (int j = 0; j < NJ; j++) b[j] = __ldg(p.w + ((t * KC + kc) * NJ + j) * 32 + lane);
+            }
 #pragma unroll
             for (int i = 0; i < WR; i++) {
                 uint32_t a[4];
@@ -167,6 +193,26 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
                     mma16816(acc[i][2 * j], a, b[j].x, b[j].y);
                     mma16816(acc[i][2 * j + 1], a, b[j].z, b[j].w);
                 }
+                if constexpr (NO) mma16816(acc[i][NT - 1], a, bo.x, bo.y);
+            }
+        }
+        if constexpr (K8) {
+            const uint32_t *seg = wv + (t * WT + KC * WK) * 32;
+            uint2 b[NJ];
+#pragma unroll
+            for (int j = 0; j < NJ; j++) b[j] = __ldg(reinterpret_cast<const uint2 *>(seg) + j * 32 + lane);
+            [[maybe_unused]] uint32_t bo;
+            if constexpr (NO) bo = __ldg(seg + NJ * 2 * 32 + lane);
+#pragma unroll
+            for (int i = 0; i < WR; i++) {
+                uint32_t a[2];  // m16k8: rows 0-7 and 8-15 of the K tail
+                ldsm_x2(a, sm + ((row0 + i + dy) * (TW + 2) + (lane & 15) + dx) * CP + KC * 16);
+#pragma unroll
+                for (int j = 0; j < NJ; j++) {
+                    mma1688(acc[i][2 * j], a, b[j].x);
+                    mma1688(acc[i][2 * j + 1], a, b[j].y);
+                }
+                if constexpr (NO) mma1688(acc[i][NT - 1], a, bo);
             }
         }
     }

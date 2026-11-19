@@ -50,8 +50,13 @@ struct Entry {
     AJI_CONV(16, C, 2, 0, 0, 0), AJI_CONV(16, C, 2, 1, 0, 0), AJI_CONV(16, C, 2, 2, 0, 0)
 #define AJI_TAIL(C) AJI_CONV(C, 16, 0, 0, 0, 1), AJI_CONV(C, 48, 0, 0, 0, 2), AJI_CONV(C, 16, 0, 0, 0, 3), AJI_CONV(C, 32, 0, 0, 0, 4)
 
+// 24 channels (SuperUltraCompact): every body form but the tanh gate, whose 1x1 conv takes 16-channel K chunks
+#define AJI_BODY24                                                                            \
+    AJI_CONV(24, 24, 0, 0, 0, 0), AJI_CONV(24, 24, 0, 1, 0, 0), AJI_CONV(24, 24, 0, 2, 0, 0), \
+    AJI_CONV(24, 24, 0, 3, 0, 0), AJI_CONV(24, 24, 0, 0, 1, 0), AJI_CONV(24, 24, 0, 0, 3, 0)
+
 const Entry kConv[] = {AJI_BODY(32), AJI_BODY(48), AJI_BODY(64), AJI_HEAD(32), AJI_HEAD(48), AJI_HEAD(64),
-                       AJI_TAIL(32), AJI_TAIL(48), AJI_TAIL(64)};
+                       AJI_TAIL(32), AJI_TAIL(48), AJI_TAIL(64), AJI_BODY24, AJI_HEAD(24), AJI_TAIL(24)};
 
 template <int C, int NSRC, int WARPS>
 cudaError_t run_concat(const dev::ConcatParams &p, cudaStream_t s)
@@ -89,7 +94,7 @@ bool key_of(const Conv3x3 &op, Key &k, std::string *why)
     k.out = (int)op.out;
     switch (op.in) {
     case Input::NHWC:
-        if (op.cin % 16) return fail(why, "NHWC input channels must be a multiple of 16");
+        if (op.cin % 8) return fail(why, "NHWC input channels must be a multiple of 8");
         k.cinp = op.cin;
         break;
     case Input::NCHW3:
@@ -103,7 +108,7 @@ bool key_of(const Conv3x3 &op, Key &k, std::string *why)
     }
     switch (op.out) {
     case Output::NHWC:
-        if (op.cout % 16) return fail(why, "NHWC output channels must be a multiple of 16");
+        if (op.cout % 8) return fail(why, "NHWC output channels must be a multiple of 8");
         k.coutp = op.cout;
         break;
     case Output::DepthToSpace2:
@@ -177,8 +182,9 @@ cudaError_t upload(Weights &out, const uint16_t *w, const float *bias, const flo
                    int cin_pad, int cout, int cout_pad)
 {
     release(out);
-    if (cin_pad % 16 || cout_pad % 16 || cin > cin_pad || cout > cout_pad) return cudaErrorInvalidValue;
-    const std::vector<uint32_t> f = pack_fragments(w, taps, cin, cin_pad, cout, cout_pad);
+    if (cin_pad % 8 || cout_pad % 8 || cout_pad < 16 || cin > cin_pad || cout > cout_pad) return cudaErrorInvalidValue;
+    const std::vector<uint32_t> f = cin_pad % 16 || cout_pad % 16 ? pack_fragments8(w, taps, cin, cin_pad, cout, cout_pad)
+                                                                  : pack_fragments(w, taps, cin, cin_pad, cout, cout_pad);
     cudaError_t e = cudaMalloc(&out.frag, f.size() * 4);
     if (e == cudaSuccess) e = cudaMemcpy(out.frag, f.data(), f.size() * 4, cudaMemcpyHostToDevice);
     if (e == cudaSuccess) e = upload_half2(&out.bias, bias, cout, cout_pad);

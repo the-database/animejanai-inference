@@ -233,6 +233,34 @@ int main()
     CHECK(!p.steps[1].in_norm);
     const std::string span_desc = describe(p);
 
+    // SuperUltraCompact's 24 channels: widened to the 32-channel kernels with zero weights
+    {
+        CHECK(lower_bytes(compact(24, 8, false), &p, &why));
+        CHECK(p.model_channels.size() == p.channels.size());
+        for (size_t i = 0; i < p.channels.size(); i++) CHECK(p.model_channels[i] == 24 && p.channels[i] == 32);
+        const PlanStep &h = p.steps[0], &b = p.steps[1], &t = p.steps.back();
+        CHECK(h.cin == 3 && h.cout == 32 && h.w.cout == 32 && h.w.bias.size() == 32 && h.w.slope.size() == 32);
+        CHECK(b.cin == 32 && b.cout == 32 && b.w.w.size() == (size_t)9 * 32 * 32);
+        CHECK(t.cin == 32 && t.cout == 12 && t.dst == kModelOutput);
+        bool zero = true;  // the added inputs and outputs carry zero weights, bias and slope
+        for (int tap = 0; tap < 9; tap++)
+            for (int c = 0; c < 32; c++)
+                for (int o = 0; o < 32; o++)
+                    if ((c >= 24 || o >= 24) && b.w.w[((size_t)tap * 32 + c) * 32 + o] != 0) zero = false;
+        for (int o = 24; o < 32; o++) zero = zero && b.w.bias[o] == 0.f && b.w.slope[o] == 0.f;
+        for (int tap = 0; tap < 9; tap++)
+            for (int c = 24; c < 32; c++)
+                for (int o = 0; o < 12; o++) zero = zero && t.w.w[((size_t)tap * 32 + c) * 12 + o] == 0;
+        CHECK(zero);
+        CHECK(describe(p).find("24 ch padded to 32") != std::string::npos);
+        CHECK(lower_bytes(compact(64, 2, false), &p, &why) && p.model_channels.empty());  // a kernel width: as it is
+        // CUDA has 24-channel kernels: kept as it is
+        OnnxGraph g;
+        const std::string m = compact(24, 8, false);
+        CHECK(parse_onnx(m.data(), m.size(), &g, &why) && lower(g, &p, &why, kernel_widths_cuda()));
+        CHECK(p.model_channels.empty() && p.channels[0] == 24 && p.steps[1].cin == 24 && p.steps[1].w.w.size() == (size_t)9 * 24 * 24);
+    }
+
     // refusals, with a reason
     {
         G g;

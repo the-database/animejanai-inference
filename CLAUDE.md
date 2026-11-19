@@ -253,8 +253,14 @@ PReLU, SiLU; LeakyReLU = PReLU with a constant slope), SPAN gates with the resid
 conv fed straight from the accumulators, sigmoid−0.5, plain residual), NCHW / pixel-unshuffled
 model input, and depth-to-space output with SRVGG's upsampled-input add. `k_concat1x1` is
 `conv_cat` without the concat buffer. `native/conv.h` is the API; `conv.cu`'s `kConv` table is the
-set of instantiated shapes (32/48/64 channels), each with two tile variants that `pick_variant`
-times on the running GPU. Needs sm_80+ (the kernels trap below it; `device_supported` says so).
+set of instantiated shapes (32/48/64 channels, and 24 for SuperUltraCompact: an `m16n8k8` K tail
+and an odd n8 tile, weights in `pack_fragments8`'s layout, no tanh gate or concat), each with tile
+variants that `pick_variant` times on the running GPU. `lower` widens a feature map narrower than
+the backend's widths (`kernel_widths_cuda` / `kernel_widths_vulkan`) to the next one with zero
+weights (`widen`, logged as `24 ch padded to 32 ch`); the added channels stay zero, so the output
+is the model's. SuperUltraCompact, RTX 5090, device chain time: 24 channels 1.50 ms a 1080p frame
+(0.53 at 720p), padded to 32 2.00 (0.80), TensorRT 5.94 (3.67). Vulkan pads (its shaders work in
+16-channel groups). Needs sm_80+ (the kernels trap below it; `device_supported` says so).
 
 `aji_native_conv_test` (gpu) checks every table entry and variant at a ragged and an aligned size
 against a CPU reference, with guard bands. `aji_native_bench` (built on request) assembles whole

@@ -704,13 +704,86 @@ struct Lowerer {
     }
 };
 
+// The narrowest of the backend's kernel widths that holds c channels (c itself above them all)
+int kernel_width(int c, const std::vector<int> &widths)
+{
+    for (int w : widths)
+        if (c <= w) return w;
+    return c;
+}
+
+// w over cin2 inputs (old input c at cin_to[c]) and cout2 outputs, the added ones zero
+void remap(PlanWeights &w, const std::vector<int> &cin_to, int cin2, int cout2)
+{
+    std::vector<uint16_t> nw((size_t)w.taps * cin2 * cout2, 0);
+    for (int t = 0; t < w.taps; t++)
+        for (int c = 0; c < w.cin; c++)
+            for (int o = 0; o < w.cout; o++)
+                nw[((size_t)t * cin2 + cin_to[c]) * cout2 + o] = w.w[((size_t)t * w.cin + c) * w.cout + o];
+    w.w.swap(nw);
+    w.bias.resize(cout2, 0.f);
+    if (!w.slope.empty()) w.slope.resize(cout2, 0.f);
+    w.cin = cin2;
+    w.cout = cout2;
+}
+
+std::vector<int> iota_map(int n, int groups = 1, int stride = 0)
+{
+    std::vector<int> m((size_t)n * groups);
+    for (int k = 0; k < groups; k++)
+        for (int j = 0; j < n; j++) m[(size_t)k * n + j] = k * stride + j;
+    return m;
+}
+
+// Feature maps narrower than a kernel width (SuperUltraCompact's 24 channels) widened with zero
+// weights: the added channels are 0 after every conv (zero weights and bias), activation (each
+// maps 0 to 0) and SPAN gate (x + o = 0; tanh(0) and sigmoid(0) - 0.5 are 0), and the zero rows of
+// the next conv's weights add nothing from them. The model's own widths stay in model_channels.
+void widen(Plan &p, std::vector<int> widths)
+{
+    // the widths that are not multiples of 16 (CUDA's 24) have no concat or tanh-gate kernels
+    bool k16 = false;
+    for (const PlanStep &s : p.steps) k16 = k16 || s.kind == PlanStep::CONCAT || s.gate == (int)Gate::Tanh1x1;
+    if (k16)
+        widths.erase(std::remove_if(widths.begin(), widths.end(), [](int w) { return w % 16 != 0; }), widths.end());
+    std::sort(widths.begin(), widths.end());
+    std::vector<int> wide(p.channels.size());
+    bool any = false;
+    for (size_t i = 0; i < p.channels.size(); i++) {
+        wide[i] = kernel_width(p.channels[i], widths);
+        any = any || wide[i] != p.channels[i];
+    }
+    if (!any) return;
+    for (PlanStep &s : p.steps) {
+        if (s.kind == PlanStep::CONCAT) {
+            const int c2 = wide[s.srcs[0]];
+            remap(s.w, iota_map(s.c, s.nsrc, c2), s.nsrc * c2, c2);
+            s.c = c2;
+            s.cin = s.w.cin;
+            s.cout = s.w.cout;
+            continue;
+        }
+        const int cin2 = s.src >= 0 ? wide[s.src] : s.cin, cout2 = s.dst >= 0 ? wide[s.dst] : s.cout;
+        if (cin2 == s.cin && cout2 == s.cout) continue;
+        remap(s.w, iota_map(s.cin), cin2, cout2);
+        if (s.gate == (int)Gate::Tanh1x1) remap(s.att, iota_map(s.att.cin), cout2, cout2);
+        s.cin = cin2;
+        s.cout = cout2;
+    }
+    p.model_channels = p.channels;
+    p.channels = wide;
+}
+
 }  // namespace
 
-bool lower(const OnnxGraph &g, Plan *plan, std::string *why)
+bool lower(const OnnxGraph &g, Plan *plan, std::string *why, const std::vector<int> &widths)
 {
     *plan = Plan{};
     Lowerer l(g, *plan);
-    if (l.run()) return true;
+    if (l.run()) {
+        widen(*plan, widths);
+        return true;
+    }
     if (why) *why = l.why;
     *plan = Plan{};
     return false;
@@ -718,9 +791,14 @@ bool lower(const OnnxGraph &g, Plan *plan, std::string *why)
 
 std::string describe(const Plan &p)
 {
-    std::set<int> cs(p.channels.begin(), p.channels.end());
-    std::string ch;
-    for (int c : cs) ch += (ch.empty() ? "" : "/") + std::to_string(c);
+    auto list = [](const std::vector<int> &v) {
+        std::set<int> cs(v.begin(), v.end());
+        std::string s;
+        for (int c : cs) s += (s.empty() ? "" : "/") + std::to_string(c);
+        return s;
+    };
+    std::string ch = list(p.model_channels.empty() ? p.channels : p.model_channels);
+    if (!p.model_channels.empty()) ch += " ch padded to " + list(p.channels);
     char buf[200];
     std::snprintf(buf, sizeof(buf), "%zu kernels, %s ch%s%s, depth-to-space %d%s", p.steps.size(), ch.c_str(),
                   p.in_norm ? ", input normalized" : "", p.unshuffle > 1 ? ", pixel-unshuffle 2" : "", p.depth_to_space,

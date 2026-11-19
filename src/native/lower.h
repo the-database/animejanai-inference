@@ -66,6 +66,7 @@ struct PlanStep {
 struct Plan {
     std::vector<PlanStep> steps;
     std::vector<int> channels;   // per feature id
+    std::vector<int> model_channels;  // the model's own, when narrower ones were widened to a kernel width (else empty)
     int unshuffle = 1;           // the input is pixel-unshuffled by this before the first conv
     int depth_to_space = 1;      // the output is depth-to-space'd by this after the last conv
     bool aligned_only = false;   // the graph pads/crops to the unshuffle factor: sizes must be multiples
@@ -75,7 +76,20 @@ struct Plan {
     // output = input * depth_to_space / unshuffle
 };
 
-bool lower(const OnnxGraph &g, Plan *plan, std::string *why);
+// The feature widths the backends' conv kernels are built for (native/conv.cu's kConv and kConcat;
+// the Vulkan shaders): a narrower feature map is widened to the next one with zero weights.
+inline const std::vector<int> &kernel_widths_vulkan()
+{
+    static const std::vector<int> w = {32, 48, 64};
+    return w;
+}
+inline const std::vector<int> &kernel_widths_cuda()
+{
+    static const std::vector<int> w = {24, 32, 48, 64};
+    return w;
+}
+
+bool lower(const OnnxGraph &g, Plan *plan, std::string *why, const std::vector<int> &widths = kernel_widths_vulkan());
 
 // One line for the log, e.g. "18 kernels, 48 ch, pixel-unshuffle 2, depth-to-space 4".
 std::string describe(const Plan &plan);

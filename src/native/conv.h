@@ -37,7 +37,7 @@ namespace ajinative {
 
 // Fragment-packed weights in device memory (owned; release() frees).
 struct Weights {
-    void *frag = nullptr;   // uint4[taps][cin_pad/16][cout_pad/16][32]
+    void *frag = nullptr;   // uint4[taps][cin_pad/16][cout_pad/16][32] (pack.h; 24-channel shapes: pack_fragments8)
     void *bias = nullptr;   // half2[cout_pad/2]
     void *slope = nullptr;  // half2[cout_pad/2], PReLU only
     int taps = 0, cin = 0, cin_pad = 0, cout = 0, cout_pad = 0;

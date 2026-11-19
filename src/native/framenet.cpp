@@ -115,7 +115,7 @@ public:
 std::unique_ptr<ImgNet> build_lowered(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
 {
     Plan plan;
-    if (!lower(g, &plan, why)) return nullptr;
+    if (!lower(g, &plan, why, kernel_widths_cuda())) return nullptr;
     if (plan.unshuffle < 1 || plan.depth_to_space % plan.unshuffle) {
         if (why) *why = "output scale is not a whole number";
         return nullptr;

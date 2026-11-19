@@ -885,7 +885,7 @@ std::unique_ptr<ajinative::FrameNet> try_native(aji_ctx *c, const std::string &n
             np.why = "cannot read the model";
         else
             np.ok = ajinative::guarded(&np.why, [&] {
-                return ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &np.why) && ajinative::lower(g, &np.plan, &np.why);
+                return ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &np.why) && ajinative::lower(g, &np.plan, &np.why, ajinative::kernel_widths_cuda());
             });
         it = c->native_plans.emplace(path, std::move(np)).first;
     }
