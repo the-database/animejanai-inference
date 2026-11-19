@@ -75,6 +75,7 @@ struct Skip {
     float scale = 0.f;  // 0: r
     int64_t cast_to = 1;
     int64_t body_cast = 0;  // a Cast to this type and back to fp16 after the first conv (0: none)
+    enum Sizes { SCALES, SHAPE, SHAPE_ALL, CONST_BROADCAST, CONST_SIZES, SCALES_COMPUTED, SCALES_FOLDED, AXES } sizes = SCALES;
 };
 
 // SRVGG Compact: conv+PReLU stack, depth-to-space r, + nearest-upsampled input
@@ -95,11 +96,51 @@ std::string compact(int c, int body, bool leaky, const Skip &sk = Skip())
     for (int i = 0; i < body; i++) x = act(g.conv(x, c, c, 3));
     const std::string d = g.op1("DepthToSpace", g.conv(x, c, 3 * sk.r * sk.r, 3), {attr_i("blocksize", sk.r), attr_s("mode", "CRD")});
     const float s = sk.scale > 0.f ? sk.scale : (float)sk.r;
-    g.init(tensor_v("scales", {4}, {1.f, 1.f, s, s}));
     g.node("Cast", {"input"}, {"in32"}, {attr_i("to", sk.cast_to)});
     std::vector<Pb> ra = {attr_s("mode", "nearest"), attr_s("coordinate_transformation_mode", sk.ct)};
     if (sk.nm) ra.push_back(attr_s("nearest_mode", sk.nm));
-    g.node("Resize", {"in32", "", "scales"}, {"up32"}, ra);
+    std::vector<std::string> rin = {"in32", "", "scales"};
+    switch (sk.sizes) {
+    case Skip::SCALES:
+        g.init(tensor_v("scales", {4}, {1.f, 1.f, s, s}));
+        break;
+    case Skip::SHAPE:
+    case Skip::SHAPE_ALL: {
+        // the legacy exporters' sizes: Concat(Shape[:2], Cast(Floor(Cast(Shape[2:]) * s)))
+        g.node("Shape", {"input"}, {"shp"});
+        g.init(tensor_i("i0", {1}, {0}));
+        g.init(tensor_i("i2", {1}, {2}));
+        g.init(tensor_i("i4", {1}, {4}));
+        g.init(tensor_v("sf", {sk.sizes == Skip::SHAPE ? 1 : 4}, sk.sizes == Skip::SHAPE ? std::vector<float>{s} : std::vector<float>{s, s, s, s}));
+        g.node("Slice", {"shp", "i0", "i2"}, {"nc"});
+        g.node("Slice", {"shp", "i2", "i4"}, {"hw"});
+        const std::string hwf = g.op1("Cast", sk.sizes == Skip::SHAPE ? "hw" : "shp", {attr_i("to", 1)});
+        const std::string hws = g.op1("Cast", g.op1("Floor", g.op2("Mul", hwf, "sf")), {attr_i("to", 7)});
+        if (sk.sizes == Skip::SHAPE) g.node("Concat", {"nc", hws}, {"sizes"}, {attr_i("axis", 0)});
+        else g.node("Identity", {hws}, {"sizes"});  // N and C scaled too
+        rin = {"in32", "", "", "sizes"};
+        break;
+    }
+    case Skip::CONST_BROADCAST:  // [1, 3, 1, 1]: the Add broadcasts it (the review's reproducer)
+    case Skip::CONST_SIZES:      // one fixed output size
+        g.init(tensor_i("sizes", {4}, sk.sizes == Skip::CONST_BROADCAST ? std::vector<int64_t>{1, 3, 1, 1} : std::vector<int64_t>{1, 3, 32, 32}));
+        rin = {"in32", "", "", "sizes"};
+        break;
+    case Skip::SCALES_COMPUTED:  // from the input's shape: not a constant
+        g.node("Shape", {"input"}, {"shp"});
+        g.node("Cast", {"shp"}, {"scales"}, {attr_i("to", 1)});
+        break;
+    case Skip::SCALES_FOLDED:  // a Concat of constants the exporter left unfolded
+        g.init(tensor_v("ones", {2}, {1.f, 1.f}));
+        g.init(tensor_v("rr", {2}, {s, s}));
+        g.node("Concat", {"ones", "rr"}, {"scales"}, {attr_i("axis", 0)});
+        break;
+    case Skip::AXES:  // opset 18: scales for H and W alone
+        g.init(tensor_v("scales", {2}, {s, s}));
+        ra.push_back(attr_ints("axes", {2, 3}));
+        break;
+    }
+    g.node("Resize", rin, {"up32"}, ra);
     g.node("Cast", {"up32"}, {"up"}, {attr_i("to", 10)});
     g.node("Add", {d, "up"}, {"output"});
     return g.bytes("input", "output");
@@ -207,6 +248,32 @@ int main()
         Skip sk;
         sk.scale = 2.5f;  // scales other than the depth-to-space factor
         CHECK(!lower_bytes(compact(16, 2, true, sk), &p, &why) && why.find("scale") != std::string::npos);
+        // scales or sizes: only those that are r on H and W at every input size
+        struct Sz {
+            Skip::Sizes s;
+            int r;
+            bool ok;
+        };
+        const Sz szs[] = {
+            {Skip::SHAPE, 2, true}, {Skip::SHAPE, 4, true}, {Skip::SHAPE_ALL, 2, false}, {Skip::CONST_BROADCAST, 2, false},
+            {Skip::CONST_SIZES, 2, false}, {Skip::SCALES_COMPUTED, 2, false}, {Skip::SCALES_FOLDED, 2, true}, {Skip::AXES, 2, true},
+        };
+        for (const Sz &z : szs) {
+            sk = Skip();
+            sk.sizes = z.s;
+            sk.r = z.r;
+            sk.nm = "floor";
+            const bool ok = lower_bytes(compact(16, 2, true, sk), &p, &why);
+            if (ok != z.ok) std::fprintf(stderr, "Resize sizes form %d at %dx: %s\n", (int)z.s, z.r, ok ? "lowered" : why.c_str());
+            CHECK(ok == z.ok);
+            if (!ok) CHECK(why.find("scale") != std::string::npos);
+            if (ok) CHECK(p.depth_to_space == z.r && p.steps.back().resid == kModelInput);
+        }
+        sk = Skip();
+        sk.sizes = Skip::SHAPE;
+        sk.scale = 3.f;  // sizes 3x the input under a 2x depth-to-space
+        sk.nm = "floor";
+        CHECK(!lower_bytes(compact(16, 2, true, sk), &p, &why));
     }
     // Casts on the data path: float types pass through, others change the values (refused)
     for (int64_t to : {1, 10, 11, 16, 6, 7, 9, 2}) {
