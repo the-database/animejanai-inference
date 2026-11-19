@@ -255,8 +255,9 @@ model input, and depth-to-space output with SRVGG's upsampled-input add. `k_conc
 `conv_cat` without the concat buffer. `native/conv.h` is the API; `conv.cu`'s `kConv` table is the
 set of instantiated shapes (32/48/64 channels, and 24 for SuperUltraCompact: an `m16n8k8` K tail
 and an odd n8 tile, weights in `pack_fragments8`'s layout, no tanh gate or concat), each with four
-tile variants; `tile_variant` picks one from the op's shape (nothing is timed at load;
-`pick_variant` times them for benchmarks). `lower` widens a feature map narrower than
+tile variants; `tile_variant` picks one from the op's shape and the GPU
+generation (Ampere / Ada / Blackwell: a table measured on an RTX 3090 / 4090 / 5090; nothing is
+timed at load; `pick_variant` times them for benchmarks). `lower` widens a feature map narrower than
 the backend's widths (`kernel_widths_cuda` / `kernel_widths_vulkan`) to the next one with zero
 weights (`widen`, logged as `24 ch padded to 32 ch`); the added channels stay zero, so the output
 is the model's. SuperUltraCompact, RTX 5090, device chain time: 24 channels 1.50 ms a 1080p frame

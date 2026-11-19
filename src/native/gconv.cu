@@ -1,6 +1,7 @@
 // native/gconv.cu — see gconv.h. Instantiates k_gconv for a fixed set of shapes.
 #include "native/gconv.h"
 #include "native/gconv.cuh"
+#include "native/device.h"
 #include "native/pack.h"
 
 #include <algorithm>
@@ -218,6 +219,116 @@ void grelease(GWeights &w)
 bool gsupported(const GWeights &w, const GConvArgs &a, std::string *why) { return gfind(w, a, why) != nullptr; }
 int gvariant_count() { return kGVariants; }
 
+namespace {
+
+// Warp count per kernel bucket and GPU generation (index into kWarps; -1: not measured, use gvariant_rule).
+// Bucket: kernel class (K chunk, output chunk, stride, NCHW input, pixel-shuffle output), band (0 whole map,
+// 1 splits K at 8 warps: small maps, 2 unsplit but under 8 CTAs per SM: only where measured apart), output
+// chunks (1, 2, 3+) and K chunks (1, 2, 3+). Each entry is the variant with the least summed time (each
+// layer alone) over the bucket's layers in ESRGAN 2x / 4x (256 and 512 tiles), DAT, HAT, FDAT-M / XL, SPAN-S,
+// RIFE 4.14 / 4.22 / 4.26 (1080p, 480p), TFix (DVD, 720p, 1080p) and TFDAT, every model weighted the same, on
+// an RTX 3090 (Ampere), 4090 (Ada), 5090 (Blackwell); the commented ones were set from whole-network runs.
+// The generations want different warp counts for the same layers (ESRGAN's 64 -> 32 convs: 2 warps on the
+// 3090, 8 on the others; its 64 -> 64: 4 on the 3090 / 4090, 8 on the 5090), more than SM count or
+// occupancy explains.
+struct GPick {
+    signed char kch, coutp, s, in, out, band, ch, kc, v[3];
+};
+constexpr GPick kGPick[] = {
+    {16, 16, 1, 0, 0, 0, 1, 1, {1, 1, 0}},
+    {16, 16, 1, 0, 0, 0, 1, 3, {1, -1, -1}},
+    {16, 16, 1, 0, 0, 1, 1, 3, {1, 2, 1}},
+    {16, 16, 1, 0, 1, 0, 1, 1, {1, 1, 0}},
+    {16, 16, 2, 1, 0, 0, 1, 1, {1, 1, 1}},
+    {16, 32, 1, 0, 0, 0, 1, 1, {1, 0, 0}},
+    {16, 32, 1, 0, 0, 0, 1, 3, {1, 1, 0}},
+    {16, 32, 2, 0, 0, 0, 1, 1, {2, 0, 0}},
+    {16, 32, 2, 0, 0, 1, 1, 1, {-1, 1, 1}},
+    {16, 32, 2, 1, 0, 0, 1, 1, {2, 1, 0}},
+    {16, 48, 2, 0, 0, 0, 2, 3, {1, 1, 0}},
+    {16, 48, 2, 0, 0, 1, 1, 1, {2, 2, 2}},
+    {16, 48, 2, 0, 0, 1, 2, 1, {2, 2, 2}},
+    {16, 48, 2, 0, 0, 1, 2, 3, {1, 2, 2}},
+    {16, 64, 1, 0, 0, 0, 1, 1, {1, 0, 0}},
+    {16, 64, 1, 0, 0, 0, 1, 3, {2, 0, 0}},
+    {16, 64, 1, 0, 0, 0, 2, 1, {0, 2, 1}},
+    {16, 64, 1, 0, 0, 0, 3, 1, {2, 2, 1}},
+    {16, 64, 1, 0, 0, 1, 1, 1, {2, 2, 2}},
+    {32, 16, 1, 0, 0, 0, 1, 1, {0, 0, 0}},
+    {32, 16, 1, 0, 0, 1, 1, 3, {1, 2, 2}},
+    {32, 16, 1, 0, 1, 0, 1, 1, {0, 0, 0}},
+    {32, 16, 2, 0, 0, 0, 1, 1, {2, 2, 1}},
+    {32, 32, 1, 0, 0, 0, 1, 1, {0, 0, 1}},
+    {32, 32, 1, 0, 0, 0, 1, 3, {0, 0, 1}},  // Blackwell: 8 warps 1-3% faster alone, 4 faster in the whole network (ESRGAN 2x 11%)
+    {32, 32, 1, 0, 0, 1, 1, 1, {-1, 1, 1}},
+    {32, 32, 1, 0, 0, 1, 1, 3, {1, 0, 2}},
+    {32, 32, 1, 0, 1, 0, 1, 3, {1, -1, -1}},
+    {32, 32, 1, 0, 1, 1, 1, 3, {-1, 1, 2}},
+    {32, 32, 2, 0, 0, 0, 1, 1, {2, 1, 1}},
+    {32, 32, 2, 0, 0, 1, 1, 1, {2, 2, 2}},
+    {32, 48, 1, 0, 0, 0, 2, 3, {1, 0, 2}},
+    {32, 48, 1, 0, 0, 1, 2, 3, {1, 0, 2}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
+    {32, 48, 2, 0, 0, 0, 1, 1, {2, 0, 0}},
+    {32, 48, 2, 0, 0, 0, 2, 2, {1, -1, -1}},
+    {32, 48, 2, 0, 0, 1, 1, 1, {2, 1, 2}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
+    {32, 48, 2, 0, 0, 1, 2, 1, {1, 1, 2}},
+    {32, 48, 2, 0, 0, 1, 2, 2, {-1, 1, 1}},
+    {32, 64, 1, 0, 1, 0, 1, 1, {2, 0, 0}},
+    {32, 64, 1, 0, 1, 1, 1, 1, {-1, 1, 1}},
+    {32, 64, 1, 0, 1, 1, 1, 3, {1, 0, 1}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
+    {32, 64, 2, 0, 0, 0, 1, 1, {1, 0, 0}},
+    {32, 64, 2, 0, 0, 1, 1, 1, {2, 1, 2}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
+    {32, 64, 2, 0, 0, 1, 2, 2, {2, 2, 2}},
+    {32, 64, 2, 0, 0, 1, 3, 3, {1, 1, 1}},
+    {64, 16, 1, 0, 0, 0, 1, 1, {0, 1, 0}},
+    {64, 16, 1, 0, 0, 1, 1, 1, {2, 2, 1}},
+    {64, 32, 1, 0, 0, 0, 1, 1, {2, 0, 0}},
+    {64, 32, 1, 0, 0, 0, 1, 2, {2, 0, 0}},
+    {64, 32, 1, 0, 0, 1, 1, 1, {2, 1, 2}},
+    {64, 32, 1, 0, 0, 1, 1, 2, {2, 0, 2}},
+    {64, 32, 1, 0, 1, 0, 1, 1, {1, 0, 0}},
+    {64, 32, 1, 0, 1, 0, 1, 2, {1, 1, 0}},
+    {64, 32, 1, 0, 1, 0, 1, 3, {1, 0, 0}},
+    {64, 32, 1, 0, 1, 1, 1, 2, {2, 1, 2}},
+    {64, 32, 1, 0, 1, 1, 1, 3, {1, 1, 1}},
+    {64, 48, 1, 0, 0, 0, 2, 3, {0, -1, -1}},
+    {64, 48, 1, 0, 0, 1, 2, 3, {-1, 1, 2}},
+    {64, 64, 1, 0, 0, 0, 1, 1, {1, 1, 0}},
+    {64, 64, 1, 0, 0, 0, 1, 2, {1, 1, 0}},
+    {64, 64, 1, 0, 0, 0, 1, 3, {1, 1, 0}},
+    {64, 64, 1, 0, 0, 2, 1, 3, {-1, 2, -1}},  // Ada, under 8 CTAs per SM: ESRGAN 2x 153.1 -> 151.2 ms (4 warps stay ahead at 512 x 512)
+    {64, 64, 1, 0, 0, 0, 2, 2, {1, 1, 0}},
+    {64, 64, 1, 0, 0, 0, 3, 1, {0, 0, 0}},
+    {64, 64, 1, 0, 0, 0, 3, 3, {1, 1, 0}},
+    {64, 64, 1, 0, 0, 1, 1, 1, {2, 1, 1}},
+    {64, 64, 1, 0, 0, 1, 1, 3, {1, 1, 1}},
+    {64, 64, 1, 0, 0, 1, 2, 2, {1, 1, 1}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
+    {64, 64, 1, 0, 0, 1, 3, 3, {1, 1, 1}},
+    {64, 64, 1, 0, 1, 0, 1, 1, {2, -1, -1}},
+    {64, 64, 1, 0, 1, 0, 2, 1, {1, 1, 0}},
+    {64, 64, 1, 0, 1, 0, 3, 2, {1, 1, 0}},
+    {64, 64, 1, 0, 1, 0, 3, 3, {1, 1, 0}},
+    {64, 64, 1, 0, 1, 1, 1, 1, {2, 1, 2}},
+    {64, 64, 1, 0, 1, 1, 1, 2, {2, 1, 1}},
+    {64, 64, 1, 0, 1, 1, 1, 3, {1, 2, 1}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
+};
+
+int gvariant_rule(const GWeights &w, const GConvArgs &a, const GKey &k)
+{
+    // 192+ output channels (HAT / DAT / FDAT-XL, 3+ chunks of 64): 8 warps
+    if (w.coutp && w.cout_pad / w.coutp >= 3) return 0;
+    if (k.s == 1 && k.in == 0 && k.out == 0 && k.coutp == 32) {
+        if (k.kch == 64) return 0;
+        if (k.kch == 32) {  // 8 warps where they would split K (small maps), else 4
+            const long c8 = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + 7) / 8) * (w.coutp ? w.cout_pad / w.coutp : 1);
+            return c8 < 2L * sm_count() ? 0 : 1;
+        }
+    }
+    return 1;
+}
+
+}  // namespace
+
 int gvariant_for(const GWeights &w, const GConvArgs &a)
 {
     static const int env = [] {
@@ -229,21 +340,20 @@ int gvariant_for(const GWeights &w, const GConvArgs &a)
     const GEntry *e = gfind(w, a, nullptr);
     if (!e) return 1;
     const GKey &k = e->key;
-    // One choice per kernel class, the one with the smallest worst-case loss over whole models (ESRGAN 2x / 4x
-    // at 256 and 512 tiles, FDAT-M, RIFE, TFix, TFDAT) on an RTX 5090 and 4090, each class moved alone. The
-    // best warp count per class differs between GPUs in ways their occupancy does not predict (ESRGAN's
-    // 32 -> 32 growth convs: 8 warps 11% slower overall on the 5090, 4 warps up to 8% on the 4090; its
-    // 64 -> 64 convs: 8 warps 12% slower on the 4090), so nothing here depends on the GPU.
-    // 192+ output channels (HAT / DAT / FDAT-XL, 3+ chunks of 64): 8 warps, HAT-L 0.9% faster on the 5090, the same on the 4090
-    if (w.coutp && w.cout_pad / w.coutp >= 3) return 0;
-    if (k.s == 1 && k.in == 0 && k.out == 0 && k.coutp == 32) {
-        if (k.kch == 64) return 0;  // 8 warps: best or tied on both
-        if (k.kch == 32) {          // 8 warps where they would split K (small maps), else 4
-            const long c8 = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + 7) / 8) * (w.coutp ? w.cout_pad / w.coutp : 1);
-            return c8 < 2L * sm_count() ? 0 : 1;
-        }
+    const int split = ksplit_for(w, a, kWarps[0]) > 1 ? 1 : 0;
+    const int ch = std::min(w.coutp ? w.cout_pad / w.coutp : 1, 3), kc = k.in ? 1 : std::min(w.cin_pad / k.kch, 3);
+    const int gen = gpu_gen();
+    // band 2: unsplit but under 8 CTAs per SM at 8 warps; only where it was measured, else the unsplit entry
+    const long c8 = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + 7) / 8) * (w.coutp ? w.cout_pad / w.coutp : 1);
+    const int band = split ? 1 : c8 < 8L * sm_count() ? 2 : 0;
+    for (int pass = band == 2 ? 0 : 1; pass < 2; pass++) {
+        const int want = pass ? (band == 2 ? 0 : band) : 2;
+        for (const GPick &g : kGPick)
+            if (g.kch == k.kch && g.coutp == k.coutp && g.s == k.s && g.in == k.in && g.out == k.out && g.band == want && g.ch == ch && g.kc == kc &&
+                g.v[gen] >= 0)
+                return g.v[gen];
     }
-    return 1;  // 4 warps: the rest within ~1% either way, 64 -> 64 well ahead of 8 on the 4090
+    return gvariant_rule(w, a, k);
 }
 
 size_t gworkspace(const GWeights &w, const GConvArgs &a)

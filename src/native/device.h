@@ -26,6 +26,25 @@ inline bool large_l2()
     return v == 2;
 }
 
+// The current device's GPU generation, for the kernel choices measured per generation (gconv warps, conv3x3
+// tiles): 0 Ampere (compute 8.0-8.7, and anything older), 1 Ada (8.9), 2 Blackwell (10.0 and up; RTX 50-series 12.0).
+inline int gpu_gen()
+{
+    constexpr int kMaxDev = 16;
+    static std::atomic<int> state[kMaxDev] = {};  // 0 unknown, else generation + 1
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDev) return 2;
+    int v = state[dev].load(std::memory_order_relaxed);
+    if (!v) {
+        int ma = 0, mi = 0;
+        cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, dev);
+        v = 1 + (ma >= 10 ? 2 : ma == 8 && mi >= 9 ? 1 : 0);
+        state[dev].store(v, std::memory_order_relaxed);
+    }
+    return v - 1;
+}
+
 }  // namespace ajinative
 
 #endif

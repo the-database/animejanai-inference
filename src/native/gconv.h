@@ -77,7 +77,8 @@ bool gsupported(const GWeights &w, const GConvArgs &a, std::string *why = nullpt
 int gvariant_count();
 // Runs all output chunks. variant < 0 picks the default.
 cudaError_t glaunch(const GWeights &w, const GConvArgs &a, int variant, cudaStream_t s);
-// The variant the backends run for a, from its kernel class (nothing is timed; see gconv.cu).
+// The variant the backends run for a, from its kernel bucket and the GPU generation (nothing is timed;
+// see gconv.cu).
 // AJI_NATIVE_GVARIANT=n overrides.
 int gvariant_for(const GWeights &w, const GConvArgs &a);
 // Time the variants on a (writes a.dst) and return the fastest, or -1. For benchmarks and tests.

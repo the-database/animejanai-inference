@@ -16,7 +16,7 @@
  *
  * Weights are packed once, on the host, into mma B-fragment order (pack.cpp), so each lane
  * fetches a fragment pair with one 16-byte load. Each op has a few tile-shape variants;
- * tile_variant chooses one from the op's shape (no timing at load).
+ * tile_variant chooses one from the op's shape and the GPU generation (no timing at load).
  *
  * Requires compute capability 8.0 or newer (device_supported). Internal to the CUDA backends:
  * no ABI of its own.
