@@ -97,35 +97,10 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
     for (size_t t = 0; t < L.buffer.size(); t++)
         if (L.buffer[t] >= 0) e->tensor_[t] = e->buffers_[L.buffer[t]];
 
-    // tile variants, timed on scratch input/output in step order
-    void *in = nullptr, *out = nullptr;
-    const size_t in_bytes = (size_t)3 * in_w * in_h * 2, out_bytes = (size_t)3 * e->out_w_ * e->out_h_ * 2;
-    if (cudaMalloc(&in, in_bytes) != cudaSuccess || cudaMalloc(&out, out_bytes) != cudaSuccess) {
-        cudaFree(in);
-        return fail("scratch allocation failed");
-    }
-    cudaMemsetAsync(in, 0, in_bytes, s);
-    for (Step &st : e->steps_) {
-        if (st.concat) {
-            const void *srcs[4];
-            for (int k = 0; k < 4; k++) srcs[k] = e->ptr(st.srcs[k], in, out);
-            if (launch(st.cop, srcs, const_cast<void *>(e->ptr(st.dst, in, out)), e->W_ * e->H_, 0, s) != cudaSuccess) {
-                reason = "concat launch failed";
-                break;
-            }
-            continue;
-        }
-        Tensors t;
-        t.src = e->ptr(st.src, in, out);
-        t.resid = e->ptr(st.resid, in, out);
-        t.dst = const_cast<void *>(e->ptr(st.dst, in, out));
-        st.variant = pick_variant(st.op, t, e->H_, e->W_, s);
-        if (st.variant < 0) { reason = "timing the tile variants failed"; break; }
-    }
-    cudaStreamSynchronize(s);
-    cudaFree(in);
-    cudaFree(out);
-    if (!reason.empty()) return fail(reason);
+    // tile variants from the ops' shapes
+    for (Step &st : e->steps_)
+        if (!st.concat) st.variant = tile_variant(st.op);
+    (void)s;
     return e;
 }
 

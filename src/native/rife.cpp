@@ -340,10 +340,6 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     d.nb = nb;
     d.steps.push_back(Step{Step::FINAL});
 
-    // check every conv and pick its tile variant on scratch data (the input pointer of the first
-    // encoder conv is unknown until run: use a zeroed full-size scratch tensor)
-    void *scratch_in = d.alloc(plane * 11);
-    if (!scratch_in) return refuse(why, "out of GPU memory"), nullptr;
     size_t wsf = 0;
     for (Step &st : d.steps)
         if (st.kind == Step::GCONV) wsf = std::max(wsf, gworkspace(*st.w, st.a));
@@ -359,20 +355,15 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     for (Step &st : d.steps)
         if (st.kind == Step::GATHER && !rife_gather_supported(d.frame, st.g))
             return refuse(why, "no gather kernel for this feature layout"), nullptr;
+    // check every conv and set its tile variant
     for (Step &st : d.steps) {
         if (st.kind != Step::GCONV) continue;
-        GConvArgs a = st.a;
-        if (a.nchw) a.src = (const uint16_t *)scratch_in + (size_t)st.variant * 3 * plane;
         std::string w;
-        if (!gsupported(*st.w, a, &w)) return refuse(why, "kernel: " + w), nullptr;
-        const int v = gpick(*st.w, a, s);
-        if (v < 0) return refuse(why, "kernel timing failed"), nullptr;
-        if (!a.nchw) st.variant = v;
+        if (!gsupported(*st.w, st.a, &w)) return refuse(why, "kernel: " + w), nullptr;
+        const int v = gvariant_for(*st.w, st.a);
+        if (!st.a.nchw) st.variant = v;
         else st.a.sy = st.variant, st.variant = v;  // remember the frame index in sy (unused for NHWC output)
     }
-    cudaFree(scratch_in);
-    d.bufs.erase(std::find(d.bufs.begin(), d.bufs.end(), scratch_in));
-    d.bytes -= plane * 11 * 2;
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
 
     char buf[160];

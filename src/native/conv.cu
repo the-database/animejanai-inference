@@ -1,10 +1,12 @@
 // native/conv.cu — see conv.h. The kernels are instantiated here for a fixed set of shapes
 // (the kConv table); supported() reports what is in it.
 #include "native/conv.h"
+#include "native/device.h"
 #include "native/pack.h"
 #include "native/conv_kernels.cuh"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ajinative {
@@ -265,6 +267,61 @@ cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, 
     p.bias = static_cast<const half2 *>(op.w->bias);
     p.npx = npx;
     return e->fn(p, s);
+}
+
+namespace {
+
+// Tile per conv shape and GPU generation (-1: not measured, use tile_rule): the variant with the least
+// summed time over SPANF3 Performance / Balanced (1080p), Compact (854x480) and SPAN-S (images), every model
+// weighted the same, on an RTX 3090 (Ampere), 4090 (Ada), 5090 (Blackwell).
+struct CPick {
+    short cin, cout;
+    signed char in, act, gate, out, v[3];
+};
+constexpr CPick kCPick[] = {
+    {3, 48, 1, 0, 0, 0, {3, 3, 3}},
+    {3, 64, 1, 2, 0, 0, {3, 3, 2}},
+    {12, 48, 2, 0, 0, 0, {1, 3, 3}},
+    {12, 64, 2, 0, 0, 0, {3, 3, 3}},
+    {48, 12, 0, 0, 0, 1, {2, 0, 2}},
+    {48, 48, 0, 0, 0, 0, {2, 3, 2}},
+    {48, 48, 0, 0, 0, 2, {2, 3, 3}},
+    {48, 48, 0, 0, 2, 0, {2, 2, 3}},
+    {48, 48, 0, 0, 3, 0, {2, 0, 3}},
+    {48, 48, 0, 1, 0, 0, {3, 3, 3}},
+    {48, 48, 0, 3, 0, 0, {2, 3, 2}},
+    {64, 12, 0, 0, 0, 1, {2, 2, 0}},
+    {64, 48, 0, 0, 0, 2, {3, 2, 0}},
+    {64, 64, 0, 0, 2, 0, {3, 3, 3}},
+    {64, 64, 0, 1, 0, 0, {0, 3, 1}},
+    {64, 64, 0, 2, 0, 0, {0, 3, 1}},
+};
+
+int tile_rule(const Conv3x3 &op)
+{
+    // The 8-row tiles (more halo per pixel, 4-5 CTAs per SM) pay where the channel count is small: the
+    // input convs and 48-channel bodies. At 64 channels the 16-row tiles win: 4x4 with an activation, 8x2
+    // under a gate. Output convs: 8x1 from 48 channels, 8x2 from 64.
+    if (op.in != Input::NHWC || op.cin < 32) return 3;          // 4 warps x 2 rows
+    if (op.out != Output::NHWC) return op.cin <= 48 ? 2 : 0;     // 8 warps x 1 row / 8 x 2
+    if (op.cin <= 48 && op.cout <= 48) return 3;
+    return op.gate != Gate::None ? 0 : 1;                        // 8 x 2 / 4 x 4
+}
+
+}  // namespace
+
+int tile_variant(const Conv3x3 &op)
+{
+    static const int env = [] {
+        const char *v = std::getenv("AJI_NATIVE_CONV_VARIANT");
+        return v && *v ? std::atoi(v) : -1;
+    }();
+    if (env >= 0 && env < kVariants) return env;
+    const int gen = gpu_gen();
+    for (const CPick &c : kCPick)
+        if (c.cin == op.cin && c.cout == op.cout && c.in == (int)op.in && c.act == (int)op.act && c.gate == (int)op.gate && c.out == (int)op.out)
+            return c.v[gen] >= 0 ? c.v[gen] : tile_rule(op);
+    return tile_rule(op);
 }
 
 int pick_variant(const Conv3x3 &op, const Tensors &t, int H, int W, cudaStream_t s, float *best_ms)
