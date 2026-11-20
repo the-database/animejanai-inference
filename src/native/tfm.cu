@@ -1988,13 +1988,12 @@ cudaError_t tchanstats(const void *qkv, int sq, int qo, int ko, int M, int heads
     const int C = heads * hd, total = heads * hd * hd + 2 * C;
     if (hd <= 32 && hd % 2 == 0 && heads <= CS_MAXH && C <= 256 && sq % 2 == 0 && qo % 2 == 0 && ko % 2 == 0 && (uintptr_t)qkv % 4 == 0) {
         const int smem = 2 * CS_ROWS * (heads * 32 + 8) * 2;
-        static const int sms = [] {
-            int dev = 0, n = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        static const bool attr = [] {
             cudaFuncSetAttribute(k_chanstats_mma, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * CS_ROWS * (CS_MAXH * 32 + 8) * 2);
-            return std::max(1, n);
+            return true;
         }();
+        (void)attr;
+        const int sms = sm_count();
         // ~2 waves of 3 CTAs per SM (each CTA's partial sums go out as atomics: fewer, longer CTAs)
         const int tpc = std::max(CS_ROWS, (M + 6 * sms - 1) / (6 * sms) + CS_ROWS - 1) / CS_ROWS * CS_ROWS;
         k_chanstats_mma<<<(M + tpc - 1) / tpc, 128, smem, s>>>((const half *)qkv, sq, qo, ko, M, heads, hd, tpc, stats);

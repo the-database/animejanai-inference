@@ -45,6 +45,21 @@ inline int gpu_gen()
     return v - 1;
 }
 
+// The current device's SM count (launch sizes: gconv's K splits and table bands, the channel-stats grid).
+inline int sm_count()
+{
+    constexpr int kMaxDev = 16;
+    static std::atomic<int> state[kMaxDev] = {};  // 0 unknown
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDev) return 80;
+    int v = state[dev].load(std::memory_order_relaxed);
+    if (!v) {
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || v <= 0) v = 80;
+        state[dev].store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+
 }  // namespace ajinative
 
 #endif

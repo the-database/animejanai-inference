@@ -104,18 +104,6 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
     return nullptr;
 }
 
-int sm_count()
-{
-    static int n = 0;
-    if (!n) {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
-        if (n <= 0) n = 80;
-    }
-    return n;
-}
-
 // K splits for a: enough CTAs to cover the SMs about twice, at most one split per (tap, K chunk).
 int ksplit_for(const GWeights &w, const GConvArgs &a, int warps)
 {
