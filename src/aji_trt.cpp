@@ -127,6 +127,7 @@ struct aji_ctx {
     std::string conf_path, model_dir, trtexec, trtexec_env, rife_model_dir;
     AjiConf conf;
     int slot = 1;
+    ajinative::SpanPrecision span_precision = ajinative::SpanPrecision::Default;  // configured slot
     bool engines_cleaned = false;
     std::vector<ModelEngine> engines;
     std::vector<std::unique_ptr<ajinative::FrameNet>> natives;  // NATIVE steps
@@ -932,7 +933,7 @@ std::unique_ptr<ajinative::FrameNet> try_native(aji_ctx *c, const std::string &n
     std::unique_ptr<ajinative::FrameNet> n;
     if (np.ok) {
         ajinative::guarded(why, [&] {
-            n = ajinative::FrameNet::lowered(np.plan, w, h, s, why);
+            n = ajinative::FrameNet::lowered(np.plan, w, h, s, why, c->span_precision);
             return n != nullptr;
         });
     } else {
@@ -1291,6 +1292,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     c->out_w = w; c->out_h = h;
 
     auto sit = c->conf.slots.find(c->slot);
+    c->span_precision = sit == c->conf.slots.end() ? ajinative::SpanPrecision::Default : sit->second.span_precision;
     std::string profile = sit != c->conf.slots.end()
                               ? sit->second.profile_name : "(missing slot)";
     if (c->slot == 0)

@@ -27,6 +27,28 @@ std::string mb(size_t bytes)
     return std::to_string((bytes + (1 << 20) - 1) >> 20) + " MB";
 }
 
+// Match the two V3.1 HD topologies. Other networks using the same channel width keep their precision.
+bool full_spanf3(const Plan &plan)
+{
+    if (plan.unshuffle != 2 || plan.depth_to_space != 4 || !plan.model_channels.empty() ||
+        (plan.steps.size() != 18 && plan.steps.size() != 27)) return false;
+    const auto &steps = plan.steps;
+    const int c = steps.size() == 18 ? 48 : 64;
+    const PlanStep &head = steps.front(), &join = steps[steps.size() - 2], &tail = steps.back();
+    if (head.kind != PlanStep::CONV || head.in != int(Input::NCHW3Unshuffle2) || head.cout != c ||
+        join.kind != PlanStep::CONCAT || join.c != c || join.nsrc != 4 ||
+        tail.kind != PlanStep::CONV || tail.src != join.dst || tail.out != int(Output::DepthToSpace4)) return false;
+    for (size_t i = 1; i + 2 < steps.size(); ++i) {
+        const PlanStep &st = steps[i];
+        const bool gated = i % 3 == 0;
+        if (st.kind != PlanStep::CONV || st.cin != c || st.cout != c || st.src != steps[i - 1].dst ||
+            st.in != int(Input::NHWC) || st.out != int(Output::NHWC) ||
+            st.act != int(gated ? Act::None : Act::Relu) || st.gate != int(gated ? Gate::Tanh1x1 : Gate::None) ||
+            (gated && st.resid != steps[i - 3].dst)) return false;
+    }
+    return true;
+}
+
 // The executor at the frame size.
 class LoweredFrame : public FrameNet {
 public:
@@ -132,11 +154,21 @@ std::unique_ptr<ImgNet> build_lowered(const OnnxGraph &g, int max_w, int max_h, 
     return n;
 }
 
-std::unique_ptr<FrameNet> FrameNet::lowered(const Plan &plan, int w, int h, cudaStream_t s, std::string *why)
+std::unique_ptr<FrameNet> FrameNet::lowered(const Plan &plan, int w, int h, cudaStream_t s, std::string *why,
+                                            SpanPrecision precision)
 {
-    auto ex = Executor::create(plan, w, h, s, why);
+    const bool optimize = precision != SpanPrecision::Default && full_spanf3(plan);
+    auto ex = Executor::create(plan, w, h, s, why, true, optimize && precision == SpanPrecision::FP8);
     if (!ex) return nullptr;
-    return std::make_unique<LoweredFrame>(std::move(ex), ajinative::describe(plan));
+    const bool fused = optimize && ex->enable_gate_projection();
+    std::string description = ajinative::describe(plan, plan.steps.size() - (fused ? 1 : 0));
+    if (ex->uses_fp8()) description += ", FP8 SPANF3 body";
+    else if (optimize) description += ", FP16 SPANF3 body";
+    if (ex->packed_links()) description += ", " + std::to_string(ex->packed_links()) + " packed feature maps";
+    if (optimize && ex->enable_fp16_cache_order())
+        description += ", FP16 alternating tile rows";
+    if (fused) description += ", fused gate and projection";
+    return std::make_unique<LoweredFrame>(std::move(ex), std::move(description));
 }
 
 std::unique_ptr<FrameNet> FrameNet::image(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why, bool *size_only)

@@ -212,6 +212,12 @@ AjiSlotConf parse_slot(const Section &sec)
     auto it = sec.find("profile_name");
     if (it != sec.end())
         s.profile_name = it->second;
+    it = sec.find("native_span_precision");
+    if (it != sec.end()) {
+        const auto precision = lower(strip(it->second));
+        if (precision == "fp8") s.span_precision = ajinative::SpanPrecision::FP8;
+        if (precision == "fp16") s.span_precision = ajinative::SpanPrecision::FP16;
+    }
 
     std::set<int> chain_ids;
     for (const auto &kv : sec) {

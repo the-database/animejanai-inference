@@ -9,6 +9,9 @@
 
 namespace ajinative {
 
+// The slot selects the full SPANF3 video path. Default preserves the normal native executor.
+enum class SpanPrecision { Default, FP16, FP8 };
+
 // NHWC feature map, the model's NCHW RGB input, or that input pixel-unshuffled by 2.
 enum class Input { NHWC = 0, NCHW3 = 1, NCHW3Unshuffle2 = 2 };
 // After bias; LeakyReLU is a PReLU with a constant slope.

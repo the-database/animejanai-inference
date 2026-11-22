@@ -20,6 +20,8 @@
 
 #include <cuda_runtime.h>
 
+#include "native/ops.h"
+
 namespace ajinative {
 
 struct OnnxGraph;
@@ -35,7 +37,8 @@ public:
     virtual size_t device_bytes() const = 0;
 
     // Null with *why on refusal; the caller then uses TensorRT. s must not be capturing.
-    static std::unique_ptr<FrameNet> lowered(const Plan &plan, int w, int h, cudaStream_t s, std::string *why);
+    static std::unique_ptr<FrameNet> lowered(const Plan &plan, int w, int h, cudaStream_t s, std::string *why,
+                                             SpanPrecision precision = SpanPrecision::Default);
     // *size_only (if given) tells whether the refusal is about this frame size or the free memory
     // (another size may work) rather than the model.
     static std::unique_ptr<FrameNet> image(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why,

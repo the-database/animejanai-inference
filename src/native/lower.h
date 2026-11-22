@@ -93,6 +93,7 @@ bool lower(const OnnxGraph &g, Plan *plan, std::string *why, const std::vector<i
 
 // One line for the log, e.g. "18 kernels, 48 ch, pixel-unshuffle 2, depth-to-space 4".
 std::string describe(const Plan &plan);
+std::string describe(const Plan &plan, size_t kernel_count);
 
 }  // namespace ajinative
 
