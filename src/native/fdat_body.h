@@ -54,6 +54,7 @@ private:
     TMat foldm;
     void *G = nullptr, *X = nullptr, *N1 = nullptr, *QKV = nullptr, *CF = nullptr, *AT = nullptr, *H1 = nullptr, *H2 = nullptr;
     float *sums = nullptr, *cm = nullptr, *stats = nullptr, *attnb = nullptr, *fold = nullptr, *wsp = nullptr;
+    float *lst = nullptr;
     bool shared = false;  // the large buffers are in a caller's scratch (not zeroed between runs)
     void carve(Bump &b, size_t M);
     size_t ws_floats = 0;

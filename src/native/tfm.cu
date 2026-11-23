@@ -66,6 +66,15 @@ struct GemmP {
     int k;  // A's real columns: those from k up to kpad load as zeros (A may be a slice whose row ends sooner)
     const float *lng, *lnb;  // k_gemm_rs only: A LayerNorm'd over its k channels on load, or null
     float lneps;
+    float *stats;  // k_gemm_rs with STATS: per row (mean, 1 / std) of output columns [st_c0, st_c0 + st_n) as stored
+    int st_c0, st_n;
+    float st_eps;
+    // k_gemm_rs with MIX (DAT's token-gate mix): z = a * cg + mo * sigm(w2 . out + b2) over A's k channels
+    const half *mo;
+    const float *mcg, *mw2;
+    float mb2;
+    int mr, smo;
+    half *mz;
 };
 
 // RES: out is one of the adds, an fp32 stream (prefetched, the epilogue in two passes; see below).
@@ -915,6 +924,118 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
     }
 }
 
+// k_dw8s (no bias, no gate) of a LayerNorm of in that isn't stored: each pixel normalised as it loads from
+// lst's per-token statistics (k_gemm_rs's STATS 2) and lg / lb, as tlayernorm then k_dw8s. A copy of its
+// own, so k_dw8s compiles as before.
+template <int V>
+__global__ void __launch_bounds__(128) k_dw8s_ln(const half *in, int sin, half *out, int sout, int H, int W, int C, const float *w, int gelu_,
+                                                 float *sums, const float *lst, const float *lg, const float *lb)
+{
+    using VT = typename DwVec<V>::T;
+    auto unpackv = [](const VT &u, float (&v)[V]) {
+        const half2 *h = reinterpret_cast<const half2 *>(&u);
+#pragma unroll
+        for (int j = 0; j < V / 2; j++) {
+            const float2 f = __half22float2(h[j]);
+            v[2 * j] = f.x;
+            v[2 * j + 1] = f.y;
+        }
+    };
+    __shared__ float ss[1024];
+    if (sums) {
+        for (int i = threadIdx.x; i < C; i += blockDim.x) ss[i] = 0.f;
+        __syncthreads();
+    }
+    const int G = (C + V - 1) / V, strips = (H + DW_R - 1) / DW_R;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool live = i < G * W * strips;
+    const int g = i % G, rest = i / G, x = rest % W, y0 = (rest / W) * DW_R, c = g * V;
+    float part[V] = {};
+    const bool full = c + V <= C;
+    if (live) {
+        float wr[9][V];
+#pragma unroll
+        for (int k = 0; k < 9; k++)
+#pragma unroll
+            for (int j = 0; j < V; j++) wr[k][j] = c + j < C ? __ldg(w + (c + j) * 9 + k) : 0.f;
+        float gg[V], bb[V];
+#pragma unroll
+        for (int j = 0; j < V; j++) {
+            gg[j] = c + j < C ? __ldg(lg + c + j) : 0.f;
+            bb[j] = c + j < C ? __ldg(lb + c + j) : 0.f;
+        }
+        // a row's 3 pixels, LayerNorm'd (lst: per token mean, 1 / std) and rounded to fp16 as a stored LayerNorm;
+        // zeros outside the map
+        auto row = [&](int y, VT (&r)[3]) {
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                const int xx = x + dx - 1;
+                r[dx] = VT{};
+                if (y >= 0 && y < H && xx >= 0 && xx < W) {
+                    const size_t t = (size_t)y * W + xx;
+                    const float2 st = *reinterpret_cast<const float2 *>(lst + t * 2);
+                    float v[V];
+                    unpackv(*reinterpret_cast<const VT *>(in + t * sin + c), v);
+                    uint32_t *pr = reinterpret_cast<uint32_t *>(&r[dx]);
+#pragma unroll
+                    for (int j = 0; j < V / 2; j++)
+                        pr[j] = h2u(__floats2half2_rn((v[2 * j] - st.x) * st.y * gg[2 * j] + bb[2 * j], (v[2 * j + 1] - st.x) * st.y * gg[2 * j + 1] + bb[2 * j + 1]));
+                }
+            }
+        };
+        VT r0[3], r1[3], r2[3];
+        row(y0 - 1, r0);
+        row(y0, r1);
+#pragma unroll 2
+        for (int y = y0; y < min(H, y0 + DW_R); y++) {
+            row(y + 1, r2);
+            float a[V] = {};
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                float v[V];
+                unpackv(r0[dx], v);
+#pragma unroll
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[dx][j];
+                unpackv(r1[dx], v);
+#pragma unroll
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[3 + dx][j];
+                unpackv(r2[dx], v);
+#pragma unroll
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[6 + dx][j];
+            }
+            if (gelu_)
+#pragma unroll
+                for (int j = 0; j < V; j++) a[j] = gelu(a[j]);
+            VT pk;
+            uint32_t *pw = reinterpret_cast<uint32_t *>(&pk);
+#pragma unroll
+            for (int j = 0; j < V / 2; j++) pw[j] = h2u(__floats2half2_rn(a[2 * j], a[2 * j + 1]));
+            if (full) {
+                *reinterpret_cast<VT *>(out + ((size_t)y * W + x) * sout + c) = pk;
+            } else {
+#pragma unroll
+                for (int j = 0; j < V / 2; j++)
+                    if (c + 2 * j < C) *reinterpret_cast<uint32_t *>(out + ((size_t)y * W + x) * sout + c + 2 * j) = pw[j];
+            }
+#pragma unroll
+            for (int j = 0; j < V; j++) part[j] += c + j < C ? a[j] : 0.f;
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                r0[dx] = r1[dx];
+                r1[dx] = r2[dx];
+            }
+        }
+    }
+    if (sums) {
+        if (live)
+#pragma unroll
+            for (int j = 0; j < V; j++)
+                if (c + j < C) atomicAdd(ss + c + j, part[j]);
+        __syncthreads();
+        for (int k = threadIdx.x; k < C; k += blockDim.x) atomicAdd(sums + k, ss[k]);
+    }
+}
+
 // Channel attention statistics on tensor cores: per head the Gram matrix q^T k over the CTA's tokens
 // (64-token chunks in shared memory, each head's dims padded to 32), warp w doing heads w and w + 4;
 // the squared norms on the CUDA cores while copying.
@@ -1009,7 +1130,15 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
 // chunks per cp.async stage through shared memory (two stages), and writes each 16x16 result as it
 // is done. No accumulator lives across chunks, so it runs at ~100 registers and 4 CTAs per SM, and
 // W is read once per 64 rows instead of once per 64x64 tile. Same sums as k_gemm.
-template <int KC1, bool PF = true>
+// AF32: A is an fp32 map, LayerNorm'd on load (p.lng required; as k_mlp's LN, tlayernorm2's maths).
+// STATS 1: each row's mean and 1 / std over output columns [st_c0, st_c0 + st_n) of the fp16 values stored
+// (one pass: E[x^2] - mean^2), for a LayerNorm the next kernel applies as it loads them (k_dwmm_ln). STATS 2:
+// those of the fp16 A rows' LayerNorm on load (p.lng), for another reader of the same LayerNorm (k_dw8s_ln).
+// MIX: a single 16-column chunk (W: A's k channels -> the token gate's hidden layer, GELU) whose rows are not
+// stored: their first mr values (rounded to fp16) give the token gate g = sigm(mw2 . h + mb2), and the
+// kernel writes z = a * mcg + mo * g (A's raw rows, fp16; zeros from k to KC1 * 16), as k_mix_tg. (A's rows
+// are read with uint4s: sa a multiple of 8.)
+template <int KC1, bool PF = true, bool AF32 = false, int STATS = 0, bool MIX = false>
 __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerNorm of A's rows on load (see below)
 {
 #if TFM_OK
@@ -1030,29 +1159,23 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
     for (int hh = 0; hh < 2; hh++) {
         const int r = hh ? r1 : r0;
         if (r >= p.M || !PF) continue;
-        const char *ra = reinterpret_cast<const char *>(p.a + (size_t)r * p.sa);
-        for (int l = tq; l * 128 < KC1 * 32; l += 4) asm volatile("prefetch.global.L2 [%0];" ::"l"(ra + l * 128));
+        const char *ra = reinterpret_cast<const char *>(p.a) + (size_t)r * p.sa * (AF32 ? 4 : 2);
+        for (int l = tq; l * 128 < KC1 * 32 * (AF32 ? 2 : 1); l += 4) asm volatile("prefetch.global.L2 [%0];" ::"l"(ra + l * 128));
     }
     uint32_t a[KC1][4];
-#pragma unroll
-    for (int kc = 0; kc < KC1; kc++)
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            const int r = (j & 1) ? r1 : r0, c = kc * 16 + 2 * tq + (j >> 1) * 8;
-            half2 v = __float2half2_rn(0.f);
-            if (r < p.M && c < p.k) v = *reinterpret_cast<const half2 *>(p.a + (size_t)r * p.sa + c);
-            a[kc][j] = h2u(v);
-        }
-    if (p.lng) {
-        // the rows' LayerNorm over their k channels, in place on the raw fp16 fragments (as tlayernorm):
-        // a row's channels sit in its lane quad, so the sums take two shuffles
+    if constexpr (AF32) {
+        // the fp32 rows' LayerNorm straight into the fragments: a row's channels are spread over the 4 lanes
+        // of its quad, so the sums take two shuffles
+        float2 x[KC1][4];
         float s[2] = {0.f, 0.f}, q[2] = {0.f, 0.f}, mean[2], rs[2];
 #pragma unroll
         for (int kc = 0; kc < KC1; kc++)
 #pragma unroll
             for (int j = 0; j < 4; j++) {
-                const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
-                s[j & 1] += v.x + v.y;
+                const int r = (j & 1) ? r1 : r0, c = kc * 16 + 2 * tq + (j >> 1) * 8;
+                x[kc][j] = r < p.M && c < p.k ? *reinterpret_cast<const float2 *>(reinterpret_cast<const float *>(p.a) + (size_t)r * p.sa + c)
+                                              : make_float2(0.f, 0.f);
+                s[j & 1] += x[kc][j].x + x[kc][j].y;
             }
 #pragma unroll
         for (int i = 0; i < 2; i++) {
@@ -1065,9 +1188,8 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
 #pragma unroll
             for (int j = 0; j < 4; j++)
                 if (kc * 16 + 2 * tq + (j >> 1) * 8 < p.k) {
-                    const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
-                    const float d0 = v.x - mean[j & 1], d1 = v.y - mean[j & 1];
-                    q[j & 1] += d0 * d0 + d1 * d1;
+                    const float dx = x[kc][j].x - mean[j & 1], dy = x[kc][j].y - mean[j & 1];
+                    q[j & 1] += dx * dx + dy * dy;
                 }
 #pragma unroll
         for (int i = 0; i < 2; i++) {
@@ -1080,15 +1202,78 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
 #pragma unroll
             for (int j = 0; j < 4; j++) {
                 const int c = kc * 16 + 2 * tq + (j >> 1) * 8, i = j & 1;
-                half2 y = __float2half2_rn(0.f);
+                half2 v = __float2half2_rn(0.f);
                 if (c < p.k) {
-                    const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
                     const float2 gm = __ldg(reinterpret_cast<const float2 *>(p.lng + c)), bt = __ldg(reinterpret_cast<const float2 *>(p.lnb + c));
-                    y = __floats2half2_rn((v.x - mean[i]) * rs[i] * gm.x + bt.x, (v.y - mean[i]) * rs[i] * gm.y + bt.y);
+                    v = __floats2half2_rn((x[kc][j].x - mean[i]) * rs[i] * gm.x + bt.x, (x[kc][j].y - mean[i]) * rs[i] * gm.y + bt.y);
                 }
-                a[kc][j] = h2u(y);
+                a[kc][j] = h2u(v);
             }
+    } else {
+#pragma unroll
+        for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int r = (j & 1) ? r1 : r0, c = kc * 16 + 2 * tq + (j >> 1) * 8;
+                half2 v = __float2half2_rn(0.f);
+                if (r < p.M && c < p.k) v = *reinterpret_cast<const half2 *>(p.a + (size_t)r * p.sa + c);
+                a[kc][j] = h2u(v);
+            }
+        if (p.lng) {
+            // the rows' LayerNorm over their k channels, in place on the raw fp16 fragments (as tlayernorm):
+            // a row's channels sit in its lane quad, so the sums take two shuffles
+            float s[2] = {0.f, 0.f}, q[2] = {0.f, 0.f}, mean[2], rs[2];
+#pragma unroll
+            for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
+                    s[j & 1] += v.x + v.y;
+                }
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                s[i] += __shfl_xor_sync(0xffffffffu, s[i], 1);
+                s[i] += __shfl_xor_sync(0xffffffffu, s[i], 2);
+                mean[i] = s[i] / p.k;
+            }
+#pragma unroll
+            for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    if (kc * 16 + 2 * tq + (j >> 1) * 8 < p.k) {
+                        const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
+                        const float d0 = v.x - mean[j & 1], d1 = v.y - mean[j & 1];
+                        q[j & 1] += d0 * d0 + d1 * d1;
+                    }
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                q[i] += __shfl_xor_sync(0xffffffffu, q[i], 1);
+                q[i] += __shfl_xor_sync(0xffffffffu, q[i], 2);
+                rs[i] = rsqrtf(q[i] / p.k + p.lneps);
+            }
+            if constexpr (STATS == 2) {
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const int r = i ? r1 : r0;
+                    if (!tq && r < p.M) *reinterpret_cast<float2 *>(p.stats + (size_t)r * 2) = make_float2(mean[i], rs[i]);
+                }
+            }
+#pragma unroll
+            for (int kc = 0; kc < KC1; kc++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const int c = kc * 16 + 2 * tq + (j >> 1) * 8, i = j & 1;
+                    half2 y = __float2half2_rn(0.f);
+                    if (c < p.k) {
+                        const float2 v = __half22float2(*reinterpret_cast<const half2 *>(&a[kc][j]));
+                        const float2 gm = __ldg(reinterpret_cast<const float2 *>(p.lng + c)), bt = __ldg(reinterpret_cast<const float2 *>(p.lnb + c));
+                        y = __floats2half2_rn((v.x - mean[i]) * rs[i] * gm.x + bt.x, (v.y - mean[i]) * rs[i] * gm.y + bt.y);
+                    }
+                    a[kc][j] = h2u(y);
+                }
+        }
     }
+    [[maybe_unused]] float ss[2] = {0.f, 0.f}, sq[2] = {0.f, 0.f}, mo[2] = {0.f, 0.f};
     for (int pp = 0; pp < npair; pp++) {
         asm volatile("cp.async.wait_all;" ::: "memory");
         __syncthreads();
@@ -1137,6 +1322,19 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
                         v0 *= cs.x;
                         v1 *= cs.y;
                     }
+                    if constexpr (MIX) {
+                        const float2 f = __half22float2(__floats2half2_rn(v0, v1));
+                        if (col < p.mr) mo[hh] += __ldg(p.mw2 + col) * f.x;
+                        if (col + 1 < p.mr) mo[hh] += __ldg(p.mw2 + col + 1) * f.y;
+                        continue;
+                    }
+                    if constexpr (STATS == 1) {
+                        if (col >= p.st_c0 && col < p.st_c0 + p.st_n) {  // st_c0, st_n even: both columns or neither
+                            const float2 f = __half22float2(__floats2half2_rn(v0, v1));
+                            ss[hh] += f.x + f.y;
+                            sq[hh] += f.x * f.x + f.y * f.y;
+                        }
+                    }
                     if (r >= p.M) continue;
                     if (p.out_f32)
                         *reinterpret_cast<float2 *>(reinterpret_cast<float *>(p.out) + (size_t)r * p.so + col) = make_float2(v0, v1);
@@ -1144,6 +1342,55 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
                         *reinterpret_cast<half2 *>(p.out + (size_t)r * p.so + col) = __floats2half2_rn(v0, v1);
                 }
             }
+        }
+    }
+    if constexpr (MIX) {
+        // the rows' gates through shared memory (the weight stages are done with), then z as k_mix_tg: a thread
+        // per (row, 8 channels), coalesced (A's rows again, from L2)
+        __syncthreads();
+        float *gs = reinterpret_cast<float *>(smw);
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            mo[hh] += __shfl_xor_sync(0xffffffffu, mo[hh], 1);
+            mo[hh] += __shfl_xor_sync(0xffffffffu, mo[hh], 2);
+            if (!tq) gs[warp * 16 + g + hh * 8] = 1.f / (1.f + __expf(-(mo[hh] + p.mb2)));
+        }
+        __syncthreads();
+        constexpr int CPR = KC1 * 2;  // 8-channel chunks per row
+        const int m0 = (int)blockIdx.x * 64;
+        for (int i = tid; i < 64 * CPR; i += 128) {
+            const int lr = i / CPR, c0 = (i % CPR) * 8, r = m0 + lr;
+            if (r >= p.M) continue;
+            const float k = gs[lr];
+            const uint4 ua = *reinterpret_cast<const uint4 *>(p.a + (size_t)r * p.sa + c0), ub = *reinterpret_cast<const uint4 *>(p.mo + (size_t)r * p.smo + c0);
+            const half2 *ha = reinterpret_cast<const half2 *>(&ua), *hb = reinterpret_cast<const half2 *>(&ub);
+            uint4 uo;
+            half2 *ho = reinterpret_cast<half2 *>(&uo);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int c = c0 + 2 * e;
+                const float2 fa = __half22float2(ha[e]), fb = __half22float2(hb[e]);
+                float2 q = make_float2(0.f, 0.f);
+                if (c < p.k) {
+                    q.x = fa.x * __ldg(p.mcg + c) + fb.x * k;
+                    if (c + 1 < p.k) q.y = fa.y * __ldg(p.mcg + c + 1) + fb.y * k;
+                }
+                ho[e] = __floats2half2_rn(q.x, q.y);
+            }
+            *reinterpret_cast<uint4 *>(p.mz + (size_t)r * p.smo + c0) = uo;
+        }
+    }
+    if constexpr (STATS == 1) {
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            ss[hh] += __shfl_xor_sync(0xffffffffu, ss[hh], 1);
+            ss[hh] += __shfl_xor_sync(0xffffffffu, ss[hh], 2);
+            sq[hh] += __shfl_xor_sync(0xffffffffu, sq[hh], 1);
+            sq[hh] += __shfl_xor_sync(0xffffffffu, sq[hh], 2);
+            const int r = hh ? r1 : r0;
+            if (tq || r >= p.M) continue;
+            const float mean = ss[hh] / p.st_n;
+            *reinterpret_cast<float2 *>(p.stats + (size_t)r * 2) = make_float2(mean, rsqrtf(fmaxf(sq[hh] / p.st_n - mean * mean, 0.f) + p.st_eps));
         }
     }
 #else
@@ -1173,6 +1420,11 @@ struct DwmmP {
     int so, out_f32;
     const void *add1;
     int s1, add1_f32;
+};
+// k_dwmm_ln's input LayerNorm: per token (mean, 1 / std), gamma and beta of the first c channels
+struct DwmmLn {
+    const float *st, *g, *b;
+    int c;
 };
 
 template <int NJ2>
@@ -1325,6 +1577,174 @@ __global__ void __launch_bounds__(128) k_dwmm(DwmmP p)
 #endif
 }
 
+// k_dwmm with its input LayerNorm'd per token as it is read (ln.st's statistics, rounded to fp16 as a stored
+// LayerNorm would be), zero outside the map and past ln.c channels. A kernel of its own, with its parameters
+// apart (more code or fields in k_dwmm change how every one of them compiles).
+template <int NJ2, bool F32, bool GATE, bool PF = true>
+__global__ void __launch_bounds__(128) k_dwmm_ln(DwmmP p, DwmmLn ln)
+{
+#if TFM_OK
+    using S = DwmmSmem<NJ2>;
+    constexpr int CW = S::cw, CT = S::ct, CB = GATE ? S::cb : 0, CHALO = S::chalo, CH = CW + CT + CB + CHALO + (GATE ? S::cm : 0), NT = 128, BM = 64;
+    extern __shared__ __align__(16) uint4 smw[];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tq = lane & 3;
+    const int m0 = (int)blockIdx.x * BM, y0 = m0 / p.W, x0 = m0 % p.W;
+    const int r0 = m0 + warp * 16 + g, r1 = r0 + 8;
+    const int tbytes = p.dwc * 36, bbytes = p.dwc * 4;  // the tap weights' and biases' bytes
+    constexpr int nload = CH;
+    auto load = [&](int c, int st) {
+        if (c < p.nh) {
+            uint4 *base = smw + (size_t)st * CH;
+            for (int i = tid; i < nload; i += NT) {
+                if (i < CW) {
+                    cp16(base + i, p.w + (size_t)c * NJ2 * 32 + i, 16);
+                } else if (i < CW + CT) {
+                    const int off = c * 576 + (i - CW) * 16, n = min(16, max(0, tbytes - off));
+                    cp16(base + i, reinterpret_cast<const char *>(p.dw) + (n ? off : 0), n);
+                } else if (i < CW + CT + CB) {
+                    const int off = c * 64 + (i - CW - CT) * 16, n = GATE ? min(16, max(0, bbytes - off)) : 0;
+                    cp16(base + i, n ? reinterpret_cast<const char *>(p.dwb) + off : reinterpret_cast<const char *>(p.dw), n);
+                } else if (i < CW + CT + CB + CHALO) {
+                    const int e = i - CW - CT - CB, t = e >> 1, hf = e & 1, dy = t / 66, xx = x0 - 1 + t % 66, yy = y0 - 1 + dy;
+                    const bool ok = yy >= 0 && yy < p.H && xx >= 0 && xx < p.W;
+                    cp16(base + i, ok ? p.in + ((size_t)yy * p.W + xx) * p.sin + c * 16 + hf * 8 : p.in, ok ? 16 : 0);
+                } else {
+                    const int e = i - CW - CT - CB - CHALO, t = e >> 1, hf = e & 1;
+                    cp16(base + i, p.mul + (size_t)(m0 + t) * p.smul + c * 16 + hf * 8, 16);
+                }
+            }
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    load(0, 0);
+    load(1, 1);
+    // LN: the halo tokens' mean, 1 / std and 1 (0 outside the map, where the stored LayerNorm is zero padding)
+    {
+        float *lst = reinterpret_cast<float *>(smw + 3 * CH);  // [3][66] x {mean, rs, in}
+        for (int t = tid; t < 3 * 66; t += NT) {
+            const int yy = y0 - 1 + t / 66, xx = x0 - 1 + t % 66;
+            const bool ok = yy >= 0 && yy < p.H && xx >= 0 && xx < p.W;
+            const float2 st = ok ? *reinterpret_cast<const float2 *>(ln.st + ((size_t)yy * p.W + xx) * 2) : make_float2(0.f, 0.f);
+            lst[3 * t] = st.x;
+            lst[3 * t + 1] = st.y;
+            lst[3 * t + 2] = ok ? 1.f : 0.f;
+        }
+    }
+    constexpr int res = F32 ? 4 : 2;
+    if (p.add1 && PF)
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++)
+            for (int l = tq; l * 128 < NJ2 * 16 * res; l += 4)
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(reinterpret_cast<const char *>(p.add1) + (size_t)(hh ? r1 : r0) * p.s1 * res + l * 128));
+    float acc[NJ2 * 2][4];
+#pragma unroll
+    for (int n = 0; n < NJ2 * 2; n++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) acc[n][e] = 0.f;
+    for (int c = 0; c < p.nh; c++) {
+        asm volatile("cp.async.wait_group 1;" ::: "memory");  // chunk c is in (c + 1 may still be landing)
+        __syncthreads();  // ... for every thread; and every warp is done with chunk c - 1's stage
+        load(c + 2, (c + 2) % 3);
+        const uint4 *sw = smw + (size_t)(c % 3) * CH;
+        const float *tw = reinterpret_cast<const float *>(sw + CW);                    // [16][9]
+        const float *tb = reinterpret_cast<const float *>(sw + CW + CT);               // [16]
+        const half *halo = reinterpret_cast<const half *>(sw + CW + CT + CB);          // [3][66][16]
+        const half *gate = reinterpret_cast<const half *>(sw + CW + CT + CB + CHALO);  // [64][16]
+        uint32_t pa[4];  // pa[j]: token (j & 1 ? r1 : r0), channels 2tq + (j >> 1) * 8, +1 of the chunk
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int lt = warp * 16 + g + (j & 1) * 8, cl = 2 * tq + (j >> 1) * 8;
+            float a0 = 0.f, a1 = 0.f;
+            float2 lg = make_float2(0.f, 0.f), lb = make_float2(0.f, 0.f);
+            const int ch = c * 16 + cl;  // lnc even: both channels or neither
+            if (ch < ln.c) {
+                lg = __ldg(reinterpret_cast<const float2 *>(ln.g + ch));
+                lb = __ldg(reinterpret_cast<const float2 *>(ln.b + ch));
+            }
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++)
+#pragma unroll
+                for (int dy = 0; dy < 3; dy++) {
+                    float2 v = __half22float2(*reinterpret_cast<const half2 *>(halo + (dy * 66 + lt + dx) * 16 + cl));
+                    {
+                        const float *st = reinterpret_cast<const float *>(smw + 3 * CH) + 3 * (dy * 66 + lt + dx);
+                        v = __half22float2(__floats2half2_rn((v.x - st[0]) * st[1] * lg.x + lb.x * st[2], (v.y - st[0]) * st[1] * lg.y + lb.y * st[2]));
+                    }
+                    a0 += v.x * tw[cl * 9 + dy * 3 + dx];
+                    a1 += v.y * tw[(cl + 1) * 9 + dy * 3 + dx];
+                }
+            if (GATE) {
+                a0 += tb[cl];
+                a1 += tb[cl + 1];
+            }
+            if (GATE) {
+                const float2 m = __half22float2(*reinterpret_cast<const half2 *>(gate + lt * 16 + cl));
+                a0 *= m.x;
+                a1 *= m.y;
+            }
+            pa[j] = h2u(__floats2half2_rn(a0, a1));
+        }
+#pragma unroll
+        for (int n = 0; n < NJ2; n++) {
+            const uint4 b = sw[n * 32 + lane];
+            mma32(acc[2 * n], pa, b.x, b.y);
+            mma32(acc[2 * n + 1], pa, b.z, b.w);
+        }
+    }
+    // the residual tile through shared memory, 16-byte chunks swizzled by row, then the epilogue
+    constexpr int cpr = NJ2 * res;  // 16-byte chunks per row: 24 (fp16) or 48 (fp32)
+    const unsigned char *sres = reinterpret_cast<const unsigned char *>(smw);
+    if (p.add1) {
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        __syncthreads();
+        for (int i = tid; i < BM * cpr; i += NT) {
+            const int lr = i / cpr, chn = i % cpr;
+            cp16(reinterpret_cast<unsigned char *>(smw) + lr * cpr * 16 + ((chn ^ (lr & 7)) * 16),
+                 reinterpret_cast<const char *>(p.add1) + (size_t)(m0 + lr) * p.s1 * res + chn * 16, 16);
+        }
+        cp_wait();
+        __syncthreads();
+    }
+#pragma unroll
+    for (int n = 0; n < NJ2 * 2; n++) {
+        const int c = n * 8 + tq * 2;
+        const float2 bb = p.bias ? __ldg(reinterpret_cast<const float2 *>(p.bias + c)) : make_float2(0.f, 0.f);
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            const int lr = warp * 16 + g + hh * 8;
+            float v0 = acc[n][2 * hh], v1 = acc[n][2 * hh + 1];
+            if (p.bias) {
+                v0 += bb.x;
+                v1 += bb.y;
+            }
+            if (p.add1) {
+                const unsigned char *row = sres + lr * cpr * 16;
+                const float2 f = F32 ? *reinterpret_cast<const float2 *>(row + (((2 * n + (tq >> 1)) ^ g) * 16) + (tq & 1) * 8)
+                                            : __half22float2(*reinterpret_cast<const half2 *>(row + ((n ^ g) * 16) + tq * 4));
+                v0 += f.x;
+                v1 += f.y;
+            }
+            acc[n][2 * hh] = v0;
+            acc[n][2 * hh + 1] = v1;
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < NJ2 * 2; n++) {
+        const int c = n * 8 + tq * 2;
+#pragma unroll
+        for (int hh = 0; hh < 2; hh++) {
+            const size_t r = (size_t)(hh ? r1 : r0);
+            if (F32)
+                *reinterpret_cast<float2 *>(reinterpret_cast<float *>(p.out) + r * p.so + c) = make_float2(acc[n][2 * hh], acc[n][2 * hh + 1]);
+            else
+                *reinterpret_cast<half2 *>(reinterpret_cast<half *>(p.out) + r * p.so + c) = __floats2half2_rn(acc[n][2 * hh], acc[n][2 * hh + 1]);
+        }
+    }
+#else
+    __trap();
+#endif
+}
+
 // Whether the GEMM / MLP / depthwise-GEMM kernels prefetch their rows into L2 ahead of use (they only
 // pay where L2 holds them until then: large_l2()). AJI_NATIVE_L2PREFETCH=0 / 1 overrides.
 static int l2_prefetch()
@@ -1339,18 +1759,31 @@ static int l2_prefetch()
     return large_l2() ? 1 : 0;
 }
 
-template <int NJ2, bool F32, bool GATE>
-cudaError_t launch_dwmm(const DwmmP &p, cudaStream_t s)
+template <int NJ2, bool F32, bool GATE, bool LN = false>
+cudaError_t launch_dwmm(const DwmmP &p, cudaStream_t s, const DwmmLn &ln = DwmmLn{})
 {
     using S = DwmmSmem<NJ2>;
     constexpr int stages = 3 * (S::cw + S::ct + S::chalo + (GATE ? S::cb + S::cm : 0)) * 16, res = 64 * NJ2 * 16 * (F32 ? 4 : 2);
-    constexpr int sm = stages > res ? stages : res;
+    constexpr int sm = (stages + (LN ? 3 * 66 * 3 * 4 : 0)) > res ? stages + (LN ? 3 * 66 * 3 * 4 : 0) : res;
     const bool pf = l2_prefetch();
-    static const cudaError_t attr = cudaFuncSetAttribute(k_dwmm<NJ2, F32, GATE, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
-    static const cudaError_t attr0 = cudaFuncSetAttribute(k_dwmm<NJ2, F32, GATE, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    auto k1 = [] {
+        if constexpr (LN) return k_dwmm_ln<NJ2, F32, GATE, true>;
+        else return k_dwmm<NJ2, F32, GATE, true>;
+    }();
+    auto k0 = [] {
+        if constexpr (LN) return k_dwmm_ln<NJ2, F32, GATE, false>;
+        else return k_dwmm<NJ2, F32, GATE, false>;
+    }();
+    static const cudaError_t attr = cudaFuncSetAttribute(k1, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    static const cudaError_t attr0 = cudaFuncSetAttribute(k0, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     if ((pf ? attr : attr0) != cudaSuccess) return pf ? attr : attr0;
-    if (pf) k_dwmm<NJ2, F32, GATE, true><<<(unsigned)(p.M / 64), 128, sm, s>>>(p);
-    else k_dwmm<NJ2, F32, GATE, false><<<(unsigned)(p.M / 64), 128, sm, s>>>(p);
+    if constexpr (LN) {
+        if (pf) k1<<<(unsigned)(p.M / 64), 128, sm, s>>>(p, ln);
+        else k0<<<(unsigned)(p.M / 64), 128, sm, s>>>(p, ln);
+    } else {
+        if (pf) k1<<<(unsigned)(p.M / 64), 128, sm, s>>>(p);
+        else k0<<<(unsigned)(p.M / 64), 128, sm, s>>>(p);
+    }
     return cudaGetLastError();
 }
 
@@ -1727,6 +2160,30 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     p.lneps = g.ln_eps;
     if (g.ln_gamma && (g.add1 || g.add2 || g.act_last || w.K % 2 || !g.ln_beta || !(w.Kpad == 128 || w.Kpad == 192 || w.Kpad == 224 || w.Kpad == 256)))
         return cudaErrorNotSupported;
+    if (g.a_f32 && !g.ln_gamma) return cudaErrorNotSupported;
+    p.stats = g.a_stats_out ? g.a_stats_out : g.stats_out;
+    if (g.a_stats_out && (g.stats_out || g.a_f32 || !g.ln_gamma)) return cudaErrorNotSupported;
+    p.st_c0 = g.stats_c0;
+    p.st_n = g.stats_n;
+    p.st_eps = g.stats_eps;
+    if (g.stats_out && (!g.a_f32 || g.out_f32 || g.stats_c0 % 2 || g.stats_n % 2 || g.stats_n < 2 || g.stats_c0 + g.stats_n > w.Npad))
+        return cudaErrorNotSupported;
+    p.mo = (const half *)g.mix_other;
+    p.mcg = g.mix_cg;
+    p.mw2 = g.mix_w2;
+    p.mb2 = g.mix_b2;
+    p.mr = g.mix_r;
+    p.smo = g.mix_s;
+    p.mz = (half *)g.mix_z;
+    if (g.mix_z) {
+        if (w.Npad != 16 || w.Kpad != 192 || g.ln_gamma || g.stats_out || g.a_stats_out || g.act != TAct::Gelu || g.mix_r > 16 || !g.mix_other || !g.mix_cg ||
+            !g.mix_w2 || g.mix_s % 8 || g.mix_s < w.Kpad || g.sa < w.Kpad)
+            return cudaErrorNotSupported;
+        const unsigned grid = (unsigned)((g.M + 63) / 64);
+        if (pf) k_gemm_rs<12, true, false, 0, true><<<grid, 128, 4 * 12 * 32 * 16, s>>>(p);
+        else k_gemm_rs<12, false, false, 0, true><<<grid, 128, 4 * 12 * 32 * 16, s>>>(p);
+        return cudaGetLastError();
+    }
     // without adds, K = 128 / 192 / 224 / 256 (the transformers' qkv / fc1): the row-stationary kernel
     // (AJI_NATIVE_GEMM_RS=0: k_gemm)
     static const bool rs = [] {
@@ -1736,12 +2193,18 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     if ((rs || g.ln_gamma) && !g.add1 && !g.add2 && !g.act_last && (w.Kpad == 128 || w.Kpad == 192 || w.Kpad == 224 || w.Kpad == 256)) {
         const unsigned grid = (unsigned)((g.M + 63) / 64);
         switch (w.Kpad) {
-#define RS(K) (pf ? k_gemm_rs<K, true><<<grid, 128, 4 * K * 32 * 16, s>>>(p) : k_gemm_rs<K, false><<<grid, 128, 4 * K * 32 * 16, s>>>(p))
+#define RSL(K, PF_, AF_, ST_) k_gemm_rs<K, PF_, AF_, ST_><<<grid, 128, 4 * K * 32 * 16, s>>>(p)
+#define RS(K)                                                                                                                 \
+    (g.stats_out     ? (pf ? RSL(K, true, true, 1) : RSL(K, false, true, 1))                                                  \
+     : g.a_stats_out ? (pf ? RSL(K, true, false, 2) : RSL(K, false, false, 2))                                                \
+     : g.a_f32       ? (pf ? RSL(K, true, true, 0) : RSL(K, false, true, 0))                                                  \
+                     : (pf ? RSL(K, true, false, 0) : RSL(K, false, false, 0)))
         case 128: RS(8); break;
         case 192: RS(12); break;
         case 224: RS(14); break;
         default: RS(16); break;
 #undef RS
+#undef RSL
         }
         return cudaGetLastError();
     }
@@ -1791,6 +2254,10 @@ cudaError_t tdwgemm(const TMat &w, const TDwGemm &g, cudaStream_t s)
     // fp16 stream without a gate (FDAT) or fp32 stream with one (DAT)
     const bool gate = g.mul || g.dwb;
     if (g.out_f32 != g.add1_f32 && g.add1) return cudaErrorNotSupported;
+    if (g.ln_stats) {
+        if (!g.ln_gamma || !g.ln_beta || g.ln_c % 2 || g.ln_c > w.Kpad || !(g.out_f32 && gate && g.mul && g.dwb && nj2 == 12)) return cudaErrorNotSupported;
+        return launch_dwmm<12, true, true, true>(p, s, DwmmLn{g.ln_stats, g.ln_gamma, g.ln_beta, g.ln_c});
+    }
     if (!g.out_f32 && !gate) return nj2 == 8 ? launch_dwmm<8, false, false>(p, s) : launch_dwmm<12, false, false>(p, s);
     if (g.out_f32 && gate && g.mul && g.dwb && nj2 == 12) return launch_dwmm<12, true, true>(p, s);
     return cudaErrorNotSupported;
@@ -1969,6 +2436,21 @@ cudaError_t tdwconv2(const void *in, int sin, void *out, int sout, int H, int W,
     else
         k_dw8s<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, bias,
                                                       (const half *)mul, smul);
+    return cudaGetLastError();
+}
+
+cudaError_t tdwconv_ln(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, float *sums,
+                       const float *stats, const float *gamma, const float *beta, cudaStream_t s)
+{
+    const int C8 = (C + 7) / 8 * 8;
+    if (C % 2 || C > 1024 || sin % 8 || sout % 8 || sin < C8 || sout < C8 || ((uintptr_t)in | (uintptr_t)out) % 16 || !stats || !gamma || !beta)
+        return cudaErrorNotSupported;
+    const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
+    if (n >= (1ll << 30)) return cudaErrorNotSupported;
+    if (dw_vec() == 8)
+        k_dw8s_ln<8><<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, stats, gamma, beta);
+    else
+        k_dw8s_ln<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, stats, gamma, beta);
     return cudaGetLastError();
 }
 

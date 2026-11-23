@@ -178,6 +178,7 @@ bool FdatBody::setup(int bw, int bh, cudaStream_t s, std::string *why, void *scr
     stats = (float *)res.alloc((size_t)(heads * hd * hd + 2 * C) * 4);
     attnb = (float *)res.alloc((size_t)heads * hd * hd * 4);
     fold = (float *)res.alloc((size_t)C * C * 4);
+    lst = (float *)res.alloc(M * 2 * 4);  // LN1's statistics per token (qkv -> the depthwise conv)
     if (res.failed) return refuse(why, "out of GPU memory");
     std::vector<std::pair<GOp *, GConvArgs>> ops;
     for (int sz : {0, 1}) {
@@ -227,15 +228,32 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
         mark(P_IO);
         for (int bi = 0; bi < nblk; bi++) {
             const Block &b = blocks[(size_t)gi * nblk + bi];
-            CK(tlayernorm(X, CP, N1, CP, M, C, CP, b.ln1g, b.ln1b, b.eps1, s));
-            mark(P_LN);
-            TGemm q;
-            q.a = N1; q.sa = CP; q.M = M; q.out = QKV; q.so = QS;
-            CK(tgemm(*b.qkv, q, s));
-            mark(P_QKV);
+            // LN1 applied by its two readers (qkv on its A load, which also gives the rows' statistics, and the
+            // depthwise conv from them) where they can, else stored first
             if (b.spatial) CK(cudaMemsetAsync(sums, 0, CP * 4, s));
-            CK(tdwconv(N1, CP, CF, CP, bh, bw, C, b.dw, true, b.spatial ? sums : nullptr, s));
-            mark(P_DW);
+            TGemm q;
+            q.a = X; q.sa = CP; q.M = M; q.out = QKV; q.so = QS;
+            q.ln_gamma = b.ln1g; q.ln_beta = b.ln1b; q.ln_eps = b.eps1; q.a_stats_out = lst;
+            cudaError_t eq = lst ? tgemm(*b.qkv, q, s) : cudaErrorNotSupported;
+            if (eq == cudaSuccess) {
+                mark(P_QKV);
+                eq = tdwconv_ln(X, CP, CF, CP, bh, bw, C, b.dw, true, b.spatial ? sums : nullptr, lst, b.ln1g, b.ln1b, s);
+                if (eq == cudaErrorNotSupported) {
+                    CK(tlayernorm(X, CP, N1, CP, M, C, CP, b.ln1g, b.ln1b, b.eps1, s));
+                    eq = tdwconv(N1, CP, CF, CP, bh, bw, C, b.dw, true, b.spatial ? sums : nullptr, s);
+                }
+                CK(eq);
+                mark(P_DW);
+            } else {
+                if (eq != cudaErrorNotSupported) return eq;
+                CK(tlayernorm(X, CP, N1, CP, M, C, CP, b.ln1g, b.ln1b, b.eps1, s));
+                mark(P_LN);
+                q.a = N1; q.ln_gamma = q.ln_beta = nullptr; q.a_stats_out = nullptr;
+                CK(tgemm(*b.qkv, q, s));
+                mark(P_QKV);
+                CK(tdwconv(N1, CP, CF, CP, bh, bw, C, b.dw, true, b.spatial ? sums : nullptr, s));
+                mark(P_DW);
+            }
             if (b.spatial) {
                 TWinAttn a;
                 a.qkv = QKV; a.sq = QS; a.qo = 0; a.ko = C; a.vo = 2 * C; a.H = bh; a.W = bw; a.heads = heads; a.hd = hd;

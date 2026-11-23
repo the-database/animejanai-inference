@@ -76,6 +76,7 @@ private:
     float *identf = nullptr;
     void *IN16 = nullptr, *XF = nullptr, *N1 = nullptr, *QKV = nullptr, *AT = nullptr, *CX = nullptr, *Z = nullptr, *H1 = nullptr, *TG = nullptr;
     void *N2 = nullptr, *PR = nullptr, *S16 = nullptr, *TT = nullptr, *U0 = nullptr, *V1 = nullptr, *V2 = nullptr, *O16 = nullptr;
+    float *LST = nullptr;  // the SGFN's LN3 statistics per token (fc1's epilogue -> the gated depthwise GEMM)
     float *S = nullptr, *GIN = nullptr, *sums = nullptr, *cg = nullptr, *tg = nullptr, *stats = nullptr, *attnb = nullptr, *fold = nullptr;
     float *wsp = nullptr;
     size_t ws_floats = 0;
@@ -381,6 +382,7 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     lt.add(&f->TG, M * 16 * 2, {{13, 14}});  // the token gate's hidden layer
     lt.add(&f->H1, M * f->FS * 2, {{17, 19}});
     lt.add(&f->N2, M * CP * 2, {{18, 19}});
+    lt.add((void **)&f->LST, M * 8, {{17, 19}});
     lt.add(&f->PR, M * CP * 2, {{19, 20}});
     lt.add(&f->S16, M * CP * 2, {{21, 22}});
     lt.add(&f->TT, M * CP * 2, {{31, 32}});
@@ -454,13 +456,39 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         if (collect) return cudaSuccess;
         return tlayernorm2(x, xf32, sx, y, yf32, CP, M, C, CP, l.g, l.b, l.eps, s);
     };
+    // the GEMM of LN(S) (the fp32 stream normalised as the GEMM loads it; else the LayerNorm into N1 first)
+    // st: also the LayerNorm statistics (st->eps) of output columns [CP, CP + C) into LST; *made: whether it did
+    auto gemm_ln = [&](const Ln &l, const TMat &m, void *o, int so, TAct act, const Ln *st = nullptr, bool *made = nullptr) -> cudaError_t {
+        if (made) *made = false;
+        if (collect) return cudaSuccess;
+        TGemm gm;
+        gm.a = S; gm.sa = CP; gm.M = M; gm.out = o; gm.so = so; gm.act = act;
+        gm.a_f32 = true; gm.ln_gamma = l.g; gm.ln_beta = l.b; gm.ln_eps = l.eps;
+        if (st) { gm.stats_out = LST; gm.stats_c0 = CP; gm.stats_n = C; gm.stats_eps = st->eps; }
+        cudaError_t e = tgemm(m, gm, s);
+        if (e == cudaErrorNotSupported && st) {
+            gm.stats_out = nullptr;
+            e = tgemm(m, gm, s);
+        } else if (st && e == cudaSuccess) {
+            *made = true;
+        }
+        if (e != cudaErrorNotSupported) return e;
+        CK(lnorm(l, S, true, CP, N1, false));
+        return gemm(m, N1, CP, o, so, act, false);
+    };
     const uint16_t *q16 = (const uint16_t *)QKV;
     // Z = the mix of AT and CX with the channel gate cg and the token gate from src: the gate's hidden layer
     // as a GEMM (tensor cores, GELU, into TG), then the mix reading it (cudaErrorNotSupported: none of it ran)
+    // (src: AT in mode 0, CX in mode 1; Z = src * cg + the other * the token gate.) In one kernel where tgemm
+    // has it: the gate's GEMM mixes from its A rows instead of storing its hidden layer.
     auto token_gate_mix = [&](const Block &b, const void *src, int mode) -> cudaError_t {
         TGemm g;
         g.a = src; g.sa = CP; g.M = M; g.out = TG; g.so = 16; g.act = TAct::Gelu;
         if (!b.sg1 || b.sg1->Npad != 16) return cudaErrorNotSupported;
+        TGemm gm = g;
+        gm.mix_other = mode ? AT : CX; gm.mix_cg = cg; gm.mix_w2 = b.sw2; gm.mix_b2 = b.sb2; gm.mix_r = b.sr; gm.mix_s = CP; gm.mix_z = Z;
+        const cudaError_t e = tgemm(*b.sg1, gm, s);
+        if (e != cudaErrorNotSupported) return e;
         CK(tgemm(*b.sg1, g, s));
         return dat_mix_tg(AT, CX, CP, cg, TG, 16, b.sr, b.sw2, b.sb2, mode, Z, M, C, s);
     };
@@ -477,9 +505,7 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
     for (size_t gi = 0; gi < groups.size(); gi++) {
         K(cudaMemcpyAsync(GIN, S, (size_t)M * CP * 4, cudaMemcpyDeviceToDevice, s));
         for (Block &b : groups[gi]) {
-            CK(lnorm(b.n1, S, true, CP, N1, false));
-            pr.mark(P_LN);
-            CK(gemm(*b.qkv, N1, CP, QKV, QS, TAct::None, false));
+            CK(gemm_ln(b.n1, *b.qkv, QKV, QS, TAct::None));
             pr.mark(P_QKV);
             // conv branch: GELU(dwconv(v) + b); its channel sums for the spatial blocks' channel gate
             K(cudaMemsetAsync(sums, 0, CP * 4, s));
@@ -538,13 +564,21 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             CK(gemm(*b.proj, Z, CP, S, CP, TAct::None, true));
             pr.mark(P_PROJ);
             // SGFN
-            CK(lnorm(b.n2, S, true, CP, N1, false));
-            CK(gemm(*b.fc1, N1, CP, H1, FS, TAct::Gelu, false));
+            bool st_made = false;
+            CK(gemm_ln(b.n2, *b.fc1, H1, FS, TAct::Gelu, &b.n3, &st_made));
             pr.mark(P_FC1);
-            CK(lnorm(b.n3, (const uint16_t *)H1 + CP, false, FS, N2, false));
-            // S += ((dw(N2) + b) * x1) fc2 in one kernel where there is one (else the gated depthwise conv, then the GEMM)
+            // S += ((dw(LN3(x2)) + b) * x1) fc2 in one kernel, LN3 applied as it loads x2 where fc1 gave its
+            // statistics (else LN3 into N2 first; else the gated depthwise conv, then the GEMM)
             cudaError_t e2 = cudaErrorNotSupported;
-            if (!collect) {
+            if (!collect && st_made) {
+                TDwGemm dg;
+                dg.in = (const uint16_t *)H1 + CP; dg.sin = FS; dg.H = h; dg.W = w; dg.dw = b.fdw; dg.dwb = b.fdwb; dg.dwc = C8;
+                dg.mul = H1; dg.smul = FS; dg.out = S; dg.so = CP; dg.out_f32 = true; dg.add1 = S; dg.s1 = CP; dg.add1_f32 = true;
+                dg.ln_stats = LST; dg.ln_gamma = b.n3.g; dg.ln_beta = b.n3.b; dg.ln_c = C;
+                e2 = tdwgemm(*b.fc2, dg, s);
+            }
+            if (e2 == cudaErrorNotSupported) CK(lnorm(b.n3, (const uint16_t *)H1 + CP, false, FS, N2, false));
+            if (!collect && e2 == cudaErrorNotSupported) {
                 TDwGemm dg;
                 dg.in = N2; dg.sin = CP; dg.H = h; dg.W = w; dg.dw = b.fdw; dg.dwb = b.fdwb; dg.dwc = C8; dg.mul = H1; dg.smul = FS;
                 dg.out = S; dg.so = CP; dg.out_f32 = true; dg.add1 = S; dg.s1 = CP; dg.add1_f32 = true;
