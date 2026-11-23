@@ -70,8 +70,9 @@ struct GConvArgs {
     float *sums = nullptr;
 };
 
-// Floats of workspace glaunch would use to split K for a (0: it would not split).
-size_t gworkspace(const GWeights &w, const GConvArgs &a);
+// Floats of workspace glaunch would use to split K for a (0: it would not split): with the variants 0-2 and
+// gvariant_for's, or with all_variants every variant's split.
+size_t gworkspace(const GWeights &w, const GConvArgs &a, bool all_variants = false);
 
 bool gsupported(const GWeights &w, const GConvArgs &a, std::string *why = nullptr);
 int gvariant_count();

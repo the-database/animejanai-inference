@@ -12,14 +12,22 @@ namespace ajinative {
 namespace {
 
 using GFn = cudaError_t (*)(const gdev::GParams &, int, cudaStream_t);
-constexpr int kGVariants = 3;
-constexpr int kWarps[kGVariants] = {8, 4, 2};
+// A variant is a CTA shape (warps x rows of 16 pixels per warp) and a cap on the K chunk: variants 0-5 take the
+// largest chunk the input allows (64 channels, 32 at stride 2), 6-11 the same shapes with chunks of at most 32
+// channels (smaller tiles, more CTAs per SM; the 64-channel kernels' variants 6-11 are the 32-channel kernels').
+constexpr int kGShapes = 6, kGVariants = 2 * kGShapes;
+constexpr int kWarps[kGShapes] = {8, 4, 2, 8, 4, 2}, kRows[kGShapes] = {1, 1, 1, 2, 2, 2};
+int vrows(int v) { return kWarps[v % kGShapes] * kRows[v % kGShapes]; }  // output rows per CTA
+int vcap(int v) { return v < kGShapes ? 64 : 32; }
 
-template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0, int SUMS = 0>
+template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0, int SUMS = 0, int WR = 1>
 cudaError_t run_g(const gdev::GParams &p, int zdim, cudaStream_t s)
 {
-    constexpr int smem = gdev::gconv_smem_bytes<KCH, COUTP, S, WARPS>();
-    auto k = gdev::k_gconv<KCH, COUTP, S, IN, OUT, WARPS, ACC, SUMS>;
+    constexpr int smem = gdev::gconv_smem_bytes<KCH, COUTP, S, WARPS, WR>();
+    auto k = [] {
+        if constexpr (WR == 1) return gdev::k_gconv<KCH, COUTP, S, IN, OUT, WARPS, ACC, SUMS>;
+        else return gdev::k_gconv_rows<KCH, COUTP, S, IN, OUT, WARPS, ACC, SUMS, WR>;
+    }();
     if constexpr (smem > 48 * 1024) {
         static bool set = false;
         if (!set) {
@@ -28,7 +36,7 @@ cudaError_t run_g(const gdev::GParams &p, int zdim, cudaStream_t s)
             set = true;
         }
     }
-    const dim3 grid((p.W + gdev::TW - 1) / gdev::TW, (p.H + WARPS - 1) / WARPS, zdim);
+    const dim3 grid((p.W + gdev::TW - 1) / gdev::TW, (p.H + WARPS * WR - 1) / (WARPS * WR), zdim);
     k<<<grid, WARPS * 32, smem, s>>>(p);
     return cudaGetLastError();
 }
@@ -42,14 +50,17 @@ struct GKey {
 };
 struct GEntry {
     GKey key;
-    GFn fn[kGVariants];
+    GFn fn[kGShapes];
 };
 
-#define AJI_G(K, C, S, IN, OUT) {{K, C, S, IN, OUT, 0}, {&run_g<K, C, S, IN, OUT, 8>, &run_g<K, C, S, IN, OUT, 4>, &run_g<K, C, S, IN, OUT, 2>}}
-#define AJI_G32(K, C) {{K, C, 1, 0, 0, 1}, {&run_g<K, C, 1, 0, 0, 8, 1>, &run_g<K, C, 1, 0, 0, 4, 1>, &run_g<K, C, 1, 0, 0, 2, 1>}}
+#define AJI_GSH(K, C, S, IN, OUT, ACC, SUMS)                                                                                   \
+    {&run_g<K, C, S, IN, OUT, 8, ACC, SUMS>, &run_g<K, C, S, IN, OUT, 4, ACC, SUMS>, &run_g<K, C, S, IN, OUT, 2, ACC, SUMS>,          \
+     &run_g<K, C, S, IN, OUT, 8, ACC, SUMS, 2>, &run_g<K, C, S, IN, OUT, 4, ACC, SUMS, 2>, &run_g<K, C, S, IN, OUT, 2, ACC, SUMS, 2>}
+#define AJI_G(K, C, S, IN, OUT) {{K, C, S, IN, OUT, 0}, AJI_GSH(K, C, S, IN, OUT, 0, 0)}
+#define AJI_G32(K, C) {{K, C, 1, 0, 0, 1}, AJI_GSH(K, C, 1, 0, 0, 1, 0)}
 #define AJI_G32_COUT(K) AJI_G32(K, 16), AJI_G32(K, 32), AJI_G32(K, 48), AJI_G32(K, 64)
 // with the channel sums (HAT's CAB: 64 -> 192 channels)
-#define AJI_GS(K, C) {{K, C, 1, 0, 0, 0, 1}, {&run_g<K, C, 1, 0, 0, 8, 0, 1>, &run_g<K, C, 1, 0, 0, 4, 0, 1>, &run_g<K, C, 1, 0, 0, 2, 0, 1>}}
+#define AJI_GS(K, C) {{K, C, 1, 0, 0, 0, 1}, AJI_GSH(K, C, 1, 0, 0, 0, 1)}
 #define AJI_G_COUT(K, S, IN, OUT) AJI_G(K, 16, S, IN, OUT), AJI_G(K, 32, S, IN, OUT), AJI_G(K, 48, S, IN, OUT), AJI_G(K, 64, S, IN, OUT)
 
 const GEntry kG[] = {
@@ -71,16 +82,16 @@ bool gfail(std::string *why, const char *m)
     return false;
 }
 
-int kch_for(const GWeights &w, const GConvArgs &a)
+int kch_for(const GWeights &w, const GConvArgs &a, int cap = 64)
 {
     if (a.nchw) return 16;
-    const int maxk = a.stride == 2 ? 32 : 64;
+    const int maxk = a.stride == 2 || cap < 64 ? 32 : 64;
     for (int k = maxk; k >= 16; k /= 2)
         if (w.cin_pad % k == 0) return k;
     return 0;
 }
 
-const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
+const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why, int cap = 64)
 {
     if (!w.frag) return gfail(why, "no weights"), nullptr;
     if (a.stride != 1 && a.stride != 2) return gfail(why, "stride must be 1 or 2"), nullptr;
@@ -96,7 +107,7 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
     if (a.acc32 && (a.stride != 1 || a.nchw || a.R)) return gfail(why, "fp32 accumulation: stride 1, NHWC in and out"), nullptr;
     if (a.out_f32 && (!a.acc32 || a.r1 || a.r2 || a.act == GAct::Gelu)) return gfail(why, "fp32 output: fp32 accumulation, r1f only, no GELU"), nullptr;
     if (a.sums && (a.out_f32 || a.R)) return gfail(why, "channel sums: fp16 NHWC output"), nullptr;
-    const GKey k{kch_for(w, a), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0, a.sums ? 1 : 0};
+    const GKey k{kch_for(w, a, cap), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0, a.sums ? 1 : 0};
     if (!k.kch) return gfail(why, "input channels"), nullptr;
     for (const GEntry &e : kG)
         if (e.key == k) return &e;
@@ -104,12 +115,13 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why)
     return nullptr;
 }
 
-// K splits for a: enough CTAs to cover the SMs about twice, at most one split per (tap, K chunk).
-int ksplit_for(const GWeights &w, const GConvArgs &a, int warps)
+// K splits for a at `rows` output rows per CTA: enough CTAs to cover the SMs about twice, at most one split per
+// (tap, K chunk).
+int ksplit_for(const GWeights &w, const GConvArgs &a, int rows, int cap = 64)
 {
-    const int kch = kch_for(w, a);
+    const int kch = kch_for(w, a, cap);
     if (!kch) return 1;
-    const long ctas = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + warps - 1) / warps) * (w.cout_pad / w.coutp);
+    const long ctas = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + rows - 1) / rows) * (w.cout_pad / w.coutp);
     const long want = 2L * sm_count();
     if (ctas >= want) return 1;
     const int units = (a.nchw ? 1 : w.cin_pad / kch) * 9;
@@ -117,10 +129,10 @@ int ksplit_for(const GWeights &w, const GConvArgs &a, int warps)
     return k < units ? k : units;
 }
 
-gdev::GParams params(const GWeights &w, const GConvArgs &a, int ksplit)
+gdev::GParams params(const GWeights &w, const GConvArgs &a, int ksplit, int cap)
 {
     gdev::GParams p{};
-    const int kch = kch_for(w, a);
+    const int kch = kch_for(w, a, cap);
     p.src = (const half *)a.src;
     p.sstride = a.src_stride;
     p.IH = a.IH;
@@ -209,26 +221,29 @@ int gvariant_count() { return kGVariants; }
 
 namespace {
 
-// Warp count per kernel bucket and GPU generation (index into kWarps; -1: not measured, use gvariant_rule).
+// Variant per kernel bucket and GPU generation (-1: not measured, use gvariant_rule).
 // Bucket: kernel class (K chunk, output chunk, stride, NCHW input, pixel-shuffle output), band (0 whole map,
 // 1 splits K at 8 warps: small maps, 2 unsplit but under 8 CTAs per SM: only where measured apart), output
 // chunks (1, 2, 3+) and K chunks (1, 2, 3+). Each entry is the variant with the least summed time (each
 // layer alone) over the bucket's layers in ESRGAN 2x / 4x (256 and 512 tiles), DAT, HAT, FDAT-M / XL, SPAN-S,
 // RIFE 4.14 / 4.22 / 4.26 (1080p, 480p), TFix (DVD, 720p, 1080p) and TFDAT, every model weighted the same, on
 // an RTX 3090 (Ampere), 4090 (Ada), 5090 (Blackwell); the commented ones were set from whole-network runs.
-// The generations want different warp counts for the same layers (ESRGAN's 64 -> 32 convs: 2 warps on the
-// 3090, 8 on the others; its 64 -> 64: 4 on the 3090 / 4090, 8 on the 5090), more than SM count or
-// occupancy explains.
+// The 3090 and 4090 columns choose among variants 0-2 (one row per warp, the largest K chunk: measured before the
+// others existed); the 5090's among all twelve, changed from the earlier pick only where the bucket gained 1.5%+.
+// The generations want different shapes for the same layers (ESRGAN's 64 -> 32 convs: 2 warps on the 3090, 8 on
+// the 4090, 4 x 2 rows with 32-channel chunks on the 5090), more than SM count or occupancy explains.
 struct GPick {
     signed char kch, coutp, s, in, out, band, ch, kc, v[3];
 };
 constexpr GPick kGPick[] = {
-    {16, 16, 1, 0, 0, 0, 1, 1, {1, 1, 0}},
+    {16, 16, 1, 0, 0, 0, 1, 1, {1, 1, 9}},
     {16, 16, 1, 0, 0, 0, 1, 3, {1, -1, -1}},
     {16, 16, 1, 0, 0, 1, 1, 3, {1, 2, 1}},
-    {16, 16, 1, 0, 1, 0, 1, 1, {1, 1, 0}},
+    {16, 16, 1, 0, 0, 2, 1, 1, {-1, -1, 0}},
+    {16, 16, 1, 0, 1, 0, 1, 1, {1, 1, 9}},
+    {16, 16, 1, 0, 1, 2, 1, 1, {-1, -1, 0}},
     {16, 16, 2, 1, 0, 0, 1, 1, {1, 1, 1}},
-    {16, 32, 1, 0, 0, 0, 1, 1, {1, 0, 0}},
+    {16, 32, 1, 0, 0, 0, 1, 1, {1, 0, 10}},
     {16, 32, 1, 0, 0, 0, 1, 3, {1, 1, 0}},
     {16, 32, 2, 0, 0, 0, 1, 1, {2, 0, 0}},
     {16, 32, 2, 0, 0, 1, 1, 1, {-1, 1, 1}},
@@ -237,25 +252,33 @@ constexpr GPick kGPick[] = {
     {16, 48, 2, 0, 0, 1, 1, 1, {2, 2, 2}},
     {16, 48, 2, 0, 0, 1, 2, 1, {2, 2, 2}},
     {16, 48, 2, 0, 0, 1, 2, 3, {1, 2, 2}},
-    {16, 64, 1, 0, 0, 0, 1, 1, {1, 0, 0}},
+    {16, 48, 2, 0, 0, 2, 2, 3, {-1, -1, 4}},
+    {16, 64, 1, 0, 0, 0, 1, 1, {1, 0, 7}},
     {16, 64, 1, 0, 0, 0, 1, 3, {2, 0, 0}},
     {16, 64, 1, 0, 0, 0, 2, 1, {0, 2, 1}},
     {16, 64, 1, 0, 0, 0, 3, 1, {2, 2, 1}},
     {16, 64, 1, 0, 0, 1, 1, 1, {2, 2, 2}},
-    {32, 16, 1, 0, 0, 0, 1, 1, {0, 0, 0}},
+    {16, 64, 1, 0, 0, 2, 1, 1, {-1, -1, 0}},
+    {16, 64, 1, 0, 0, 2, 1, 3, {-1, -1, 10}},
+    {32, 16, 1, 0, 0, 0, 1, 1, {0, 0, 3}},
     {32, 16, 1, 0, 0, 1, 1, 3, {1, 2, 2}},
-    {32, 16, 1, 0, 1, 0, 1, 1, {0, 0, 0}},
+    {32, 16, 1, 0, 0, 2, 1, 1, {-1, -1, 0}},
+    {32, 16, 1, 0, 1, 0, 1, 1, {0, 0, 9}},
+    {32, 16, 1, 0, 1, 2, 1, 1, {-1, -1, 0}},
     {32, 16, 2, 0, 0, 0, 1, 1, {2, 2, 1}},
-    {32, 32, 1, 0, 0, 0, 1, 1, {0, 0, 1}},
-    {32, 32, 1, 0, 0, 0, 1, 3, {0, 0, 1}},  // Blackwell: 8 warps 1-3% faster alone, 4 faster in the whole network (ESRGAN 2x 11%)
+    {32, 16, 2, 0, 0, 2, 1, 1, {-1, -1, 6}},
+    {32, 32, 1, 0, 0, 0, 1, 1, {0, 0, 3}},
+    {32, 32, 1, 0, 0, 0, 1, 3, {0, 0, 4}},
     {32, 32, 1, 0, 0, 1, 1, 1, {-1, 1, 1}},
     {32, 32, 1, 0, 0, 1, 1, 3, {1, 0, 2}},
+    {32, 32, 1, 0, 0, 2, 1, 1, {-1, -1, 10}},
+    {32, 32, 1, 0, 0, 2, 1, 3, {-1, -1, 10}},
     {32, 32, 1, 0, 1, 0, 1, 3, {1, -1, -1}},
-    {32, 32, 1, 0, 1, 1, 1, 3, {-1, 1, 2}},
+    {32, 32, 1, 0, 1, 1, 1, 3, {-1, 1, 5}},
     {32, 32, 2, 0, 0, 0, 1, 1, {2, 1, 1}},
     {32, 32, 2, 0, 0, 1, 1, 1, {2, 2, 2}},
     {32, 48, 1, 0, 0, 0, 2, 3, {1, 0, 2}},
-    {32, 48, 1, 0, 0, 1, 2, 3, {1, 0, 2}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
+    {32, 48, 1, 0, 0, 1, 2, 3, {1, 0, 5}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
     {32, 48, 2, 0, 0, 0, 1, 1, {2, 0, 0}},
     {32, 48, 2, 0, 0, 0, 2, 2, {1, -1, -1}},
     {32, 48, 2, 0, 0, 1, 1, 1, {2, 1, 2}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
@@ -268,36 +291,39 @@ constexpr GPick kGPick[] = {
     {32, 64, 2, 0, 0, 1, 1, 1, {2, 1, 2}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
     {32, 64, 2, 0, 0, 1, 2, 2, {2, 2, 2}},
     {32, 64, 2, 0, 0, 1, 3, 3, {1, 1, 1}},
-    {64, 16, 1, 0, 0, 0, 1, 1, {0, 1, 0}},
-    {64, 16, 1, 0, 0, 1, 1, 1, {2, 2, 1}},
-    {64, 32, 1, 0, 0, 0, 1, 1, {2, 0, 0}},
-    {64, 32, 1, 0, 0, 0, 1, 2, {2, 0, 0}},
+    {64, 16, 1, 0, 0, 0, 1, 1, {0, 1, 3}},
+    {64, 16, 1, 0, 0, 1, 1, 1, {2, 2, 5}},
+    {64, 16, 1, 0, 0, 2, 1, 1, {-1, -1, 4}},
+    {64, 32, 1, 0, 0, 0, 1, 1, {2, 0, 10}},
+    {64, 32, 1, 0, 0, 0, 1, 2, {2, 0, 10}},
     {64, 32, 1, 0, 0, 1, 1, 1, {2, 1, 2}},
     {64, 32, 1, 0, 0, 1, 1, 2, {2, 0, 2}},
     {64, 32, 1, 0, 1, 0, 1, 1, {1, 0, 0}},
-    {64, 32, 1, 0, 1, 0, 1, 2, {1, 1, 0}},
-    {64, 32, 1, 0, 1, 0, 1, 3, {1, 0, 0}},
-    {64, 32, 1, 0, 1, 1, 1, 2, {2, 1, 2}},
+    {64, 32, 1, 0, 1, 0, 1, 2, {1, 1, 10}},
+    {64, 32, 1, 0, 1, 0, 1, 3, {1, 0, 10}},
+    {64, 32, 1, 0, 1, 1, 1, 2, {2, 1, 11}},
     {64, 32, 1, 0, 1, 1, 1, 3, {1, 1, 1}},
+    {64, 32, 1, 0, 1, 2, 1, 1, {-1, -1, 10}},
     {64, 48, 1, 0, 0, 0, 2, 3, {0, -1, -1}},
-    {64, 48, 1, 0, 0, 1, 2, 3, {-1, 1, 2}},
-    {64, 64, 1, 0, 0, 0, 1, 1, {1, 1, 0}},
-    {64, 64, 1, 0, 0, 0, 1, 2, {1, 1, 0}},
-    {64, 64, 1, 0, 0, 0, 1, 3, {1, 1, 0}},
-    {64, 64, 1, 0, 0, 2, 1, 3, {-1, 2, -1}},  // Ada, under 8 CTAs per SM: ESRGAN 2x 153.1 -> 151.2 ms (4 warps stay ahead at 512 x 512)
-    {64, 64, 1, 0, 0, 0, 2, 2, {1, 1, 0}},
-    {64, 64, 1, 0, 0, 0, 3, 1, {0, 0, 0}},
-    {64, 64, 1, 0, 0, 0, 3, 3, {1, 1, 0}},
+    {64, 48, 1, 0, 0, 1, 2, 3, {-1, 1, 10}},
+    {64, 64, 1, 0, 0, 0, 1, 1, {1, 1, 10}},
+    {64, 64, 1, 0, 0, 0, 1, 2, {1, 1, 10}},
+    {64, 64, 1, 0, 0, 0, 1, 3, {1, 1, 10}},
+    {64, 64, 1, 0, 0, 0, 2, 2, {1, 1, 10}},
+    {64, 64, 1, 0, 0, 0, 3, 1, {0, 0, 3}},
+    {64, 64, 1, 0, 0, 0, 3, 3, {1, 1, 10}},
     {64, 64, 1, 0, 0, 1, 1, 1, {2, 1, 1}},
-    {64, 64, 1, 0, 0, 1, 1, 3, {1, 1, 1}},
+    {64, 64, 1, 0, 0, 1, 1, 3, {1, 1, 10}},
     {64, 64, 1, 0, 0, 1, 2, 2, {1, 1, 1}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
     {64, 64, 1, 0, 0, 1, 3, 3, {1, 1, 1}},
+    {64, 64, 1, 0, 0, 2, 1, 1, {-1, -1, 0}},
+    {64, 64, 1, 0, 0, 2, 1, 3, {-1, 2, 7}},  // Ada, under 8 CTAs per SM: ESRGAN 2x 153.1 -> 151.2 ms (4 warps stay ahead at 512 x 512)
     {64, 64, 1, 0, 1, 0, 1, 1, {2, -1, -1}},
-    {64, 64, 1, 0, 1, 0, 2, 1, {1, 1, 0}},
-    {64, 64, 1, 0, 1, 0, 3, 2, {1, 1, 0}},
-    {64, 64, 1, 0, 1, 0, 3, 3, {1, 1, 0}},
-    {64, 64, 1, 0, 1, 1, 1, 1, {2, 1, 2}},
-    {64, 64, 1, 0, 1, 1, 1, 2, {2, 1, 1}},
+    {64, 64, 1, 0, 1, 0, 2, 1, {1, 1, 3}},
+    {64, 64, 1, 0, 1, 0, 3, 2, {1, 1, 10}},
+    {64, 64, 1, 0, 1, 0, 3, 3, {1, 1, 10}},
+    {64, 64, 1, 0, 1, 1, 1, 1, {2, 1, 7}},
+    {64, 64, 1, 0, 1, 1, 1, 2, {2, 1, 7}},
     {64, 64, 1, 0, 1, 1, 1, 3, {1, 2, 1}},  // Ada: whole-network RIFE 4.26 (2.67 -> 2.56 ms with the others here)
 };
 
@@ -328,7 +354,7 @@ int gvariant_for(const GWeights &w, const GConvArgs &a)
     const GEntry *e = gfind(w, a, nullptr);
     if (!e) return 1;
     const GKey &k = e->key;
-    const int split = ksplit_for(w, a, kWarps[0]) > 1 ? 1 : 0;
+    const int split = ksplit_for(w, a, 8) > 1 ? 1 : 0;
     const int ch = std::min(w.coutp ? w.cout_pad / w.coutp : 1, 3), kc = k.in ? 1 : std::min(w.cin_pad / k.kch, 3);
     const int gen = gpu_gen();
     // band 2: unsplit but under 8 CTAs per SM at 8 warps; only where it was measured, else the unsplit entry
@@ -344,11 +370,15 @@ int gvariant_for(const GWeights &w, const GConvArgs &a)
     return gvariant_rule(w, a, k);
 }
 
-size_t gworkspace(const GWeights &w, const GConvArgs &a)
+size_t gworkspace(const GWeights &w, const GConvArgs &a, bool all_variants)
 {
+    // room for the one-row-per-warp variants and the one this GPU's table picks (another variant whose split
+    // doesn't fit runs unsplit), or for every variant
     size_t m = 0;
+    const int pick = gfind(w, a, nullptr) ? gvariant_for(w, a) : 0;
     for (int v = 0; v < kGVariants; v++) {
-        const int k = ksplit_for(w, a, kWarps[v]);
+        if (!all_variants && v > 2 && v != pick) continue;
+        const int k = ksplit_for(w, a, vrows(v), vcap(v));
         if (k > 1 || a.out_f32) m = std::max(m, (size_t)k * a.H * a.W * w.cout_pad);
     }
     return m;
@@ -356,14 +386,16 @@ size_t gworkspace(const GWeights &w, const GConvArgs &a)
 
 cudaError_t glaunch(const GWeights &w, const GConvArgs &a, int variant, cudaStream_t s)
 {
-    const GEntry *e = gfind(w, a, nullptr);
-    if (!e) return cudaErrorInvalidValue;
     if (variant < 0 || variant >= kGVariants) variant = 0;
-    int ks = a.sums ? 1 : ksplit_for(w, a, kWarps[variant]);  // the sums come from the unsplit epilogue
+    int cap = vcap(variant);
+    const GEntry *e = gfind(w, a, nullptr, cap);
+    if (!e && cap < 64) e = gfind(w, a, nullptr, cap = 64);  // no 32-channel kernel for this shape
+    if (!e) return cudaErrorInvalidValue;
+    int ks = a.sums ? 1 : ksplit_for(w, a, vrows(variant), cap);  // the sums come from the unsplit epilogue
     if (ks > 1 && (!a.ws || (size_t)ks * a.H * a.W * w.cout_pad > a.ws_floats)) ks = 1;
     if (a.out_f32 && (!a.ws || (size_t)ks * a.H * a.W * w.cout_pad > a.ws_floats)) return cudaErrorInvalidValue;
-    const gdev::GParams p = params(w, a, ks);
-    cudaError_t r = e->fn[variant](p, (w.cout_pad / w.coutp) * ks, s);
+    const gdev::GParams p = params(w, a, ks, cap);
+    cudaError_t r = e->fn[variant % kGShapes](p, (w.cout_pad / w.coutp) * ks, s);
     if (r != cudaSuccess || (ks == 1 && !a.out_f32)) return r;
     const size_t n = (size_t)a.H * a.W * (w.cout_pad / 2);
     gdev::k_gconv_reduce<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(p);

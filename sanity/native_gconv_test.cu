@@ -1,8 +1,8 @@
 // aji_native_gconv_test: every k_gconv mode against a CPU reference (fp32 math on the same fp16
 // inputs and weights). Modes: stride 1 with ReLU / LeakyReLU / none, a strided input (a channel
 // prefix of a wider buffer) and an output slice, one and two scaled residuals, stride 2 from NHWC
-// and from NCHW planes, and the phase scatter with R = 2 and 4; ragged and aligned sizes, both
-// tile variants. Skips (exit 0) without an sm_80+ GPU.
+// and from NCHW planes, and the phase scatter with R = 2 and 4; ragged and aligned sizes, every
+// variant (CTA shapes and K-chunk caps). Skips (exit 0) without an sm_80+ GPU.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -121,7 +121,7 @@ static void run(const Case &c, int variant, bool split)
         a.sums = dsums;
     }
     if (split) {
-        a.ws_floats = gworkspace(gw, a);
+        a.ws_floats = gworkspace(gw, a, true);
         if (a.ws_floats) cudaMalloc(&dws, a.ws_floats * 4);
         a.ws = dws;
     }
