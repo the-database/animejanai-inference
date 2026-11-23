@@ -13,6 +13,7 @@
 
 #include "native/pack.h"
 #include "native/tfm.h"
+#include "native/dat_kernels.h"
 
 using namespace ajinative;
 
@@ -389,6 +390,130 @@ static void test_dwgemm_gate(int H, int W, int C)
     cudaFree(dn); cudaFree(dh); cudaFree(dp); cudaFree(o1); cudaFree(o2); cudaFree(ddw); cudaFree(ddb);
 }
 
+// DAT's SGFN on the fp32 stream with every LayerNorm fused: fc1 normalising its fp32 A rows on load and giving
+// LN3's statistics of x2, then tdwgemm normalising x2 from them, against tlayernorm2 + tgemm, tlayernorm and
+// tdwgemm (the same maths in another order: a few values round the other way).
+static void test_sgfn_ln(int H, int W, int C)
+{
+    const int Cp = (C + 15) / 16 * 16, C8 = (C + 7) / 8 * 8, M = H * W, FS = 2 * Cp;
+    std::vector<float> x((size_t)M * Cp, 0.f), w1((size_t)C * FS, 0.f), w2((size_t)C * C), b1(FS, 0.f), b2(C), g2(C), t2(C), g3(C), t3(C);
+    for (int m = 0; m < M; m++) {
+        const float off = ur(300.f), sc = 1.f + std::fabs(ur(200.f));  // a residual stream's spread
+        for (int n = 0; n < C; n++) x[(size_t)m * Cp + n] = off + sc * ur(1.f);
+    }
+    for (int k = 0; k < C; k++)  // fc1 into x1 = columns [0, C), x2 = [Cp, Cp + C)
+        for (int n = 0; n < C; n++) {
+            w1[(size_t)k * FS + n] = hf(hb(ur(0.15f)));
+            w1[(size_t)k * FS + Cp + n] = hf(hb(ur(0.15f)));
+        }
+    for (int n = 0; n < C; n++) {
+        b1[n] = ur(0.5f);
+        b1[Cp + n] = 0.4f + ur(0.5f);
+    }
+    for (auto &v : w2) v = hf(hb(ur(0.1f)));
+    for (auto &v : b2) v = ur(0.2f);
+    for (int k = 0; k < C; k++) {
+        g2[k] = 0.5f + ur(0.4f); t2[k] = ur(0.2f); g3[k] = 0.5f + ur(0.4f); t3[k] = ur(0.2f);
+    }
+    std::vector<float> dw((size_t)C8 * 9, 0.f), dwb(C8, 0.f);
+    for (int k = 0; k < C * 9; k++) dw[k] = ur(0.4f);
+    for (int k = 0; k < C; k++) dwb[k] = ur(0.3f);
+    TMat m1, m2;
+    ck(tmat_upload(m1, w1.data(), b1.data(), C, FS));
+    ck(tmat_upload(m2, w2.data(), b2.data(), C, C));
+    float *s1 = dev(x), *s2 = dev(x), *dg2 = dev(g2), *dt2 = dev(t2), *dg3 = dev(g3), *dt3 = dev(t3), *ddw = dev(dw), *ddb = dev(dwb);
+    float *dst = dev(std::vector<float>((size_t)M * 2, NAN));
+    uint16_t *dn = dev(std::vector<uint16_t>((size_t)M * Cp, 0)), *h1 = dev(std::vector<uint16_t>((size_t)M * FS, 0)),
+             *h2 = dev(std::vector<uint16_t>((size_t)M * FS, 0)), *n2 = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
+    // reference: the LayerNorms stored
+    ck(tlayernorm2(s1, true, Cp, dn, false, Cp, M, C, Cp, dg2, dt2, 1e-5f, nullptr));
+    TGemm g;
+    g.a = dn; g.sa = Cp; g.M = M; g.out = h1; g.so = FS; g.act = TAct::Gelu;
+    ck(tgemm(m1, g, nullptr));
+    ck(tlayernorm(h1 + Cp, FS, n2, Cp, M, C, Cp, dg3, dt3, 1e-5f, nullptr));
+    TDwGemm d;
+    d.in = n2; d.sin = Cp; d.H = H; d.W = W; d.dw = ddw; d.dwb = ddb; d.dwc = C8; d.mul = h1; d.smul = FS;
+    d.out = s1; d.so = Cp; d.out_f32 = true; d.add1 = s1; d.s1 = Cp; d.add1_f32 = true;
+    ck(tdwgemm(m2, d, nullptr));
+    // fused
+    g.a = s2; g.out = h2; g.a_f32 = true; g.ln_gamma = dg2; g.ln_beta = dt2; g.ln_eps = 1e-5f;
+    g.stats_out = dst; g.stats_c0 = Cp; g.stats_n = C; g.stats_eps = 1e-5f;
+    const cudaError_t e1 = tgemm(m1, g, nullptr);
+    d.in = h2 + Cp; d.sin = FS; d.mul = h2; d.out = s2; d.add1 = s2; d.ln_stats = dst; d.ln_gamma = dg3; d.ln_beta = dt3; d.ln_c = C;
+    const cudaError_t e2 = tdwgemm(m2, d, nullptr);
+    sync();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "sgfn+ln %dx%d %d vs layernorms stored", H, W, C);
+    checks++;
+    if (e1 != cudaSuccess || e2 != cudaSuccess) {
+        printf("FAIL %s: %s / %s\n", nm, cudaGetErrorString(e1), cudaGetErrorString(e2));
+        fails++;
+    } else {
+        auto a1 = host(h1, (size_t)M * FS), a2 = host(h2, (size_t)M * FS);
+        double he = 0;
+        for (size_t i = 0; i < a1.size(); i++) he = emax(he, (double)std::fabs(hf(a1[i]) - hf(a2[i])));
+        char nb[120];
+        snprintf(nb, sizeof(nb), "%s: fc1", nm);
+        report(nb, he, 0.02);
+        auto o1 = host(s1, x.size()), o2 = host(s2, x.size());
+        double se = 0;
+        for (size_t i = 0; i < o1.size(); i++) se = emax(se, (double)std::fabs(o1[i] - o2[i]) / std::max(1.0, std::fabs((double)o1[i]) * 1e-3));
+        snprintf(nb, sizeof(nb), "%s: stream", nm);
+        report(nb, se, 0.05);
+    }
+    tmat_release(m1);
+    tmat_release(m2);
+    for (void *q : {(void *)s1, (void *)s2, (void *)dg2, (void *)dt2, (void *)dg3, (void *)dt3, (void *)ddw, (void *)ddb, (void *)dst, (void *)dn,
+                    (void *)h1, (void *)h2, (void *)n2})
+        cudaFree(q);
+}
+
+// DAT's token-gate mix in the gate GEMM's epilogue against the GEMM storing its hidden layer then dat_mix_tg
+// (the gate's dot product in another order: a few values may round the other way).
+static void test_gate_mix(int M, int C, int r, int mode)
+{
+    const int Cp = (C + 15) / 16 * 16;
+    std::vector<uint16_t> a((size_t)M * Cp, 0), b((size_t)M * Cp, 0);
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < C; k++) {
+            a[(size_t)m * Cp + k] = hb(ur(3.f));
+            b[(size_t)m * Cp + k] = hb(ur(3.f));
+        }
+    std::vector<float> w((size_t)C * r), bias(r), cg(Cp, 0.f), w2(r);
+    for (auto &v : w) v = hf(hb(ur(0.1f)));
+    for (auto &v : bias) v = ur(0.3f);
+    for (int k = 0; k < C; k++) cg[k] = ur(1.f);
+    for (auto &v : w2) v = ur(0.5f);
+    const float b2 = 0.1f;
+    TMat tm;
+    ck(tmat_upload(tm, w.data(), bias.data(), C, r));
+    uint16_t *da = dev(a), *db = dev(b), *tg = dev(std::vector<uint16_t>((size_t)M * 16, 0)), *z1 = dev(std::vector<uint16_t>((size_t)M * Cp, 0x7c00)),
+             *z2 = dev(std::vector<uint16_t>((size_t)M * Cp, 0x7c00));
+    float *dcg = dev(cg), *dw2 = dev(w2);
+    const void *src = mode ? db : da, *oth = mode ? da : db;
+    TGemm g;
+    g.a = src; g.sa = Cp; g.M = M; g.out = tg; g.so = 16; g.act = TAct::Gelu;
+    ck(tgemm(tm, g, nullptr));
+    ck(dat_mix_tg(da, db, Cp, dcg, tg, 16, r, dw2, b2, mode, z1, M, C, nullptr));
+    g.mix_other = oth; g.mix_cg = dcg; g.mix_w2 = dw2; g.mix_b2 = b2; g.mix_r = r; g.mix_s = Cp; g.mix_z = z2;
+    const cudaError_t e = tgemm(tm, g, nullptr);
+    sync();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "gate mix %d x %d r %d mode %d vs gemm + mix", M, C, r, mode);
+    if (e != cudaSuccess) {
+        printf("FAIL %s: %s\n", nm, cudaGetErrorString(e));
+        fails++;
+        checks++;
+    } else {
+        auto h1 = host(z1, (size_t)M * Cp), h2 = host(z2, (size_t)M * Cp);
+        double me = 0;
+        for (size_t i = 0; i < h1.size(); i++) me = emax(me, (double)std::fabs(hf(h1[i]) - hf(h2[i])));
+        report(nm, me, 0.01);
+    }
+    tmat_release(tm);
+    for (void *q : {(void *)da, (void *)db, (void *)tg, (void *)z1, (void *)z2, (void *)dcg, (void *)dw2}) cudaFree(q);
+}
+
 static void test_ln(int M, int C)
 {
     const int cp = (C + 15) / 16 * 16 + 8;
@@ -608,6 +733,10 @@ int main()
     test_dwgemm(40, 64, 360, 180);  // FDAT-XL's smix + fc2
     test_dwgemm(9, 128, 240, 120);  // FDAT-M's
     test_dwgemm_gate(20, 128, 180);  // DAT-2's SGFN
+    test_sgfn_ln(20, 128, 180);      // the same with its LayerNorms fused (fp32 A of fc1, LN3 from fc1's statistics)
+    test_sgfn_ln(7, 64, 180);
+    test_gate_mix(1000, 180, 11, 0);  // DAT-2's token gates (from the attention / from the conv branch)
+    test_gate_mix(77, 180, 11, 1);
     test_gemm(90, 120, 120, true, false, false, true, false, true);
     test_mlp(1000, 180, 360, true);  // HAT-L's MLP, a row tail
     test_mlp(77, 180, 360, false);
