@@ -2,7 +2,8 @@
  * Pre/post-processing and resize CUDA kernels for the aji shim.
  *
  * pre:    NV12/P010 -> fp16 NCHW RGB, Spline36 chroma upsample + matrix
- * post:   fp16 NCHW RGB -> NV12/P010, matrix + Spline36 chroma downsample
+ * post:   fp16 NCHW RGB -> NV12/P010, matrix + Spline36 chroma downsample (one kernel,
+ *         k_post_fused, where the 2x downsample's tiles fit; else three)
  * resize: Spline36 on fp16 NCHW RGB (chain resize steps)
  *
  * Resampling replicates zimg's compute_filter (what VapourSynth resize —
@@ -18,6 +19,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "aji.h"
@@ -82,6 +84,10 @@ struct aji_plan {
     pass ph, pv;
     float *tmp0 = nullptr;     // after the first pass
     float *tmp1 = nullptr;     // after the horizontal pass (post only)
+    // post in one kernel (k_post_fused): per tile column / row the luma range its taps read ([lo, hi],
+    // mirrored indices included), and the widest / tallest; null: the three-kernel path
+    int *fx = nullptr, *fy = nullptr;
+    int frw = 0, frh = 0;
 };
 
 /* ---------------- device helpers ---------------- */
@@ -230,6 +236,77 @@ __global__ void k_uv_v_store(const float *src, int cw, pass py, aji_csp csp,
     uvrow[2 * x + 1] = (T)quant(v * csp.cscale + csp.coff, qdiv, qmax);
 }
 
+// The three kernels above in one, per tile of PF_TX x PF_TY chroma samples. The luma region the tile's taps
+// read (fx / fy: [lo, hi] per tile column / row) goes through in groups of PF_RG rows: the matrix on each
+// pixel once (Y stored for the tile's own pixels, chroma into shared memory as fp32), then the group's
+// horizontal pass into the tile's columns; then the vertical pass. The same operations in the same order as
+// the three kernels: the same output.
+constexpr int PF_TX = 32, PF_TY = 16, PF_RG = 8;
+template <typename T>
+__global__ void __launch_bounds__(256) k_post_fused(const __half *src, int w, int h, aji_csp csp, float qdiv, float qmax,
+                                                    uint8_t *y_plane, ptrdiff_t y_stride, uint8_t *uv, ptrdiff_t uv_stride,
+                                                    pass px, pass py, const int *fx, const int *fy, int frw)
+{
+    extern __shared__ float pf_sm[];
+    const int cw = px.dst, ch = py.dst;
+    const int cx0 = blockIdx.x * PF_TX, cy0 = blockIdx.y * PF_TY;
+    const int ntx = min(PF_TX, cw - cx0), nty = min(PF_TY, ch - cy0);
+    const int lx = fx[2 * blockIdx.x], rw = fx[2 * blockIdx.x + 1] - lx + 1;
+    const int ly = fy[2 * blockIdx.y], rh = fy[2 * blockIdx.y + 1] - ly + 1;
+    float *us = pf_sm, *vs = us + PF_RG * frw;           // [PF_RG][frw]: a row group's chroma
+    float *hu = vs + PF_RG * frw, *hv = hu + PF_TX * rh;  // [rh][PF_TX]: after the horizontal pass
+    // this tile's own luma pixels (the last tile column / row also takes an odd width's / height's last one)
+    const int ox0 = 2 * cx0, ox1 = blockIdx.x == gridDim.x - 1 ? w : 2 * (cx0 + ntx);
+    const int oy0 = 2 * cy0, oy1 = blockIdx.y == gridDim.y - 1 ? h : 2 * (cy0 + nty);
+    const size_t plane = (size_t)w * h;
+    for (int r0 = 0; r0 < rh; r0 += PF_RG) {
+        const int ng = min(PF_RG, rh - r0);
+        for (int i = threadIdx.x; i < ng * rw; i += blockDim.x) {
+            const int ry = i / rw, rx = i % rw, x = lx + rx, y = ly + r0 + ry;
+            const size_t idx = (size_t)y * w + x;
+            const float r = __half2float(src[idx]);
+            const float g = __half2float(src[plane + idx]);
+            const float b = __half2float(src[2 * plane + idx]);
+            const float Y = csp.kr * r + (1.0f - csp.kr - csp.kb) * g + csp.kb * b;
+            if (x >= ox0 && x < ox1 && y >= oy0 && y < oy1) {
+                T *yrow = (T *)(y_plane + (size_t)y * y_stride);
+                yrow[x] = (T)quant(Y * csp.yscale + csp.yoff, qdiv, qmax);
+            }
+            us[ry * frw + rx] = (b - Y) / (2.0f * (1.0f - csp.kb));
+            vs[ry * frw + rx] = (r - Y) / (2.0f * (1.0f - csp.kr));
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < ng * ntx; i += blockDim.x) {
+            const int ry = i / ntx, xc = i % ntx, x = cx0 + xc;
+            const float *wt = px.wt + (size_t)x * px.taps;
+            const int s0 = px.start[x];
+            float a = 0.0f, c = 0.0f;
+            for (int j = 0; j < px.taps; j++) {
+                const int k = ry * frw + mirr(s0 + j, px.src) - lx;
+                a += wt[j] * us[k];
+                c += wt[j] * vs[k];
+            }
+            hu[(r0 + ry) * PF_TX + xc] = a;
+            hv[(r0 + ry) * PF_TX + xc] = c;
+        }
+        __syncthreads();
+    }
+    for (int i = threadIdx.x; i < nty * ntx; i += blockDim.x) {
+        const int yc = i / ntx, xc = i % ntx, y = cy0 + yc, x = cx0 + xc;
+        const float *wt = py.wt + (size_t)y * py.taps;
+        const int s0 = py.start[y];
+        float u = 0.0f, v = 0.0f;
+        for (int j = 0; j < py.taps; j++) {
+            const int k = (mirr(s0 + j, py.src) - ly) * PF_TX + xc;
+            u += wt[j] * hu[k];
+            v += wt[j] * hv[k];
+        }
+        T *uvrow = (T *)(uv + (size_t)y * uv_stride);
+        uvrow[2 * x]     = (T)quant(u * csp.cscale + csp.coff, qdiv, qmax);
+        uvrow[2 * x + 1] = (T)quant(v * csp.cscale + csp.coff, qdiv, qmax);
+    }
+}
+
 /* -------- 4:4:4 16-bit planar: pure matrix, no resampling -------- */
 
 __global__ void k_post444(const __half *src, int w, int h, aji_csp csp,
@@ -361,7 +438,10 @@ static void plan_destroy_inner(aji_plan *p)
     free_pass(&p->pv);
     cudaFree(p->tmp0);
     cudaFree(p->tmp1);
+    cudaFree(p->fx);
+    cudaFree(p->fy);
     p->tmp0 = p->tmp1 = nullptr;
+    p->fx = p->fy = nullptr;
 }
 
 extern "C" void aji_plan_destroy(aji_plan *p)
@@ -392,6 +472,43 @@ extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting,
     return p;
 }
 
+namespace {
+
+int mirr_host(int i, int n)
+{
+    i = i < 0 ? -i - 1 : i;
+    i = i >= n ? 2 * n - 1 - i : i;
+    return i < 0 ? 0 : i >= n ? n - 1 : i;
+}
+
+// Per tile of `tile` outputs: the source range [lo, hi] its taps read (mirrored), into lohi (2 per tile);
+// the largest range; false where a tile's range doesn't cover its own source pixels (2 per output, the
+// last tile to the end) or would be larger than `cap`.
+bool post_ranges(const aji_resample::weights &wt, int tile, int cap, std::vector<int> *lohi, int *maxr)
+{
+    const int nt = (wt.dst + tile - 1) / tile;
+    lohi->assign((size_t)nt * 2, 0);
+    *maxr = 0;
+    for (int t = 0; t < nt; t++) {
+        const int x0 = t * tile, x1 = std::min(wt.dst, x0 + tile);
+        int lo = wt.src, hi = -1;
+        for (int x = x0; x < x1; x++)
+            for (int j = 0; j < wt.taps; j++) {
+                const int k = mirr_host(wt.start[x] + j, wt.src);
+                lo = std::min(lo, k);
+                hi = std::max(hi, k);
+            }
+        const int own1 = t == nt - 1 ? wt.src - 1 : 2 * x1 - 1;
+        if (lo > 2 * x0 || hi < own1 || hi - lo + 1 > cap) return false;
+        (*lohi)[2 * t] = lo;
+        (*lohi)[2 * t + 1] = hi;
+        *maxr = std::max(*maxr, hi - lo + 1);
+    }
+    return true;
+}
+
+} // namespace
+
 extern "C" aji_plan *aji_post_plan_create(int format, int w, int h, int siting,
                                           int filter)
 {
@@ -404,8 +521,27 @@ extern "C" aji_plan *aji_post_plan_create(int format, int w, int h, int siting,
     double sx, sy;
     chroma_shifts(siting, false, &sx, &sy);
     if (!build_pass(&p->ph, w, cw, sx, filter) ||
-        !build_pass(&p->pv, h, ch, sy, filter) ||
-        cudaMalloc(&p->tmp0, (size_t)2 * w * h * sizeof(float)) != cudaSuccess ||
+        !build_pass(&p->pv, h, ch, sy, filter)) {
+        aji_plan_destroy(p);
+        return nullptr;
+    }
+    // the fused kernel where its tiles' regions are those of a 2x downsample (2 * tile + taps, up to 32
+    // taps) and cover the tiles' own luma; else the three kernels and their fp32 intermediates
+    std::vector<int> lx, ly;
+    int rw = 0, rh = 0;
+    const aji_resample::weights wx = aji_resample::compute(w, cw, sx, filter), wy = aji_resample::compute(h, ch, sy, filter);
+    if (cw > 0 && ch > 0 && post_ranges(wx, PF_TX, 2 * PF_TX + 34, &lx, &rw) && post_ranges(wy, PF_TY, 2 * PF_TY + 34, &ly, &rh)) {
+        if (cudaMalloc(&p->fx, lx.size() * sizeof(int)) != cudaSuccess || cudaMalloc(&p->fy, ly.size() * sizeof(int)) != cudaSuccess) {
+            aji_plan_destroy(p);
+            return nullptr;
+        }
+        cudaMemcpy(p->fx, lx.data(), lx.size() * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(p->fy, ly.data(), ly.size() * sizeof(int), cudaMemcpyHostToDevice);
+        p->frw = rw;
+        p->frh = rh;
+        return p;
+    }
+    if (cudaMalloc(&p->tmp0, (size_t)2 * w * h * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&p->tmp1, (size_t)2 * cw * h * sizeof(float)) != cudaSuccess) {
         aji_plan_destroy(p);
         return nullptr;
@@ -474,6 +610,17 @@ extern "C" int aji_run_post(aji_plan *p, const void *src_f16,
     const bool p010 = p->format == AJI_FMT_P010;
     const float qdiv = p010 ? 64.0f : 1.0f;
     const float qmax = p010 ? 1023.0f : 255.0f;
+    if (p->fx) {
+        const dim3 grid((cw + PF_TX - 1) / PF_TX, (ch + PF_TY - 1) / PF_TY);
+        const size_t sm = (size_t)(2 * PF_RG * p->frw + 2 * PF_TX * p->frh) * sizeof(float);
+        if (p010)
+            k_post_fused<uint16_t><<<grid, 256, sm, s>>>((const __half *)src_f16, w, h, *csp, qdiv, qmax, (uint8_t *)y_plane, y_stride,
+                                                         (uint8_t *)uv_plane, uv_stride, p->ph, p->pv, p->fx, p->fy, p->frw);
+        else
+            k_post_fused<uint8_t><<<grid, 256, sm, s>>>((const __half *)src_f16, w, h, *csp, qdiv, qmax, (uint8_t *)y_plane, y_stride,
+                                                        (uint8_t *)uv_plane, uv_stride, p->ph, p->pv, p->fx, p->fy, p->frw);
+        return (int)cudaGetLastError();
+    }
     if (p010) {
         k_post_matrix<uint16_t><<<GRID(w, h, 1), 0, s>>>(
             (const __half *)src_f16, w, h, *csp, qdiv, qmax,
