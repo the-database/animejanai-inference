@@ -514,6 +514,64 @@ static void test_gate_mix(int M, int C, int r, int mode)
     for (void *q : {(void *)da, (void *)db, (void *)tg, (void *)z1, (void *)z2, (void *)dcg, (void *)dw2}) cudaFree(q);
 }
 
+// FDAT's LN1 read by qkv (normalising on load and giving the rows' statistics) and by the depthwise conv
+// (from those statistics) against tlayernorm, then tgemm and tdwconv of the stored rows.
+static void test_ln1_fused(int H, int W, int C, int N)
+{
+    const int Cp = (C + 15) / 16 * 16, Np = (N + 15) / 16 * 16, M = H * W;
+    std::vector<uint16_t> x((size_t)M * Cp, 0);
+    for (int m = 0; m < M; m++) {
+        const float off = ur(3.f), sc = 0.5f + std::fabs(ur(4.f));
+        for (int k = 0; k < C; k++) x[(size_t)m * Cp + k] = hb(off + sc * ur(1.f));
+    }
+    std::vector<float> w((size_t)C * N), gm(C), bt(C), dw((size_t)C * 9);
+    for (auto &v : w) v = hf(hb(ur(0.1f)));
+    for (auto &v : gm) v = 0.5f + ur(0.4f);
+    for (auto &v : bt) v = ur(0.2f);
+    for (auto &v : dw) v = ur(0.4f);
+    TMat tm;
+    ck(tmat_upload(tm, w.data(), nullptr, C, N));
+    uint16_t *dx = dev(x), *dn = dev(std::vector<uint16_t>((size_t)M * Cp, 0)), *q1 = dev(std::vector<uint16_t>((size_t)M * Np, 0)),
+             *q2 = dev(std::vector<uint16_t>((size_t)M * Np, 0)), *c1 = dev(std::vector<uint16_t>((size_t)M * Cp, 0)),
+             *c2 = dev(std::vector<uint16_t>((size_t)M * Cp, 0));
+    float *dg = dev(gm), *db = dev(bt), *ddw = dev(dw), *st = dev(std::vector<float>((size_t)M * 2, NAN)), *s1 = dev(std::vector<float>(Cp, 0.f)),
+          *s2 = dev(std::vector<float>(Cp, 0.f));
+    ck(tlayernorm(dx, Cp, dn, Cp, M, C, Cp, dg, db, 1e-5f, nullptr));
+    TGemm g;
+    g.a = dn; g.sa = Cp; g.M = M; g.out = q1; g.so = Np;
+    ck(tgemm(tm, g, nullptr));
+    ck(tdwconv(dn, Cp, c1, Cp, H, W, C, ddw, true, s1, nullptr));
+    g.a = dx; g.out = q2; g.ln_gamma = dg; g.ln_beta = db; g.ln_eps = 1e-5f; g.a_stats_out = st;
+    const cudaError_t e1 = tgemm(tm, g, nullptr);
+    const cudaError_t e2 = tdwconv_ln(dx, Cp, c2, Cp, H, W, C, ddw, true, s2, st, dg, db, nullptr);
+    sync();
+    char nm[96];
+    snprintf(nm, sizeof(nm), "ln1 fused %dx%d %d->%d vs layernorm stored", H, W, C, N);
+    checks++;
+    if (e1 != cudaSuccess || e2 != cudaSuccess) {
+        printf("FAIL %s: %s / %s\n", nm, cudaGetErrorString(e1), cudaGetErrorString(e2));
+        fails++;
+    } else {
+        auto a1 = host(q1, (size_t)M * Np), a2 = host(q2, (size_t)M * Np), d1 = host(c1, (size_t)M * Cp), d2 = host(c2, (size_t)M * Cp);
+        auto u1 = host(s1, (size_t)Cp), u2 = host(s2, (size_t)Cp);
+        double qe = 0, de = 0, se = 0;
+        for (size_t i = 0; i < a1.size(); i++) qe = emax(qe, (double)std::fabs(hf(a1[i]) - hf(a2[i])));
+        for (size_t i = 0; i < d1.size(); i++) de = emax(de, (double)std::fabs(hf(d1[i]) - hf(d2[i])));
+        for (int c = 0; c < C; c++) se = emax(se, std::fabs((double)u1[c] - u2[c]) / std::max(1.0, std::fabs((double)u1[c]) * 1e-3));
+        char nb[120];
+        snprintf(nb, sizeof(nb), "%s: qkv", nm);
+        report(nb, qe, 0.02);
+        snprintf(nb, sizeof(nb), "%s: dwconv", nm);
+        report(nb, de, 0.02);
+        snprintf(nb, sizeof(nb), "%s: sums", nm);
+        report(nb, se, 0.05);
+    }
+    tmat_release(tm);
+    for (void *q : {(void *)dx, (void *)dn, (void *)q1, (void *)q2, (void *)c1, (void *)c2, (void *)dg, (void *)db, (void *)ddw, (void *)st,
+                    (void *)s1, (void *)s2})
+        cudaFree(q);
+}
+
 static void test_ln(int M, int C)
 {
     const int cp = (C + 15) / 16 * 16 + 8;
@@ -737,6 +795,8 @@ int main()
     test_sgfn_ln(7, 64, 180);
     test_gate_mix(1000, 180, 11, 0);  // DAT-2's token gates (from the attention / from the conv branch)
     test_gate_mix(77, 180, 11, 1);
+    test_ln1_fused(23, 40, 120, 360);  // FDAT-M's LN1 -> qkv and the depthwise conv
+    test_ln1_fused(16, 64, 180, 540);  // FDAT-XL's
     test_gemm(90, 120, 120, true, false, false, true, false, true);
     test_mlp(1000, 180, 360, true);  // HAT-L's MLP, a row tail
     test_mlp(77, 180, 360, false);

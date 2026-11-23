@@ -64,6 +64,9 @@ struct TGemm {
     float *stats_out = nullptr;
     int stats_c0 = 0, stats_n = 0;
     float stats_eps = 1e-5f;
+    // with ln_gamma on fp16 A: per row {mean, 1 / std} of that LayerNorm into a_stats_out [M][2], for another
+    // reader of the same normalised rows (tdwconv_ln)
+    float *a_stats_out = nullptr;
     // DAT's token-gate mix in the epilogue (W: K = 192 -> the gate's hidden layer, Npad 16; act GELU): out is
     // not written; instead mix_z = a * mix_cg + mix_other * sigm(mix_w2 . h + mix_b2), h the first mix_r
     // hidden values as fp16 (zeros from K to Kpad; mix_other and mix_z with stride mix_s), as dat_mix_tg.
@@ -168,6 +171,11 @@ cudaError_t twinattn(const TWinAttn &a, cudaStream_t s);
 
 // Depthwise 3x3 (zero padding, no bias) over the first C channels; w: [C][9] floats (device).
 cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu, cudaStream_t s);
+// tdwconv of the LayerNorm of in (per token {mean, 1 / std} from stats, as TGemm::a_stats_out gives;
+// gamma, beta: C floats) without storing it: as tlayernorm then tdwconv. cudaErrorNotSupported (nothing
+// launched) where the vector kernel doesn't apply.
+cudaError_t tdwconv_ln(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, float *sums,
+                       const float *stats, const float *gamma, const float *beta, cudaStream_t s);
 // The same, also adding the channel sums of the output to sums[C] (float device, zeroed by the caller).
 cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu, float *sums,
                     cudaStream_t s);

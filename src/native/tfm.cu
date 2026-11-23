@@ -924,6 +924,118 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
     }
 }
 
+// k_dw8s (no bias, no gate) of a LayerNorm of in that isn't stored: each pixel normalised as it loads from
+// lst's per-token statistics (k_gemm_rs's STATS 2) and lg / lb, as tlayernorm then k_dw8s. A copy of its
+// own, so k_dw8s compiles as before.
+template <int V>
+__global__ void __launch_bounds__(128) k_dw8s_ln(const half *in, int sin, half *out, int sout, int H, int W, int C, const float *w, int gelu_,
+                                                 float *sums, const float *lst, const float *lg, const float *lb)
+{
+    using VT = typename DwVec<V>::T;
+    auto unpackv = [](const VT &u, float (&v)[V]) {
+        const half2 *h = reinterpret_cast<const half2 *>(&u);
+#pragma unroll
+        for (int j = 0; j < V / 2; j++) {
+            const float2 f = __half22float2(h[j]);
+            v[2 * j] = f.x;
+            v[2 * j + 1] = f.y;
+        }
+    };
+    __shared__ float ss[1024];
+    if (sums) {
+        for (int i = threadIdx.x; i < C; i += blockDim.x) ss[i] = 0.f;
+        __syncthreads();
+    }
+    const int G = (C + V - 1) / V, strips = (H + DW_R - 1) / DW_R;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool live = i < G * W * strips;
+    const int g = i % G, rest = i / G, x = rest % W, y0 = (rest / W) * DW_R, c = g * V;
+    float part[V] = {};
+    const bool full = c + V <= C;
+    if (live) {
+        float wr[9][V];
+#pragma unroll
+        for (int k = 0; k < 9; k++)
+#pragma unroll
+            for (int j = 0; j < V; j++) wr[k][j] = c + j < C ? __ldg(w + (c + j) * 9 + k) : 0.f;
+        float gg[V], bb[V];
+#pragma unroll
+        for (int j = 0; j < V; j++) {
+            gg[j] = c + j < C ? __ldg(lg + c + j) : 0.f;
+            bb[j] = c + j < C ? __ldg(lb + c + j) : 0.f;
+        }
+        // a row's 3 pixels, LayerNorm'd (lst: per token mean, 1 / std) and rounded to fp16 as a stored LayerNorm;
+        // zeros outside the map
+        auto row = [&](int y, VT (&r)[3]) {
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                const int xx = x + dx - 1;
+                r[dx] = VT{};
+                if (y >= 0 && y < H && xx >= 0 && xx < W) {
+                    const size_t t = (size_t)y * W + xx;
+                    const float2 st = *reinterpret_cast<const float2 *>(lst + t * 2);
+                    float v[V];
+                    unpackv(*reinterpret_cast<const VT *>(in + t * sin + c), v);
+                    uint32_t *pr = reinterpret_cast<uint32_t *>(&r[dx]);
+#pragma unroll
+                    for (int j = 0; j < V / 2; j++)
+                        pr[j] = h2u(__floats2half2_rn((v[2 * j] - st.x) * st.y * gg[2 * j] + bb[2 * j], (v[2 * j + 1] - st.x) * st.y * gg[2 * j + 1] + bb[2 * j + 1]));
+                }
+            }
+        };
+        VT r0[3], r1[3], r2[3];
+        row(y0 - 1, r0);
+        row(y0, r1);
+#pragma unroll 2
+        for (int y = y0; y < min(H, y0 + DW_R); y++) {
+            row(y + 1, r2);
+            float a[V] = {};
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                float v[V];
+                unpackv(r0[dx], v);
+#pragma unroll
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[dx][j];
+                unpackv(r1[dx], v);
+#pragma unroll
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[3 + dx][j];
+                unpackv(r2[dx], v);
+#pragma unroll
+                for (int j = 0; j < V; j++) a[j] += v[j] * wr[6 + dx][j];
+            }
+            if (gelu_)
+#pragma unroll
+                for (int j = 0; j < V; j++) a[j] = gelu(a[j]);
+            VT pk;
+            uint32_t *pw = reinterpret_cast<uint32_t *>(&pk);
+#pragma unroll
+            for (int j = 0; j < V / 2; j++) pw[j] = h2u(__floats2half2_rn(a[2 * j], a[2 * j + 1]));
+            if (full) {
+                *reinterpret_cast<VT *>(out + ((size_t)y * W + x) * sout + c) = pk;
+            } else {
+#pragma unroll
+                for (int j = 0; j < V / 2; j++)
+                    if (c + 2 * j < C) *reinterpret_cast<uint32_t *>(out + ((size_t)y * W + x) * sout + c + 2 * j) = pw[j];
+            }
+#pragma unroll
+            for (int j = 0; j < V; j++) part[j] += c + j < C ? a[j] : 0.f;
+#pragma unroll
+            for (int dx = 0; dx < 3; dx++) {
+                r0[dx] = r1[dx];
+                r1[dx] = r2[dx];
+            }
+        }
+    }
+    if (sums) {
+        if (live)
+#pragma unroll
+            for (int j = 0; j < V; j++)
+                if (c + j < C) atomicAdd(ss + c + j, part[j]);
+        __syncthreads();
+        for (int k = threadIdx.x; k < C; k += blockDim.x) atomicAdd(sums + k, ss[k]);
+    }
+}
+
 // Channel attention statistics on tensor cores: per head the Gram matrix q^T k over the CTA's tokens
 // (64-token chunks in shared memory, each head's dims padded to 32), warp w doing heads w and w + 4;
 // the squared norms on the CUDA cores while copying.
@@ -1019,13 +1131,14 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
 // is done. No accumulator lives across chunks, so it runs at ~100 registers and 4 CTAs per SM, and
 // W is read once per 64 rows instead of once per 64x64 tile. Same sums as k_gemm.
 // AF32: A is an fp32 map, LayerNorm'd on load (p.lng required; as k_mlp's LN, tlayernorm2's maths).
-// STATS: each row's mean and 1 / std over output columns [st_c0, st_c0 + st_n) of the fp16 values stored
-// (one pass: E[x^2] - mean^2), for a LayerNorm the next kernel applies as it loads them (k_dwmm's LN).
+// STATS 1: each row's mean and 1 / std over output columns [st_c0, st_c0 + st_n) of the fp16 values stored
+// (one pass: E[x^2] - mean^2), for a LayerNorm the next kernel applies as it loads them (k_dwmm_ln). STATS 2:
+// those of the fp16 A rows' LayerNorm on load (p.lng), for another reader of the same LayerNorm (k_dw8s_ln).
 // MIX: a single 16-column chunk (W: A's k channels -> the token gate's hidden layer, GELU) whose rows are not
 // stored: their first mr values (rounded to fp16) give the token gate g = sigm(mw2 . h + mb2), and the
 // kernel writes z = a * mcg + mo * g (A's raw rows, fp16; zeros from k to KC1 * 16), as k_mix_tg. (A's rows
 // are read with uint4s: sa a multiple of 8.)
-template <int KC1, bool PF = true, bool AF32 = false, bool STATS = false, bool MIX = false>
+template <int KC1, bool PF = true, bool AF32 = false, int STATS = 0, bool MIX = false>
 __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerNorm of A's rows on load (see below)
 {
 #if TFM_OK
@@ -1138,6 +1251,13 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
                 q[i] += __shfl_xor_sync(0xffffffffu, q[i], 2);
                 rs[i] = rsqrtf(q[i] / p.k + p.lneps);
             }
+            if constexpr (STATS == 2) {
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const int r = i ? r1 : r0;
+                    if (!tq && r < p.M) *reinterpret_cast<float2 *>(p.stats + (size_t)r * 2) = make_float2(mean[i], rs[i]);
+                }
+            }
 #pragma unroll
             for (int kc = 0; kc < KC1; kc++)
 #pragma unroll
@@ -1208,7 +1328,7 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
                         if (col + 1 < p.mr) mo[hh] += __ldg(p.mw2 + col + 1) * f.y;
                         continue;
                     }
-                    if constexpr (STATS) {
+                    if constexpr (STATS == 1) {
                         if (col >= p.st_c0 && col < p.st_c0 + p.st_n) {  // st_c0, st_n even: both columns or neither
                             const float2 f = __half22float2(__floats2half2_rn(v0, v1));
                             ss[hh] += f.x + f.y;
@@ -1260,7 +1380,7 @@ __global__ void __launch_bounds__(128) k_gemm_rs(GemmP p)  // with p.lng: LayerN
             *reinterpret_cast<uint4 *>(p.mz + (size_t)r * p.smo + c0) = uo;
         }
     }
-    if constexpr (STATS) {
+    if constexpr (STATS == 1) {
 #pragma unroll
         for (int hh = 0; hh < 2; hh++) {
             ss[hh] += __shfl_xor_sync(0xffffffffu, ss[hh], 1);
@@ -2041,7 +2161,8 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     if (g.ln_gamma && (g.add1 || g.add2 || g.act_last || w.K % 2 || !g.ln_beta || !(w.Kpad == 128 || w.Kpad == 192 || w.Kpad == 224 || w.Kpad == 256)))
         return cudaErrorNotSupported;
     if (g.a_f32 && !g.ln_gamma) return cudaErrorNotSupported;
-    p.stats = g.stats_out;
+    p.stats = g.a_stats_out ? g.a_stats_out : g.stats_out;
+    if (g.a_stats_out && (g.stats_out || g.a_f32 || !g.ln_gamma)) return cudaErrorNotSupported;
     p.st_c0 = g.stats_c0;
     p.st_n = g.stats_n;
     p.st_eps = g.stats_eps;
@@ -2055,12 +2176,12 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
     p.smo = g.mix_s;
     p.mz = (half *)g.mix_z;
     if (g.mix_z) {
-        if (w.Npad != 16 || w.Kpad != 192 || g.ln_gamma || g.stats_out || g.act != TAct::Gelu || g.mix_r > 16 || !g.mix_other || !g.mix_cg ||
+        if (w.Npad != 16 || w.Kpad != 192 || g.ln_gamma || g.stats_out || g.a_stats_out || g.act != TAct::Gelu || g.mix_r > 16 || !g.mix_other || !g.mix_cg ||
             !g.mix_w2 || g.mix_s % 8 || g.mix_s < w.Kpad || g.sa < w.Kpad)
             return cudaErrorNotSupported;
         const unsigned grid = (unsigned)((g.M + 63) / 64);
-        if (pf) k_gemm_rs<12, true, false, false, true><<<grid, 128, 4 * 12 * 32 * 16, s>>>(p);
-        else k_gemm_rs<12, false, false, false, true><<<grid, 128, 4 * 12 * 32 * 16, s>>>(p);
+        if (pf) k_gemm_rs<12, true, false, 0, true><<<grid, 128, 4 * 12 * 32 * 16, s>>>(p);
+        else k_gemm_rs<12, false, false, 0, true><<<grid, 128, 4 * 12 * 32 * 16, s>>>(p);
         return cudaGetLastError();
     }
     // without adds, K = 128 / 192 / 224 / 256 (the transformers' qkv / fc1): the row-stationary kernel
@@ -2074,9 +2195,10 @@ cudaError_t tgemm(const TMat &w, const TGemm &g, cudaStream_t s)
         switch (w.Kpad) {
 #define RSL(K, PF_, AF_, ST_) k_gemm_rs<K, PF_, AF_, ST_><<<grid, 128, 4 * K * 32 * 16, s>>>(p)
 #define RS(K)                                                                                                                 \
-    (g.stats_out ? (pf ? RSL(K, true, true, true) : RSL(K, false, true, true))                                                \
-     : g.a_f32   ? (pf ? RSL(K, true, true, false) : RSL(K, false, true, false))                                              \
-                 : (pf ? RSL(K, true, false, false) : RSL(K, false, false, false)))
+    (g.stats_out     ? (pf ? RSL(K, true, true, 1) : RSL(K, false, true, 1))                                                  \
+     : g.a_stats_out ? (pf ? RSL(K, true, false, 2) : RSL(K, false, false, 2))                                                \
+     : g.a_f32       ? (pf ? RSL(K, true, true, 0) : RSL(K, false, true, 0))                                                  \
+                     : (pf ? RSL(K, true, false, 0) : RSL(K, false, false, 0)))
         case 128: RS(8); break;
         case 192: RS(12); break;
         case 224: RS(14); break;
@@ -2314,6 +2436,21 @@ cudaError_t tdwconv2(const void *in, int sin, void *out, int sout, int H, int W,
     else
         k_dw8s<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, bias,
                                                       (const half *)mul, smul);
+    return cudaGetLastError();
+}
+
+cudaError_t tdwconv_ln(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, float *sums,
+                       const float *stats, const float *gamma, const float *beta, cudaStream_t s)
+{
+    const int C8 = (C + 7) / 8 * 8;
+    if (C % 2 || C > 1024 || sin % 8 || sout % 8 || sin < C8 || sout < C8 || ((uintptr_t)in | (uintptr_t)out) % 16 || !stats || !gamma || !beta)
+        return cudaErrorNotSupported;
+    const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
+    if (n >= (1ll << 30)) return cudaErrorNotSupported;
+    if (dw_vec() == 8)
+        k_dw8s_ln<8><<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, stats, gamma, beta);
+    else
+        k_dw8s_ln<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, stats, gamma, beta);
     return cudaGetLastError();
 }
 
