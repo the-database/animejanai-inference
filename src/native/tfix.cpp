@@ -46,7 +46,7 @@ struct Chain {
         void *X = nullptr, *A = nullptr, *B = nullptr, *B2 = nullptr, *T = nullptr, *O = nullptr, *ST = nullptr;
         float *F = nullptr;
     } sb[3];
-    void *FULL = nullptr, *WH = nullptr, *RCH = nullptr, *WF = nullptr, *CIN = nullptr, *C1 = nullptr, *C2 = nullptr, *C3 = nullptr;
+    void *FULL = nullptr, *WH = nullptr, *RCH = nullptr, *CIN = nullptr, *C1 = nullptr, *C2 = nullptr, *C3 = nullptr;
     float *FF = nullptr, *FH = nullptr, *wsp = nullptr;
     cudaStream_t st = nullptr;
     cudaEvent_t done = nullptr;
@@ -271,40 +271,78 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
         for (int i = 1; i < NF; i++) S.pyr[i] = S.pyr[0] ? (char *)S.pyr[0] + i * f->pyb[k] : nullptr;
     }
     f->dsel = (int *)r.alloc(NF * sizeof(int));
-    // concurrent chains while the frame is small enough for them to pay (and for their memory)
-    const int nch = M <= (size_t)1500000 ? 3 : 1;  // 720p: 1.25x faster; from 1080p up bandwidth-bound
+    // Concurrent chains (their small kernels overlap). RTX 5090, frame ms by chains 1 / 2 / 3 / 6: DVD 1.82 /
+    // 1.44 / 1.25 / 1.11, 720p 2.87 / 2.19 / 2.02 / 1.99, 1080p 4.73 / 4.37 / 4.20 / 4.09. A chain is ~140 MB
+    // at 1080p, so 2 there take what 1 did before the chains shared their buffers.
+    int nch = M <= (size_t)500000 ? 6 : M <= (size_t)1500000 ? 3 : 2;
+    if (const char *e = std::getenv("AJI_NATIVE_TFIX_CHAINS")) nch = std::max(1, std::min(6, std::atoi(e)));  // for benchmarks
     f->ch.resize(nch);
-    for (Chain &c : f->ch) {
-        for (int k = 0; k < 3; k++) {
-            const Stage &S = f->st[k];
-            Chain::Sb &b = c.sb[k];
-            const size_t Ms = (size_t)S.h * S.w, Ma = (size_t)S.ha * S.wa, Mq = (size_t)S.hq * S.wq;
-            b.X = r.alloc(Ms * S.xs * 2);
-            b.A = r.alloc(Ma * pad16(S.ca) * 2);
-            b.B = r.alloc(Mq * S.c * 2);
-            b.B2 = r.alloc(Mq * S.c * 2);
-            b.T = r.alloc(Mq * S.c * 2);
-            b.O = r.alloc(Mq * 16 * 2);
-            b.ST = r.alloc(Ms * 16 * 2);
-            b.F = (float *)r.alloc(Ms * 8);
+    // A chain's scratch is one block in two overlapping layouts, as a support runs on its stream: the
+    // aligner stages (A), then from the full-resolution pass on the confidence head (B). Stage 2's flow
+    // and state, which that pass reads, sit at the end of A, clear of where it writes (FULL, FF). In B,
+    // C2 takes CIN's place (dead after the head's first conv) and C3 C1's (dead after the second).
+    // Every buffer is fully written before it is read, so none relies on the block's zeroing.
+    auto bump = [](size_t &off, size_t n) {
+        const size_t at = off;
+        off += (n + 255) & ~(size_t)255;
+        return at;
+    };
+    size_t oA = 0, at[3][8];
+    for (int k = 0; k < 3; k++) {
+        const Stage &S = f->st[k];
+        const size_t Ms = (size_t)S.h * S.w, Ma = (size_t)S.ha * S.wa, Mq = (size_t)S.hq * S.wq;
+        at[k][0] = bump(oA, Ms * S.xs * 2);
+        at[k][1] = bump(oA, Ma * pad16(S.ca) * 2);
+        at[k][2] = bump(oA, Mq * S.c * 2);
+        at[k][3] = bump(oA, Mq * S.c * 2);
+        at[k][4] = bump(oA, Mq * S.c * 2);
+        at[k][5] = bump(oA, Mq * 16 * 2);
+        if (k < 2) {
+            at[k][6] = bump(oA, Ms * 16 * 2);
+            at[k][7] = bump(oA, Ms * 8);
         }
-        c.FULL = r.alloc(M * 8 * 2);
-        c.FF = (float *)r.alloc(M * 8);
-        c.FH = (float *)r.alloc(M1 * 8);
-        c.WH = r.alloc(M1 * 8 * 2);
-        c.RCH = r.alloc(M1 * 16 * 2);
-        c.WF = r.alloc(M1 * 8 * 2);
-        c.CIN = r.alloc(M1 * 32 * 2);
-        c.C1 = r.alloc(M1 * 32 * 2);
-        c.C2 = r.alloc(M1 * 32 * 2);
-        c.C3 = r.alloc(M1 * 16 * 2);
+    }
+    const size_t ms2 = (size_t)f->st[2].h * f->st[2].w, keep = oA;  // stage 2's ST and F from here
+    at[2][6] = bump(oA, ms2 * 16 * 2);
+    at[2][7] = bump(oA, ms2 * 8);
+    size_t oB = 0;
+    (void)bump(oB, M * 8 * 2);
+    (void)bump(oB, M * 8);
+    oB = oB <= keep ? 0 : oA;  // FULL and FF before stage 2's flow and state if they fit, else after all of A
+    const size_t pFULL = bump(oB, M * 8 * 2), pFF = bump(oB, M * 8);
+    const size_t pFH = bump(oB, M1 * 8), pWH = bump(oB, M1 * 8 * 2), pRCH = bump(oB, M1 * 16 * 2);
+    const size_t pCIN = bump(oB, M1 * 32 * 2), pC1 = bump(oB, M1 * 32 * 2);
+    const size_t chain_bytes = std::max(oA, oB);
+    for (Chain &c : f->ch) {
+        char *blk = (char *)r.alloc(chain_bytes);
+        if (!blk) return refuse(why, "out of GPU memory"), nullptr;
+        for (int k = 0; k < 3; k++) {
+            Chain::Sb &b = c.sb[k];
+            b.X = blk + at[k][0];
+            b.A = blk + at[k][1];
+            b.B = blk + at[k][2];
+            b.B2 = blk + at[k][3];
+            b.T = blk + at[k][4];
+            b.O = blk + at[k][5];
+            b.ST = blk + at[k][6];
+            b.F = (float *)(blk + at[k][7]);
+        }
+        c.FULL = blk + pFULL;
+        c.FF = (float *)(blk + pFF);
+        c.FH = (float *)(blk + pFH);
+        c.WH = blk + pWH;
+        c.RCH = blk + pRCH;
+        c.CIN = blk + pCIN;
+        c.C1 = blk + pC1;
+        c.C2 = c.CIN;
+        c.C3 = c.C1;
         if (cudaStreamCreateWithFlags(&c.st, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&c.done, cudaEventDisableTiming) != cudaSuccess)
             return refuse(why, "cannot create a CUDA stream"), nullptr;
     }
     for (cudaEvent_t &e : f->ev)
         if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return refuse(why, "cannot create a CUDA event"), nullptr;
-    f->ACC = (float *)r.alloc(M * 8 * 4);
+    f->ACC = (float *)r.alloc(M * 5 * 4);  // float4 sums, then the gate sum (tx_accum)
     if (r.failed) return refuse(why, "out of GPU memory"), nullptr;
     {
         int id[NF];
@@ -398,14 +436,6 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
         if (!collect) pr.report("temporalfix encode");
         return cudaSuccess;
     }
-    // the centre's channels of each stage input, once per chain
-    for (Chain &c : ch)
-        for (int k = 0; k < 3; k++) {
-            const Stage &S = st[k];
-            K(tx_resize(pym(k, CEN, 0), S.h, S.w, tm(c.sb[k].X, S.xs, 0), S.h, S.w, 3, 1.f, 1.f, false, s));
-            K(tx_resize(pym(k, CEN, 3), S.h, S.w, tm(c.sb[k].X, S.xs, 6), S.h, S.w, 4, 1.f, 1.f, false, s));
-        }
-    K(cudaMemsetAsync(ACC, 0, plane * 8 * 4, s));
     pr.mark(P_ALIGN);
     K(cudaEventRecord(ev[0], s));
     for (Chain &c : ch) K(cudaStreamWaitEvent(c.st, ev[0], 0));
@@ -440,22 +470,14 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
         for (int k = 0; k < 3; k++) {
             Stage &S = st[k];
             Chain::Sb &b = c.sb[k];
-            if (k == 0) {
-                K(tx_resize(pym(k, fr, 0), S.h, S.w, tm(b.X, S.xs, 3), S.h, S.w, 3, 1.f, 1.f, false, q));
-                K(tx_resize(pym(k, fr, 3), S.h, S.w, tm(b.X, S.xs, 10), S.h, S.w, 4, 1.f, 1.f, false, q));
-            } else {
-                const Stage &P = st[k - 1];
-                Chain::Sb &pb = c.sb[k - 1];
-                K(tx_resize(tm(pb.F, 2, 0, true), P.h, P.w, tm(b.F, 2, 0, true), S.h, S.w, 2, (float)S.w / P.w, (float)S.h / P.h, false, q));
-                K(tx_resize(tm(pb.ST, 16), P.h, P.w, tm(b.X, S.xs, 15), S.h, S.w, 9, 1.f, 1.f, false, q));
-                K(tx_resize(tm(b.F, 2, 0, true), S.h, S.w, tm(b.X, S.xs, 24), S.h, S.w, 2, 1.f, 1.f, false, q));
-                K(tx_warp(pym(k, fr, 0), 3, b.F, S.h, S.w, tm(b.X, S.xs, 3), TxMap(), q));
-                K(tx_warp(pym(k, fr, 3), 4, b.F, S.h, S.w, tm(b.X, S.xs, 10), TxMap(), q));
-            }
-            K(tx_fill(tm(b.X, S.xs, 14), S.h, S.w, dt, q));
+            // the whole MCBlock input in one pass: centre, the support (warped from the second stage on),
+            // dt, and the previous stage's flow and state upsampled
+            const Stage *P = k ? &st[k - 1] : nullptr;
+            const Chain::Sb *pb = k ? &c.sb[k - 1] : nullptr;
+            K(tx_assemble(pym(k, CEN, 0), pym(k, fr, 0), k ? pb->F : nullptr, k ? pb->ST : nullptr, k ? P->h : 0, k ? P->w : 0, b.F, b.X,
+                          S.xs, S.h, S.w, dt, q));
             CK(mcblock(S, S, b, q, c.wsp));
-            K(tx_resize(tm(b.O, 16, 0), S.hq, S.wq, tm(b.F, 2, 0, true), S.h, S.w, 2, 1.f, 1.f, k > 0, q));
-            K(tx_resize(tm(b.O, 16, 2), S.hq, S.wq, tm(b.ST, 16, 0), S.h, S.w, 9, 1.f, 1.f, false, q));
+            K(tx_head_up(b.O, S.hq, S.wq, b.F, b.ST, S.h, S.w, k > 0, q));
         }
         // full resolution: flow, logit, the warped support and its validity
         const Stage &L = st[2];
@@ -464,9 +486,7 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
         // the confidence head at 1/2 on the low-passed results
         K(tx_down(tm(c.FF, 2, 0, true), H, W, tm(c.FH, 2, 0, true), h1, w1, 2, (float)w1 / W, (float)h1 / H, q));
         K(tx_down(tm(c.FULL, 8), H, W, tm(c.WH, 8, 0), h1, w1, 4, 1.f, 1.f, q));  // warped half 0..2, raw logit 3
-        K(tx_resize(tm(c.WH, 8, 3), h1, w1, tm(c.RCH, 16, 0), h1, w1, 1, 1.f, 1.f, false, q));
-        K(tx_warp(pym(2, fr, 3), 4, c.FH, h1, w1, tm(c.WF, 8, 0), TxMap(), q));
-        K(tx_conf_in(pym(2, CEN, 0), tm(c.WH, 8, 0), tm(c.WF, 8, 0), c.FH, dt, c.CIN, h1, w1, q));
+        K(tx_conf_in_warp(pym(2, CEN, 0), tm(c.WH, 8, 0), pym(2, fr, 0), c.FH, dt, c.CIN, c.RCH, h1, w1, q));
         CK(Gc(h0, lrelu(ga(c.CIN, 32, h1, w1, c.C1, 32, h1, w1)), q, c.wsp));
         CK(Gc(hh1, lrelu(ga(c.C1, 32, h1, w1, c.C2, 32, h1, w1)), q, c.wsp));
         GConvArgs a = ga(c.C2, 32, h1, w1, c.C3, 16, h1, w1);
@@ -475,7 +495,7 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
         CK(Gc(h2c, a, q, c.wsp));
         // the accumulation in support order (one buffer)
         if (si > 0) K(cudaStreamWaitEvent(q, ev[si], 0));
-        K(tx_accum(tm(c.C3, 16, 0), h1, w1, tm(c.FULL, 8, 0), 4, ACC, H, W, thresh, gslope, q));
+        K(tx_accum(tm(c.C3, 16, 0), h1, w1, tm(c.FULL, 8, 0), 4, ACC, H, W, thresh, gslope, si == 0, q));
         K(cudaEventRecord(ev[1 + si], q));
     }
     for (Chain &c : ch) {
