@@ -34,6 +34,12 @@ public:
     ~Rife();
     // in11: the NCHW fp16 input tensor; out3: NCHW fp16 RGB. t: the timestep.
     cudaError_t run(const void *in11, float t, void *out3, cudaStream_t s);
+    // As run, encoding only the frames asked for: the other's features are those of the frame its
+    // planes held at the last encode (a frame the caller knows unchanged, or moved there by move_frame).
+    cudaError_t run(const void *in11, float t, void *out3, cudaStream_t s, bool enc0, bool enc1);
+    // Frame 1's features into frame 0's (the caller moves its planes the same way): the next pair's first
+    // frame is this pair's second.
+    cudaError_t move_frame(cudaStream_t s);
     std::string describe() const;  // e.g. "5 blocks, scales 16/8/4/2/1, 4 feature channels"
     size_t device_bytes() const;
 

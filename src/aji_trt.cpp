@@ -219,6 +219,10 @@ struct aji_ctx {
         void *out_tensor = nullptr;  // 3 * pw*ph fp16
         float *scd = nullptr;        // device diff accumulator
         std::shared_ptr<ajinative::Rife> native;  // native kernels in place of the engine
+        // aji_infer_rife_ids: the caller's ids of the frames in_tensor's planes (and the native
+        // features) hold, for the format and range they were converted with; -1: none
+        int64_t id_a = -1, id_b = -1;
+        int id_fmt = 0, id_range = -1;
     } rife;
 
     // CUDA graph replay of the whole chain (pre -> steps -> post). The
@@ -2912,10 +2916,36 @@ extern "C" AJI_EXPORT int aji_rife_scene_supported(aji_ctx *c)
     return c != nullptr;
 }
 
+static int rife_infer(aji_ctx *c, const aji_frame *a, int64_t a_id, const aji_frame *b, int64_t b_id, double t,
+                      const aji_frame *out, void *cu_stream, int scene);
+
 extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
                                          const aji_frame *b, double t,
                                          const aji_frame *out, void *cu_stream,
                                          int scene)
+{
+    return rife_infer(c, a, -1, b, -1, t, out, cu_stream, scene);
+}
+
+extern "C" AJI_EXPORT int aji_rife_ids_supported(aji_ctx *c)
+{
+    return c != nullptr;
+}
+
+extern "C" AJI_EXPORT int aji_infer_rife_ids(aji_ctx *c, const aji_frame *a, int64_t a_id,
+                                             const aji_frame *b, int64_t b_id, double t,
+                                             const aji_frame *out, void *cu_stream, int scene)
+{
+    // AJI_RIFE_IDS=0: ignore the ids (A/B checks; every frame converted and encoded as without them)
+    static const bool use = [] {
+        const char *v = getenv("AJI_RIFE_IDS");
+        return !v || atoi(v) != 0;
+    }();
+    return use ? rife_infer(c, a, a_id, b, b_id, t, out, cu_stream, scene) : rife_infer(c, a, -1, b, -1, t, out, cu_stream, scene);
+}
+
+static int rife_infer(aji_ctx *c, const aji_frame *a, int64_t a_id, const aji_frame *b, int64_t b_id, double t,
+                      const aji_frame *out, void *cu_stream, int scene)
 {
     if (!c || !a || !b || !out || scene < -1 || scene > 1)
         return AJI_ERR;
@@ -3022,7 +3052,16 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
             return AJI_SCENE;
     }
 
-    // stage both frames into the padded buffers (interior only)
+    // frames the input tensor already holds (by the caller's ids): the same pair again (a higher factor's
+    // next t), or this pair's a is the last pair's b (its planes and features move over); nothing is kept
+    // across a failure below
+    const bool keep = a_id >= 0 && b_id >= 0 && a_id != b_id && R.id_fmt == fmt && R.id_range == a->range;
+    const bool same = keep && R.id_a == a_id && R.id_b == b_id;
+    const bool shift = keep && !same && R.id_b == a_id;
+    const bool fresh[2] = {!same && !shift, !same};
+    R.id_a = R.id_b = -1;
+
+    // stage the new frames into the padded buffers (interior only)
     const size_t doff_y = (size_t)R.pad_t * prow + (size_t)R.pad_l * bpp;
     const size_t doff_uv = py + (size_t)(R.pad_t / 2) * prow +
                            (size_t)R.pad_l * bpp;
@@ -3030,6 +3069,8 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
     const aji_frame *src[2] = {a, b};
     void *pad[2] = {R.pad_a, R.pad_b};
     for (int i = 0; i < 2; i++) {
+        if (!fresh[i])
+            continue;
         bool ok;
         if (f444) {
             ok = true;
@@ -3056,7 +3097,17 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
     // no resampling at all. Matrix hardcoded BT.709 like the reference.
     const aji_csp csp = aji_make_csp(fmt, AJI_MATRIX_BT709, a->range);
     char *tin = (char *)R.in_tensor;
+    if (shift) {
+        // b's planes (3-5) and features become a's, before b's own overwrite them
+        if (cudaMemcpyAsync(tin, tin + plane * 2 * 3, plane * 2 * 3, cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+            (R.native && R.native->move_frame(stream) != cudaSuccess)) {
+            c->set_error("rife frame move failed");
+            return AJI_ERR_CUDA;
+        }
+    }
     for (int i = 0; i < 2; i++) {
+        if (!fresh[i])
+            continue;
         if (f444) {
             err = aji_run_pre444(R.pw, R.ph,
                                  pad[i], prow,
@@ -3082,7 +3133,7 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
     }
 
     if (R.native) {
-        const cudaError_t ne = R.native->run(R.in_tensor, (float)t, R.out_tensor, stream);
+        const cudaError_t ne = R.native->run(R.in_tensor, (float)t, R.out_tensor, stream, fresh[0], fresh[1]);
         if (ne != cudaSuccess) {
             c->set_error("native rife failed: %s", cudaGetErrorString(ne));
             return AJI_ERR_CUDA;
@@ -3134,6 +3185,10 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
         c->set_error("rife crop copy failed");
         return AJI_ERR_CUDA;
     }
+    R.id_a = a_id;
+    R.id_b = b_id;
+    R.id_fmt = fmt;
+    R.id_range = a->range;
     return AJI_OK;
 }
 

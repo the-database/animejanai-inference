@@ -464,6 +464,10 @@ typedef struct {
                                         1/rnum of the interval to its
                                         successor: 0 = on the held frame */
     AVFrame *src_prev;               /* RIFE-first: previous work-res source */
+    /* aji_infer_rife_ids: a number per picture given to RIFE (each new
+     * frame takes the next; a frame's number stays with it), so the backend
+     * keeps the work of a pair's frame for the next pair */
+    int64_t  rife_next_id, up_prev_id, up_cur_id, src_prev_id;
 
     /* bookkeeping */
     int64_t  out_frames;
@@ -3929,11 +3933,13 @@ static int rife_step(enc_ctx *c, AVFrame *up, int held)
 
     if (!c->have_prev) {
         c->up_prev = up;
+        c->up_prev_id = c->rife_next_id++;
         c->have_prev = 1;
         c->rife_acc = 0;               /* the grid starts on the first frame */
         return 0;
     }
     c->up_cur = up;
+    c->up_cur_id = c->rife_next_id++;
 
     for (; c->rife_acc < c->rnum; c->rife_acc += c->rden) {
         const int acc = c->rife_acc;
@@ -3962,7 +3968,7 @@ static int rife_step(enc_ctx *c, AVFrame *up, int held)
         fill_aji_frame(c, &a, c->up_prev, 1);
         fill_aji_frame(c, &b, c->up_cur, 1);
         fill_aji_frame(c, &o, interp, 1);
-        int ret = aji_infer_rife(c->aji, &a, &b, t, &o, c->stream);
+        int ret = aji_infer_rife_ids(c->aji, &a, c->up_prev_id, &b, c->up_cur_id, t, &o, c->stream, -1);
         vk_sync(c);
         AVFrame *emit = interp;
         if (ret == AJI_SCENE) { emit = c->up_prev; c->scene_dupes++; }
@@ -3980,6 +3986,7 @@ static int rife_step(enc_ctx *c, AVFrame *up, int held)
 
     av_frame_free(&c->up_prev);
     c->up_prev = c->up_cur;
+    c->up_prev_id = c->up_cur_id;
     c->up_cur = NULL;
     return 0;
 }
@@ -4091,6 +4098,7 @@ static int rife_first_flush(enc_ctx *c)
 static int rife_first_consume(enc_ctx *c, held_frame p, int skip)
 {
     AVFrame *dec = p.f, *cur = dec;
+    const int64_t cur_id = c->rife_next_id++;
     if (skip) {
         cur = NULL;
     } else if (c->pre_resize) {
@@ -4129,8 +4137,8 @@ static int rife_first_consume(enc_ctx *c, held_frame p, int skip)
             fill_aji_frame(c, &a, c->src_prev, 0);
             fill_aji_frame(c, &b, cur, 0);
             fill_aji_frame(c, &o, interp, 0);
-            int ret = aji_infer_rife(c->aji, &a, &b, (double)acc / c->rnum, &o,
-                                     c->stream);
+            int ret = aji_infer_rife_ids(c->aji, &a, c->src_prev_id, &b, cur_id, (double)acc / c->rnum, &o,
+                                         c->stream, -1);
             vk_sync(c);
             if (ret == AJI_SCENE) {
                 c->scene_dupes++;
@@ -4157,12 +4165,14 @@ static int rife_first_consume(enc_ctx *c, held_frame p, int skip)
         /* N+1 shows the anchor's picture (prev_anchor stays set) */
         c->src_prev = av_frame_clone(c->pre_resize ? c->anchor_work
                                                    : c->anchor_src);
+        c->src_prev_id = c->rife_next_id++;  /* the anchor's picture: a number of its own */
         if (c->src_prev) c->src_prev->pts = dec->pts;
         else if (!rc) { loge("av_frame_clone failed"); rc = -1; }
     } else {
         /* after the pair: on CUDA the new anchor's copy overwrites the old
          * one, which src_prev may have been */
         c->src_prev = cur;
+        c->src_prev_id = cur_id;
         c->prev_anchor = reuse_new_anchor(c, &p, NULL);
         if (c->prev_anchor && c->pre_resize) {
             av_frame_unref(c->anchor_work);
