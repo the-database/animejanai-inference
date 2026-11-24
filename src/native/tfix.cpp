@@ -46,8 +46,8 @@ struct Chain {
         void *X = nullptr, *A = nullptr, *B = nullptr, *B2 = nullptr, *T = nullptr, *O = nullptr, *ST = nullptr;
         float *F = nullptr;
     } sb[3];
-    void *FULL = nullptr, *WH = nullptr, *RCH = nullptr, *CIN = nullptr, *C1 = nullptr, *C2 = nullptr, *C3 = nullptr;
-    float *FF = nullptr, *FH = nullptr, *wsp = nullptr;
+    void *WH = nullptr, *RCH = nullptr, *CIN = nullptr, *C1 = nullptr, *C2 = nullptr, *C3 = nullptr;
+    float *FH = nullptr, *wsp = nullptr;
     cudaStream_t st = nullptr;
     cudaEvent_t done = nullptr;
 };
@@ -65,8 +65,7 @@ public:
             if (c.st) cudaStreamDestroy(c.st);
             if (c.done) cudaEventDestroy(c.done);
         }
-        for (cudaEvent_t e : ev)
-            if (e) cudaEventDestroy(e);
+        if (ev) cudaEventDestroy(ev);
     }
     // The whole window from the model input: every frame encoded into the slot of its position.
     cudaError_t run(const void *in, void *out, cudaStream_t s) override
@@ -100,13 +99,17 @@ private:
     GOp e0, e1, e2, ep, h0, hh1, h2c;
     Stage st[3];
     std::vector<Chain> ch;
-    cudaEvent_t ev[7] = {};  // ev[0]: the encoder done; ev[1 + si]: support si accumulated
+    cudaEvent_t ev = nullptr;  // the encoder done
     // Per frame (one slot each, frb / Stage pyb bytes apart): the 8-channel full-resolution map and
     // its pyramid. run() fills slot i from window position i; encode() fills one slot.
     void *FR[NF] = {}, *E1 = nullptr, *E2 = nullptr, *EP = nullptr;
     size_t frb = 0, pyb[3] = {};
     int *dsel = nullptr;  // 0..NF-1: run()'s window, position i in slot i
-    float *ACC = nullptr, *wsp = nullptr;
+    float *wsp = nullptr;
+    // Per support at half resolution, what the blend reads: the last stage's flow (PF, fp32 [h1][w1][2])
+    // and (raw logit, confidence logit) pairs (PL, fp16 [h1][w1][2]).
+    float *PF = nullptr;
+    void *PL = nullptr;
     // A window is ~400 small launches, a frame's encoding ~10: each captured once per (key, out) as a
     // CUDA graph and replayed (AJI_NATIVE_PROFILE runs them directly, for the per-phase times).
     struct Replay {
@@ -271,15 +274,15 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
         for (int i = 1; i < NF; i++) S.pyr[i] = S.pyr[0] ? (char *)S.pyr[0] + i * f->pyb[k] : nullptr;
     }
     f->dsel = (int *)r.alloc(NF * sizeof(int));
-    // Concurrent chains (their small kernels overlap). RTX 5090, frame ms by chains 1 / 2 / 3 / 6: DVD 1.82 /
-    // 1.44 / 1.25 / 1.11, 720p 2.87 / 2.19 / 2.02 / 1.99, 1080p 4.73 / 4.37 / 4.20 / 4.09. A chain is ~140 MB
-    // at 1080p, so 2 there take what 1 did before the chains shared their buffers.
-    int nch = M <= (size_t)500000 ? 6 : M <= (size_t)1500000 ? 3 : 2;
+    // Concurrent chains (their small kernels overlap). RTX 5090, frame ms by chains 1 / 2 / 3 / 6: DVD 1.73 /
+    // 1.31 / 1.15 / 0.99, 720p 2.30 / 1.92 / 1.74 / 1.69, 1080p 3.92 / 3.59 / 3.46 / 3.38. A chain is ~92 MB at
+    // 1080p, so 3 there take what 2 did before the blend stopped needing full-resolution buffers.
+    int nch = M <= (size_t)500000 ? 6 : M <= (size_t)2200000 ? 3 : 2;
     if (const char *e = std::getenv("AJI_NATIVE_TFIX_CHAINS")) nch = std::max(1, std::min(6, std::atoi(e)));  // for benchmarks
     f->ch.resize(nch);
     // A chain's scratch is one block in two overlapping layouts, as a support runs on its stream: the
-    // aligner stages (A), then from the full-resolution pass on the confidence head (B). Stage 2's flow
-    // and state, which that pass reads, sit at the end of A, clear of where it writes (FULL, FF). In B,
+    // aligner stages (A), then from the full-resolution pass on the confidence head (B). The last stage's
+    // flow and logit, which B's first pass reads, are the support's own (PF, PL), outside the block. In B,
     // C2 takes CIN's place (dead after the head's first conv) and C3 C1's (dead after the second).
     // Every buffer is fully written before it is read, so none relies on the block's zeroing.
     auto bump = [](size_t &off, size_t n) {
@@ -287,7 +290,7 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
         off += (n + 255) & ~(size_t)255;
         return at;
     };
-    size_t oA = 0, at[3][8];
+    size_t oA = 0, at[3][8] = {};
     for (int k = 0; k < 3; k++) {
         const Stage &S = f->st[k];
         const size_t Ms = (size_t)S.h * S.w, Ma = (size_t)S.ha * S.wa, Mq = (size_t)S.hq * S.wq;
@@ -297,19 +300,12 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
         at[k][3] = bump(oA, Mq * S.c * 2);
         at[k][4] = bump(oA, Mq * S.c * 2);
         at[k][5] = bump(oA, Mq * 16 * 2);
-        if (k < 2) {
+        if (k < 2) {  // the flow and state the next stage reads
             at[k][6] = bump(oA, Ms * 16 * 2);
             at[k][7] = bump(oA, Ms * 8);
         }
     }
-    const size_t ms2 = (size_t)f->st[2].h * f->st[2].w, keep = oA;  // stage 2's ST and F from here
-    at[2][6] = bump(oA, ms2 * 16 * 2);
-    at[2][7] = bump(oA, ms2 * 8);
     size_t oB = 0;
-    (void)bump(oB, M * 8 * 2);
-    (void)bump(oB, M * 8);
-    oB = oB <= keep ? 0 : oA;  // FULL and FF before stage 2's flow and state if they fit, else after all of A
-    const size_t pFULL = bump(oB, M * 8 * 2), pFF = bump(oB, M * 8);
     const size_t pFH = bump(oB, M1 * 8), pWH = bump(oB, M1 * 8 * 2), pRCH = bump(oB, M1 * 16 * 2);
     const size_t pCIN = bump(oB, M1 * 32 * 2), pC1 = bump(oB, M1 * 32 * 2);
     const size_t chain_bytes = std::max(oA, oB);
@@ -324,11 +320,9 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
             b.B2 = blk + at[k][3];
             b.T = blk + at[k][4];
             b.O = blk + at[k][5];
-            b.ST = blk + at[k][6];
-            b.F = (float *)(blk + at[k][7]);
+            b.ST = k < 2 ? blk + at[k][6] : nullptr;
+            b.F = k < 2 ? (float *)(blk + at[k][7]) : nullptr;
         }
-        c.FULL = blk + pFULL;
-        c.FF = (float *)(blk + pFF);
         c.FH = (float *)(blk + pFH);
         c.WH = blk + pWH;
         c.RCH = blk + pRCH;
@@ -340,9 +334,9 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
             cudaEventCreateWithFlags(&c.done, cudaEventDisableTiming) != cudaSuccess)
             return refuse(why, "cannot create a CUDA stream"), nullptr;
     }
-    for (cudaEvent_t &e : f->ev)
-        if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) return refuse(why, "cannot create a CUDA event"), nullptr;
-    f->ACC = (float *)r.alloc(M * 5 * 4);  // float4 sums, then the gate sum (tx_accum)
+    if (cudaEventCreateWithFlags(&f->ev, cudaEventDisableTiming) != cudaSuccess) return refuse(why, "cannot create a CUDA event"), nullptr;
+    f->PF = (float *)r.alloc((NF - 1) * M1 * 8);
+    f->PL = r.alloc((NF - 1) * M1 * 4);
     if (r.failed) return refuse(why, "out of GPU memory"), nullptr;
     {
         int id[NF];
@@ -437,8 +431,8 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
         return cudaSuccess;
     }
     pr.mark(P_ALIGN);
-    K(cudaEventRecord(ev[0], s));
-    for (Chain &c : ch) K(cudaStreamWaitEvent(c.st, ev[0], 0));
+    K(cudaEventRecord(ev, s));
+    for (Chain &c : ch) K(cudaStreamWaitEvent(c.st, ev, 0));
     auto mcblock = [&](const Stage &Sc, Stage &S, Chain::Sb &b, cudaStream_t q, float *ws) -> cudaError_t {
         (void)Sc;
         CK(Gc(S.c00, s2(lrelu(ga(b.X, S.xs, S.h, S.w, b.A, pad16(S.ca), S.ha, S.wa))), q, ws));
@@ -467,6 +461,8 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
         const float dt = kDt[si];
         Chain &c = ch[si % ch.size()];
         const cudaStream_t q = c.st;
+        float *const pf = PF + (size_t)si * h1 * w1 * 2;   // the support's last-stage flow,
+        void *const pl = (char *)PL + (size_t)si * h1 * w1 * 4;  // raw and confidence logits
         for (int k = 0; k < 3; k++) {
             Stage &S = st[k];
             Chain::Sb &b = c.sb[k];
@@ -474,18 +470,19 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
             // dt, and the previous stage's flow and state upsampled
             const Stage *P = k ? &st[k - 1] : nullptr;
             const Chain::Sb *pb = k ? &c.sb[k - 1] : nullptr;
-            K(tx_assemble(pym(k, CEN, 0), pym(k, fr, 0), k ? pb->F : nullptr, k ? pb->ST : nullptr, k ? P->h : 0, k ? P->w : 0, b.F, b.X,
+            float *const F = k < 2 ? b.F : pf;
+            K(tx_assemble(pym(k, CEN, 0), pym(k, fr, 0), k ? pb->F : nullptr, k ? pb->ST : nullptr, k ? P->h : 0, k ? P->w : 0, F, b.X,
                           S.xs, S.h, S.w, dt, q));
             CK(mcblock(S, S, b, q, c.wsp));
-            K(tx_head_up(b.O, S.hq, S.wq, b.F, b.ST, S.h, S.w, k > 0, q));
+            if (k < 2)
+                K(tx_head_up(b.O, S.hq, S.wq, F, b.ST, S.h, S.w, k > 0, q));
+            else
+                K(tx_head_up_last(b.O, S.hq, S.wq, F, pl, S.h, S.w, q));
         }
-        // full resolution: flow, logit, the warped support and its validity
+        // full resolution (flow, logit, the warped support and its validity), low-passed to 1/2 for the
+        // confidence head in the same pass
         const Stage &L = st[2];
-        const Chain::Sb &lb = c.sb[2];
-        K(tx_full(lb.F, lb.ST, 16, L.h, L.w, frm(fr, 0), c.FF, c.FULL, H, W, q));
-        // the confidence head at 1/2 on the low-passed results
-        K(tx_down(tm(c.FF, 2, 0, true), H, W, tm(c.FH, 2, 0, true), h1, w1, 2, (float)w1 / W, (float)h1 / H, q));
-        K(tx_down(tm(c.FULL, 8), H, W, tm(c.WH, 8, 0), h1, w1, 4, 1.f, 1.f, q));  // warped half 0..2, raw logit 3
+        K(tx_full_down(pf, pl, 2, L.h, L.w, frm(fr, 0), c.FH, c.WH, H, W, h1, w1, q));  // WH: warped 0..2, raw logit 3
         K(tx_conf_in_warp(pym(2, CEN, 0), tm(c.WH, 8, 0), pym(2, fr, 0), c.FH, dt, c.CIN, c.RCH, h1, w1, q));
         CK(Gc(h0, lrelu(ga(c.CIN, 32, h1, w1, c.C1, 32, h1, w1)), q, c.wsp));
         CK(Gc(hh1, lrelu(ga(c.C1, 32, h1, w1, c.C2, 32, h1, w1)), q, c.wsp));
@@ -493,17 +490,25 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
         a.r1 = c.RCH;
         a.r1_stride = 16;
         CK(Gc(h2c, a, q, c.wsp));
-        // the accumulation in support order (one buffer)
-        if (si > 0) K(cudaStreamWaitEvent(q, ev[si], 0));
-        K(tx_accum(tm(c.C3, 16, 0), h1, w1, tm(c.FULL, 8, 0), 4, ACC, H, W, thresh, gslope, si == 0, q));
-        K(cudaEventRecord(ev[1 + si], q));
+        K(tx_pick(c.C3, 16, pl, h1 * w1, q));  // the confidence logit next to the raw one
     }
     for (Chain &c : ch) {
         K(cudaEventRecord(c.done, c.st));
         K(cudaStreamWaitEvent(s, c.done, 0));
     }
     pr.mark(P_FUSE);
-    K(tx_final(frm(CEN, 0), ACC, H, W, minsup, cslope, eps, out, s));
+    // every support's confidence-gated accumulation and the blend, per pixel
+    TxBlend bl;
+    bl.pf = PF;
+    bl.pl = PL;
+    for (int si = 0; si < 6; si++) bl.fr[si] = frm(kSupports[si], 0);
+    bl.center = frm(CEN, 0);
+    bl.thresh = thresh;
+    bl.gslope = gslope;
+    bl.minsup = minsup;
+    bl.cslope = cslope;
+    bl.eps = eps;
+    K(tx_blend(bl, h1, w1, H, W, out, s));
     pr.mark(P_IO);
 #undef K
 #undef CK

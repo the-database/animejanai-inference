@@ -228,12 +228,13 @@ __global__ void k_frame(const half *pl, const half *feat, int fs, int h, int w, 
     *reinterpret_cast<uint4 *>(dst + (size_t)p * 8) = pack8h(o);
 }
 
-__global__ void k_full(const float *F, const half *logit, int ls, int h, int w, TxMap frm, float *ff, half *full, int H, int W)
+// One full-resolution pixel of a support: the flow resized from F (fp32 [h][w][2], scaled by W/w, H/h),
+// the logit resized (fp16, channel 0 of ls), and the frame (rgb 0..2 of an 8-channel map) warped by the
+// flow; o = warped rgb, logit, the warp's validity. Shared by every kernel that needs it, so all of them
+// compute the same bits.
+__device__ __forceinline__ void full_px(const float *F, const half *logit, int ls, int h, int w, const half *fr, int H, int W, int y, int x,
+                                        float *ux_, float *uy_, float (&o)[5])
 {
-    const half *fr = (const half *)txr(frm);
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= H * W) return;
-    const int y = p / W, x = p % W;
     int y0, y1, x0, x1;
     float fy, fx;
     srcc(y, h, (float)H / h, &y0, &y1, &fy);
@@ -242,12 +243,13 @@ __global__ void k_full(const float *F, const half *logit, int ls, int h, int w, 
     const float2 a = f2[y0 * w + x0], b = f2[y0 * w + x1], c = f2[y1 * w + x0], d = f2[y1 * w + x1];
     const float ux = ((a.x * (1 - fx) + b.x * fx) * (1 - fy) + (c.x * (1 - fx) + d.x * fx) * fy) * ((float)W / w);
     const float uy = ((a.y * (1 - fx) + b.y * fx) * (1 - fy) + (c.y * (1 - fx) + d.y * fx) * fy) * ((float)H / h);
-    reinterpret_cast<float2 *>(ff)[p] = make_float2(ux, uy);
-    const float lg = (__half2float(logit[((size_t)y0 * w + x0) * ls]) * (1 - fx) + __half2float(logit[((size_t)y0 * w + x1) * ls]) * fx) * (1 - fy) +
-                     (__half2float(logit[((size_t)y1 * w + x0) * ls]) * (1 - fx) + __half2float(logit[((size_t)y1 * w + x1) * ls]) * fx) * fy;
+    *ux_ = ux;
+    *uy_ = uy;
+    o[3] = (__half2float(logit[((size_t)y0 * w + x0) * ls]) * (1 - fx) + __half2float(logit[((size_t)y0 * w + x1) * ls]) * fx) * (1 - fy) +
+           (__half2float(logit[((size_t)y1 * w + x0) * ls]) * (1 - fx) + __half2float(logit[((size_t)y1 * w + x1) * ls]) * fx) * fy;
     const float px = x + ux, py = y + uy, gx0 = floorf(px), gy0 = floorf(py), ax = px - gx0, ay = py - gy0;
     const int ix = (int)gx0, iy = (int)gy0;
-    float o[8] = {};
+    o[0] = o[1] = o[2] = 0.f;
     float vs = 0.f;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
@@ -261,11 +263,90 @@ __global__ void k_full(const float *F, const half *logit, int ls, int h, int w, 
         o[1] += wt * v[1];
         o[2] += wt * v[2];
     }
-    o[3] = lg;
     o[4] = vs;
-    *reinterpret_cast<uint4 *>(full + (size_t)p * 8) = pack8h(o);
 }
 
+// tx_full_down: a support's full-resolution pixels (full_px) and their two half-resolution downsizes in one
+// kernel, with no full-resolution map stored. A 32 x 8 half-resolution tile computes the pixels of its
+// source block into shared memory (the flow in fp32, the rest rounded to fp16), then filters rows and
+// columns as k_down_t does. The block's halo is computed again by the neighbouring tile.
+__global__ void __launch_bounds__(256) k_full_down_t(const float *F, const half *logit, int ls, int h, int w, TxMap frm, int H, int W,
+                                                     float *fh, half *wh, int oh, int ow)
+{
+    __shared__ float2 tf[kDtSY * kDtSX];
+    __shared__ uint2 tv[kDtSY * kDtSX];
+    __shared__ float hs[6 * kDtSY * kDtW];  // [channel: flow x, y, rgb, logit][source row][output column]
+    const half *fr = (const half *)txr(frm);
+    const int ox0 = blockIdx.x * kDtW, oy0 = blockIdx.y * kDtH;
+    const float sx = (float)ow / W, sy = (float)oh / H;
+    float w6[6];
+    int bx0, by0, bxl, byl;
+    taps6(ox0, W, sx, &bx0, w6);
+    taps6(oy0, H, sy, &by0, w6);
+    taps6(min(ox0 + kDtW, ow) - 1, W, sx, &bxl, w6);
+    taps6(min(oy0 + kDtH, oh) - 1, H, sy, &byl, w6);
+    const int SX = bxl + 6 - bx0, SY = byl + 6 - by0;
+    for (int i = threadIdx.x; i < SX * SY; i += blockDim.x) {
+        const int r = i / SX, c = i % SX, yy = by0 + r, xx = bx0 + c;
+        float2 f = make_float2(0.f, 0.f);
+        uint2 v = make_uint2(0u, 0u);
+        if (yy >= 0 && yy < H && xx >= 0 && xx < W) {
+            float o[5];
+            full_px(F, logit, ls, h, w, fr, H, W, yy, xx, &f.x, &f.y, o);
+            half2 *hv = reinterpret_cast<half2 *>(&v);
+            hv[0] = __floats2half2_rn(o[0], o[1]);
+            hv[1] = __floats2half2_rn(o[2], o[3]);
+        }
+        tf[r * kDtSX + c] = f;
+        tv[r * kDtSX + c] = v;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < SY * kDtW; i += blockDim.x) {
+        const int r = i / kDtW, x = i % kDtW, ox = ox0 + x;
+        float acc[6] = {};
+        if (ox < ow) {
+            int bx;
+            float wx[6];
+            taps6(ox, W, sx, &bx, wx);
+            const int o0 = r * kDtSX + (bx - bx0);
+#pragma unroll
+            for (int t = 0; t < 6; t++) {
+                if (wx[t] == 0.f) continue;
+                const float2 f = tf[o0 + t];
+                acc[0] += wx[t] * f.x;
+                acc[1] += wx[t] * f.y;
+                const uint2 u = tv[o0 + t];
+                const float2 a = __half22float2(reinterpret_cast<const half2 *>(&u)[0]), b = __half22float2(reinterpret_cast<const half2 *>(&u)[1]);
+                acc[2] += wx[t] * a.x;
+                acc[3] += wx[t] * a.y;
+                acc[4] += wx[t] * b.x;
+                acc[5] += wx[t] * b.y;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 6; j++) hs[(j * kDtSY + r) * kDtW + x] = acc[j];
+    }
+    __syncthreads();
+    const int x = threadIdx.x % kDtW, ox = ox0 + x, oy = oy0 + threadIdx.x / kDtW;
+    if (ox >= ow || oy >= oh) return;
+    int by;
+    float wy[6];
+    taps6(oy, H, sy, &by, wy);
+    const int r0 = by - by0;
+    float acc[6] = {};
+#pragma unroll
+    for (int r = 0; r < 6; r++) {
+        if (wy[r] == 0.f) continue;
+#pragma unroll
+        for (int j = 0; j < 6; j++) acc[j] += wy[r] * hs[(j * kDtSY + r0 + r) * kDtW + x];
+    }
+    const size_t p = (size_t)oy * ow + ox;
+    reinterpret_cast<float2 *>(fh)[p] = make_float2(acc[0] * sx, acc[1] * sy);
+    uint2 u;
+    reinterpret_cast<half2 *>(&u)[0] = __floats2half2_rn(acc[2], acc[3]);
+    reinterpret_cast<half2 *>(&u)[1] = __floats2half2_rn(acc[4], acc[5]);
+    *reinterpret_cast<uint2 *>(wh + p * 8) = u;
+}
 
 // tx_assemble: one thread a pixel, the pixel written whole (16-byte stores; writing a few channels of a
 // 32- or 64-byte pixel per pass touched a memory segment per thread).
@@ -464,47 +545,78 @@ __global__ void k_conf_in_warp(TxMap cen, TxMap wh, TxMap sup, const float *flow
 }
 
 
-// acc: float4 [H][W] (weighted rgb sum, weight sum), then float [H][W] (gate sum); first: the first
-// support writes it (no clear, no read).
-__global__ void k_accum(TxMap logit, int h2, int w2, TxMap full, int vch, float *acc, int H, int W, float thresh, float gslope, int first)
+// tx_head_up_last: the last stage's head resized; the flow to F (fp32 [oh][ow][2]) += , the raw logit
+// (O channel 2) to lg (fp16, stride 2: channel 0 of an interleaved pair); the rest of the state is unused.
+__global__ void k_head_up_last(const half *O, int ih, int iw, float *F, half *lg, int oh, int ow)
 {
-    logit.p = txr(logit);
-    full.p = txr(full);
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= oh * ow) return;
+    const int y = p / ow, x = p % ow;
+    int y0, y1, x0, x1;
+    float fy, fx;
+    srcc(y, ih, (float)oh / ih, &y0, &y1, &fy);
+    srcc(x, iw, (float)ow / iw, &x0, &x1, &fx);
+    const uint2 qa = *reinterpret_cast<const uint2 *>(O + ((size_t)y0 * iw + x0) * 16), qb = *reinterpret_cast<const uint2 *>(O + ((size_t)y0 * iw + x1) * 16),
+                qc = *reinterpret_cast<const uint2 *>(O + ((size_t)y1 * iw + x0) * 16), qd = *reinterpret_cast<const uint2 *>(O + ((size_t)y1 * iw + x1) * 16);
+    float v[3];
+#pragma unroll
+    for (int j = 0; j < 3; j++) {
+        const float a = __half2float(reinterpret_cast<const half *>(&qa)[j]), b = __half2float(reinterpret_cast<const half *>(&qb)[j]),
+                    c = __half2float(reinterpret_cast<const half *>(&qc)[j]), d = __half2float(reinterpret_cast<const half *>(&qd)[j]);
+        v[j] = (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
+    }
+    float2 f = make_float2(v[0], v[1]);
+    const float2 g = reinterpret_cast<const float2 *>(F)[p];
+    f.x += g.x;
+    f.y += g.y;
+    reinterpret_cast<float2 *>(F)[p] = f;
+    lg[(size_t)p * 2] = __float2half(v[2]);
+}
+
+// tx_pick: channel 0 of a strided fp16 map into channel 1 of an interleaved pair.
+__global__ void k_pick(const half *src, int ss, half *dst, int n)
+{
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    dst[(size_t)p * 2 + 1] = src[(size_t)p * ss];
+}
+
+// tx_blend: the confidence-gated accumulation of every support, in support order, and the final blend, per
+// pixel: nothing is accumulated in memory. Per support at half resolution: F (fp32 [h][w][2], the full flow before its
+// resize) and an interleaved fp16 pair (the raw logit, the confidence head's logit).
+__global__ void k_blend(TxBlend b, int h, int w, int H, int W, half *out)
+{
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= H * W) return;
     const int y = p / W, x = p % W;
     int y0, y1, x0, x1;
     float fy, fx;
-    srcc(y, h2, (float)H / h2, &y0, &y1, &fy);
-    srcc(x, w2, (float)W / w2, &x0, &x1, &fx);
-    const float l = (ld(logit, (size_t)y0 * w2 + x0, 0) * (1 - fx) + ld(logit, (size_t)y0 * w2 + x1, 0) * fx) * (1 - fy) +
-                    (ld(logit, (size_t)y1 * w2 + x0, 0) * (1 - fx) + ld(logit, (size_t)y1 * w2 + x1, 0) * fx) * fy;
-    float fv[8];
-    unpack8h(*reinterpret_cast<const uint4 *>(reinterpret_cast<const half *>(full.p) + (size_t)p * 8), fv);
-    const float conf = sigm(l) * fv[vch], gate = sigm((conf - thresh) * gslope), wgt = conf * gate;
-    float4 *a = reinterpret_cast<float4 *>(acc) + p;
-    float *g = acc + (size_t)4 * H * W + p;
-    float4 a0 = first ? make_float4(0.f, 0.f, 0.f, 0.f) : *a;
-    float g0 = first ? 0.f : *g;
-    a0.x += wgt * fv[0];
-    a0.y += wgt * fv[1];
-    a0.z += wgt * fv[2];
-    a0.w += wgt;
-    g0 += gate;
-    *a = a0;
-    *g = g0;
-}
-
-__global__ void k_final(TxMap center, const float *acc, int H, int W, float minsup, float cslope, float eps, half *out)
-{
-    center.p = txr(center);
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= H * W) return;
-    const float4 a0 = reinterpret_cast<const float4 *>(acc)[p];
-    const float gs = acc[(size_t)4 * H * W + p];
-    const float r = sigm((gs - minsup + 0.5f) * cslope), den = fmaxf(1.f + a0.w, eps);
+    srcc(y, h, (float)H / h, &y0, &y1, &fy);
+    srcc(x, w, (float)W / w, &x0, &x1, &fx);
+    float4 a0 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float g0 = 0.f;
+    const size_t m = (size_t)h * w;
+#pragma unroll 1
+    for (int si = 0; si < 6; si++) {
+        const half *pl = (const half *)b.pl + si * m * 2;
+        const float l = (__half2float(pl[((size_t)y0 * w + x0) * 2 + 1]) * (1 - fx) + __half2float(pl[((size_t)y0 * w + x1) * 2 + 1]) * fx) * (1 - fy) +
+                        (__half2float(pl[((size_t)y1 * w + x0) * 2 + 1]) * (1 - fx) + __half2float(pl[((size_t)y1 * w + x1) * 2 + 1]) * fx) * fy;
+        float ux, uy, o[5];
+        full_px(b.pf + si * m * 2, pl, 2, h, w, (const half *)txr(b.fr[si]), H, W, y, x, &ux, &uy, o);
+        float fv[5];
+#pragma unroll
+        for (int j = 0; j < 5; j++) fv[j] = __half2float(__float2half(o[j]));
+        const float conf = sigm(l) * fv[4], gate = sigm((conf - b.thresh) * b.gslope), wgt = conf * gate;
+        a0.x += wgt * fv[0];
+        a0.y += wgt * fv[1];
+        a0.z += wgt * fv[2];
+        a0.w += wgt;
+        g0 += gate;
+    }
+    const half *cp = (const half *)txr(b.center);
+    const float r = sigm((g0 - b.minsup + 0.5f) * b.cslope), den = fmaxf(1.f + a0.w, b.eps);
     float cv[8];
-    unpack8h(*reinterpret_cast<const uint4 *>(reinterpret_cast<const half *>(center.p) + (size_t)p * 8), cv);
+    unpack8h(*reinterpret_cast<const uint4 *>(cp + (size_t)p * 8), cv);
     const float aa[3] = {a0.x, a0.y, a0.z};
     for (int c = 0; c < 3; c++) {
         const float cc = cv[c], bl = (cc + aa[c]) / den;
@@ -566,21 +678,30 @@ cudaError_t tx_frame(const void *planes, const void *feat, int fs, int h, int w,
     k_frame<<<nb((long long)H * W), 256, 0, s>>>((const half *)planes, (const half *)feat, fs, h, w, (half *)dst, H, W);
     return cudaGetLastError();
 }
-cudaError_t tx_full(const float *F, const void *logit, int ls, int h, int w, TxMap fr, float *ff, void *full, int H, int W, cudaStream_t s)
+cudaError_t tx_full_down(const float *F, const void *logit, int ls, int h, int w, TxMap fr, float *fh, void *wh, int H, int W, int oh, int ow,
+                         cudaStream_t s)
 {
-    k_full<<<nb((long long)H * W), 256, 0, s>>>(F, (const half *)logit, ls, h, w, fr, ff, (half *)full, H, W);
+    // the tile's source block holds downscales of at most 2x
+    if (W > 2 * ow || H > 2 * oh || fr.f32 || fr.stride != 8 || fr.off) return cudaErrorInvalidValue;
+    const dim3 tg((ow + kDtW - 1) / kDtW, (oh + kDtH - 1) / kDtH);
+    k_full_down_t<<<tg, kDtW * kDtH, 0, s>>>(F, (const half *)logit, ls, h, w, fr, H, W, fh, (half *)wh, oh, ow);
     return cudaGetLastError();
 }
-cudaError_t tx_accum(TxMap logit, int h2, int w2, TxMap full, int vch, float *acc, int H, int W, float thresh, float gslope, bool first,
-                     cudaStream_t s)
+cudaError_t tx_head_up_last(const void *O, int ih, int iw, float *F, void *lg, int oh, int ow, cudaStream_t s)
 {
-    k_accum<<<nb((long long)H * W), 256, 0, s>>>(logit, h2, w2, full, vch, acc, H, W, thresh, gslope, first ? 1 : 0);
+    k_head_up_last<<<nb((long long)oh * ow), 256, 0, s>>>((const half *)O, ih, iw, F, (half *)lg, oh, ow);
     return cudaGetLastError();
 }
-cudaError_t tx_final(TxMap center, const float *acc, int H, int W, float minsup, float cslope, float eps, void *out, cudaStream_t s)
+cudaError_t tx_pick(const void *src, int ss, void *dst, int n, cudaStream_t s)
 {
-    k_final<<<nb((long long)H * W), 256, 0, s>>>(center, acc, H, W, minsup, cslope, eps, (half *)out);
+    k_pick<<<nb(n), 256, 0, s>>>((const half *)src, ss, (half *)dst, n);
     return cudaGetLastError();
 }
-
+cudaError_t tx_blend(const TxBlend &b, int h, int w, int H, int W, void *out, cudaStream_t s)
+{
+    for (const TxMap &m : b.fr)
+        if (m.f32 || m.stride != 8 || m.off) return cudaErrorInvalidValue;
+    k_blend<<<nb((long long)H * W), 256, 0, s>>>(b, h, w, H, W, (half *)out);
+    return cudaGetLastError();
+}
 }  // namespace ajinative
