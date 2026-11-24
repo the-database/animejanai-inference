@@ -464,6 +464,20 @@ AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame *a,
                               const aji_frame *b, double t,
                               const aji_frame *out, void *cu_stream, int scene);
 
+/* aji_infer_rife_with_scene with the frames' identities: a_id, b_id are the
+ * caller's numbers for the source frames (an index or pts; -1: unknown).
+ * Equal ids promise equal frame contents within this context until the next
+ * aji_configure, which lets the backend keep a frame's work for the next
+ * call: in a 2x stream each pair's b is the next pair's a, and a higher
+ * factor calls the same pair for several t. Never pass the id of a frame
+ * whose contents changed (after a seek, reuse ids only for the same frames).
+ * Additive: aji_rife_ids_supported() reports a backend that uses the ids;
+ * where it returns 0 this call still works (as aji_infer_rife_with_scene). */
+AJI_EXPORT int aji_rife_ids_supported(aji_ctx *c);
+AJI_EXPORT int aji_infer_rife_ids(aji_ctx *c, const aji_frame *a, int64_t a_id,
+                              const aji_frame *b, int64_t b_id, double t,
+                              const aji_frame *out, void *cu_stream, int scene);
+
 /* Temporal (multi-frame) models. A chain model whose input takes T = 2r+1
  * frames (oldest first, the frame to upscale in the middle) is a temporal
  * step: it needs the neighboring source frames, so a chain containing one

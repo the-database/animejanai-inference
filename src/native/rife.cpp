@@ -44,16 +44,22 @@ struct Rife::Impl {
     std::vector<Step> steps;
     std::string what;
     float *dt = nullptr;                  // the timestep, device
-    cudaGraphExec_t graph = nullptr;      // replay of steps for (graph_in, graph_out)
-    const void *graph_in = nullptr;
-    void *graph_out = nullptr;
+    // the steps in parts: frame 0's encoder, frame 1's, then the blocks ([begin, end) each; no encoder:
+    // empty parts); each replayed as a graph of its own for (graph_in, graph_out)
+    size_t part[4] = {0, 0, 0, 0};
+    cudaGraphExec_t graph[3] = {};
+    const void *graph_in[3] = {};
+    void *graph_out[3] = {};
     bool graph_ok = true;
+    size_t fbytes = 0;                    // a frame's features
 
-    cudaError_t enqueue(const void *in11, void *out3, cudaStream_t s, bool prof);
+    cudaError_t enqueue(const void *in11, void *out3, cudaStream_t s, bool prof, size_t b, size_t e);
+    cudaError_t launch(int k, const void *in11, void *out3, cudaStream_t s);
 
     ~Impl()
     {
-        if (graph) cudaGraphExecDestroy(graph);
+        for (cudaGraphExec_t g : graph)
+            if (g) cudaGraphExecDestroy(g);
         for (GWeights *w : weights) {
             grelease(*w);
             delete w;
@@ -138,6 +144,7 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
             if (!w) return refuse(why, "weight upload failed"), nullptr;
             ew.push_back(w);
         }
+        d.fbytes = plane * d.FP * 2;
         std::vector<GWeights *> ph(2);
         for (int py = 0; py < 2; py++) {
             std::vector<uint16_t> w;
@@ -147,6 +154,7 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
             if (!ph[py]) return refuse(why, "weight upload failed"), nullptr;
         }
         for (int k = 0; k < 2; k++) {
+            d.part[k] = d.steps.size();
             void *cur = nullptr;
             int curc = 0;
             for (size_t i = 0; i + 1 < enc.size(); i++) {
@@ -197,6 +205,8 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
             }
         }
     }
+    d.part[2] = d.steps.size();
+    if (!F) d.part[0] = d.part[1] = d.part[2];
     d.frame.W = W;
     d.frame.H = H;
     d.frame.feat[0] = feat[0];
@@ -339,6 +349,7 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     }
     d.nb = nb;
     d.steps.push_back(Step{Step::FINAL});
+    d.part[3] = d.steps.size();
 
     size_t wsf = 0;
     for (Step &st : d.steps)
@@ -376,12 +387,12 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
 
 Rife::~Rife() = default;
 
-cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bool prof)
+cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bool prof, size_t b, size_t e)
 {
     Impl &d = *this;
     std::vector<cudaEvent_t> ev;
     if (prof) {
-        ev.resize(d.steps.size() + 1);
+        ev.resize(e - b + 1);
         for (auto &e : ev) cudaEventCreate(&e);
         cudaEventRecord(ev[0], s);
     }
@@ -389,7 +400,8 @@ cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bo
     const size_t plane = (size_t)d.W * d.H;
     RifeFrame fr = d.frame;
     fr.in11 = in11;
-    for (Step &st : d.steps) {
+    for (size_t i = b; i < e; i++) {
+        Step &st = d.steps[i];
         cudaError_t e = cudaSuccess;
         switch (st.kind) {
         case Step::GCONV: {
@@ -422,9 +434,9 @@ cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bo
     if (prof) {
         cudaEventSynchronize(ev.back());
         std::map<std::string, float> agg;
-        for (size_t i = 0; i < d.steps.size(); i++) {
+        for (size_t i = b; i < e; i++) {
             float ms = 0;
-            cudaEventElapsedTime(&ms, ev[i], ev[i + 1]);
+            cudaEventElapsedTime(&ms, ev[i - b], ev[i - b + 1]);
             const Step &st = d.steps[i];
             std::string k = st.kind == Step::GATHER ? "gather s" + std::to_string(st.g.s)
                           : st.kind == Step::FINAL ? "final"
@@ -443,36 +455,61 @@ cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bo
     return cudaSuccess;
 }
 
-cudaError_t Rife::run(const void *in11, float t, void *out3, cudaStream_t s)
+cudaError_t Rife::Impl::launch(int k, const void *in11, void *out3, cudaStream_t s)
+{
+    Impl &d = *this;
+    const size_t b = d.part[k], e = d.part[k + 1];
+    if (b == e) return cudaSuccess;
+    if (!d.graph_ok) return d.enqueue(in11, out3, s, false, b, e);
+    if (!d.graph[k] || d.graph_in[k] != in11 || d.graph_out[k] != out3) {
+        if (d.graph[k]) cudaGraphExecDestroy(d.graph[k]);
+        d.graph[k] = nullptr;
+        cudaGraph_t gr = nullptr;
+        if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            cudaGetLastError();
+            d.graph_ok = false;
+            return d.enqueue(in11, out3, s, false, b, e);
+        }
+        cudaError_t r = d.enqueue(in11, out3, s, false, b, e);
+        const cudaError_t ce = cudaStreamEndCapture(s, &gr);
+        if (r != cudaSuccess || ce != cudaSuccess || !gr || cudaGraphInstantiate(&d.graph[k], gr, 0) != cudaSuccess) {
+            if (gr) cudaGraphDestroy(gr);
+            cudaGetLastError();
+            d.graph[k] = nullptr;
+            d.graph_ok = false;
+            return d.enqueue(in11, out3, s, false, b, e);
+        }
+        cudaGraphDestroy(gr);
+        d.graph_in[k] = in11;
+        d.graph_out[k] = out3;
+    }
+    return cudaGraphLaunch(d.graph[k], s);
+}
+
+cudaError_t Rife::run(const void *in11, float t, void *out3, cudaStream_t s) { return run(in11, t, out3, s, true, true); }
+
+cudaError_t Rife::run(const void *in11, float t, void *out3, cudaStream_t s, bool enc0, bool enc1)
 {
     Impl &d = *this->d;
     static const bool prof = getenv("AJI_NATIVE_PROFILE") != nullptr;
     cudaError_t e = cudaMemcpyAsync(d.dt, &t, sizeof(float), cudaMemcpyHostToDevice, s);
     if (e != cudaSuccess) return e;
-    if (prof || !d.graph_ok) return d.enqueue(in11, out3, s, prof);
-    if (!d.graph || d.graph_in != in11 || d.graph_out != out3) {
-        if (d.graph) cudaGraphExecDestroy(d.graph);
-        d.graph = nullptr;
-        cudaGraph_t gr = nullptr;
-        if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-            cudaGetLastError();
-            d.graph_ok = false;
-            return d.enqueue(in11, out3, s, false);
-        }
-        e = d.enqueue(in11, out3, s, false);
-        const cudaError_t ce = cudaStreamEndCapture(s, &gr);
-        if (e != cudaSuccess || ce != cudaSuccess || !gr || cudaGraphInstantiate(&d.graph, gr, 0) != cudaSuccess) {
-            if (gr) cudaGraphDestroy(gr);
-            cudaGetLastError();
-            d.graph = nullptr;
-            d.graph_ok = false;
-            return d.enqueue(in11, out3, s, false);
-        }
-        cudaGraphDestroy(gr);
-        d.graph_in = in11;
-        d.graph_out = out3;
+    const bool enc[2] = {enc0, enc1};
+    if (prof) {
+        for (int k = 0; k < 2; k++)
+            if (enc[k] && (e = d.enqueue(in11, out3, s, true, d.part[k], d.part[k + 1])) != cudaSuccess) return e;
+        return d.enqueue(in11, out3, s, true, d.part[2], d.part[3]);
     }
-    return cudaGraphLaunch(d.graph, s);
+    for (int k = 0; k < 2; k++)
+        if (enc[k] && (e = d.launch(k, in11, out3, s)) != cudaSuccess) return e;
+    return d.launch(2, in11, out3, s);
+}
+
+cudaError_t Rife::move_frame(cudaStream_t s)
+{
+    Impl &d = *this->d;
+    if (!d.frame.F || !d.fbytes) return cudaSuccess;
+    return cudaMemcpyAsync(const_cast<void *>(d.frame.feat[0]), d.frame.feat[1], d.fbytes, cudaMemcpyDeviceToDevice, s);
 }
 
 std::string Rife::describe() const { return d->what; }

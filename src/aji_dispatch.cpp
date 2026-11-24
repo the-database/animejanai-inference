@@ -64,6 +64,7 @@ struct aji_backend {
                       double, const aji_frame *, void *);
     int (*infer_rife_with_scene)(aji_ctx *, const aji_frame *, const aji_frame *,
                       double, const aji_frame *, void *, int);
+    int (*infer_rife_ids)(aji_ctx *, const aji_frame *, int64_t, const aji_frame *, int64_t, double, const aji_frame *, void *, int);
     int (*temporal_radius)(aji_ctx *);
     int (*ingest)(aji_ctx *, const aji_frame *, uint64_t, void *);
     int (*infer_seq)(aji_ctx *, uint64_t, const aji_frame *, void *);
@@ -210,6 +211,7 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(infer_rife,   "aji_infer_rife");
     // Optional: do not make old backends unusable for existing callers.
     *(void **)&be->infer_rife_with_scene = lib_sym(be->lib, "aji_infer_rife_with_scene");
+    *(void **)&be->infer_rife_ids = lib_sym(be->lib, "aji_infer_rife_ids");
     *(void **)&be->rife_enhanced_scene = lib_sym(be->lib, "aji_rife_enhanced_scene");
     // Optional too: aji_resize_frame is TensorRT-only (DirectML has none);
     // aji_frame_diff is in every backend since its DirectML port.
@@ -615,6 +617,23 @@ extern "C" AJI_EXPORT int aji_infer_rife_with_scene(aji_ctx *c, const aji_frame 
     // Default remains callable with an older backend. An explicit decision
     // cannot silently fall back to a different scene detector.
     return scene == -1 ? c->be.infer_rife(c->inner, a, b, t, out, cu_stream) : AJI_ERR;
+}
+
+extern "C" AJI_EXPORT int aji_rife_ids_supported(aji_ctx *c)
+{
+    return c && c->be.infer_rife_ids;
+}
+
+extern "C" AJI_EXPORT int aji_infer_rife_ids(aji_ctx *c, const aji_frame *a, int64_t a_id,
+                                             const aji_frame *b, int64_t b_id, double t,
+                                             const aji_frame *out, void *cu_stream, int scene)
+{
+    if (!c || scene < -1 || scene > 1)
+        return AJI_ERR;
+    if (c->be.infer_rife_ids)
+        return c->be.infer_rife_ids(c->inner, a, a_id, b, b_id, t, out, cu_stream, scene);
+    // an older backend, or one without the reuse: the ids are only a promise, so ignoring them is exact
+    return aji_infer_rife_with_scene(c, a, b, t, out, cu_stream, scene);
 }
 
 extern "C" AJI_EXPORT int aji_temporal_radius(aji_ctx *c)

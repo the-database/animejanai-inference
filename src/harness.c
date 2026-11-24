@@ -78,13 +78,14 @@ int main(int argc, char **argv)
     const char *rife_model_dir = NULL;
     const char *format = "nv12", *matrix = "709", *range = "limited", *siting = "left";
     int w = 0, h = 0, max_frames = 1 << 30, slot = 1, rife = 0, out444 = 0;
-    int rife_chain = 0, ingest_ahead = -1, reset_at = -1, async_build = 0;
+    int rife_chain = 0, ingest_ahead = -1, reset_at = -1, async_build = 0, rife_ids = 0;
 
     double fps = 23.976;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--rife")) { rife = 1; continue; }
         if (!strcmp(argv[i], "--rife-chain")) { rife_chain = 1; continue; }
+        if (!strcmp(argv[i], "--rife-ids")) { rife = 1; rife_ids = 1; continue; }  /* aji_infer_rife_ids, the frame numbers */
         if (!strcmp(argv[i], "--out444")) { out444 = 1; continue; }
         if (!strcmp(argv[i], "--async-build")) { async_build = 1; continue; }
         if (i >= argc - 1) break;
@@ -391,8 +392,8 @@ int main(int argc, char **argv)
             if (prev >= 0 && fout) {
                 CK(cudaStreamSynchronize(stream));
                 CK(cudaEventRecord(re0, stream));
-                int ret = aji_infer_rife(aji, &fr[prev], &fr[cur], 0.5,
-                                         &fr[2], stream);
+                int ret = rife_ids ? aji_infer_rife_ids(aji, &fr[prev], n - 1, &fr[cur], n, 0.5, &fr[2], stream, -1)
+                                   : aji_infer_rife(aji, &fr[prev], &fr[cur], 0.5, &fr[2], stream);
                 CK(cudaEventRecord(re1, stream));
                 const aji_frame *emit;
                 if (ret == AJI_OK) {
