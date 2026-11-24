@@ -12,6 +12,10 @@
  * Split K (small images, where a few CTAs would leave most SMs idle): the 9 taps x K chunks are
  * divided among ksplit CTAs, each writes fp32 partial sums to a workspace, and k_gconv_reduce sums
  * them and runs the epilogue.
+ *
+ * BAT: nb same-size images in one launch, blockIdx.y = image * tiles_y + CTA row. The input, output and
+ * residuals of image b are b whole images further on; the workspace is [K split][image][pixel]. Only the
+ * BAT instantiations hold this code, so the others compile as before.
  */
 #pragma once
 
@@ -44,6 +48,7 @@ struct GParams {
     const float *r1f;
     int r1fs;
     float *sums;                        // or null: the output's channel sums added here (NHWC, no split)
+    int nb, tiles_y;                    // BAT kernels: nb images (contiguous, IH x IW in, H x W out), tiles_y CTA rows each
 };
 
 __device__ __forceinline__ half2 u2h(uint32_t u) { return *reinterpret_cast<half2 *>(&u); }
@@ -106,7 +111,8 @@ __device__ __forceinline__ half2 g_epi(const GParams &p, half2 v, int y, int x, 
 // ACC: 0 fp16 accumulation (full rate), 1 fp32 accumulation (half rate on GeForce, for deep sums).
 // SUMS: the output's channel sums into p.sums (an instantiation of its own: the code would change how
 // every other one compiles, which cost ESRGAN's convs ~20% on sm_89).
-template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0, int SUMS = 0>
+// BAT: see the top.
+template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0, int SUMS = 0, int BAT = 0>
 __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
 {
 #if AJI_GCONV_ARCH_OK
@@ -118,7 +124,18 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
     extern __shared__ __align__(16) unsigned char smraw[];
     half *sm = reinterpret_cast<half *>(smraw);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int tx0 = blockIdx.x * TW, ty0 = blockIdx.y * TH;
+    int by = blockIdx.y;
+    if constexpr (BAT) {
+        const int b = by / p.tiles_y;
+        by -= b * p.tiles_y;
+        const size_t ip = (size_t)b * p.IH * p.IW, op = (size_t)b * p.H * p.W;
+        p.src += ip * p.sstride;
+        p.dst += op * p.dstride;
+        if (p.r1) p.r1 += op * p.r1s;
+        if (p.r2) p.r2 += op * p.r2s;
+        if (p.ws) p.ws += op * p.coutp_all;
+    }
+    const int tx0 = blockIdx.x * TW, ty0 = by * TH;
     const int iy0 = S * ty0 - 1, ix0 = S * tx0 - 1;
     const int och = blockIdx.z / p.ksplit, kz = blockIdx.z % p.ksplit;
     const uint4 *wt = p.w + och * p.wchunk;
@@ -203,7 +220,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
                 const int ox = tx0 + g + h * 8;
                 if (oy >= p.H || ox >= p.W) continue;
                 const float2 f = ACC ? make_float2(accf[n][2 * h], accf[n][2 * h + 1]) : __half22float2(u2h(acc[n][h]));
-                *reinterpret_cast<float2 *>(p.ws + ((size_t)kz * p.H * p.W + (size_t)oy * p.W + ox) * p.coutp_all + och * COUTP + n * 8 +
+                *reinterpret_cast<float2 *>(p.ws + ((size_t)kz * (BAT ? p.nb : 1) * p.H * p.W + (size_t)oy * p.W + ox) * p.coutp_all + och * COUTP + n * 8 +
                                             tq * 2) = f;
             }
         return;
@@ -271,7 +288,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv(GParams p)
 
 // k_gconv with WR rows of 16 pixels per warp (WR >= 2): each B fragment feeds WR MMAs, and the CTA covers
 // WARPS * WR rows. A kernel of its own, so k_gconv (one row per warp) compiles as before on every GPU.
-template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC, int SUMS, int WR>
+template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC, int SUMS, int WR, int BAT = 0>
 __global__ void __launch_bounds__(WARPS * 32) k_gconv_rows(GParams p)
 {
 #if AJI_GCONV_ARCH_OK
@@ -283,7 +300,18 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv_rows(GParams p)
     extern __shared__ __align__(16) unsigned char smraw[];
     half *sm = reinterpret_cast<half *>(smraw);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int tx0 = blockIdx.x * TW, ty0 = blockIdx.y * TH;
+    int by = blockIdx.y;
+    if constexpr (BAT) {
+        const int b = by / p.tiles_y;
+        by -= b * p.tiles_y;
+        const size_t ip = (size_t)b * p.IH * p.IW, op = (size_t)b * p.H * p.W;
+        p.src += ip * p.sstride;
+        p.dst += op * p.dstride;
+        if (p.r1) p.r1 += op * p.r1s;
+        if (p.r2) p.r2 += op * p.r2s;
+        if (p.ws) p.ws += op * p.coutp_all;
+    }
+    const int tx0 = blockIdx.x * TW, ty0 = by * TH;
     const int iy0 = S * ty0 - 1, ix0 = S * tx0 - 1;
     const int och = blockIdx.z / p.ksplit, kz = blockIdx.z % p.ksplit;
     const uint4 *wt = p.w + och * p.wchunk;
@@ -375,7 +403,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_gconv_rows(GParams p)
                     const int ox = tx0 + g + h * 8, oy = ty0 + warp * WR + r;
                     if (oy >= p.H || ox >= p.W) continue;
                     const float2 f = ACC ? make_float2(accf[r][n][2 * h], accf[r][n][2 * h + 1]) : __half22float2(u2h(acc[r][n][h]));
-                    *reinterpret_cast<float2 *>(p.ws + ((size_t)kz * p.H * p.W + (size_t)oy * p.W + ox) * p.coutp_all + och * COUTP +
+                    *reinterpret_cast<float2 *>(p.ws + ((size_t)kz * (BAT ? p.nb : 1) * p.H * p.W + (size_t)oy * p.W + ox) * p.coutp_all + och * COUTP +
                                                 n * 8 + tq * 2) = f;
                 }
         return;
