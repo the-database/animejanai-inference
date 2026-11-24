@@ -20,13 +20,13 @@ constexpr int kWarps[kGShapes] = {8, 4, 2, 8, 4, 2}, kRows[kGShapes] = {1, 1, 1,
 int vrows(int v) { return kWarps[v % kGShapes] * kRows[v % kGShapes]; }  // output rows per CTA
 int vcap(int v) { return v < kGShapes ? 64 : 32; }
 
-template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0, int SUMS = 0, int WR = 1>
+template <int KCH, int COUTP, int S, int IN, int OUT, int WARPS, int ACC = 0, int SUMS = 0, int WR = 1, int BAT = 0>
 cudaError_t run_g(const gdev::GParams &p, int zdim, cudaStream_t s)
 {
     constexpr int smem = gdev::gconv_smem_bytes<KCH, COUTP, S, WARPS, WR>();
     auto k = [] {
-        if constexpr (WR == 1) return gdev::k_gconv<KCH, COUTP, S, IN, OUT, WARPS, ACC, SUMS>;
-        else return gdev::k_gconv_rows<KCH, COUTP, S, IN, OUT, WARPS, ACC, SUMS, WR>;
+        if constexpr (WR == 1) return gdev::k_gconv<KCH, COUTP, S, IN, OUT, WARPS, ACC, SUMS, BAT>;
+        else return gdev::k_gconv_rows<KCH, COUTP, S, IN, OUT, WARPS, ACC, SUMS, WR, BAT>;
     }();
     if constexpr (smem > 48 * 1024) {
         static bool set = false;
@@ -36,16 +36,22 @@ cudaError_t run_g(const gdev::GParams &p, int zdim, cudaStream_t s)
             set = true;
         }
     }
-    const dim3 grid((p.W + gdev::TW - 1) / gdev::TW, (p.H + WARPS * WR - 1) / (WARPS * WR), zdim);
-    k<<<grid, WARPS * 32, smem, s>>>(p);
+    const int ty = (p.H + WARPS * WR - 1) / (WARPS * WR);
+    if constexpr (BAT) {
+        gdev::GParams q = p;
+        q.tiles_y = ty;
+        k<<<dim3((p.W + gdev::TW - 1) / gdev::TW, ty * p.nb, zdim), WARPS * 32, smem, s>>>(q);
+    } else {
+        k<<<dim3((p.W + gdev::TW - 1) / gdev::TW, ty, zdim), WARPS * 32, smem, s>>>(p);
+    }
     return cudaGetLastError();
 }
 
 struct GKey {
-    int kch, coutp, s, in, out, acc, sums = 0;
+    int kch, coutp, s, in, out, acc, sums = 0, bat = 0;
     bool operator==(const GKey &o) const
     {
-        return kch == o.kch && coutp == o.coutp && s == o.s && in == o.in && out == o.out && acc == o.acc && sums == o.sums;
+        return kch == o.kch && coutp == o.coutp && s == o.s && in == o.in && out == o.out && acc == o.acc && sums == o.sums && bat == o.bat;
     }
 };
 struct GEntry {
@@ -62,6 +68,11 @@ struct GEntry {
 // with the channel sums (HAT's CAB: 64 -> 192 channels)
 #define AJI_GS(K, C) {{K, C, 1, 0, 0, 0, 1}, AJI_GSH(K, C, 1, 0, 0, 0, 1)}
 #define AJI_G_COUT(K, S, IN, OUT) AJI_G(K, 16, S, IN, OUT), AJI_G(K, 32, S, IN, OUT), AJI_G(K, 48, S, IN, OUT), AJI_G(K, 64, S, IN, OUT)
+// batched (GConvArgs::nb): NHWC in and out, fp16 accumulation
+#define AJI_GBSH(K, C, S)                                                                                                     \
+    {&run_g<K, C, S, 0, 0, 8, 0, 0, 1, 1>, &run_g<K, C, S, 0, 0, 4, 0, 0, 1, 1>, &run_g<K, C, S, 0, 0, 2, 0, 0, 1, 1>,            \
+     &run_g<K, C, S, 0, 0, 8, 0, 0, 2, 1>, &run_g<K, C, S, 0, 0, 4, 0, 0, 2, 1>, &run_g<K, C, S, 0, 0, 2, 0, 0, 2, 1>}
+#define AJI_GB(K, C, S) {{K, C, S, 0, 0, 0, 0, 1}, AJI_GBSH(K, C, S)}
 
 const GEntry kG[] = {
     // stride 1, NHWC (residuals are a runtime option)
@@ -74,6 +85,8 @@ const GEntry kG[] = {
     AJI_G32_COUT(16), AJI_G32_COUT(32), AJI_G32_COUT(64),
     // stride 1, NHWC, with the channel sums
     AJI_GS(64, 64),
+    // batched: TemporalFix's first two aligner stages (its 6 supports); another shape runs image by image
+    AJI_GB(16, 48, 2), AJI_GB(32, 32, 2), AJI_GB(32, 64, 2), AJI_GB(32, 16, 1), AJI_GB(32, 48, 1), AJI_GB(64, 16, 1),
 };
 
 bool gfail(std::string *why, const char *m)
@@ -107,7 +120,9 @@ const GEntry *gfind(const GWeights &w, const GConvArgs &a, std::string *why, int
     if (a.acc32 && (a.stride != 1 || a.nchw || a.R)) return gfail(why, "fp32 accumulation: stride 1, NHWC in and out"), nullptr;
     if (a.out_f32 && (!a.acc32 || a.r1 || a.r2 || a.act == GAct::Gelu)) return gfail(why, "fp32 output: fp32 accumulation, r1f only, no GELU"), nullptr;
     if (a.sums && (a.out_f32 || a.R)) return gfail(why, "channel sums: fp16 NHWC output"), nullptr;
-    const GKey k{kch_for(w, a, cap), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0, a.sums ? 1 : 0};
+    if (a.nb < 1 || (a.nb > 1 && (a.nchw || a.R || a.up2 || a.acc32 || a.out_f32 || a.sums)))
+        return gfail(why, "batched: NHWC in and out, fp16 accumulation"), nullptr;
+    const GKey k{kch_for(w, a, cap), w.coutp, a.stride, a.nchw ? 1 : 0, a.R ? 1 : 0, a.acc32 ? 1 : 0, a.sums ? 1 : 0, a.nb > 1 ? 1 : 0};
     if (!k.kch) return gfail(why, "input channels"), nullptr;
     for (const GEntry &e : kG)
         if (e.key == k) return &e;
@@ -121,7 +136,7 @@ int ksplit_for(const GWeights &w, const GConvArgs &a, int rows, int cap = 64)
 {
     const int kch = kch_for(w, a, cap);
     if (!kch) return 1;
-    const long ctas = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + rows - 1) / rows) * (w.cout_pad / w.coutp);
+    const long ctas = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + rows - 1) / rows) * (w.cout_pad / w.coutp) * a.nb;
     const long want = 2L * sm_count();
     if (ctas >= want) return 1;
     const int units = (a.nchw ? 1 : w.cin_pad / kch) * 9;
@@ -166,6 +181,7 @@ gdev::GParams params(const GWeights &w, const GConvArgs &a, int ksplit, int cap)
     p.r1fs = a.r1f_stride;
     p.sums = a.sums;
     p.slopef = a.slope;
+    p.nb = a.nb;
     return p;
 }
 
@@ -358,7 +374,7 @@ int gvariant_for(const GWeights &w, const GConvArgs &a)
     const int ch = std::min(w.coutp ? w.cout_pad / w.coutp : 1, 3), kc = k.in ? 1 : std::min(w.cin_pad / k.kch, 3);
     const int gen = gpu_gen();
     // band 2: unsplit but under 8 CTAs per SM at 8 warps; only where it was measured, else the unsplit entry
-    const long c8 = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + 7) / 8) * (w.coutp ? w.cout_pad / w.coutp : 1);
+    const long c8 = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + 7) / 8) * (w.coutp ? w.cout_pad / w.coutp : 1) * a.nb;
     const int band = split ? 1 : c8 < 8L * sm_count() ? 2 : 0;
     for (int pass = band == 2 ? 0 : 1; pass < 2; pass++) {
         const int want = pass ? (band == 2 ? 0 : band) : 2;
@@ -379,7 +395,7 @@ size_t gworkspace(const GWeights &w, const GConvArgs &a, bool all_variants)
     for (int v = 0; v < kGVariants; v++) {
         if (!all_variants && v > 2 && v != pick) continue;
         const int k = ksplit_for(w, a, vrows(v), vcap(v));
-        if (k > 1 || a.out_f32) m = std::max(m, (size_t)k * a.H * a.W * w.cout_pad);
+        if (k > 1 || a.out_f32) m = std::max(m, (size_t)k * a.nb * a.H * a.W * w.cout_pad);
     }
     return m;
 }
@@ -392,13 +408,16 @@ cudaError_t glaunch(const GWeights &w, const GConvArgs &a, int variant, cudaStre
     if (!e && cap < 64) e = gfind(w, a, nullptr, cap = 64);  // no 32-channel kernel for this shape
     if (!e) return cudaErrorInvalidValue;
     int ks = a.sums ? 1 : ksplit_for(w, a, vrows(variant), cap);  // the sums come from the unsplit epilogue
-    if (ks > 1 && (!a.ws || (size_t)ks * a.H * a.W * w.cout_pad > a.ws_floats)) ks = 1;
+    if (ks > 1 && (!a.ws || (size_t)ks * a.nb * a.H * a.W * w.cout_pad > a.ws_floats)) ks = 1;
     if (a.out_f32 && (!a.ws || (size_t)ks * a.H * a.W * w.cout_pad > a.ws_floats)) return cudaErrorInvalidValue;
     const gdev::GParams p = params(w, a, ks, cap);
     cudaError_t r = e->fn[variant % kGShapes](p, (w.cout_pad / w.coutp) * ks, s);
     if (r != cudaSuccess || (ks == 1 && !a.out_f32)) return r;
-    const size_t n = (size_t)a.H * a.W * (w.cout_pad / 2);
-    gdev::k_gconv_reduce<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(p);
+    // batched: the reduce sees the images as one tall image ([split][image][pixel] is [split][pixel] of it)
+    gdev::GParams pr = p;
+    pr.H *= a.nb;
+    const size_t n = (size_t)pr.H * a.W * (w.cout_pad / 2);
+    gdev::k_gconv_reduce<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(pr);
     return cudaGetLastError();
 }
 
