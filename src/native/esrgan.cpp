@@ -7,6 +7,9 @@
 // RRDB also folds the RRDB's own 0.2 and residual (out = 0.2 * (conv + x3) + x) and writes in place
 // over the RRDB input, which the next RRDB then reads. The upsampler convs read their input
 // nearest-upsampled on the fly.
+//
+// The tail (the upsample stages, hr, last) is a Tail (native/tail.h); split (ImgNet::tail_rows), the
+// body (first conv, the RRDBs, the body conv) runs over the tile into T and the tail per strip of T.
 #include "native/imgnet.h"
 
 #include <algorithm>
@@ -14,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -22,16 +26,12 @@
 #include "native/netres.h"
 #include "native/esrgan_graph.h"
 #include "native/onnx_read.h"
+#include "native/tail.h"
 
 namespace ajinative {
 namespace {
 
 using namespace onnxread;
-
-struct GOp {
-    GWeights *w = nullptr;
-    int variant = 0;
-};
 
 class Esrgan : public ImgNet {
 public:
@@ -44,8 +44,11 @@ public:
         for (void *b : bufs) cudaFree(b);
     }
 
-    static std::unique_ptr<ImgNet> build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
+    static std::unique_ptr<ImgNet> build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why, int tail_rows);
     cudaError_t run(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s) override;
+    int tail_rows() const override { return split_rows; }
+    cudaError_t body(const void *in, bool in_f32, int w, int h, cudaStream_t s) override;
+    cudaError_t tail(int r0, int r1, void *out, bool out_f32, cudaStream_t s) override;
     int scale() const override { return scale_; }
     std::string describe() const override { return what; }
     size_t device_bytes() const override { return bytes; }
@@ -60,16 +63,20 @@ private:
     int unshuffle = 1;   // the input's pixel-unshuffle factor (1, 2, 4)
     int nup = 2;         // nearest 2x upsample stages (S = 2^nup over the body size)
     int in_stride = 16;  // channels of the unshuffled input (16, or 48 for 4x unshuffle)
+    Tail tl;             // ups..., hr, last
+    int split_rows = 0;  // input rows per tail strip (0: no split)
+    int lbw = 0, lbh = 0;  // the last body()'s size (body rows and columns)
     bool clamp = false;  // a final Clip(0, 1)
     std::vector<float> rrdb_scale;  // per RRDB
     int acc_mode = 0;
-    GOp first, body, hr, last;
+    GOp first, bconv, hr, last;  // bconv: the body conv
     std::vector<GOp> ups;    // nup
     std::vector<GOp> dense;  // nb * 3 RDBs * 5 convs
     std::vector<GWeights *> weights;
     std::vector<void *> bufs;
     size_t bytes = 0, wbytes = 0;  // all device memory; of which the weights
-    void *in16 = nullptr, *F0 = nullptr, *D[3] = {}, *T = nullptr, *U[3] = {}, *Q = nullptr, *O16 = nullptr;
+    void *in16 = nullptr, *F0 = nullptr, *D[3] = {}, *T = nullptr, *O16 = nullptr;  // O16: the tail's last output
+    void *strip = nullptr;  // split: run()'s output strip (fp32 at most), made by its first call
     float *ws = nullptr;
     size_t ws_floats = 0;
     std::string what;
@@ -96,8 +103,12 @@ private:
         wbytes += (size_t)9 * cin_pad * pad16(c.cout) * 2;
         return g;
     }
-    // The ops of one run at body size bw x bh, in order, as (op, args) pairs.
+    // The ops of one run at body size bw x bh, in order, as (op, args) pairs: the body's, then the
+    // tail's on T's rows [t0, t0 + tn) (all of them in plan()).
     void plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops);
+    void plan_body(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops);
+    void plan_tail(int bw, int t0, int tn, std::vector<std::pair<GOp *, GConvArgs>> *ops);
+    void finish(std::vector<std::pair<GOp *, GConvArgs>> *ops);
 };
 
 GConvArgs args(const void *src, int sstride, int IH, int IW, void *dst, int dstride, int H, int W, GAct act)
@@ -119,6 +130,13 @@ GConvArgs args(const void *src, int sstride, int IH, int IW, void *dst, int dstr
 void Esrgan::plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops)
 {
     ops->clear();
+    plan_body(bw, bh, ops);
+    plan_tail(bw, 0, bh, ops);
+    finish(ops);
+}
+
+void Esrgan::plan_body(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops)
+{
     const GAct L = GAct::LRelu, N = GAct::None;
     // first conv -> F0 (also the trunk's global residual); its copy into D[0] is done by run()
     ops->push_back({&first, args(in16, in_stride, bh, bw, F0, nf, bh, bw, N)});
@@ -144,19 +162,17 @@ void Esrgan::plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops)
     GConvArgs b = args(D[0], DS, bh, bw, T, nf, bh, bw, N);
     b.r1 = F0;
     b.r1_stride = nf;
-    ops->push_back({&body, b});
-    // nup nearest 2x upsample stages, each conv reading its input upsampled on the fly
-    void *cur = T;
-    int s = 1;
-    for (int k = 0; k < nup; k++) {
-        s *= 2;
-        GConvArgs u = args(cur, nf, s * bh, s * bw, U[k], nf, s * bh, s * bw, L);
-        u.up2 = true;
-        ops->push_back({&ups[k], u});
-        cur = U[k];
-    }
-    ops->push_back({&hr, args(cur, nf, s * bh, s * bw, Q, nf, s * bh, s * bw, L)});
-    ops->push_back({&last, args(Q, nf, s * bh, s * bw, O16, 16, s * bh, s * bw, N)});
+    ops->push_back({&bconv, b});
+}
+
+void Esrgan::plan_tail(int bw, int t0, int tn, std::vector<std::pair<GOp *, GConvArgs>> *ops)
+{
+    // nup nearest 2x upsample stages (each conv reading its input upsampled on the fly), hr, last
+    tl.plan(T, nf, bw, t0, tn, ops);
+}
+
+void Esrgan::finish(std::vector<std::pair<GOp *, GConvArgs>> *ops)
+{
     // accumulation: acc_mode 0 fp16 everywhere, 1 fp32 everywhere, 2 fp32 on the deep convs (cin >= 128)
     for (auto &o : *ops) {
         o.second.ws = ws;
@@ -165,7 +181,7 @@ void Esrgan::plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops)
     }
 }
 
-std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
+std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why, int tail_rows)
 {
     Reader rd(g);
     EsrganGraph eg;
@@ -213,7 +229,7 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
     Conv cb, chr, cl;
     if (!rd.conv(eg.body, &cb, why) || !rd.conv(eg.hr, &chr, why) || !rd.conv(eg.last, &cl, why)) return nullptr;
     if (cb.lrelu || !chr.lrelu || cl.lrelu) return refuse(why, "ESRGAN output activations"), nullptr;
-    e->body.w = e->upload(cb, 1.f, e->nf);
+    e->bconv.w = e->upload(cb, 1.f, e->nf);
     e->hr.w = e->upload(chr, 1.f, e->nf);
     e->last.w = e->upload(cl, 1.f, e->nf);
     for (const OnnxNode *u : eg.ups) {
@@ -224,6 +240,9 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
         op.w = e->upload(cu, 1.f, e->nf);
         e->ups.push_back(op);
     }
+    for (GOp &u : e->ups) e->tl.add(&u, e->nf, GAct::LRelu, 0.2f, true);
+    e->tl.add(&e->hr, e->nf, GAct::LRelu, 0.2f);
+    e->tl.add(&e->last, 16);
     for (GWeights *w : e->weights)
         if (!w) return refuse(why, "weight upload failed"), nullptr;
 
@@ -234,6 +253,12 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
     if (bw < 1 || bh < 1) return refuse(why, "tile too small"), nullptr;
     const size_t px = (size_t)bw * bh;
     const int S = 1 << e->nup;
+    if (tail_rows > 0) {
+        e->split_rows = std::max(e->unshuffle, tail_rows / e->unshuffle * e->unshuffle);
+        if (e->split_rows >= max_h) e->split_rows = 0;  // one strip: no split
+    }
+    // the tail's buffers: a strip's (its rows and the halos) when split, else the tile's
+    const size_t tpx = e->split_rows ? (size_t)bw * std::min(bh, e->split_rows / e->unshuffle + 2 * Tail::kHalo) : px;
     // One arena shared by lifetime (steps of run(): 1 in16, 2 F0 and its copy into D[0], 3 the
     // dense blocks, 4 T, 5.. the upsample stages, then Q, O16, out): the upsampler's buffers reuse
     // the trunk's.
@@ -241,24 +266,39 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
     lt.add(&e->in16, px * e->in_stride * 2, {{1, 2}});
     lt.add(&e->F0, px * e->nf * 2, {{2, 4}});
     for (auto &d : e->D) lt.add(&d, px * e->DS * 2, {{2, 4}});
-    lt.add(&e->T, px * e->nf * 2, {{4, 5}});
-    for (int k = 0; k < e->nup; k++) lt.add(&e->U[k], px * ((size_t)1 << (2 * (k + 1))) * e->nf * 2, {{5 + k, 6 + k}});
-    lt.add(&e->Q, px * S * S * e->nf * 2, {{5 + e->nup, 6 + e->nup}});
-    lt.add(&e->O16, px * S * S * 16 * 2, {{6 + e->nup, 7 + e->nup}});
+    // split: T lives through every strip
+    lt.add(&e->T, px * e->nf * 2, {{4, e->split_rows ? 8 + e->nup : 5}});
+    const int trows = (int)(tpx / bw);
+    for (int k = 0; k < e->tl.steps(); k++) lt.add(e->tl.out(k), e->tl.bytes(k, bw, trows), {{5 + k, 6 + k}});
     if (!lt.assign([&](size_t n) { return e->alloc((n + 1) / 2); })) return refuse(why, "out of GPU memory"), nullptr;
+    e->O16 = *e->tl.out(e->tl.steps() - 1);
     // split-K workspace: the most any op needs at the largest and at a small tile
     std::vector<std::pair<GOp *, GConvArgs>> ops;
+    const int tn = (int)(tpx / bw);  // the tail's rows (split: a strip and its halos)
     for (int sz : {0, 1}) {
         const int tw = sz ? std::min(bw, 32) : bw, th = sz ? std::min(bh, 32) : bh;
         e->plan(tw, th, &ops);
+        if (e->split_rows) {  // the body at this size, the tail at a strip's
+            ops.clear();
+            e->plan_body(tw, th, &ops);
+            e->plan_tail(tw, 0, std::min(th, tn), &ops);
+            e->finish(&ops);
+        }
         for (auto &o : ops) e->ws_floats = std::max(e->ws_floats, gworkspace(*o.first->w, o.second));
     }
     if (e->ws_floats) {
         e->ws = (float *)e->alloc(e->ws_floats * 2);
         if (!e->ws) return refuse(why, "out of GPU memory"), nullptr;
     }
-    // check the ops at the largest tile
-    e->plan(bw, bh, &ops);
+    // check the ops at the largest tile (split: the tail at a strip)
+    if (e->split_rows) {
+        ops.clear();
+        e->plan_body(bw, bh, &ops);
+        e->plan_tail(bw, 0, tn, &ops);
+        e->finish(&ops);
+    } else {
+        e->plan(bw, bh, &ops);
+    }
     for (auto &o : ops) {
         std::string w2;
         if (!gsupported(*o.first->w, o.second, &w2)) return refuse(why, "kernel: " + w2), nullptr;
@@ -266,15 +306,68 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
     }
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
     char buf[160];
-    snprintf(buf, sizeof(buf), "ESRGAN %dx, %d RRDB, %d features, growth %d%s%s", e->scale_, e->nb, e->nf, e->gc,
-             e->unshuffle > 1 ? (e->unshuffle == 2 ? ", pixel-unshuffle 2" : ", pixel-unshuffle 4") : "", e->clamp ? ", clamped" : "");
+    snprintf(buf, sizeof(buf), "ESRGAN %dx, %d RRDB, %d features, growth %d%s%s%s", e->scale_, e->nb, e->nf, e->gc,
+             e->unshuffle > 1 ? (e->unshuffle == 2 ? ", pixel-unshuffle 2" : ", pixel-unshuffle 4") : "", e->clamp ? ", clamped" : "",
+             e->split_rows ? (", tail in strips of " + std::to_string(e->split_rows) + " rows").c_str() : "");
     e->what = buf;
     return std::unique_ptr<ImgNet>(e.release());
+}
+
+cudaError_t Esrgan::body(const void *in, bool in_f32, int w, int h, cudaStream_t s)
+{
+    if (!split_rows || !accepts(w, h)) return cudaErrorInvalidValue;
+    const int bw = w / unshuffle, bh = h / unshuffle;
+    cudaError_t e = img_to_nhwc_by(in, in_f32, w, h, unshuffle, in16, in_stride, s);
+    if (e != cudaSuccess) return e;
+    std::vector<std::pair<GOp *, GConvArgs>> ops;
+    plan_body(bw, bh, &ops);
+    finish(&ops);
+    for (size_t i = 0; i < ops.size(); i++) {
+        e = glaunch(*ops[i].first->w, ops[i].second, ops[i].first->variant, s);
+        if (e != cudaSuccess) return e;
+        if (i == 0) {
+            e = cudaMemcpy2DAsync(D[0], (size_t)DS * 2, F0, (size_t)nf * 2, (size_t)nf * 2, (size_t)bw * bh, cudaMemcpyDeviceToDevice, s);
+            if (e != cudaSuccess) return e;
+        }
+    }
+    lbw = bw;
+    lbh = bh;
+    return cudaSuccess;
+}
+
+cudaError_t Esrgan::tail(int r0, int r1, void *out, bool out_f32, cudaStream_t s)
+{
+    if (!split_rows || r0 < 0 || r1 <= r0 || r1 - r0 > split_rows || r0 % unshuffle || r1 % unshuffle || r1 / unshuffle > lbh)
+        return cudaErrorInvalidValue;
+    const int b0 = r0 / unshuffle, b1 = r1 / unshuffle;
+    int a, z;
+    Tail::band(b0, b1, lbh, &a, &z);
+    std::vector<std::pair<GOp *, GConvArgs>> ops;
+    plan_tail(lbw, a, z - a, &ops);
+    finish(&ops);
+    for (auto &o : ops) {
+        const cudaError_t e = glaunch(*o.first->w, o.second, o.first->variant, s);
+        if (e != cudaSuccess) return e;
+    }
+    return tl.emit(a, b0, b1, lbw, out, out_f32, clamp, s);
 }
 
 cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s)
 {
     if (!accepts(w, h)) return cudaErrorInvalidValue;
+    if (split_rows) {  // the body, then the tail strip by strip into out's planes
+        if (!strip && !(strip = alloc((size_t)3 * maxw * scale_ * split_rows * scale_ * 2))) return cudaErrorMemoryAllocation;
+        cudaError_t e = body(in, in_f32, w, h, s);
+        const size_t es = out_f32 ? 4 : 2, ow = (size_t)w * scale_, plane = ow * h * scale_;
+        for (int r0 = 0; r0 < h && e == cudaSuccess; r0 += split_rows) {
+            const int r1 = std::min(h, r0 + split_rows), n = (r1 - r0) * scale_;
+            e = tail(r0, r1, strip, out_f32, s);
+            for (int c = 0; c < 3 && e == cudaSuccess; c++)
+                e = cudaMemcpyAsync((char *)out + (c * plane + (size_t)r0 * scale_ * ow) * es, (char *)strip + c * ow * n * es, ow * n * es,
+                                    cudaMemcpyDeviceToDevice, s);
+        }
+        return e;
+    }
     const int bw = w / unshuffle, bh = h / unshuffle, S = 1 << nup;
     cudaError_t e = img_to_nhwc_by(in, in_f32, w, h, unshuffle, in16, in_stride, s);
     if (e != cudaSuccess) return e;
@@ -300,11 +393,11 @@ std::unique_ptr<ImgNet> build_dat(const OnnxGraph &g, int max_w, int max_h, cuda
 std::unique_ptr<ImgNet> build_sst(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
 std::unique_ptr<ImgNet> build_lowered(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
 
-std::unique_ptr<ImgNet> ImgNet::create(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why)
+std::unique_ptr<ImgNet> ImgNet::create(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why, int tail_rows)
 {
     if (g.inputs.size() != 1) return refuse(why, "one input expected"), nullptr;
     std::string w;
-    if (auto n = Esrgan::build(g, max_w, max_h, s, &w)) return n;
+    if (auto n = Esrgan::build(g, max_w, max_h, s, &w, tail_rows)) return n;
     std::string w2, w3, w4;
     if (auto n = build_fdat(g, max_w, max_h, s, &w2)) return n;
     if (auto n = build_hat(g, max_w, max_h, s, &w3)) return n;
