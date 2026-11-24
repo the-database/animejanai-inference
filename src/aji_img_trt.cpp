@@ -606,7 +606,12 @@ bool load_native(aji_img_model *m, const std::vector<char> &blob, std::string *w
         return false;
     }
     if (!ajinative::guarded(why, [&] {
-            m->native = ajinative::ImgNet::create(g, m->tile_w, m->tile_h, m->stream, why);
+            // Models that split (ESRGAN) run the body over a tile and the upscale tail in strips of
+            // kTailRows input rows, so only a strip of the tail is in memory (ImgNet::tail_rows).
+            // AJI_IMG_TAIL_ROWS=n for comparisons (0: no split).
+            constexpr int kTailRows = 256;
+            const char *tr = std::getenv("AJI_IMG_TAIL_ROWS");
+            m->native = ajinative::ImgNet::create(g, m->tile_w, m->tile_h, m->stream, why, tr ? std::atoi(tr) : kTailRows);
             return m->native != nullptr;
         }))
         return false;
@@ -621,6 +626,8 @@ bool load_native(aji_img_model *m, const std::vector<char> &blob, std::string *w
     m->in_dt = m->out_dt = nvinfer1::DataType::kHALF;
     m->in_elems = (size_t)3 * m->tile_w * m->tile_h;
     m->out_elems = m->in_elems * m->scale * m->scale;
+    if (const int tr = m->native->tail_rows(); tr > 0)  // the output of one tail strip
+        m->out_elems = (size_t)3 * m->tile_w * m->scale * tr * m->scale;
     const size_t ib = m->in_elems * 2, ob = m->out_elems * 2;
     m->weights = (int64_t)m->native->weight_bytes();
     m->native_act = (int64_t)(m->native->device_bytes() - m->native->weight_bytes());
@@ -985,6 +992,31 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
                 return cuda_fail(e, "tile extract");
             if (prof)
                 cudaEventRecord(m.tile_ev[2 * done], st);
+            if (m.native && m.native->tail_rows() > 0) {
+                // the body over the tile, then its tail strip by strip into the band: the tile's
+                // weights for the strip's rows, and only rows inside the image
+                const int tr = m.native->tail_rows();
+                e = m.native->body(m.d_in, in_t == GpuDtype::F32, Tw, Th, st);
+                for (int r0 = 0; r0 < Th && r0 * s < band_rows && e == cudaSuccess; r0 += tr) {
+                    const int r1 = std::min(Th, r0 + tr);
+                    e = m.native->tail(r0, r1, m.d_out, out_t == GpuDtype::F32, st);
+                    if (e == cudaSuccess)
+                        e = gpu_tile_blend(m.d_out, out_t, m.out_ch, tow, (r1 - r0) * s, g.wx + i * cols,
+                                           g.wy + j * band_rows + r0 * s, cols, std::min(r1 * s, band_rows) - r0 * s,
+                                           ox[i] * s, oy[j] * s + r0 * s, g.band, Co, band_rows, OW, st);
+                }
+                if (e != cudaSuccess)
+                    return cuda_fail(e, "native kernels");
+                if (prof)
+                    cudaEventRecord(m.tile_ev[2 * done + 1], st);
+                done++;
+                if (progress && progress(opaque, done, total)) {
+                    cudaStreamSynchronize(st);
+                    *err = "cancelled";
+                    return AJI_IMG_CANCELLED;
+                }
+                continue;
+            }
             if (m.native) {
                 e = m.native->run(m.d_in, in_t == GpuDtype::F32, m.d_out, out_t == GpuDtype::F32, Tw, Th, st);
                 if (e != cudaSuccess)
