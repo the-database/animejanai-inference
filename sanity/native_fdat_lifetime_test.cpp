@@ -4,14 +4,14 @@
 using namespace ajinative;
 using namespace ajinative::lifetime_test;
 
-static void shorten_cf(LifetimePlan &plan)
+static void set_lifetime(LifetimePlan &plan, const char *name, LifetimePlan::Range range)
 {
     for (auto &buffer : plan.buffers)
-        if (buffer.name && std::string(buffer.name) == "CF") {
-            buffer.live = {{6,8}};
+        if (buffer.name && std::string(buffer.name) == name) {
+            buffer.live = {range};
             return;
         }
-    throw std::runtime_error("missing FDAT padding mutation target");
+    throw std::runtime_error(std::string("missing FDAT mutation target: ") + name);
 }
 
 static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> &shapes)
@@ -25,13 +25,22 @@ static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> 
         std::printf("%s: %zu FP16 values exact\n", label.c_str(), actual[i].size());
     }
     if (shapes.back() == built) return;
-    const auto broken = render("FDAT", 2, graph, built, {shapes.back()}, false, true, shorten_cf);
-    const auto &v = stock.back();
-    const auto diff = std::mismatch(v.begin(), v.end(), broken.front().begin());
-    require(diff.first != v.end(), "poison failed to expose a lost CF padding lane");
-    std::printf("FDAT mutation %s on %s, element %zu: stock %04x, shortened CF %04x\n",
-                dimensions(shapes.back()).c_str(), dimensions(built).c_str(), size_t(diff.first-v.begin()),
-                *diff.first, *diff.second);
+    const auto check_mutation = [&](const char *label, void (*edit)(LifetimePlan &)) {
+        const auto broken = render("FDAT", 2, graph, built, {shapes.back()}, false, true, edit);
+        const auto &v = stock.back();
+        const auto diff = std::mismatch(v.begin(), v.end(), broken.front().begin());
+        require(diff.first != v.end(), std::string("poison missed FDAT mutation: ") + label);
+        std::printf("FDAT mutation %s on %s, %s, element %zu: stock %04x, mutant %04x\n",
+                    dimensions(shapes.back()).c_str(), dimensions(built).c_str(), label,
+                    size_t(diff.first - v.begin()), *diff.first, *diff.second);
+    };
+    check_mutation("CF 6-8", [](LifetimePlan &p) { set_lifetime(p, "CF", {6,8}); });
+    check_mutation("original CF 6-8 and AT 7-8", [](LifetimePlan &p) {
+        set_lifetime(p, "CF", {6,8});
+        set_lifetime(p, "AT", {7,8});
+    });
+    check_mutation("QKV ends at 6", [](LifetimePlan &p) { set_lifetime(p, "QKV", {5,6}); });
+    check_mutation("H1 ends at 9", [](LifetimePlan &p) { set_lifetime(p, "H1", {9,9}); });
 }
 
 int main()
