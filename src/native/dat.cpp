@@ -23,6 +23,7 @@
 #include "native/export_forms.h"
 #include "native/imgnet.h"
 #include "native/netres.h"
+#include "native/dat_lifetimes.h"
 #include "native/static_eval.h"
 
 namespace ajinative {
@@ -53,7 +54,7 @@ struct Block {
     float *fdw = nullptr, *fdwb = nullptr;           // the SGFN's depthwise conv
 };
 
-class Dat : public ImgNet {
+class Dat : public ImgNet, private DatBuffers {
 public:
     ~Dat() override { tmat_release(foldm); }
     static std::unique_ptr<ImgNet> build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
@@ -75,17 +76,14 @@ private:
     GOp first, after, cbu, up0[2], up2[2], last;
     TMat *ident = nullptr, foldm;
     float *identf = nullptr;
-    void *IN16 = nullptr, *XF = nullptr, *N1 = nullptr, *QKV = nullptr, *AT = nullptr, *CX = nullptr, *Z = nullptr, *H1 = nullptr, *TG = nullptr;
-    void *N2 = nullptr, *PR = nullptr, *S16 = nullptr, *TT = nullptr, *U0 = nullptr, *V1 = nullptr, *V2 = nullptr, *O16 = nullptr;
-    float *LST = nullptr;  // the SGFN's LN3 statistics per token (fc1's epilogue -> the gated depthwise GEMM)
-    float *S = nullptr, *GIN = nullptr, *sums = nullptr, *cg = nullptr, *tg = nullptr, *stats = nullptr, *attnb = nullptr, *fold = nullptr;
-    float *wsp = nullptr;
-    size_t ws_floats = 0;
+    float *sums = nullptr, *cg = nullptr, *tg = nullptr, *stats = nullptr, *attnb = nullptr, *fold = nullptr;
+    StepWorkspaces<36> scratch;
+    LifetimeCheck *checks = LifetimeCheck::active;
     int maxm = 0;
     std::string what;
 
     cudaError_t exec(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s,
-                     std::vector<std::pair<GOp *, GConvArgs>> *collect);
+                     std::vector<std::pair<GOp *, GConvArgs>> *collect, std::vector<int> *steps = nullptr);
 };
 
 // The data-path ops of interest, in order.
@@ -359,7 +357,7 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
         for (int i = 0; i < C; i++) id[(size_t)i * C + i] = 1.f;
         f->identf = r.dfl(id, (size_t)C * C);
         float *zb = (float *)r.alloc((size_t)C * 4);
-        if (!zb || tmat_alloc(f->foldm, C, C, zb) != cudaSuccess) return refuse(why, "weight upload failed"), nullptr;
+        if (!zb || !r.mutable_mat(f->foldm, C, C, zb)) return refuse(why, "weight upload failed"), nullptr;
     }
     if (r.failed) return refuse(why, "weight upload failed"), nullptr;
 
@@ -371,27 +369,8 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     // The per-pixel buffers share one arena by lifetime: the steps of exec() each is live in (1-3 the
     // input conv, 9-22 a group (10-20 a block), 30-36 the tail). Kept in step with exec().
     Lifetimes lt;
-    lt.add(&f->IN16, M * 32, {{1, 2}});
-    lt.add(&f->XF, M * CP * 2, {{2, 31}});
-    lt.add((void **)&f->S, M * CP * 4, {{3, 30}});
-    lt.add((void **)&f->GIN, M * CP * 4, {{9, 22}});
-    lt.add(&f->N1, M * CP * 2, {{10, 11}, {16, 17}, {30, 31}});
-    lt.add(&f->QKV, M * f->QS * 2, {{11, 14}});
-    lt.add(&f->CX, M * CP * 2, {{12, 14}});
-    lt.add(&f->AT, M * CP * 2, {{13, 14}});
-    lt.add(&f->Z, M * CP * 2, {{14, 15}});
-    lt.add(&f->TG, M * 16 * 2, {{13, 14}});  // the token gate's hidden layer
-    lt.add(&f->H1, M * f->FS * 2, {{17, 19}});
-    lt.add(&f->N2, M * CP * 2, {{18, 19}});
-    lt.add((void **)&f->LST, M * 8, {{17, 19}});
-    lt.add(&f->PR, M * CP * 2, {{19, 20}});
-    lt.add(&f->S16, M * CP * 2, {{21, 22}});
-    lt.add(&f->TT, M * CP * 2, {{31, 32}});
-    lt.add(&f->U0, M * 64 * 2, {{32, 33}});
-    lt.add(&f->V1, 4 * M * 64 * 2, {{33, 34}});
-    lt.add(&f->V2, 16 * M * 64 * 2, {{34, 35}});
-    lt.add(&f->O16, 16 * M * 16 * 2, {{35, 36}});
-    if (!lt.assign(r)) return refuse(why, "out of GPU memory"), nullptr;
+    f->declare(lt, M, CP, f->QS, f->FS);
+    if (!lt.assign(r, f->checks)) return refuse(why, "out of GPU memory"), nullptr;
     f->sums = (float *)r.alloc(CP * 4);
     f->cg = (float *)r.alloc(CP * 4);
     f->tg = (float *)r.alloc(M * 4);
@@ -400,14 +379,26 @@ std::unique_ptr<ImgNet> Dat::build(const OnnxGraph &g, int max_w, int max_h, cud
     f->fold = (float *)r.alloc((size_t)C * C * 4);
     if (r.failed) return refuse(why, "out of GPU memory"), nullptr;
     std::vector<std::pair<GOp *, GConvArgs>> ops;
-    for (int sz : {0, 1}) {
+    std::vector<int> steps;
+    size_t stock_limit = 0;
+    // Visit the build shape last so preparation can use the same ops, with their final workspace addresses.
+    for (bool small : {true, false}) {
         ops.clear();
-        f->exec(nullptr, false, nullptr, false, sz ? std::min(max_w, 64) : max_w, sz ? std::min(max_h, 64) : max_h, s, &ops);
-        f->ws_floats = std::max(f->ws_floats, gworkspace_max(ops));
+        const int w = small ? std::min(max_w, 64) : max_w, h = small ? std::min(max_h, 64) : max_h;
+        const auto err = f->exec(nullptr, false, nullptr, false, w, h, s, &ops, small ? nullptr : &steps);
+        if (err != cudaSuccess) return refuse(why, cudaGetErrorString(err)), nullptr;
+        stock_limit = std::max(stock_limit, gworkspace_max(ops));
     }
-    if (f->ws_floats && !(f->wsp = (float *)r.alloc(f->ws_floats * 4))) return refuse(why, "out of GPU memory"), nullptr;
-    ops.clear();
-    f->exec(nullptr, false, nullptr, false, max_w, max_h, s, &ops);
+    for (size_t i = 0; i < ops.size(); ++i)
+        f->scratch.need(steps[i], gworkspace_for_subtiles(*ops[i].first->w, ops[i].second, stock_limit));
+    if (!f->scratch.place(lt, [&](size_t n) { return r.alloc(n); }, f->checks))
+        return refuse(why, "out of GPU memory"), nullptr;
+    if (f->checks && !f->checks->valid()) return refuse(why, f->checks->error), nullptr;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const auto &slot = f->scratch.slots[steps[i]];
+        ops[i].second.ws = slot.ptr;
+        ops[i].second.ws_floats = slot.floats;
+    }
     if (!gprepare(ops, s, why)) return nullptr;
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
     int nb = 0, sh = 0;
@@ -431,18 +422,28 @@ cudaError_t Dat::run(const void *in, bool in_f32, void *out, bool out_f32, int w
 }
 
 cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s,
-                      std::vector<std::pair<GOp *, GConvArgs>> *collect)
+                      std::vector<std::pair<GOp *, GConvArgs>> *collect, std::vector<int> *steps)
 {
     const int M = w * h, Hp = (h + pad_to - 1) / pad_to * pad_to, Wp = (w + pad_to - 1) / pad_to * pad_to;
     StepProf pr(s, !collect);
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) return e_; } while (0)
 #define K(x) do { if (!collect) CK(x); } while (0)
-    auto Gc = [&](GOp &op, GConvArgs a) -> cudaError_t {
-        a.ws = wsp;
-        a.ws_floats = ws_floats;
+    auto enter = [&](int step) -> cudaError_t {
+        return checks->enter(step, [&](void *p, size_t n) { return cudaMemsetAsync(p, 0xff, n, s) == cudaSuccess; }) ? cudaSuccess : cudaErrorInvalidValue;
+    };
+#define STEP(n) do { if (checks && !collect) CK(enter(n)); } while (0)
+    auto Gc = [&](int step, GOp &op, GConvArgs a) -> cudaError_t {
         if (collect) {
             collect->push_back({&op, a});
+            if (steps) steps->push_back(step);
             return cudaSuccess;
+        }
+        const auto &slot = scratch.slots[step];
+        a.ws = slot.ptr;
+        a.ws_floats = slot.floats;
+        if (checks) {
+            CK(enter(step));
+            if (!checks->workspace(step, a.ws, a.ws_floats * sizeof(float))) return cudaErrorInvalidValue;
         }
         return glaunch(*op.w, a, op.variant, s);
     };
@@ -497,21 +498,28 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
     // Steps (the buffers' lifetimes in build()): 1 IN16, 2 XF, 3 S; per group 9 GIN; per block 10 N1,
     // 11 QKV, 12 CX, 13 AT, 14 Z, 15 S, 16 N1, 17 H1, 18 N2, 19 PR, 20 S; 21 S16, 22 S; then 30 N1,
     // 31 TT, 32 U0, 33 V1, 34 V2, 35 O16, 36 out.
+    STEP(1);
     K(img_to_nhwc(in, in_f32, w, h, false, IN16, 16, s));
     K(tok_sub3(IN16, 16, M, mean[0], mean[1], mean[2], s));
     pr.mark(P_IO);
-    CK(Gc(first, ga(IN16, 16, h, w, XF, CP, h, w)));
+    CK(Gc(2, first, ga(IN16, 16, h, w, XF, CP, h, w)));
+    STEP(3);
     CK(lnorm(before, XF, false, CP, S, true));
     pr.mark(P_CONV);
     for (size_t gi = 0; gi < groups.size(); gi++) {
+        STEP(9);
         K(cudaMemcpyAsync(GIN, S, (size_t)M * CP * 4, cudaMemcpyDeviceToDevice, s));
         for (Block &b : groups[gi]) {
+            STEP(10);
+            STEP(11);
             CK(gemm_ln(b.n1, *b.qkv, QKV, QS, TAct::None));
             pr.mark(P_QKV);
             // conv branch: GELU(dwconv(v) + b); its channel sums for the spatial blocks' channel gate
             K(cudaMemsetAsync(sums, 0, CP * 4, s));
+            STEP(12);
             K(tdwconv2(q16 + 2 * C, QS, CX, CP, h, w, C8, b.dw, b.dwb, true, nullptr, 0, b.spatial ? sums : nullptr, s));
             pr.mark(P_DW);
+            STEP(13);
             if (b.spatial) {
                 for (int br = 0; br < 2; br++) {
                     const Branch &B = b.br[br];
@@ -525,6 +533,7 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                     CK(twinattn(a, s));
                 }
                 pr.mark(P_WIN);
+                STEP(14);
                 // channel gate from the conv branch's average, token gate from the attention
                 K(chan_gate(sums, M, C, b.cr, b.cw1, b.cb1, b.cw2, b.cb2, 0, 1.f, cg, CP, s));
                 if (!collect) {
@@ -549,6 +558,7 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 }
                 pr.mark(P_CPROJ);
                 // channel gate from the attention's average, token gate from the conv branch
+                STEP(14);
                 K(tcolsum(AT, CP, M, C, sums, s));
                 K(chan_gate(sums, M, C, b.cr, b.cw1, b.cb1, b.cw2, b.cb2, 0, 1.f, cg, CP, s));
                 if (!collect) {
@@ -562,15 +572,20 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 }
             }
             pr.mark(P_GATE);
+            STEP(15);
             CK(gemm(*b.proj, Z, CP, S, CP, TAct::None, true));
             pr.mark(P_PROJ);
             // SGFN
             bool st_made = false;
+            STEP(16);
+            STEP(17);
             CK(gemm_ln(b.n2, *b.fc1, H1, FS, TAct::Gelu, &b.n3, &st_made));
             pr.mark(P_FC1);
             // S += ((dw(LN3(x2)) + b) * x1) fc2 in one kernel, LN3 applied as it loads x2 where fc1 gave its
             // statistics (else LN3 into N2 first; else the gated depthwise conv, then the GEMM)
+            STEP(18);
             cudaError_t e2 = cudaErrorNotSupported;
+            STEP(19);
             if (!collect && st_made) {
                 TDwGemm dg;
                 dg.in = (const uint16_t *)H1 + CP; dg.sin = FS; dg.H = h; dg.W = w; dg.dw = b.fdw; dg.dwb = b.fdwb; dg.dwc = C8;
@@ -586,49 +601,55 @@ cudaError_t Dat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
                 e2 = tdwgemm(*b.fc2, dg, s);
             }
             if (e2 != cudaErrorNotSupported) {
+                STEP(20);
                 CK(e2);
                 pr.mark(P_FC2);
             } else {
                 K(tdwconv2(N2, CP, PR, CP, h, w, C8, b.fdw, b.fdwb, false, H1, FS, nullptr, s));
                 pr.mark(P_SMIX);
+                STEP(20);
                 CK(gemm(*b.fc2, PR, CP, S, CP, TAct::None, true));
                 pr.mark(P_FC2);
             }
         }
+        STEP(21);
         K(tconvert(S, true, CP, S16, false, CP, M, CP, s, kStreamScale));
         GConvArgs a = ga(S16, CP, h, w, S, CP, h, w);
         a.acc32 = true;
         a.out_f32 = true;
         a.r1f = GIN;
         a.r1f_stride = CP;
-        CK(Gc(gconvs[gi], a));
+        CK(Gc(22, gconvs[gi], a));
         pr.mark(P_CONV);
     }
+    STEP(30);
     CK(lnorm(fin, S, true, CP, N1, false));
     GConvArgs a = ga(N1, CP, h, w, TT, CP, h, w);
     a.r1 = XF;
     a.r1_stride = CP;
-    CK(Gc(after, a));
+    CK(Gc(31, after, a));
     GConvArgs b = ga(TT, CP, h, w, U0, 64, h, w);
     b.act = GAct::LRelu;
     b.slope = cbu_slope;
-    CK(Gc(cbu, b));
+    CK(Gc(32, cbu, b));
     for (int sy = 0; sy < 2; sy++) {
         GConvArgs u = ga(U0, 64, h, w, V1, 64, h, w);
         u.R = 2;
         u.sy = sy;
-        CK(Gc(up0[sy], u));
+        CK(Gc(33, up0[sy], u));
     }
     for (int sy = 0; sy < 2; sy++) {
         GConvArgs u = ga(V1, 64, 2 * h, 2 * w, V2, 64, 2 * h, 2 * w);
         u.R = 2;
         u.sy = sy;
-        CK(Gc(up2[sy], u));
+        CK(Gc(34, up2[sy], u));
     }
-    CK(Gc(last, ga(V2, 64, 4 * h, 4 * w, O16, 16, 4 * h, 4 * w)));
+    CK(Gc(35, last, ga(V2, 64, 4 * h, 4 * w, O16, 16, 4 * h, 4 * w)));
     pr.mark(P_UP);
+    STEP(36);
     K(img_from_nhwc(O16, 16, 4 * w, 4 * h, out, out_f32, s, clamp));
     pr.mark(P_IO);
+#undef STEP
 #undef K
 #undef CK
     if (!collect) {

@@ -1,6 +1,17 @@
 // native/tfm.cu — see tfm.h.
 #include "native/allocation_count.h"
 #include "native/tfm.h"
+#ifdef AJI_TEST_ORDERED_TFM
+#include "../../sanity/ordered_tfm.cuh"
+#define TFM_PARTIALS(dst, blocks, width) \
+    OrderedTfmPartials partial(dst, blocks, width, s); \
+    if (partial.error != cudaSuccess) return partial.error; \
+    dst = partial.parts
+#define TFM_REDUCTION_RESULT() partial.finish(cudaGetLastError())
+#else
+#define TFM_PARTIALS(dst, blocks, width) ((void)0)
+#define TFM_REDUCTION_RESULT() cudaGetLastError()
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -439,7 +450,11 @@ __global__ void k_colsum(const half *in, int sin, int M, int C, float *sums)
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
         float s = 0.f;
         for (int t = t0; t < min(M, t0 + 256); t++) s += __half2float(in[(size_t)t * sin + c]);
+#ifdef AJI_TEST_ORDERED_TFM
+        sums[(size_t)blockIdx.x * C + c] = s;
+#else
         atomicAdd(sums + c, s);
+#endif
     }
 }
 
@@ -486,7 +501,12 @@ __global__ void __launch_bounds__(256) k_chanstats(const half *qkv, int sq, int 
         }
     }
     int n = 0;
-    for (int id = threadIdx.x; id < total; id += 256, n++) atomicAdd(stats + id, acc[n]);
+    for (int id = threadIdx.x; id < total; id += 256, n++)
+#ifdef AJI_TEST_ORDERED_TFM
+        stats[(size_t)blockIdx.x * total + id] = acc[n];
+#else
+        atomicAdd(stats + id, acc[n]);
+#endif
 }
 
 // ---- vector paths (8 channels per thread, uint4 access): strides and channel offsets multiples of 8
@@ -916,12 +936,16 @@ __global__ void __launch_bounds__(128) k_dw8s(const half *in, int sin, half *out
         }
     }
     if (sums) {
+#ifdef AJI_TEST_ORDERED_TFM
+        ordered_dw_sums(sums, ss, c, C, live, part);
+#else
         if (live)
 #pragma unroll
             for (int j = 0; j < V; j++)
                 if (c + j < C) atomicAdd(ss + c + j, part[j]);
         __syncthreads();
         for (int k = threadIdx.x; k < C; k += blockDim.x) atomicAdd(sums + k, ss[k]);
+#endif
     }
 }
 
@@ -1028,12 +1052,16 @@ __global__ void __launch_bounds__(128) k_dw8s_ln(const half *in, int sin, half *
         }
     }
     if (sums) {
+#ifdef AJI_TEST_ORDERED_TFM
+        ordered_dw_sums(sums, ss, c, C, live, part);
+#else
         if (live)
 #pragma unroll
             for (int j = 0; j < V; j++)
                 if (c + j < C) atomicAdd(ss + c + j, part[j]);
         __syncthreads();
         for (int k = threadIdx.x; k < C; k += blockDim.x) atomicAdd(sums + k, ss[k]);
+#endif
     }
 }
 
@@ -1047,6 +1075,9 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
 #if TFM_OK
     extern __shared__ __align__(16) unsigned char smraw[];
     const int P = heads * 32 + 8, C = heads * hd, pairs = C / 2;
+#ifdef AJI_TEST_ORDERED_TFM
+    stats += (size_t)blockIdx.x * (heads * hd * hd + 2 * C);
+#endif
     constexpr int R = CS_ROWS;  // tokens per step
     half *s_q = reinterpret_cast<half *>(smraw), *s_k = s_q + R * P;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -1110,7 +1141,11 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
 #pragma unroll
                 for (int q = 0; q < 4; q++) {
                     const int d = mt * 16 + lane / 4 + (q >> 1) * 8, e = nt * 8 + (lane % 4) * 2 + (q & 1);
+#ifdef AJI_TEST_ORDERED_TFM
+                    if (d < hd && e < hd) stats[((size_t)h * hd + d) * hd + e] = acc[hi][mt][nt][q];
+#else
                     if (d < hd && e < hd) atomicAdd(stats + ((size_t)h * hd + d) * hd + e, acc[hi][mt][nt][q]);
+#endif
                 }
     }
 #pragma unroll
@@ -1120,8 +1155,13 @@ __global__ void __launch_bounds__(128) k_chanstats_mma(const half *qkv, int sq, 
         const bool isk = sl >= pairs;
         const int c = 2 * (sl - (isk ? pairs : 0));
         float *dst = stats + heads * hd * hd + (isk ? C : 0) + c;
+#ifdef AJI_TEST_ORDERED_TFM
+        dst[0] = nrm[j][0];
+        dst[1] = nrm[j][1];
+#else
         atomicAdd(dst, nrm[j][0]);
         atomicAdd(dst + 1, nrm[j][1]);
+#endif
     }
 #endif
 }
@@ -2101,10 +2141,10 @@ cudaError_t tmat_alloc(TMat &m, int K, int N, const float *bias_dev)
     m.N = N;
     m.Kpad = (K + 15) / 16 * 16;
     m.Npad = (N + 15) / 16 * 16;
-    cudaError_t e = cudaMalloc(&m.frag, (size_t)m.Kpad * m.Npad * 2);
+    cudaError_t e = model_malloc(&m.frag, (size_t)m.Kpad * m.Npad * 2, AllocationKind::Activation);
     if (e == cudaSuccess) e = cudaMemset(m.frag, 0, (size_t)m.Kpad * m.Npad * 2);
     if (e == cudaSuccess && bias_dev) {
-        e = cudaMalloc(&m.bias, (size_t)m.Npad * 4);
+        e = model_malloc(&m.bias, (size_t)m.Npad * 4, AllocationKind::Activation);
         if (e == cudaSuccess) e = cudaMemset(m.bias, 0, (size_t)m.Npad * 4);
         if (e == cudaSuccess) e = cudaMemcpy(m.bias, bias_dev, (size_t)N * 4, cudaMemcpyDeviceToDevice);
     }
@@ -2409,11 +2449,12 @@ cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, 
     if (vec) {
         const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
         if (n < (1ll << 31)) {
+            TFM_PARTIALS(sums, (n * (dw_vec() == 8 ? 1 : 2) + 127) / 128, C);
             if (dw_vec() == 8)
                 k_dw8s<8><<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums);
             else
                 k_dw8s<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums);
-            return cudaGetLastError();
+            return TFM_REDUCTION_RESULT();
         }
     }
     const size_t n = (size_t)H * W * ((C + 1) / 2);
@@ -2431,13 +2472,14 @@ cudaError_t tdwconv2(const void *in, int sin, void *out, int sout, int H, int W,
         ((uintptr_t)in | (uintptr_t)out | (uintptr_t)mul) % 16)
         return cudaErrorInvalidValue;
     const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
+    TFM_PARTIALS(sums, (n * (dw_vec() == 8 ? 1 : 2) + 127) / 128, C);
     if (dw_vec() == 8)
         k_dw8s<8><<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, bias,
                                                       (const half *)mul, smul);
     else
         k_dw8s<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, bias,
                                                       (const half *)mul, smul);
-    return cudaGetLastError();
+    return TFM_REDUCTION_RESULT();
 }
 
 cudaError_t tdwconv_ln(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, float *sums,
@@ -2448,11 +2490,12 @@ cudaError_t tdwconv_ln(const void *in, int sin, void *out, int sout, int H, int 
         return cudaErrorNotSupported;
     const long long n = (long long)(C8 / 8) * W * ((H + DW_R - 1) / DW_R);
     if (n >= (1ll << 30)) return cudaErrorNotSupported;
+    TFM_PARTIALS(sums, (n * (dw_vec() == 8 ? 1 : 2) + 127) / 128, C);
     if (dw_vec() == 8)
         k_dw8s_ln<8><<<(unsigned)((n + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, stats, gamma, beta);
     else
         k_dw8s_ln<4><<<(unsigned)((n * 2 + 127) / 128), 128, 0, s>>>((const half *)in, sin, (half *)out, sout, H, W, C, w, gelu_ ? 1 : 0, sums, stats, gamma, beta);
-    return cudaGetLastError();
+    return TFM_REDUCTION_RESULT();
 }
 
 cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, bool gelu_, cudaStream_t s)
@@ -2462,8 +2505,9 @@ cudaError_t tdwconv(const void *in, int sin, void *out, int sout, int H, int W, 
 
 cudaError_t tcolsum(const void *in, int sin, int M, int C, float *sums, cudaStream_t s)
 {
+    TFM_PARTIALS(sums, (M + 255) / 256, C);
     k_colsum<<<(M + 255) / 256, 128, 0, s>>>((const half *)in, sin, M, C, sums);
-    return cudaGetLastError();
+    return TFM_REDUCTION_RESULT();
 }
 
 cudaError_t tchanstats(const void *qkv, int sq, int qo, int ko, int M, int heads, int hd, float *stats, cudaStream_t s)
@@ -2479,14 +2523,16 @@ cudaError_t tchanstats(const void *qkv, int sq, int qo, int ko, int M, int heads
         const int sms = sm_count();
         // ~2 waves of 3 CTAs per SM (each CTA's partial sums go out as atomics: fewer, longer CTAs)
         const int tpc = std::max(CS_ROWS, (M + 6 * sms - 1) / (6 * sms) + CS_ROWS - 1) / CS_ROWS * CS_ROWS;
+        TFM_PARTIALS(stats, (M + tpc - 1) / tpc, total);
         k_chanstats_mma<<<(M + tpc - 1) / tpc, 128, smem, s>>>((const half *)qkv, sq, qo, ko, M, heads, hd, tpc, stats);
-        return cudaGetLastError();
+        return TFM_REDUCTION_RESULT();
     }
     if ((total + 255) / 256 > 24) return cudaErrorInvalidValue;
     const int smem = 2 * 64 * C * 2;
     if (smem > 48 * 1024) cudaFuncSetAttribute(k_chanstats, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    TFM_PARTIALS(stats, (M + 255) / 256, total);
     k_chanstats<<<(M + 255) / 256, 256, smem, s>>>((const half *)qkv, sq, qo, ko, M, heads, hd, stats);
-    return cudaGetLastError();
+    return TFM_REDUCTION_RESULT();
 }
 
 }  // namespace ajinative

@@ -122,6 +122,13 @@ public:
         weight_bytes += m->device_bytes();
         return m;
     }
+    // The channel-attention fold matrix is rewritten per block. Its owner releases it.
+    bool mutable_mat(TMat &m, int k, int n, const float *bias)
+    {
+        if (tmat_alloc(m, k, n, bias) != cudaSuccess) return false;
+        bytes += m.device_bytes();
+        return true;
+    }
     size_t bytes = 0;         // everything allocated
     size_t weight_bytes = 0;  // of which the uploaded weights (dfl, gup, mat)
     bool failed = false;
