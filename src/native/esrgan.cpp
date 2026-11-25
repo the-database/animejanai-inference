@@ -24,6 +24,9 @@
 #include "native/gconv.h"
 #include "native/img_kernels.h"
 #include "native/netres.h"
+#include "native/allocation_count.h"
+#include "native/esrgan_lifetimes.h"
+#include "native/lifetime_check.h"
 #include "native/esrgan_graph.h"
 #include "native/onnx_read.h"
 #include "native/tail.h"
@@ -33,7 +36,7 @@ namespace {
 
 using namespace onnxread;
 
-class Esrgan : public ImgNet {
+class Esrgan : public ImgNet, private EsrganBuffers {
 public:
     ~Esrgan() override
     {
@@ -75,18 +78,17 @@ private:
     std::vector<GWeights *> weights;
     std::vector<void *> bufs;
     size_t bytes = 0, wbytes = 0;  // all device memory; of which the weights
-    void *in16 = nullptr, *F0 = nullptr, *D[3] = {}, *T = nullptr, *O16 = nullptr;  // O16: the tail's last output
+    void *O16 = nullptr;  // the tail's last output
+    LifetimeCheck *checks = LifetimeCheck::active;
     void *strip = nullptr;  // split: run()'s output strip (fp32 at most), made by its first call
-    float *ws = nullptr;
-    size_t ws_floats = 0;
     std::string what;
 
-    void *alloc(size_t halfs)
+    void *alloc(size_t n)
     {
         void *p = nullptr;
-        if (cudaMalloc(&p, halfs * 2) != cudaSuccess) return nullptr;
+        if (model_malloc(&p, n, AllocationKind::Activation) != cudaSuccess) return nullptr;
         bufs.push_back(p);
-        bytes += halfs * 2;
+        bytes += n;
         return p;
     }
     GWeights *upload(const Conv &c, float scale, int cin_pad)
@@ -99,8 +101,8 @@ private:
             return nullptr;
         }
         weights.push_back(g);
-        bytes += (size_t)9 * cin_pad * pad16(c.cout) * 2;
-        wbytes += (size_t)9 * cin_pad * pad16(c.cout) * 2;
+        bytes += g->device_bytes;
+        wbytes += g->device_bytes;
         return g;
     }
     // The ops of one run at body size bw x bh, in order, as (op, args) pairs: the body's, then the
@@ -108,6 +110,8 @@ private:
     void plan(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops);
     void plan_body(int bw, int bh, std::vector<std::pair<GOp *, GConvArgs>> *ops);
     void plan_tail(int bw, int t0, int tn, std::vector<std::pair<GOp *, GConvArgs>> *ops);
+    cudaError_t enter(int step, cudaStream_t s) const;
+    cudaError_t launch(const std::pair<GOp *, GConvArgs> &op, size_t index, bool tail_only, cudaStream_t s);
     void finish(std::vector<std::pair<GOp *, GConvArgs>> *ops);
 };
 
@@ -263,14 +267,10 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
     // dense blocks, 4 T, 5.. the upsample stages, then Q, O16, out): the upsampler's buffers reuse
     // the trunk's.
     Lifetimes lt;
-    lt.add(&e->in16, px * e->in_stride * 2, {{1, 2}});
-    lt.add(&e->F0, px * e->nf * 2, {{2, 4}});
-    for (auto &d : e->D) lt.add(&d, px * e->DS * 2, {{2, 4}});
-    // split: T lives through every strip
-    lt.add(&e->T, px * e->nf * 2, {{4, e->split_rows ? 8 + e->nup : 5}});
-    const int trows = (int)(tpx / bw);
-    for (int k = 0; k < e->tl.steps(); k++) lt.add(e->tl.out(k), e->tl.bytes(k, bw, trows), {{5 + k, 6 + k}});
-    if (!lt.assign([&](size_t n) { return e->alloc((n + 1) / 2); })) return refuse(why, "out of GPU memory"), nullptr;
+    const int strip_body_rows = e->split_rows / e->unshuffle;
+    e->declare(lt, bw, bh, e->in_stride, e->nf, e->DS, strip_body_rows, e->tl);
+    auto allocate = [&](size_t n) { return e->alloc(n); };
+    if (!lt.assign(allocate, e->checks)) return refuse(why, "out of GPU memory"), nullptr;
     e->O16 = *e->tl.out(e->tl.steps() - 1);
     // split-K workspace: the most any op needs at the largest and at a small tile
     std::vector<std::pair<GOp *, GConvArgs>> ops;
@@ -286,10 +286,8 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
         }
         for (auto &o : ops) e->ws_floats = std::max(e->ws_floats, gworkspace(*o.first->w, o.second));
     }
-    if (e->ws_floats) {
-        e->ws = (float *)e->alloc(e->ws_floats * 2);
-        if (!e->ws) return refuse(why, "out of GPU memory"), nullptr;
-    }
+    if (!e->assign_workspace(allocate, e->checks)) return refuse(why, "out of GPU memory"), nullptr;
+    if (e->checks && !e->checks->valid()) return refuse(why, e->checks->error), nullptr;
     // check the ops at the largest tile (split: the tail at a strip)
     if (e->split_rows) {
         ops.clear();
@@ -313,17 +311,36 @@ std::unique_ptr<ImgNet> Esrgan::build(const OnnxGraph &g, int max_w, int max_h, 
     return std::unique_ptr<ImgNet>(e.release());
 }
 
+cudaError_t Esrgan::enter(int step, cudaStream_t s) const
+{
+    return !checks || checks->enter(step, [&](void *p, size_t n) {
+        return cudaMemsetAsync(p, 0xff, n, s) == cudaSuccess;
+    }) ? cudaSuccess : cudaErrorInvalidValue;
+}
+
+cudaError_t Esrgan::launch(const std::pair<GOp *, GConvArgs> &op, size_t index, bool tail_only, cudaStream_t s)
+{
+    const GConvArgs &a = op.second;
+    if (checks) {
+        const int step = tail_only ? 5 + (int)index : EsrganBuffers::step(index, dense.size());
+        if (enter(step, s) != cudaSuccess || !checks->workspace(step, a.ws, a.ws_floats * sizeof(float)))
+            return cudaErrorInvalidValue;
+    }
+    return glaunch(*op.first->w, a, op.first->variant, s);
+}
+
 cudaError_t Esrgan::body(const void *in, bool in_f32, int w, int h, cudaStream_t s)
 {
     if (!split_rows || !accepts(w, h)) return cudaErrorInvalidValue;
     const int bw = w / unshuffle, bh = h / unshuffle;
+    if (checks && enter(1, s) != cudaSuccess) return cudaErrorInvalidValue;
     cudaError_t e = img_to_nhwc_by(in, in_f32, w, h, unshuffle, in16, in_stride, s);
     if (e != cudaSuccess) return e;
     std::vector<std::pair<GOp *, GConvArgs>> ops;
     plan_body(bw, bh, &ops);
     finish(&ops);
     for (size_t i = 0; i < ops.size(); i++) {
-        e = glaunch(*ops[i].first->w, ops[i].second, ops[i].first->variant, s);
+        e = launch(ops[i], i, false, s);
         if (e != cudaSuccess) return e;
         if (i == 0) {
             e = cudaMemcpy2DAsync(D[0], (size_t)DS * 2, F0, (size_t)nf * 2, (size_t)nf * 2, (size_t)bw * bh, cudaMemcpyDeviceToDevice, s);
@@ -345,10 +362,11 @@ cudaError_t Esrgan::tail(int r0, int r1, void *out, bool out_f32, cudaStream_t s
     std::vector<std::pair<GOp *, GConvArgs>> ops;
     plan_tail(lbw, a, z - a, &ops);
     finish(&ops);
-    for (auto &o : ops) {
-        const cudaError_t e = glaunch(*o.first->w, o.second, o.first->variant, s);
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const cudaError_t e = launch(ops[i], i, true, s);
         if (e != cudaSuccess) return e;
     }
+    if (checks && enter(5 + tl.steps(), s) != cudaSuccess) return cudaErrorInvalidValue;
     return tl.emit(a, b0, b1, lbw, out, out_f32, clamp, s);
 }
 
@@ -356,7 +374,7 @@ cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, in
 {
     if (!accepts(w, h)) return cudaErrorInvalidValue;
     if (split_rows) {  // the body, then the tail strip by strip into out's planes
-        if (!strip && !(strip = alloc((size_t)3 * maxw * scale_ * split_rows * scale_ * 2))) return cudaErrorMemoryAllocation;
+        if (!strip && !(strip = alloc((size_t)3 * maxw * scale_ * split_rows * scale_ * sizeof(float)))) return cudaErrorMemoryAllocation;
         cudaError_t e = body(in, in_f32, w, h, s);
         const size_t es = out_f32 ? 4 : 2, ow = (size_t)w * scale_, plane = ow * h * scale_;
         for (int r0 = 0; r0 < h && e == cudaSuccess; r0 += split_rows) {
@@ -369,12 +387,13 @@ cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, in
         return e;
     }
     const int bw = w / unshuffle, bh = h / unshuffle, S = 1 << nup;
+    if (checks && enter(1, s) != cudaSuccess) return cudaErrorInvalidValue;
     cudaError_t e = img_to_nhwc_by(in, in_f32, w, h, unshuffle, in16, in_stride, s);
     if (e != cudaSuccess) return e;
     std::vector<std::pair<GOp *, GConvArgs>> ops;
     plan(bw, bh, &ops);
     for (size_t i = 0; i < ops.size(); i++) {
-        e = glaunch(*ops[i].first->w, ops[i].second, ops[i].first->variant, s);
+        e = launch(ops[i], i, false, s);
         if (e != cudaSuccess) return e;
         if (i == 0) {
             // the trunk input into the first dense buffer's prefix
@@ -382,6 +401,7 @@ cudaError_t Esrgan::run(const void *in, bool in_f32, void *out, bool out_f32, in
             if (e != cudaSuccess) return e;
         }
     }
+    if (checks && enter(5 + tl.steps(), s) != cudaSuccess) return cudaErrorInvalidValue;
     return img_from_nhwc(O16, 16, S * bw, S * bh, out, out_f32, s, clamp);
 }
 

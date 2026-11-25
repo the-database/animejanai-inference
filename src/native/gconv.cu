@@ -1,4 +1,5 @@
 // native/gconv.cu — see gconv.h. Instantiates k_gconv for a fixed set of shapes.
+#include "native/allocation_count.h"
 #include "native/gconv.h"
 #include "native/gconv.cuh"
 #include "native/device.h"
@@ -209,14 +210,15 @@ cudaError_t gupload(GWeights &out, const uint16_t *w, const float *bias, int cin
     std::vector<uint16_t> b(cout_pad, 0);
     if (bias)
         for (int o = 0; o < cout; o++) b[o] = float_to_half_bits(bias[o]);
-    cudaError_t e = cudaMalloc(&out.frag, all.size() * 4);
+    cudaError_t e = model_malloc(&out.frag, all.size() * 4, AllocationKind::Weight);
     if (e == cudaSuccess) e = cudaMemcpy(out.frag, all.data(), all.size() * 4, cudaMemcpyHostToDevice);
-    if (e == cudaSuccess) e = cudaMalloc(&out.bias, b.size() * 2);
+    if (e == cudaSuccess) e = model_malloc(&out.bias, b.size() * 2, AllocationKind::Weight);
     if (e == cudaSuccess) e = cudaMemcpy(out.bias, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) {
         grelease(out);
         return e;
     }
+    out.device_bytes = all.size() * sizeof(all[0]) + b.size() * sizeof(b[0]);
     out.cin = cin;
     out.cin_pad = cin_pad;
     out.cout = cout;
