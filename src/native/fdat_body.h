@@ -15,17 +15,20 @@
 #include <vector>
 
 #include "native/netres.h"
+#include "native/fdat_lifetimes.h"
 
 namespace ajinative {
 
-class FdatBody {
+class FdatBody : private FdatBodyBuffers {
 public:
     // The groups under prefix (e.g. "/" or "/model/"): <prefix>groups/groups.<g>/...
     static bool present(const onnxread::Reader &rd, const std::string &prefix);
     bool parse(const onnxread::Reader &rd, const std::string &prefix, int C, std::string *why);
     // Buffers for bw x bh tokens and the group convs' kernels. With scratch (scratch_bytes(bw, bh)
     // bytes, which the caller may use for other things between runs), the large buffers live there.
-    bool setup(int bw, int bh, cudaStream_t s, std::string *why, void *scratch = nullptr);
+    bool setup(int bw, int bh, cudaStream_t s, std::string *why, void *scratch = nullptr,
+               FdatPhaseLayout *image = nullptr, LifetimeCheck *observer = nullptr);
+    void image_phases(FdatPhaseLayout &layout, size_t pixels) { phases(layout, pixels, CP, QS, HS); }
     size_t scratch_bytes(int bw, int bh) const;
     // x0 [M][CP] -> out() [M][CP] at bw x bh (<= the setup size; same kernels, any smaller size).
     cudaError_t run(const void *x0, int bw, int bh, cudaStream_t s, StepProf *prof);
@@ -52,7 +55,7 @@ private:
     std::vector<Block> blocks;
     std::vector<GOp> gconvs;
     TMat foldm;
-    void *G = nullptr, *X = nullptr, *N1 = nullptr, *QKV = nullptr, *CF = nullptr, *AT = nullptr, *H1 = nullptr, *H2 = nullptr;
+    LifetimeCheck *checks = nullptr;
     float *sums = nullptr, *cm = nullptr, *stats = nullptr, *attnb = nullptr, *fold = nullptr, *wsp = nullptr;
     float *lst = nullptr;
     bool shared = false;  // the large buffers are in a caller's scratch (not zeroed between runs)

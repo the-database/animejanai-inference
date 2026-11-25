@@ -1,6 +1,7 @@
 #include "native/esrgan_lifetimes.h"
 #include "native/hat_lifetimes.h"
 #include "native/dat_lifetimes.h"
+#include "native/fdat_lifetimes.h"
 #include "native/lifetime_check.h"
 #include <cstdio>
 
@@ -104,6 +105,28 @@ static bool dat2_fixture(int w, int h)
     return false;
 }
 
+static bool fdat_fixture(int w, int h)
+{
+    const size_t m = size_t(w / 2) * (h / 2);
+    FdatImageBuffers image;
+    FdatBodyBuffers body;
+    auto layout = [&](FdatPhaseLayout &p) {
+        image.phases(p, m, 128);
+        body.phases(p, m, 128, 368, 240);
+    };
+    FdatPhaseLayout size{nullptr, nullptr};
+    layout(size);
+    LifetimePlan view;
+    // As in the other host fixtures, the verifier only uses virtual addresses.
+    FdatPhaseLayout placed{reinterpret_cast<char *>(uintptr_t{0x10000}), &view};
+    layout(placed);
+    LifetimeCheck check;
+    check.capture(view, placed.base, size.high);
+    return check.valid() && size.high == placed.high && body.G == placed.base &&
+           image.U1 == image.O16 && image.T == image.U2 && body.QKV == body.H1 &&
+           !check.workspace(5, body.CF, 256);
+}
+
 int main()
 {
     for (int rows : {0, 256})
@@ -117,6 +140,8 @@ int main()
     if (!hat_l_fixture(512,512,64u << 20,true)) return 1; // one shared fallback, other ops still in the arena
     for (auto [w,h] : {std::pair<int,int>{512,512}, {768,768}, {512,384}, {320,192}})
         if (!dat2_fixture(w,h)) return 1;
+    for (auto [w,h] : {std::pair<int,int>{512,512}, {1536,1536}, {2048,2048}, {512,384}, {320,192}})
+        if (!fdat_fixture(w,h)) return 1;
     // q = 2*SM-1, k = 2 attains the split bound. A smaller stock cutoff may
     // suppress an optional split, but must always cover the mandatory FP32 map.
     constexpr size_t q = 2 * 170 - 1, tile = 16 * 16 * 64;

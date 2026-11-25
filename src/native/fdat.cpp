@@ -16,7 +16,7 @@ namespace {
 
 using namespace onnxread;
 
-class Fdat : public ImgNet {
+class Fdat : public ImgNet, private FdatImageBuffers {
 public:
     static std::unique_ptr<ImgNet> build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
     cudaError_t run(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s) override;
@@ -35,7 +35,7 @@ private:
     int C = 0, CP = 0, maxw = 0, maxh = 0;
     bool unshuffle = false;
     GOp first, after, up0[2], up2[2], up3;
-    void *IN16 = nullptr, *XS = nullptr, *T = nullptr, *U1 = nullptr, *U2 = nullptr, *O16 = nullptr;
+    LifetimeCheck *checks = LifetimeCheck::active;
     float *wsp = nullptr;
     size_t ws_floats = 0;
     std::string what;
@@ -117,28 +117,33 @@ std::unique_ptr<ImgNet> Fdat::build(const OnnxGraph &g, int max_w, int max_h, cu
     // (its scratch, its output G first) and the tail (T, U1, U2, O16, after G).
     f->XS = f->res.alloc(M * CPb);
     if (f->res.failed) return refuse(why, "out of GPU memory"), nullptr;
-    auto carve = [&](Bump &bp) {
-        f->IN16 = bp.take(M * 32);
-        bp.off = 0;
-        bp.take(M * CPb);  // G
-        f->T = bp.take(M * CPb);
-        f->U1 = bp.take(M * 4 * CPb);
-        f->U2 = bp.take(M * 16 * 32);
-        f->O16 = bp.take(M * 16 * 32);
-    };
-    Bump cnt;
-    carve(cnt);
-    Bump bp;
-    bp.base = (char *)f->res.alloc(std::max(cnt.off, f->body.scratch_bytes(bw, bh)));
-    if (!bp.base) return refuse(why, "out of GPU memory"), nullptr;
-    carve(bp);
-    if (!f->body.setup(bw, bh, s, why, bp.base)) return nullptr;
+    const bool disjoint = f->checks && f->checks->disjoint_features;
+    FdatPhaseLayout count{nullptr, nullptr, disjoint};
+    f->phases(count, M, CP);
+    f->body.image_phases(count, M);
+    auto *arena = static_cast<char *>(f->res.alloc(count.high));
+    if (!arena) return refuse(why, "out of GPU memory"), nullptr;
+    LifetimePlan view;
+    FdatPhaseLayout bound{arena, f->checks ? &view : nullptr, disjoint};
+    f->phases(bound, M, CP);
+    if (!f->body.setup(bw, bh, s, why, arena, &bound, f->checks)) return nullptr;
+    if (f->checks) {
+        if (f->checks->edit) f->checks->edit(view);
+        f->checks->capture(view, arena, count.high);
+        LifetimePlan residual;
+        residual.buffers.push_back({&f->XS, M * CPb, {{2,12}}, 0, "XS"});
+        f->checks->capture(residual, f->XS, M * CPb);
+    }
     std::vector<std::pair<GOp *, GConvArgs>> ops;
     for (int sz : {0, 1}) {
         f->gplan(sz ? std::min(bw, 32) : bw, sz ? std::min(bh, 32) : bh, &ops);
         f->ws_floats = std::max(f->ws_floats, gworkspace_max(ops));
     }
     if (f->ws_floats && !(f->wsp = (float *)f->res.alloc(f->ws_floats * 4))) return refuse(why, "out of GPU memory"), nullptr;
+    if (f->checks) {
+        f->checks->region(f->wsp, f->ws_floats * sizeof(float));
+        if (!f->checks->valid()) return refuse(why, f->checks->error), nullptr;
+    }
     f->gplan(bw, bh, &ops);
     if (!gprepare(ops, s, why)) return nullptr;
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
@@ -154,7 +159,17 @@ cudaError_t Fdat::run(const void *in, bool in_f32, void *out, bool out_f32, int 
     gplan(bw, bh, &ops);
     StepProf pr(s);
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) return e_; } while (0)
-    auto gl = [&](size_t i) { return glaunch(*ops[i].first->w, ops[i].second, ops[i].first->variant, s); };
+#define STEP(n) do { if (checks && !checks->enter(n, [&](void *p, size_t bytes) { \
+    return cudaMemsetAsync(p, 0xff, bytes, s) == cudaSuccess; })) return cudaErrorInvalidValue; } while (0)
+    auto gl = [&](size_t i) -> cudaError_t {
+        constexpr int steps[] = {2,12,13,13,14,14,15};
+        const int step = steps[i];
+        const auto &a = ops[i].second;
+        STEP(step);
+        if (checks && !checks->workspace(step, a.ws, a.ws_floats * sizeof(float))) return cudaErrorInvalidValue;
+        return glaunch(*ops[i].first->w, a, ops[i].first->variant, s);
+    };
+    STEP(1);
     CK(img_to_nhwc(in, in_f32, w, h, unshuffle, IN16, 16, s));
     pr.mark(P_IO);
     CK(gl(0));  // conv_first -> XS
@@ -164,8 +179,10 @@ cudaError_t Fdat::run(const void *in, bool in_f32, void *out, bool out_f32, int 
     pr.mark(P_CONV);
     for (size_t i = 2; i < ops.size(); i++) CK(gl(i));
     pr.mark(P_UP);
+    STEP(16);
     CK(img_from_nhwc(O16, 16, 4 * bw, 4 * bh, out, out_f32, s));
     pr.mark(P_IO);
+#undef STEP
 #undef CK
     char label[48];
     snprintf(label, sizeof(label), "fdat %dx%d", w, h);

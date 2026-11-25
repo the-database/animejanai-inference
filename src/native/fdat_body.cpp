@@ -163,16 +163,22 @@ size_t FdatBody::scratch_bytes(int bw, int bh) const
     return b.off;
 }
 
-bool FdatBody::setup(int bw, int bh, cudaStream_t s, std::string *why, void *scratch)
+bool FdatBody::setup(int bw, int bh, cudaStream_t s, std::string *why, void *scratch,
+                     FdatPhaseLayout *image, LifetimeCheck *observer)
 {
     const size_t M = (size_t)bw * bh;
     maxm = (int)M;
-    Bump b;
     shared = scratch != nullptr;
-    b.base = shared ? (char *)scratch : (char *)res.alloc(scratch_bytes(bw, bh));
-    if (!b.base) return refuse(why, "out of GPU memory");
-    carve(b, M);
-    if (shared) cudaMemset(scratch, 0, b.off);
+    checks = observer;
+    if (image) {
+        image_phases(*image, M);
+    } else {
+        Bump b;
+        b.base = shared ? (char *)scratch : (char *)res.alloc(scratch_bytes(bw, bh));
+        if (!b.base) return refuse(why, "out of GPU memory");
+        carve(b, M);
+        if (shared) cudaMemset(scratch, 0, b.off);
+    }
     sums = (float *)res.alloc(CP * 4);
     cm = (float *)res.alloc(CP * 4);
     stats = (float *)res.alloc((size_t)(heads * hd * hd + 2 * C) * 4);
@@ -192,6 +198,7 @@ bool FdatBody::setup(int bw, int bh, cudaStream_t s, std::string *why, void *scr
     }
     ws_floats = gworkspace_max(ops);
     if (ws_floats && !(wsp = (float *)res.alloc(ws_floats * 4))) return refuse(why, "out of GPU memory");
+    if (checks) checks->region(wsp, ws_floats * sizeof(float));
     ops.resize(ngroups);  // the full size's
     for (auto &o : ops) {
         o.second.ws = wsp;
@@ -218,12 +225,16 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
         if (pr) pr->mark(k);
     };
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) return e_; } while (0)
+#define STEP(n) do { if (checks && !checks->enter(n, [&](void *p, size_t bytes) { \
+    return cudaMemsetAsync(p, 0xff, bytes, s) == cudaSuccess; })) return cudaErrorInvalidValue; } while (0)
+    STEP(3);
     CK(cudaMemcpyAsync(G, x0, (size_t)M * CP * 2, cudaMemcpyDeviceToDevice, s));
     if (shared) {  // padding channels the kernels don't write
         CK(cudaMemsetAsync(CF, 0, (size_t)M * CP * 2, s));
         CK(cudaMemsetAsync(AT, 0, (size_t)M * CP * 2, s));
     }
     for (int gi = 0; gi < ngroups; gi++) {
+        STEP(4);
         CK(cudaMemcpyAsync(X, G, (size_t)M * CP * 2, cudaMemcpyDeviceToDevice, s));
         mark(P_IO);
         for (int bi = 0; bi < nblk; bi++) {
@@ -231,12 +242,14 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
             // LN1 applied by its two readers (qkv on its A load, which also gives the rows' statistics, and the
             // depthwise conv from them) where they can, else stored first
             if (b.spatial) CK(cudaMemsetAsync(sums, 0, CP * 4, s));
+            STEP(5);
             TGemm q;
             q.a = X; q.sa = CP; q.M = M; q.out = QKV; q.so = QS;
             q.ln_gamma = b.ln1g; q.ln_beta = b.ln1b; q.ln_eps = b.eps1; q.a_stats_out = lst;
             cudaError_t eq = lst ? tgemm(*b.qkv, q, s) : cudaErrorNotSupported;
             if (eq == cudaSuccess) {
                 mark(P_QKV);
+                STEP(6);
                 eq = tdwconv_ln(X, CP, CF, CP, bh, bw, C, b.dw, true, b.spatial ? sums : nullptr, lst, b.ln1g, b.ln1b, s);
                 if (eq == cudaErrorNotSupported) {
                     CK(tlayernorm(X, CP, N1, CP, M, C, CP, b.ln1g, b.ln1b, b.eps1, s));
@@ -251,9 +264,11 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
                 q.a = N1; q.ln_gamma = q.ln_beta = nullptr; q.a_stats_out = nullptr;
                 CK(tgemm(*b.qkv, q, s));
                 mark(P_QKV);
+                STEP(6);
                 CK(tdwconv(N1, CP, CF, CP, bh, bw, C, b.dw, true, b.spatial ? sums : nullptr, s));
                 mark(P_DW);
             }
+            STEP(7);
             if (b.spatial) {
                 TWinAttn a;
                 a.qkv = QKV; a.sq = QS; a.qo = 0; a.ko = C; a.vo = 2 * C; a.H = bh; a.W = bw; a.heads = heads; a.hd = hd;
@@ -261,6 +276,7 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
                 a.shift_y = a.shift_x = b.shift;
                 CK(twinattn(a, s));
                 mark(P_WIN);
+                STEP(8);
                 CK(fdat_aim_cg(sums, M, C, cgr, b.cg1, b.cg2, cm, CP, s));
                 mark(P_GATE);
                 TGemm pj;
@@ -281,10 +297,12 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
                 pj.a = (const uint16_t *)QKV + 2 * C; pj.sa = QS; pj.M = M; pj.out = AT; pj.so = CP;
                 CK(tgemm(foldm, pj, s));
                 mark(P_CPROJ);
+                STEP(8);
                 CK(fdat_aim_sg(AT, CF, b.sg, X, CP, M, C, s));
                 mark(P_GATE);
             }
             // fc1 with LN2 applied on its A load where tgemm can (else the LayerNorm first)
+            STEP(9);
             TGemm f1;
             f1.a = X; f1.sa = CP; f1.M = M; f1.out = H1; f1.so = HS; f1.act = TAct::Gelu;
             f1.ln_gamma = b.ln2g; f1.ln_beta = b.ln2b; f1.ln_eps = b.eps2;
@@ -299,6 +317,7 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
             CK(e1);
             mark(P_FC1);
             // X += smix(H1) fc2 in one kernel where there is one (else the depthwise conv, then the GEMM)
+            STEP(10);
             TDwGemm dg;
             dg.in = H1; dg.sin = HS; dg.H = bh; dg.W = bw; dg.dw = b.smix; dg.out = X; dg.so = CP; dg.add1 = X; dg.s1 = CP;
             const cudaError_t e2 = tdwgemm(*b.fc2, dg, s);
@@ -319,9 +338,12 @@ cudaError_t FdatBody::run(const void *x0, int bw, int bh, cudaStream_t s, StepPr
         a.r1_stride = CP;
         a.ws = wsp;
         a.ws_floats = ws_floats;
+        STEP(11);
+        if (checks && !checks->workspace(11, a.ws, a.ws_floats * sizeof(float))) return cudaErrorInvalidValue;
         CK(glaunch(*gconvs[gi].w, a, gconvs[gi].variant, s));
         mark(P_CONV);
     }
+#undef STEP
 #undef CK
     return cudaSuccess;
 }
