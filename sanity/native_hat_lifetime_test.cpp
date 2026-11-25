@@ -1,4 +1,4 @@
-#include "native_lifetime_gpu.h"
+#include "transformer_lifetime_gpu.h"
 #include "core/fileio.h"
 #include "native/imgnet.h"
 #include "native/onnx_graph.h"
@@ -10,60 +10,6 @@
 
 using namespace ajinative;
 using namespace ajinative::lifetime_test;
-
-static std::string dimensions(Shape s) { return std::to_string(s.first) + "x" + std::to_string(s.second); }
-
-static Output input_for(int w, int h)
-{
-    const size_t plane = size_t(w) * h;
-    Output input(3 * plane);
-    for (size_t i = 0; i < input.size(); ++i) {
-        const auto v = uint8_t((i * 13 + (i >> 4) * 17 + (i >> 11) * 61) ^ ((i >> 3) * 7));
-        input[(i % 3) * plane + i / 3] = float_to_half_bits(v * (1.f / 255.f));
-    }
-    return input;
-}
-
-static std::vector<Output> render(const OnnxGraph &graph, Shape built, const std::vector<Shape> &shapes,
-                                  bool separate, bool poison, void (*edit)(LifetimePlan &) = nullptr)
-{
-    LifetimeCheck check;
-    std::vector<LifetimeCheck::Workspace> launches, first_launches;
-    check.launches = &launches;
-    check.edit = edit;
-    if (separate) check.workspace_arena_limit = 0;
-    check.poison = poison;
-    LifetimeCheck::active = &check;
-    std::string why;
-    auto net = ImgNet::create(graph, built.first, built.second, nullptr, &why);
-    LifetimeCheck::active = nullptr;
-    require(net && net->scale() == 4 && net->describe().find("HAT") != std::string::npos, "expected HAT-L: " + why);
-    require(launches.empty(), "build unexpectedly recorded a dispatch");
-    std::vector<Output> results;
-    for (auto [w,h] : shapes) {
-        const auto input = input_for(w,h);
-        Output fp16(input.size() * 16);
-        Device in(input.size()), out(fp16.size());
-        gpu(cudaMemcpy(in.p, input.data(), input.size() * 2, cudaMemcpyHostToDevice));
-        // Exercise a second inference on the same allocations, including repeated groups and phase scatters.
-        for (int i = 0; i < 2; ++i) {
-            launches.clear();
-            const auto rc = net->run(in.p, false, out.p, false, w, h, nullptr);
-            require(check.error.empty(), check.error);
-            gpu(rc);
-            require(!launches.empty(), "no run-time workspace checks");
-            if (first_launches.empty()) first_launches = launches;
-            else require(launches == first_launches, "run-time GConv step, address or capacity changed on the same model");
-            if (i == 0 && Shape{w,h} != built && !edit)
-                std::printf("HAT check %s on %s: %zu identical run-time workspace ranges\n",
-                            dimensions({w,h}).c_str(), dimensions(built).c_str(), launches.size());
-            gpu(cudaMemcpy(fp16.data(), out.p, fp16.size() * 2, cudaMemcpyDeviceToHost));
-            if (i == 0) results.push_back(fp16);
-            else require(results.back() == fp16, "fixed-order HAT output did not repeat at " + dimensions({w,h}));
-        }
-    }
-    return results;
-}
 
 static void shorten_qkv(LifetimePlan &plan)
 {
@@ -77,22 +23,10 @@ static void shorten_qkv(LifetimePlan &plan)
 
 static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> &shapes)
 {
-    const auto reference = render(graph, built, shapes, true, false);
-    const char *dir = std::getenv("AJI_TEST_HAT_REFERENCE");
-    for (size_t j = 0; j < shapes.size(); ++j) {
-        const auto &v = reference[j];
-        require(std::none_of(v.begin(), v.end(), [](uint16_t x) { return (x & 0x7c00) == 0x7c00; }), "nonfinite reference");
-        // Optional independent pre-change build: raw NCHW FP16 before RGB8 conversion, using input_for().
-        if (dir && *dir) {
-            const auto name = dimensions(built) + "-" + dimensions(shapes[j]) + ".fp16";
-            std::ifstream f(std::filesystem::u8path(dir) / name, std::ios::binary);
-            Output old(v.size());
-            require(f.read(reinterpret_cast<char *>(old.data()), old.size() * 2) &&
-                    f.peek() == std::char_traits<char>::eof() && old == v, "independent stock mismatch at " + name);
-        }
-    }
+    const auto reference = render("HAT", 4, graph, built, shapes, true, false);
+    verify_stock("AJI_TEST_HAT_REFERENCE", built, shapes, reference);
     for (bool separate : {false, true}) {
-        const auto actual = render(graph, built, shapes, separate, true);
+        const auto actual = render("HAT", 4, graph, built, shapes, separate, true);
         for (size_t j = 0; j < shapes.size(); ++j) {
             const auto &a = actual[j], &b = reference[j];
             const auto diff = std::mismatch(a.begin(), a.end(), b.begin());
@@ -107,7 +41,7 @@ static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> 
         }
     }
     if (shapes.back() != built) {
-        const auto broken = render(graph, built, {shapes.back()}, false, true, shorten_qkv);
+        const auto broken = render("HAT", 4, graph, built, {shapes.back()}, false, true, shorten_qkv);
         const auto &stock = reference.back();
         const auto diff = std::mismatch(stock.begin(), stock.end(), broken.front().begin());
         require(diff.first != stock.end(), "poison failed to expose the shortened HAT QKV lifetime");

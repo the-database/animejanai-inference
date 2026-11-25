@@ -1,5 +1,6 @@
 #include "native/esrgan_lifetimes.h"
 #include "native/hat_lifetimes.h"
+#include "native/dat_lifetimes.h"
 #include "native/lifetime_check.h"
 #include <cstdio>
 
@@ -80,6 +81,29 @@ static bool hat_l_fixture(int w, int h, size_t arena_limit, bool expect_external
     return work.slots[28].floats == stream && fallback_bytes == (expect_external ? stream * sizeof(float) : 0);
 }
 
+static bool dat2_fixture(int w, int h)
+{
+    DatBuffers data;
+    LifetimePlan plan;
+    data.declare(plan, size_t(w) * h, 192, 544, 384);
+    const auto capacity = plan.arrange();
+    auto *base = reinterpret_cast<void *>(uintptr_t{0x10000});
+    plan.bind(base);
+    LifetimeCheck check;
+    check.capture(plan, base, capacity);
+    const size_t stream = size_t(w) * h * 192;
+    StepWorkspaces<36> work;
+    for (int step : {2,22,31,32,33,34,35})
+        work.need(step, gconv_workspace_bound(170, 16, step == 35 ? 16 : 64, step == 22 ? stream : 0, stream));
+    if (!check.valid() || !work.place(plan, [](size_t) -> void * { return nullptr; }, &check)) return false;
+    for (int step : {2,22,31,32,33,34,35})
+        if (!check.workspace(step, work.slots[step].ptr, work.slots[step].floats * sizeof(float))) return false;
+    for (const auto &b : plan.buffers)
+        if (b.slot == &data.QKV)
+            return b.live == std::vector<LifetimePlan::Range>{{11,13}} && !check.workspace(13, data.QKV, 256);
+    return false;
+}
+
 int main()
 {
     for (int rows : {0, 256})
@@ -91,6 +115,8 @@ int main()
     for (auto [w,h] : {std::pair<int,int>{512,512}, {768,768}, {512,384}, {320,192}})
         if (!hat_l_fixture(w,h,size_t(-1),false) || !hat_l_fixture(w,h,0,true)) return 1;
     if (!hat_l_fixture(512,512,64u << 20,true)) return 1; // one shared fallback, other ops still in the arena
+    for (auto [w,h] : {std::pair<int,int>{512,512}, {768,768}, {512,384}, {320,192}})
+        if (!dat2_fixture(w,h)) return 1;
     // q = 2*SM-1, k = 2 attains the split bound. A smaller stock cutoff may
     // suppress an optional split, but must always cover the mandatory FP32 map.
     constexpr size_t q = 2 * 170 - 1, tile = 16 * 16 * 64;

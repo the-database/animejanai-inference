@@ -136,7 +136,7 @@ bool FdatBody::parse(const Reader &rd, const std::string &prefix, int C_, std::s
     for (const Block &b : blocks)
         if (!b.spatial) {
             float *zb = (float *)res.alloc((size_t)C * 4);  // a bias buffer: each block copies its own in
-            if (!zb || tmat_alloc(foldm, C, C, zb) != cudaSuccess) return refuse(why, "weight upload failed");
+            if (!zb || !res.mutable_mat(foldm, C, C, zb)) return refuse(why, "weight upload failed");
             break;
         }
     return true;
