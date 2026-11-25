@@ -93,7 +93,7 @@ const char *variant_name(const Conv3x3 &op, int variant);
 
 cudaError_t launch(const Conv3x3 &op, const Tensors &t, int H, int W, int variant, cudaStream_t s);
 cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, int npx, int variant, cudaStream_t s);
-cudaError_t span48_gate_project(const Conv3x3 &op, const Tensors &io, const ConcatConv1x1 &project,
+cudaError_t span_gate_project(const Conv3x3 &op, const Tensors &io, const ConcatConv1x1 &project,
                                 const void *const *maps, const void *fp8_weights, int height, int width,
                                 cudaStream_t stream);
 
