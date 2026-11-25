@@ -1,5 +1,6 @@
 // native/rife.cpp — see rife.h.
 #include "native/rife.h"
+#include "native/temporal_workspace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -116,8 +117,16 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
         needT1 = std::max(needT1, px / 4 * pad16(bp.c0a.cout));
         needA = std::max(needA, px / 16 * pad16(bp.c0b.cout));
     }
-    void *sX = d.alloc(needX), *sT1 = d.alloc(needT1), *sA = d.alloc(needA), *sB = d.alloc(needA);
-    if (!sX || !sT1 || !sA || !sB) return refuse(why, "out of GPU memory"), nullptr;
+    // Each pass gathers into X. conv0a is its last reader and writes separate T1.
+    // Only then does conv0b write A, and residuals alternate disjoint A/B until
+    // lastconv writes the persistent block output. The next gather starts on the same stream.
+    // The optional feature heads finish writing separate feat[0/1] before the first gather.
+    // Repeated/shifted frame IDs keep those and the input planes (move_frame copies features).
+    // Scene cuts skip the blocks; neither entry point needs X/A/B from a previous pair.
+    const auto workspace = ping_pong_layout(needX, needA);
+    void *sX = d.alloc(workspace.size), *sT1 = d.alloc(needT1);
+    if (!sX || !sT1) return refuse(why, "out of GPU memory"), nullptr;
+    void *sA = sX, *sB = (uint16_t *)sX + workspace.second_offset;
     void *sR = ens ? d.alloc(plane * 16) : nullptr;  // ensemble: the reverse pass's block output
     if (ens && !sR) return refuse(why, "out of GPU memory"), nullptr;
     // ---- encoder steps (per frame)

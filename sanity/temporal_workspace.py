@@ -6,6 +6,7 @@ from contextlib import ExitStack
 import ctypes as C
 import os
 from pathlib import Path
+import random
 from tempfile import TemporaryDirectory
 
 P, I, S = C.c_void_p, C.c_int, C.c_size_t
@@ -73,6 +74,10 @@ class Backend:
         self.ingest = bind(lib, 'aji_ingest', I, P, C.POINTER(Frame), C.c_uint64, P)
         self.seq = bind(lib, 'aji_infer_seq', I, P, C.c_uint64, C.POINTER(Frame), P)
         self.reset = bind(lib, 'aji_temporal_reset', None, P)
+        self.rife = bind(lib, 'aji_infer_rife', I, P, C.POINTER(Frame), C.POINTER(Frame),
+                         C.c_double, C.POINTER(Frame), P)
+        self.rife_ids = bind(lib, 'aji_infer_rife_ids', I, P, C.POINTER(Frame), C.c_int64,
+                             C.POINTER(Frame), C.c_int64, C.c_double, C.POINTER(Frame), P, I)
         params = Params(version=9, conf=os.fsencode(conf), models=os.fsencode(model_dir), slot=1,
                         rife=os.fsencode(model_dir))
         self.ctx = P(bind(lib, 'aji_create', P, C.POINTER(Params))(C.byref(params)))
@@ -80,12 +85,12 @@ class Backend:
             raise RuntimeError(f'aji_create failed for {path.name}')
         stack.callback(bind(lib, 'aji_destroy', None, C.POINTER(P)), C.byref(self.ctx))
 
-    def shape(self, w, h, family):
+    def shape(self, w, h, family, spatial_status=1):
         ow, oh = I(), I()
         rc = self.configure(self.ctx, w, h, 24, C.byref(ow), C.byref(oh))
         log = self.log(self.ctx).decode(errors='replace')
-        if rc != 1 or (ow.value, oh.value) != (w, h) or family not in log:
-            raise RuntimeError(f'configure {w}x{h}: {self.error(self.ctx)!r}\n{log}')
+        if rc != spatial_status or (ow.value, oh.value) != (w, h) or family not in log:
+            raise RuntimeError(f'configure {w}x{h} returned {rc}: {self.error(self.ctx)!r}\n{log}')
 
     def ok(self, rc):
         if rc:
@@ -147,17 +152,88 @@ def temporal(device, backends):
     return count
 
 
+def rife(device, backends, use_ids):
+    w, h = 1920, 1080
+    for api in backends:
+        api.shape(w, h, 'Native kernels: rife_v4.26', spatial_status=0)  # RIFE-only spatial passthrough
+    with ExitStack() as surfaces:
+        a, b = [device.frame(w, h, 1, surfaces) for _ in range(2)]
+        outs = [device.frame(w, h, 1, surfaces) for _ in backends]
+        sentinel = bytes([0xa5]) * (w * h * 3 // 2)
+        count = 0
+
+        def pair(left, right, t, scene=-1):
+            nonlocal count
+            device.upload(a, pixels(w, h, left, left >= 6))
+            device.upload(b, pixels(w, h, right, right >= 6))
+            label = f'ids={use_ids} pair={left},{right} t={t} scene={scene}'
+            cut = scene == 1 or (scene == -1 and (left >= 6) != (right >= 6))
+            for api, out in zip(backends, outs):
+                device.upload(out, sentinel)
+                if use_ids:
+                    rc = api.rife_ids(api.ctx, C.byref(a), left, C.byref(b), right, t,
+                                      C.byref(out), device.stream, scene)
+                else:
+                    rc = api.rife(api.ctx, C.byref(a), C.byref(b), t, C.byref(out), device.stream)
+                if rc != int(cut):
+                    raise RuntimeError(f'{label}: expected status {int(cut)}, got {rc}, {api.error(api.ctx)!r}')
+            expected, actual = (device.read(out) for out in outs)
+            if cut:
+                if expected != sentinel or actual != sentinel:
+                    raise RuntimeError(f'{label}: scene return modified the output')
+            else:
+                if expected == sentinel:
+                    raise RuntimeError(f'{label}: reference did not write interpolation output')
+                same(label, expected, actual)
+            count += 1
+
+        for i in range(12):
+            pair(i, i + 1, 0.25)
+            pair(i, i + 1, 0.75)  # same pair, different time; the next pair shifts B to A
+            if i == 2:
+                pair(i + 1, i + 1, 0.5)  # held source frame
+            if i == 5:
+                pair(4, 5, 0.5)  # revisit the last successful pair after a detected cut
+        if use_ids:
+            pair(11, 12, 0.5, 1)  # caller-supplied cut and retry of a cached pair
+            pair(11, 12, 0.5, 0)
+            pair(5, 6, 0.5, 0)  # caller explicitly requests interpolation across the cut
+    if use_ids:
+        # A residual-lane overlap survived the 1080p NV12 sequence on the test GPU.
+        # This larger P010 pair exposed it. Force interpolation of the independent textures.
+        w, h = 3840, 2160
+        for api in backends:
+            api.shape(w, h, 'Native kernels: rife_v4.26', spatial_status=0)
+        with ExitStack() as surfaces:
+            a, b, ref, result = [device.frame(w, h, 2, surfaces) for _ in range(4)]
+            for seed, frame in enumerate((a, b)):
+                data = bytearray(w * h * 3)
+                data[1::2] = random.Random(seed).randbytes(len(data) // 2)
+                device.upload(frame, bytes(data))
+            for api, out in zip(backends, (ref, result)):
+                api.ok(api.rife_ids(api.ctx, C.byref(a), 0, C.byref(b), 1, 0.37, C.byref(out), device.stream, 0))
+            same('3840x2160 P010 residuals', device.read(ref), device.read(result))
+            count += 1
+    return count
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--case', choices=('temporal', 'temporal-no-cache'), required=True)
+    p.add_argument('--case', choices=('temporal', 'temporal-no-cache', 'rife', 'rife-ids'), required=True)
     p.add_argument('--reference', type=Path, required=True, help='backend built from main')
     p.add_argument('--backend', type=Path, required=True, help='backend under test')
     p.add_argument('--cuda-runtime', type=Path, required=True)
-    p.add_argument('--model', type=Path, required=True, help='TemporalFix S1 ONNX')
+    p.add_argument('--model', type=Path, required=True, help='TemporalFix S1 ONNX or rife_v4.26.onnx')
     a = p.parse_args()
     os.environ['AJI_NATIVE_FRAME_CACHE'] = 'off' if a.case == 'temporal-no-cache' else 'on'
+    os.environ['AJI_RIFE_IDS'] = '1'
     model = a.model.resolve(strict=True)
-    chain = f'chain_1_temporal_fix_model={model.stem}\n'
+    is_rife = a.case.startswith('rife')
+    if is_rife:
+        chain = ('chain_1_rife=yes\nchain_1_rife_model=426\nchain_1_rife_factor_numerator=2\n'
+                 'chain_1_rife_factor_denominator=1\nchain_1_rife_before_upscale=yes\n')
+    else:
+        chain = f'chain_1_temporal_fix_model={model.stem}\n'
     with ExitStack() as stack:
         if os.name == 'nt':
             for path in {a.reference, a.backend, a.cuda_runtime}:
@@ -167,8 +243,12 @@ def main():
                         '[slot_1]\nchain_1_max_fps=120\n' + chain)
         device = Device(a.cuda_runtime, stack)
         backends = [Backend(path, conf, model.parent, stack) for path in (a.reference, a.backend)]
-        count = temporal(device, backends)
-        print(f'{a.case}: {count} full outputs matched main byte for byte')
+        if is_rife:
+            count = rife(device, backends, a.case == 'rife-ids')
+            print(f'{a.case}: {count} pair calls matched main, including untouched scene-cut outputs')
+        else:
+            count = temporal(device, backends)
+            print(f'{a.case}: {count} full outputs matched main byte for byte')
 
 
 if __name__ == '__main__':
