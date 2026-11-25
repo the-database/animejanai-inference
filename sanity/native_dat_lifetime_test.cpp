@@ -36,6 +36,15 @@ static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> 
     }
 }
 
+static std::array<uint64_t,3> model_bytes(aji_img_ctx *ctx, const aji_img_model_params &cfg,
+                                          bool stock_qkv, bool separate)
+{
+    LifetimeCheck probe, load;
+    if (stock_qkv) probe.edit = load.edit = [](LifetimePlan &p) { qkv_end(p, 14); };
+    if (separate) probe.workspace_arena_limit = load.workspace_arena_limit = 0;
+    return account_native(ctx, cfg, probe, load);
+}
+
 int main()
 {
     const char *dir = std::getenv("AJI_TEST_IMAGE_MODELS");
@@ -59,15 +68,18 @@ int main()
         require(ctx, error);
         for (Shape size : {Shape{512,512}, {768,768}, {512,384}}) {
             aji_img_model_params cfg{path.c_str(), size.first, size.second, 32, AJI_IMG_LOAD_EVEN_TILES};
-            LifetimeCheck old_probe, old_load, probe, load;
-            old_probe.edit = old_load.edit = [](LifetimePlan &p) { qkv_end(p,14); };
-            old_probe.workspace_arena_limit = old_load.workspace_arena_limit = 0;
-            const auto old = account_native(ctx, cfg, old_probe, old_load);
-            const auto now = account_native(ctx, cfg, probe, load);
-            require(old[0] == now[0] && old[2] == now[2] && old[1] > now[1], "DAT2 model memory did not fall");
-            std::printf("DAT ledger %s weights %llu, activations %llu -> %llu, I/O %llu\n", dimensions(size).c_str(),
-                        (unsigned long long)now[0], (unsigned long long)old[1], (unsigned long long)now[1],
-                        (unsigned long long)now[2]);
+            const auto stock = model_bytes(ctx, cfg, true, true);
+            const auto qkv = model_bytes(ctx, cfg, false, true);
+            const auto workspace = model_bytes(ctx, cfg, true, false);
+            const auto both = model_bytes(ctx, cfg, false, false);
+            for (const auto &row : {qkv, workspace, both})
+                require(row[0] == stock[0] && row[2] == stock[2], "DAT2 weight or I/O bytes changed");
+            require(qkv[1] < stock[1] && workspace[1] <= stock[1] && both[1] <= qkv[1],
+                    "DAT2 QKV or workspace allocation regression");
+            std::printf("DAT ledger %s weights %llu, I/O %llu, activation bytes "
+                        "stock %llu, QKV only %llu, workspace only %llu, both %llu\n", dimensions(size).c_str(),
+                        (unsigned long long)both[0], (unsigned long long)both[2], (unsigned long long)stock[1],
+                        (unsigned long long)qkv[1], (unsigned long long)workspace[1], (unsigned long long)both[1]);
         }
         aji_img_destroy(&ctx);
     } catch (const std::exception &e) {
