@@ -25,15 +25,15 @@ struct Layout {
     std::vector<int> cin_pad, cout_pad;
     // Per feature id (Plan::channels), the buffer that holds it, or -1 if no step writes it.
     std::vector<int> buffer;
-    // Per buffer, its size: NHWC fp16 at W x H, in the order buffers are first needed.
+    // Physical bytes per buffer, in the order buffers are first needed.
     std::vector<size_t> buffer_bytes;
 };
 
 // Fails (false, *why says why) for an empty plan or a size the plan can't take.
 bool layout(const Plan &plan, int in_w, int in_h, Layout *out, std::string *why);
 
-// Apply once to a fresh CUDA layout. Dead slots keep full capacity for either representation.
-// An in-place gate reads an FP16 residual and writes an FP16 destination.
+// Apply once to a fresh CUDA layout. Only slots used exclusively by packed maps can shrink.
+// In-place gates and four-input projections read a dying FP16 map before overwriting its pixels.
 void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout, const std::vector<bool> &packed = {});
 
 }  // namespace ajinative

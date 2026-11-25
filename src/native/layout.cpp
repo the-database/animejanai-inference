@@ -94,6 +94,7 @@ void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout, const std::vector
 
     std::vector<size_t> sizes;
     std::vector<int> busy_through;
+    const bool has_packed = std::find(packed.begin(), packed.end(), true) != packed.end();
     for (int i = 0; i < (int)plan.steps.size(); ++i) {
         const PlanStep &s = plan.steps[i];
         if (s.dst < 0) continue;
@@ -109,6 +110,12 @@ void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout, const std::vector
             // Each CTA reads its own residual pixels before the barrier preceding its writes.
             // The convolution source supplies a halo to other CTAs and must be a distinct tensor.
             slot = layout.buffer[s.resid];
+        } else if (has_packed && s.kind == PlanStep::CONCAT && s.nsrc == 4 &&
+                   s.srcs[1] >= 0 && !packed[s.srcs[1]] && !packed_dst &&
+                   last_reader[s.srcs[1]] == i && plan.channels[s.srcs[1]] == plan.channels[s.dst]) {
+            // k_concat1x1 stages all four inputs before storing its own pixels. Reuse the
+            // dying FP16 gate map so the projection does not promote a packed slot to FP16.
+            slot = layout.buffer[s.srcs[1]];
         } else {
             for (slot = 0; slot < (int)sizes.size(); ++slot)
                 if (busy_through[slot] < i && sizes[slot] == bytes) break;
@@ -119,6 +126,17 @@ void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout, const std::vector
         }
         layout.buffer[s.dst] = slot;
         busy_through[slot] = last_reader[s.dst];
+    }
+    if (has_packed) {
+        // A slot can change precision between lifetimes. Size it for its largest occupant.
+        std::fill(sizes.begin(), sizes.end(), 0);
+        const size_t pixels = size_t(layout.W) * layout.H;
+        for (size_t t = 0; t < layout.buffer.size(); ++t) {
+            const int slot = layout.buffer[t];
+            if (slot < 0) continue;
+            const size_t bytes = pixels * plan.channels[t] * (packed[t] ? 1 : 2);
+            sizes[slot] = std::max(sizes[slot], bytes);
+        }
     }
     layout.buffer_bytes.swap(sizes);
 }
