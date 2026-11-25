@@ -17,6 +17,7 @@
 #include <cuda_fp16.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <algorithm>
@@ -42,33 +43,60 @@ namespace {
 
 using aji_resample::chroma_shifts;
 
+constexpr int BLOCK_X = 32;
+constexpr int BLOCK_Y = 8;
+
 struct pass {
     int taps = 0, src = 0, dst = 0;
     const int *start = nullptr;   // [dst] first source index per output
     const float *wt = nullptr;    // [dst * taps], normalized
 };
 
-bool build_pass(pass *p, int src, int dst, double shift, int filter)
+bool upload_pass(pass *p, const aji_resample::weights &w)
 {
-    aji_resample::weights w = aji_resample::compute(src, dst, shift, filter);
-
     int *d_start = nullptr;
     float *d_wt = nullptr;
-    if (cudaMalloc(&d_start, dst * sizeof(int)) != cudaSuccess ||
+    if (cudaMalloc(&d_start, w.dst * sizeof(int)) != cudaSuccess ||
         cudaMalloc(&d_wt, w.wt.size() * sizeof(float)) != cudaSuccess) {
         cudaFree(d_start);
         return false;
     }
-    cudaMemcpy(d_start, w.start.data(), dst * sizeof(int),
+    cudaMemcpy(d_start, w.start.data(), w.dst * sizeof(int),
                cudaMemcpyHostToDevice);
     cudaMemcpy(d_wt, w.wt.data(), w.wt.size() * sizeof(float),
                cudaMemcpyHostToDevice);
     p->taps = w.taps;
-    p->src = src;
-    p->dst = dst;
+    p->src = w.src;
+    p->dst = w.dst;
     p->start = d_start;
     p->wt = d_wt;
     return true;
+}
+
+bool build_pass(pass *p, int src, int dst, double shift, int filter)
+{
+    return upload_pass(p, aji_resample::compute(src, dst, shift, filter));
+}
+
+bool build_pre_vertical(pass *p, const aji_resample::weights &w, int &tile_rows)
+{
+    int max_advance = 0;
+    for (size_t y = 0; y < w.start.size(); ++y) {
+        if (y && w.start[y] < w.start[y - 1]) {
+            fprintf(stderr, "[aji-trt] fused input plan: vertical tap start decreases at row %zu\n", y);
+            return false;
+        }
+        const size_t first = y - y % BLOCK_Y;
+        const int64_t advance = int64_t(w.start[y]) - w.start[first];
+        if (advance > BLOCK_Y / 2) {
+            fprintf(stderr, "[aji-trt] fused input plan: vertical tap span exceeds %d rows of advance at row %zu\n",
+                    BLOCK_Y / 2, y);
+            return false;
+        }
+        max_advance = std::max(max_advance, int(advance));
+    }
+    tile_rows = w.taps + max_advance;
+    return upload_pass(p, w);
 }
 
 void free_pass(pass *p)
@@ -86,6 +114,7 @@ struct aji_plan {
     int w = 0, h = 0;          // pre/post luma dims; resize: src dims
     int dw = 0, dh = 0;        // resize: dst dims
     pass ph, pv;
+    int pre_rows = 0;          // maximum verified tap range of a fused input tile
     float *tmp0 = nullptr;     // after the first pass
     float *tmp1 = nullptr;     // after the horizontal pass (post only)
     // post in one kernel (k_post_fused): per tile column / row the luma range its taps read ([lo, hi],
@@ -462,7 +491,7 @@ extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting,
     double sx, sy;
     chroma_shifts(siting, true, &sx, &sy);
     if (!build_pass(&p->ph, cw, w, sx, filter) ||
-        !build_pass(&p->pv, ch, h, sy, filter)) {
+        !build_pre_vertical(&p->pv, aji_resample::compute(ch, h, sy, filter), p->pre_rows)) {
         aji_plan_destroy(p);
         return nullptr;
     }
@@ -565,8 +594,6 @@ extern "C" aji_plan *aji_resize_plan_create(int sw, int sh, int dw, int dh)
 
 /* ---------------- runs ---------------- */
 
-#define BLOCK_X 32
-#define BLOCK_Y 8
 #define GRID(w, h, d) dim3(((w) + BLOCK_X - 1) / BLOCK_X, \
                            ((h) + BLOCK_Y - 1) / BLOCK_Y, (d)), \
                       dim3(BLOCK_X, BLOCK_Y)
@@ -577,9 +604,7 @@ extern "C" int aji_run_pre(aji_plan *p,
                            const aji_csp *csp, void *dst_f16, void *stream)
 {
     cudaStream_t s = (cudaStream_t)stream;
-    // py.src = floor(h / 2). Across BLOCK_Y output rows the monotone tap start
-    // advances by at most ceil((BLOCK_Y - 1) / 2), for either vertical siting.
-    const size_t shared_bytes = (BLOCK_Y / 2 + p->pv.taps) * BLOCK_X * sizeof(float2);
+    const size_t shared_bytes = size_t(p->pre_rows) * BLOCK_X * sizeof(float2);
     if (p->format == AJI_FMT_NV12)
         k_pre_fused<uint8_t><<<GRID(p->w, p->h, 1), shared_bytes, s>>>(
             (const uint8_t *)y_plane, y_stride, (const uint8_t *)uv_plane, uv_stride,

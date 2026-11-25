@@ -122,8 +122,37 @@ void pre_case(int w,int h,int format,int sit,int matrix,int range,int filter)
     aji_plan_destroy(p); CK(cudaStreamDestroy(s));
 }
 
+void pre_tile_bounds()
+{
+    // The final block has two output rows. Its span determines the allocation.
+    auto w = aji_resample::compute(5, 10, 0.0, AJI_FILTER_SPLINE36);
+    w.start = {-2, -2, -2, -1, -1, -1, -1, -1, 0, 2};
+    pass vertical;
+    int rows = 0;
+    if (!build_pre_vertical(&vertical, w, rows) || rows != w.taps + 2) {
+        fprintf(stderr, "wrong shared row count for partial input tile\n");
+        exit(2);
+    }
+    free_pass(&vertical);
+
+    auto reject = [&](int y, int start, const char *label) {
+        const int saved = w.start[y];
+        w.start[y] = start;
+        if (build_pre_vertical(&vertical, w, rows)) {
+            fprintf(stderr, "accepted invalid vertical table: %s\n", label);
+            exit(2);
+        }
+        w.start[y] = saved;
+        printf("rejected invalid vertical table: %s\n", label);
+    };
+    reject(4, -2, "decrease inside tile");
+    reject(8, -2, "decrease at tile boundary");
+    reject(9, BLOCK_Y / 2 + 1, "excess span in final partial tile");
+}
+
 int main()
 {
+    pre_tile_bounds();
     for(int h:{540,720,1080})
         pre_case(h*16/9,h,AJI_FMT_NV12,AJI_SITING_LEFT,AJI_MATRIX_BT709,AJI_RANGE_LIMITED,AJI_FILTER_SPLINE36);
     pre_case(1920,1080,AJI_FMT_P010,AJI_SITING_LEFT,AJI_MATRIX_BT709,AJI_RANGE_LIMITED,AJI_FILTER_SPLINE36);
