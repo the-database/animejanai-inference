@@ -642,9 +642,11 @@ endif()
 # runners); `ctest -L gpu` needs an NVIDIA GPU. aji_kernel_test, the harnesses
 # and the sanity/*.py drivers take models or fixtures and are run by hand.
 enable_testing()
+add_executable(aji_frame_graph_test sanity/frame_graph_test.cpp)
+target_include_directories(aji_frame_graph_test PRIVATE src include)
 add_executable(aji_rife_conf_test sanity/rife_conf_test.cpp src/aji_conf.cpp)
 target_include_directories(aji_rife_conf_test PRIVATE src)
-set(_cpu_tests aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
+set(_cpu_tests aji_frame_graph_test aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
                aji_held_test aji_native_pack_test aji_native_lower_test aji_native_layout_test aji_native_forms_test)
 if(AJI_CUDA)
     # CPU-only, but compiled with nvcc

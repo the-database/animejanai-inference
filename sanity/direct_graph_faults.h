@@ -39,11 +39,20 @@ inline cudaError_t CUDARTAPI launch(cudaGraphExec_t exec, cudaStream_t stream) {
     if (fail("launch")) return cudaGetDevice(nullptr);
     return cudaGraphLaunch(exec, stream);
 }
+inline cudaError_t CUDARTAPI params(cudaGraphNode_t node, cudaKernelNodeParams *out) {
+    if (fail("nodes")) return cudaGetDevice(nullptr);
+    return cudaGraphKernelNodeGetParams(node, out);
+}
+inline cudaError_t CUDARTAPI update(cudaGraphExec_t exec, cudaGraphNode_t node, const cudaKernelNodeParams *p) {
+    static int calls = 0;
+    if (++calls == 2 && fail("update")) return cudaGetDevice(nullptr);
+    return cudaGraphExecKernelNodeSetParams(exec, node, p);
+}
 }
 #ifdef _WIN32
 #define AJI_GRAPH_TEST_EXPORT __declspec(dllexport)
 #else
-#define AJI_GRAPH_TEST_EXPORT __attribute__((visibility("default")))
+#define AJI_GRAPH_TEST_EXPORT __attribute__((visibility("default"), used))
 #endif
 extern "C" AJI_GRAPH_TEST_EXPORT inline int aji_test_graph_begins() { return aji_graph_test::begins; }
 extern "C" AJI_GRAPH_TEST_EXPORT inline int aji_test_graph_failures() { return aji_graph_test::failures; }
@@ -53,3 +62,5 @@ extern "C" AJI_GRAPH_TEST_EXPORT inline int aji_test_graph_last_error() { return
 #define cudaGraphInstantiate aji_graph_test::instantiate
 #define cudaStreamSynchronize aji_graph_test::sync
 #define cudaGraphLaunch aji_graph_test::launch
+#define cudaGraphKernelNodeGetParams aji_graph_test::params
+#define cudaGraphExecKernelNodeSetParams aji_graph_test::update
