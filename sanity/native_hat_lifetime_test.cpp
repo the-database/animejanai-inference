@@ -1,0 +1,134 @@
+#include "native_lifetime_gpu.h"
+#include "core/fileio.h"
+#include "native/imgnet.h"
+#include "native/onnx_graph.h"
+#include "native/pack.h"
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+
+using namespace ajinative;
+using namespace ajinative::lifetime_test;
+
+static std::string dimensions(Shape s) { return std::to_string(s.first) + "x" + std::to_string(s.second); }
+
+static Output input_for(int w, int h)
+{
+    const size_t plane = size_t(w) * h;
+    Output input(3 * plane);
+    for (size_t i = 0; i < input.size(); ++i) {
+        const auto v = uint8_t((i * 13 + (i >> 4) * 17 + (i >> 11) * 61) ^ ((i >> 3) * 7));
+        input[(i % 3) * plane + i / 3] = float_to_half_bits(v * (1.f / 255.f));
+    }
+    return input;
+}
+
+static std::vector<Output> render(const OnnxGraph &graph, Shape built, const std::vector<Shape> &shapes,
+                                  bool separate, bool poison)
+{
+    LifetimeCheck check;
+    if (separate) check.workspace_arena_limit = 0;
+    check.poison = poison;
+    LifetimeCheck::active = &check;
+    std::string why;
+    auto net = ImgNet::create(graph, built.first, built.second, nullptr, &why);
+    LifetimeCheck::active = nullptr;
+    require(net && net->scale() == 4 && net->describe().find("HAT") != std::string::npos, "expected HAT-L: " + why);
+    std::vector<Output> results;
+    for (auto [w,h] : shapes) {
+        const auto input = input_for(w,h);
+        Output fp16(input.size() * 16);
+        Device in(input.size()), out(fp16.size());
+        gpu(cudaMemcpy(in.p, input.data(), input.size() * 2, cudaMemcpyHostToDevice));
+        // Exercise a second inference on the same allocations, including repeated groups and phase scatters.
+        for (int i = 0; i < 2; ++i) {
+            const auto rc = net->run(in.p, false, out.p, false, w, h, nullptr);
+            require(check.error.empty(), check.error);
+            gpu(rc);
+            gpu(cudaMemcpy(fp16.data(), out.p, fp16.size() * 2, cudaMemcpyDeviceToHost));
+            if (i == 0) results.push_back(fp16);
+            else require(results.back() == fp16, "fixed-order HAT output did not repeat at " + dimensions({w,h}));
+        }
+    }
+    return results;
+}
+
+static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> &shapes)
+{
+    const auto reference = render(graph, built, shapes, true, false);
+    const char *dir = std::getenv("AJI_TEST_HAT_REFERENCE");
+    for (size_t j = 0; j < shapes.size(); ++j) {
+        const auto &v = reference[j];
+        require(std::none_of(v.begin(), v.end(), [](uint16_t x) { return (x & 0x7c00) == 0x7c00; }), "nonfinite reference");
+        // Optional independent pre-change build: raw NCHW FP16 before RGB8 conversion, using input_for().
+        if (dir && *dir) {
+            const auto name = dimensions(built) + "-" + dimensions(shapes[j]) + ".fp16";
+            std::ifstream f(std::filesystem::u8path(dir) / name, std::ios::binary);
+            Output old(v.size());
+            require(f.read(reinterpret_cast<char *>(old.data()), old.size() * 2) &&
+                    f.peek() == std::char_traits<char>::eof() && old == v, "independent stock mismatch at " + name);
+        }
+    }
+    for (bool separate : {false, true}) {
+        const auto actual = render(graph, built, shapes, separate, true);
+        for (size_t j = 0; j < shapes.size(); ++j) {
+            const auto &a = actual[j], &b = reference[j];
+            const auto diff = std::mismatch(a.begin(), a.end(), b.begin());
+            if (diff.first != a.end()) {
+                std::fprintf(stderr, "%s built %s, %s, element %zu: stock %04x, candidate %04x\n",
+                             dimensions(shapes[j]).c_str(), dimensions(built).c_str(), separate ? "fallback" : "arena",
+                             (size_t)(diff.first-a.begin()), *diff.second, *diff.first);
+                throw std::runtime_error("poisoned HAT output differs from deterministic stock");
+            }
+            std::printf("HAT check %s built %s, %s: %zu FP16 values exact\n", dimensions(shapes[j]).c_str(),
+                        dimensions(built).c_str(), separate ? "fallback" : "arena", a.size());
+        }
+    }
+}
+
+static void allocations(aji_img_ctx *ctx, const std::string &path, Shape built)
+{
+    const aji_img_model_params params{path.c_str(), built.first, built.second, 32, AJI_IMG_LOAD_EVEN_TILES};
+    LifetimeCheck separate_probe, separate_load, arena_probe, arena_load;
+    separate_probe.workspace_arena_limit = separate_load.workspace_arena_limit = 0;
+    const auto before = account_native(ctx, params, separate_probe, separate_load);
+    const auto after = account_native(ctx, params, arena_probe, arena_load);
+    const size_t workspace = size_t(built.first) * built.second * 192 * sizeof(float);
+    require(before[0] == after[0] && before[2] == after[2] && before[1] == after[1] + workspace,
+            "unexpected HAT fallback or workspace saving at " + dimensions(built));
+    std::printf("HAT check %s: weights %llu, activations %llu -> %llu, I/O %llu, fallback %zu bytes\n",
+                dimensions(built).c_str(), (unsigned long long)after[0], (unsigned long long)before[1],
+                (unsigned long long)after[1], (unsigned long long)after[2], workspace);
+}
+
+int main()
+{
+    const char *dir = std::getenv("AJI_TEST_IMAGE_MODELS");
+    if (!dir || !*dir) { std::puts("Set AJI_TEST_IMAGE_MODELS to the shipped ONNX directory"); return 77; }
+    try {
+        const auto path = (std::filesystem::u8path(dir) / "4x_IllustrationJaNai_V3detail_HAT_L_28k_bf16.onnx").u8string();
+        std::vector<char> blob;
+        OnnxGraph graph;
+        std::string why;
+        require(ajicore::read_file_bytes(path, &blob), "cannot read the shipped HAT-L fixture");
+        const bool parsed = parse_onnx(blob.data(), blob.size(), &graph, &why);
+        require(parsed, why);
+        exact(graph, {512,512}, {{512,512}});
+        exact(graph, {768,768}, {{768,768}});
+        exact(graph, {512,384}, {{512,384},{320,192}});
+
+        aji_img_create_params make{};
+        make.api_version = AJI_IMAGE_API_VERSION;
+        make.backend = AJI_IMG_TENSORRT;
+        char error[512]{};
+        auto *ctx = aji_img_create(&make, error, sizeof(error));
+        require(ctx, error);
+        for (Shape shape : {Shape{512,512}, {768,768}, {512,384}}) allocations(ctx, path, shape);
+        aji_img_destroy(&ctx);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return 1;
+    }
+    return 0;
+}

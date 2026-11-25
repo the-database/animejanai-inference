@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include "native/gconv.h"
+#include "native/allocation_count.h"
 #include "native/lifetime_check.h"
 #include "native/onnx_read.h"
 #include "native/tfm.h"
@@ -61,10 +62,10 @@ public:
         for (void *p : bufs) cudaFree(p);
     }
     // Zeroed device memory.
-    void *alloc(size_t n)
+    void *alloc(size_t n, AllocationKind kind = AllocationKind::Activation)
     {
         void *p = nullptr;
-        if (cudaMalloc(&p, n) != cudaSuccess) {
+        if (model_malloc(&p, n, kind) != cudaSuccess) {
             failed = true;
             return nullptr;
         }
@@ -81,7 +82,7 @@ public:
             failed = true;
             return nullptr;
         }
-        float *p = (float *)alloc(v.size() * 4);
+        float *p = (float *)alloc(v.size() * 4, AllocationKind::Weight);
         if (p) weight_bytes += v.size() * 4;
         if (p) cudaMemcpy(p, v.data(), v.size() * 4, cudaMemcpyHostToDevice);
         return p;
@@ -99,8 +100,8 @@ public:
             return nullptr;
         }
         gw.push_back(g);
-        bytes += (size_t)9 * cin_pad * cout_pad * 2;
-        weight_bytes += (size_t)9 * cin_pad * cout_pad * 2;
+        bytes += g->device_bytes;
+        weight_bytes += g->device_bytes;
         return g;
     }
     // A GEMM weight matrix, w [K][N] (row k, column n), bias N floats or null.
@@ -117,8 +118,8 @@ public:
             return nullptr;
         }
         mats.push_back(m);
-        bytes += (size_t)m->Kpad * m->Npad * 2;
-        weight_bytes += (size_t)m->Kpad * m->Npad * 2;
+        bytes += m->device_bytes();
+        weight_bytes += m->device_bytes();
         return m;
     }
     size_t bytes = 0;         // everything allocated

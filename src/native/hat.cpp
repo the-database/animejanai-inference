@@ -21,8 +21,12 @@
 #include "native/img_kernels.h"
 #include "native/imgnet.h"
 #include "native/netres.h"
+#include "native/hat_lifetimes.h"
 
 namespace ajinative {
+#ifdef AJI_TEST_ORDERED_HAT
+cudaError_t test_ordered_hat_sums(const GConvArgs &args, int channels, int rows, cudaStream_t stream);
+#endif
 namespace {
 
 using namespace onnxread;
@@ -56,7 +60,7 @@ struct Group {
     GOp conv;
 };
 
-class Hat : public ImgNet {
+class Hat : public ImgNet, private HatBuffers {
 public:
     static std::unique_ptr<ImgNet> build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
     cudaError_t run(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s) override;
@@ -75,14 +79,13 @@ private:
     Ln pe, fin;
     std::vector<Group> groups;
     GOp first, after, cbu, up0[2], up2[2], last;
-    void *IN16 = nullptr, *XF = nullptr, *N1 = nullptr, *QKV = nullptr, *AT = nullptr, *T60 = nullptr, *Y = nullptr, *H1 = nullptr;
-    void *S16 = nullptr, *TT = nullptr, *U0 = nullptr, *V1 = nullptr, *V2 = nullptr, *O16 = nullptr;
-    float *S = nullptr, *GIN = nullptr, *sums = nullptr, *cm = nullptr, *wsp = nullptr;
-    size_t ws_floats = 0;
+    float *sums = nullptr, *cm = nullptr;
+    StepWorkspaces<36> scratch;
+    LifetimeCheck *checks = LifetimeCheck::active;
     std::string what;
 
     cudaError_t exec(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s,
-                     std::vector<std::pair<GOp *, GConvArgs>> *collect);
+                     std::vector<std::pair<GOp *, GConvArgs>> *collect, std::vector<int> *steps = nullptr);
 };
 
 void up_ln(DevRes &r, const HatLn &h, int C, Ln *l)
@@ -184,42 +187,33 @@ std::unique_ptr<ImgNet> Hat::build(const OnnxGraph &g, int max_w, int max_h, cud
     // buffers for the largest tile
     f->maxw = max_w;
     f->maxh = max_h;
-    const size_t M = (size_t)max_w * max_h;
-    // The per-pixel buffers share one arena by lifetime: the steps of exec() each is live in (1-3 the
-    // input conv, 9-28 a group (10-19 a HAB, 20-26 the OCAB), 30-36 the tail). Kept in step with exec().
     Lifetimes lt;
-    lt.add(&f->IN16, M * 32, {{1, 2}});
-    lt.add(&f->XF, M * CP * 2, {{2, 31}});
-    lt.add((void **)&f->S, M * CP * 4, {{3, 30}});
-    lt.add((void **)&f->GIN, M * CP * 4, {{9, 28}});
-    lt.add(&f->N1, M * CP * 2, {{10, 14}, {17, 19}, {20, 21}, {24, 25}, {30, 31}});  // 19: the MLP makes the next LN1
-    lt.add(&f->T60, M * f->crp * 2, {{11, 12}});
-    lt.add(&f->Y, M * CP * 2, {{12, 16}});
-    lt.add(&f->QKV, M * f->QS * 2, {{14, 15}, {21, 22}});
-    lt.add(&f->AT, M * CP * 2, {{15, 16}, {22, 23}});
-    lt.add(&f->H1, M * f->HS * 2, {{18, 19}, {25, 26}});
-    lt.add(&f->S16, M * CP * 2, {{27, 28}});
-    lt.add(&f->TT, M * CP * 2, {{31, 32}});
-    // (conv_last reads the last of U0 / V1 / V2 at step 35)
-    lt.add(&f->U0, M * 64 * 2, {{32, f->nup == 0 ? 35 : 33}});
-    const size_t S2 = (size_t)1 << (2 * f->nup);  // output pixels per input pixel
-    if (f->nup >= 1) lt.add(&f->V1, 4 * M * 64 * 2, {{33, f->nup == 1 ? 35 : 34}});
-    if (f->nup >= 2) lt.add(&f->V2, 16 * M * 64 * 2, {{34, 35}});
-    lt.add(&f->O16, S2 * M * 16 * 2, {{35, 36}});
-    if (!lt.assign(r)) return refuse(why, "out of GPU memory"), nullptr;
+    f->declare(lt, (size_t)max_w * max_h, CP, f->crp, f->QS, f->HS, f->nup);
+    if (!lt.assign(r, f->checks)) return refuse(why, "out of GPU memory"), nullptr;
     f->sums = (float *)r.alloc(CP * 4);
     f->cm = (float *)r.alloc(CP * 4);
     if (r.failed) return refuse(why, "out of GPU memory"), nullptr;
     std::vector<std::pair<GOp *, GConvArgs>> ops;
-    for (int sz : {0, 1}) {
+    std::vector<int> steps;
+    size_t stock_limit = 0;
+    // Visit the build shape last so preparation can use the same ops, with their final workspace addresses.
+    for (bool small : {true, false}) {
         ops.clear();
-        const int w = sz ? std::min(max_w, 64) / f->ws * f->ws : max_w, h = sz ? std::min(max_h, 64) / f->ws * f->ws : max_h;
-        f->exec(nullptr, false, nullptr, false, w, h, s, &ops);
-        f->ws_floats = std::max(f->ws_floats, gworkspace_max(ops));
+        const int w = small ? std::min(max_w, 64) / f->ws * f->ws : max_w, h = small ? std::min(max_h, 64) / f->ws * f->ws : max_h;
+        const auto err = f->exec(nullptr, false, nullptr, false, w, h, s, &ops, small ? nullptr : &steps);
+        if (err != cudaSuccess) return refuse(why, cudaGetErrorString(err)), nullptr;
+        stock_limit = std::max(stock_limit, gworkspace_max(ops));
     }
-    if (f->ws_floats && !(f->wsp = (float *)r.alloc(f->ws_floats * 4))) return refuse(why, "out of GPU memory"), nullptr;
-    ops.clear();
-    f->exec(nullptr, false, nullptr, false, max_w, max_h, s, &ops);
+    for (size_t i = 0; i < ops.size(); ++i)
+        f->scratch.need(steps[i], gworkspace_for_subtiles(*ops[i].first->w, ops[i].second, stock_limit));
+    if (!f->scratch.place(lt, [&](size_t n) { return r.alloc(n); }, f->checks))
+        return refuse(why, "out of GPU memory"), nullptr;
+    if (f->checks && !f->checks->valid()) return refuse(why, f->checks->error), nullptr;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const auto &slot = f->scratch.slots[steps[i]];
+        ops[i].second.ws = slot.ptr;
+        ops[i].second.ws_floats = slot.floats;
+    }
     if (!gprepare(ops, s, why)) return nullptr;
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
     char buf[200];
@@ -236,18 +230,29 @@ cudaError_t Hat::run(const void *in, bool in_f32, void *out, bool out_f32, int w
 }
 
 cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s,
-                      std::vector<std::pair<GOp *, GConvArgs>> *collect)
+                      std::vector<std::pair<GOp *, GConvArgs>> *collect, std::vector<int> *steps)
 {
     const int M = w * h;
     StepProf pr(s, !collect);
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) return e_; } while (0)
 #define K(x) do { if (!collect) CK(x); } while (0)
-    auto Gc = [&](GOp &op, GConvArgs a) -> cudaError_t {
-        a.ws = wsp;
-        a.ws_floats = ws_floats;
+    auto enter = [&](int step, void **forwarded = nullptr) -> cudaError_t {
+        return checks->enter(step, [&](void *p, size_t n) { return cudaMemsetAsync(p, 0xff, n, s) == cudaSuccess; },
+                             forwarded) ? cudaSuccess : cudaErrorInvalidValue;
+    };
+#define STEP(n) do { if (checks && !collect) CK(enter(n)); } while (0)
+    auto Gc = [&](int step, GOp &op, GConvArgs a) -> cudaError_t {
         if (collect) {
             collect->push_back({&op, a});
+            if (steps) steps->push_back(step);
             return cudaSuccess;
+        }
+        const auto &slot = scratch.slots[step];
+        a.ws = slot.ptr;
+        a.ws_floats = slot.floats;
+        if (checks) {
+            CK(enter(step));
+            if (!checks->workspace(step, a.ws, a.ws_floats * sizeof(float))) return cudaErrorInvalidValue;
         }
         return glaunch(*op.w, a, op.variant, s);
     };
@@ -289,6 +294,10 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
         t.a = S; t.sa = CP; t.M = M; t.out = S; t.so = CP; t.out_f32 = true; t.add1 = S; t.s1 = CP; t.add1_f32 = true;
         t.ln_gamma = n2.g; t.ln_beta = n2.b; t.ln_eps = n2.eps;
         if (nxt) { t.lno = N1; t.slno = CP; t.lno_gamma = nxt->g; t.lno_beta = nxt->b; t.lno_eps = nxt->eps; }
+        const int first_step = nxt ? 17 : 24;
+        STEP(first_step);
+        STEP(first_step + 1);
+        STEP(first_step + 2);
         cudaError_t e = tmlp(*m.fc1, *m.fc2, t, s);
         if (e != cudaErrorNotSupported) {
             CK(e);
@@ -297,6 +306,7 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             return cudaSuccess;
         }
         t.lno = nullptr;
+        STEP(first_step);
         CK(lnorm(n2, S, true, N1, false));
         pr.mark(P_LN);
         t.a = N1; t.ln_gamma = t.ln_beta = nullptr;
@@ -306,8 +316,10 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             pr.mark(P_MLP);
             return cudaSuccess;
         }
+        STEP(first_step + 1);
         CK(gemm(*m.fc1, N1, CP, H1, HS, TAct::Gelu, false));
         pr.mark(P_FC1);
+        STEP(first_step + 2);
         CK(gemm(*m.fc2, H1, HS, S, CP, TAct::None, true));
         pr.mark(P_FC2);
         return cudaSuccess;
@@ -316,69 +328,88 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
     // Steps (the buffers' lifetimes in build()): 1 IN16, 2 XF, 3 S; per group 9 GIN; per HAB 10 N1,
     // 11 T60, 12 Y, 13 the gate, 14 QKV, 15 AT, 16 S, 17 N1, 18 H1, 19 S; the OCAB 20 N1, 21 QKV,
     // 22 AT, 23 S, 24 N1, 25 H1, 26 S; 27 S16, 28 S; then 30 N1, 31 TT, 32 U0, 33 V1, 34 V2, 35 O16, 36 out.
+    STEP(1);
     K(img_to_nhwc(in, in_f32, w, h, false, IN16, 16, s));
     K(tok_sub3(IN16, 16, M, mean[0], mean[1], mean[2], s));
     pr.mark(P_IO);
-    CK(Gc(first, ga(IN16, 16, h, w, XF, CP, h, w)));
+    CK(Gc(2, first, ga(IN16, 16, h, w, XF, CP, h, w)));
+    STEP(3);
     CK(lnorm(pe, XF, false, S, true));
     pr.mark(P_CONV);
     for (Group &gr : groups) {
+        STEP(9);
         K(cudaMemcpyAsync(GIN, S, (size_t)M * CP * 4, cudaMemcpyDeviceToDevice, s));
         bool n1_made = false;  // N1 = LN1(S) already, from the previous block's MLP
         for (size_t bi = 0; bi < gr.habs.size(); bi++) {
             Hab &b = gr.habs[bi];
+            if (checks && !collect) CK(enter(10, n1_made ? &N1 : nullptr));
             if (!n1_made) CK(lnorm(b.n1, S, true, N1, false));
             pr.mark(P_LN);
             // CAB on the normalised map (its last conv carries the 0.01), its channel gate
             GConvArgs c0 = ga(N1, CP, h, w, T60, crp, h, w);
             c0.act = GAct::Gelu;
-            CK(Gc(b.cab0, c0));
+            CK(Gc(11, b.cab0, c0));
             K(cudaMemsetAsync(sums, 0, CP * 4, s));
             GConvArgs c2 = ga(T60, crp, h, w, Y, CP, h, w);
             c2.sums = sums;  // the channel gate's sums from the conv's epilogue, where there's a kernel for it
             if (!gsupported(*b.cab2.w, c2)) c2.sums = nullptr;
-            CK(Gc(b.cab2, c2));
+            CK(Gc(12, b.cab2, c2));
+#ifdef AJI_TEST_ORDERED_HAT
+            if (!c2.sums) return cudaErrorNotSupported; // shipped HAT-L uses the CAB sums epilogue
+            K(test_ordered_hat_sums(c2, CP, gvariant_rows(b.cab2.variant), s));
+#else
             if (!c2.sums) K(tcolsum(Y, CP, M, C, sums, s));
+#endif
             pr.mark(P_CONV);
+            STEP(13);
             K(chan_gate(sums, M, C, cs, b.ca1, b.cab1, b.ca2, b.cab2b, 1, 1.f / b.conv_scale, cm, CP, s));
             pr.mark(P_GATE);
+            STEP(14);
             CK(gemm(*b.at.qkv, N1, CP, QKV, QS, TAct::None, false));
             pr.mark(P_QKV);
+            STEP(15);
             CK(attend(b.at, false));
             pr.mark(P_WIN);
+            STEP(16);
             CK(gemm(*b.at.proj, AT, CP, S, CP, TAct::None, true, Y, cm));  // S += proj(attn) + CAB * gate
             pr.mark(P_PROJ);
             CK(mlp_step(b.n2, b.mlp, bi + 1 < gr.habs.size() ? &gr.habs[bi + 1].n1 : &gr.oc.n1, &n1_made));
         }
         Ocab &o = gr.oc;
+        if (checks && !collect) CK(enter(20, n1_made ? &N1 : nullptr));
         if (!n1_made) CK(lnorm(o.n1, S, true, N1, false));
         pr.mark(P_LN);
+        STEP(21);
         CK(gemm(*o.at.qkv, N1, CP, QKV, QS, TAct::None, false));
         pr.mark(P_QKV);
+        STEP(22);
         CK(attend(o.at, true));
         pr.mark(P_WIN);
+        STEP(23);
         CK(gemm(*o.at.proj, AT, CP, S, CP, TAct::None, true));
         pr.mark(P_PROJ);
         CK(mlp_step(o.n2, o.mlp, nullptr, &n1_made));
         // the group conv plus the group input, in fp32
+        STEP(27);
         K(tconvert(S, true, CP, S16, false, CP, M, CP, s, kStreamScale));
         GConvArgs a = ga(S16, CP, h, w, S, CP, h, w);
         a.acc32 = true;
         a.out_f32 = true;
         a.r1f = GIN;
         a.r1f_stride = CP;
-        CK(Gc(gr.conv, a));
+        CK(Gc(28, gr.conv, a));
         pr.mark(P_CONV);
     }
+    STEP(30);
     CK(lnorm(fin, S, true, N1, false));
     GConvArgs a = ga(N1, CP, h, w, TT, CP, h, w);
     a.r1 = XF;
     a.r1_stride = CP;
-    CK(Gc(after, a));
+    CK(Gc(31, after, a));
     GConvArgs b = ga(TT, CP, h, w, U0, 64, h, w);
     b.act = GAct::LRelu;
     b.slope = cbu_slope;
-    CK(Gc(cbu, b));
+    CK(Gc(32, cbu, b));
     // the pixel-shuffle steps U0 -> V1 -> V2, then conv_last at the scale
     void *src = U0;
     for (int k = 0; k < nup; k++) {
@@ -388,15 +419,17 @@ cudaError_t Hat::exec(const void *in, bool in_f32, void *out, bool out_f32, int 
             GConvArgs u = ga(src, 64, sc * h, sc * w, dst, 64, sc * h, sc * w);
             u.R = 2;
             u.sy = sy;
-            CK(Gc((k ? up2 : up0)[sy], u));
+            CK(Gc(33 + k, (k ? up2 : up0)[sy], u));
         }
         src = dst;
     }
     const int S_ = 1 << nup;
-    CK(Gc(last, ga(src, 64, S_ * h, S_ * w, O16, 16, S_ * h, S_ * w)));
+    CK(Gc(35, last, ga(src, 64, S_ * h, S_ * w, O16, 16, S_ * h, S_ * w)));
     pr.mark(P_UP);
+    STEP(36);
     K(img_from_nhwc(O16, 16, S_ * w, S_ * h, out, out_f32, s, clamp));
     pr.mark(P_IO);
+#undef STEP
 #undef K
 #undef CK
     if (!collect) {

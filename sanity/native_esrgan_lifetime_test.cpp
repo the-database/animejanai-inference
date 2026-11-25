@@ -2,7 +2,7 @@
 #include "core/fileio.h"
 #include "native/allocation_count.h"
 #include "native/imgnet.h"
-#include "native/lifetime_check.h"
+#include "native_lifetime_gpu.h"
 #include "native/onnx_graph.h"
 #include "native/pack.h"
 
@@ -17,17 +17,7 @@
 
 using namespace ajinative;
 
-static void require(bool ok, const std::string &message)
-{
-    if (!ok) throw std::runtime_error(message);
-}
-static void gpu(cudaError_t e) { require(e == cudaSuccess, cudaGetErrorString(e)); }
-
-struct Device {
-    uint16_t *p = nullptr;
-    explicit Device(size_t elements) { gpu(cudaMalloc(&p, elements * sizeof(*p))); }
-    ~Device() { cudaFree(p); }
-};
+using namespace ajinative::lifetime_test;
 
 static void stock(LifetimePlan &plan)
 {
@@ -35,8 +25,6 @@ static void stock(LifetimePlan &plan)
         if (b.name && (!std::strcmp(b.name, "D1") || !std::strcmp(b.name, "D2"))) b.live = {{2,4}};
 }
 
-using Shape = std::pair<int, int>;
-using Output = std::vector<uint16_t>;
 static std::vector<Output> render(const OnnxGraph &graph, Shape built, const std::vector<Shape> &shapes,
                                   int tail_rows, bool reference)
 {
@@ -99,28 +87,9 @@ static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> 
 static uint64_t account(aji_img_ctx *ctx, const std::string &path, int side, bool reference)
 {
     const aji_img_model_params params{path.c_str(),side,side,32,AJI_IMG_LOAD_EVEN_TILES};
-    aji_img_memory estimate{}, live{};
     LifetimeCheck probe_check, load_check;
     probe_check.edit = load_check.edit = reference ? stock : nullptr;
-    LifetimeCheck::active = &probe_check;
-    const int rc = aji_img_native_probe(ctx, &params, &estimate);
-    LifetimeCheck::active = nullptr;
-    require(rc == AJI_IMG_OK, aji_img_last_error(ctx));
-
-    AllocationCount actual;
-    AllocationCount::active = &actual;
-    LifetimeCheck::active = &load_check;
-    auto *model = aji_img_load(ctx, &params);
-    LifetimeCheck::active = nullptr;
-    AllocationCount::active = nullptr;
-    require(model, aji_img_last_error(ctx));
-    const int status = aji_img_memory_get(ctx, model, &live);
-    aji_img_release(&model);
-    require(status == AJI_IMG_OK && !live.activations_shared && live.model_activations, "expected a native model");
-    const std::array<uint64_t,3> reported{estimate.model_weights,estimate.model_activations,estimate.model_buffers};
-    const std::array<uint64_t,3> loaded{live.model_weights,live.model_activations,live.model_buffers};
-    require(reported == loaded && std::equal(reported.begin(), reported.end(), actual.bytes),
-            "native probe or live model differs from its successful CUDA allocation requests");
+    const auto reported = account_native(ctx, params, probe_check, load_check);
     const auto total = reported[0] + reported[1] + reported[2];
     std::printf("%s %d: weights %llu, activations %llu, I/O %llu, total %llu\n", reference ? "stock" : "reuse",
                 side, (unsigned long long)reported[0], (unsigned long long)reported[1],

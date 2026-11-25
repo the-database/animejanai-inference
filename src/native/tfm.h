@@ -28,6 +28,7 @@ struct TMat {
     void *frag = nullptr;  // uint4[Kpad/16][Npad/16][32] (pack.h, taps = 1)
     void *bias = nullptr;  // float[Npad] or null
     int K = 0, Kpad = 0, N = 0, Npad = 0;
+    size_t device_bytes() const { return (size_t)Kpad * Npad * 2 + (bias ? (size_t)Npad * sizeof(float) : 0); }
 };
 // w: [K][N] floats (row k, column n). bias: N floats or null.
 cudaError_t tmat_upload(TMat &m, const float *w, const float *bias, int K, int N);

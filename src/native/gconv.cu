@@ -1,6 +1,7 @@
 // native/gconv.cu — see gconv.h. Instantiates k_gconv for a fixed set of shapes.
 #include "native/allocation_count.h"
 #include "native/gconv.h"
+#include "native/gconv_workspace.h"
 #include "native/gconv.cuh"
 #include "native/device.h"
 #include "native/pack.h"
@@ -400,6 +401,21 @@ size_t gworkspace(const GWeights &w, const GConvArgs &a, bool all_variants)
         if (k > 1 || a.out_f32) m = std::max(m, (size_t)k * a.nb * a.H * a.W * w.cout_pad);
     }
     return m;
+}
+
+int gvariant_rows(int variant)
+{
+    return vrows(variant >= 0 && variant < kGVariants ? variant : 0);
+}
+
+size_t gworkspace_for_subtiles(const GWeights &w, const GConvArgs &largest, size_t stock_limit)
+{
+    if (largest.sums) return 0; // the channel-sum epilogue always runs unsplit
+    static_assert(gdev::TW == gconv_tile_width);
+    int max_rows = 0;
+    for (int v = 0; v < kGShapes; ++v) max_rows = std::max(max_rows, vrows(v));
+    const size_t full = largest.out_f32 ? (size_t)largest.nb * largest.H * largest.W * w.cout_pad : 0;
+    return gconv_workspace_bound(sm_count(), max_rows, w.coutp, full, stock_limit);
 }
 
 cudaError_t glaunch(const GWeights &w, const GConvArgs &a, int variant, cudaStream_t s)

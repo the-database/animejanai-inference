@@ -1,4 +1,5 @@
 // native/tfm.cu — see tfm.h.
+#include "native/allocation_count.h"
 #include "native/tfm.h"
 
 #include <algorithm>
@@ -2131,9 +2132,9 @@ cudaError_t tmat_upload(TMat &m, const float *w, const float *bias, int K, int N
     std::vector<float> b(m.Npad, 0.f);
     if (bias)
         for (int i = 0; i < N; i++) b[i] = bias[i];
-    cudaError_t e = cudaMalloc(&m.frag, f.size() * 4);
+    cudaError_t e = model_malloc(&m.frag, f.size() * 4, AllocationKind::Weight);
     if (e == cudaSuccess) e = cudaMemcpy(m.frag, f.data(), f.size() * 4, cudaMemcpyHostToDevice);
-    if (e == cudaSuccess && bias) e = cudaMalloc(&m.bias, b.size() * 4);
+    if (e == cudaSuccess && bias) e = model_malloc(&m.bias, b.size() * 4, AllocationKind::Weight);
     if (e == cudaSuccess && bias) e = cudaMemcpy(m.bias, b.data(), b.size() * 4, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) tmat_release(m);
     return e;

@@ -461,6 +461,16 @@ target_include_directories(aji_native_esrgan_lifetime_test PRIVATE include src $
 target_link_directories(aji_native_esrgan_lifetime_test PRIVATE ${AJI_TRT_LIB})
 target_link_libraries(aji_native_esrgan_lifetime_test PRIVATE ${AJI_NVINFER} CUDA::cuda_driver CUDA::cudart)
 set_target_properties(aji_native_esrgan_lifetime_test PROPERTIES BUILD_RPATH "${AJI_TRT_LIB}")
+# The test's HAT translation unit replays the CAB sums in fixed order. An archive supplies the
+# other native objects on demand, leaving the shipped HAT object and its atomic reductions alone.
+add_library(aji_native_test_archive STATIC $<TARGET_OBJECTS:aji_native>)
+add_executable(aji_native_hat_lifetime_test sanity/native_hat_lifetime_test.cpp sanity/hat_ordered_sums.cu
+    src/native/hat.cpp src/aji_img_trt.cpp src/core/trt_engine.cpp $<TARGET_OBJECTS:aji_trt_common>)
+target_compile_definitions(aji_native_hat_lifetime_test PRIVATE AJI_TEST_ORDERED_HAT)
+target_include_directories(aji_native_hat_lifetime_test PRIVATE include src ${AJI_TRT_INCLUDE})
+target_link_directories(aji_native_hat_lifetime_test PRIVATE ${AJI_TRT_LIB})
+target_link_libraries(aji_native_hat_lifetime_test PRIVATE aji_native_test_archive ${AJI_NVINFER} CUDA::cuda_driver CUDA::cudart)
+set_target_properties(aji_native_hat_lifetime_test PROPERTIES BUILD_RPATH "${AJI_TRT_LIB}" CUDA_ARCHITECTURES "${AJI_NATIVE_CUDA_ARCHITECTURES}")
 add_executable(aji_msb444_test sanity/msb444.cu src/kernels.cu)
 target_include_directories(aji_msb444_test PRIVATE include src)
 target_link_libraries(aji_msb444_test PRIVATE CUDA::cudart)
@@ -682,6 +692,8 @@ if(AJI_CUDA)
         set_tests_properties(aji_esrgan_lifetimes_${rows} PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
             ENVIRONMENT "AJI_NATIVE=on;AJI_IMG_TAIL_ROWS=${rows}")
     endforeach()
+    add_test(NAME aji_native_hat_lifetime_test COMMAND aji_native_hat_lifetime_test)
+    set_tests_properties(aji_native_hat_lifetime_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 ENVIRONMENT "AJI_NATIVE=on")
     foreach(test IN ITEMS aji_pre_fusion_test aji_msb444_test aji_frame_diff_test aji_native_conv_test aji_native_gconv_test aji_native_tfm_test)
         add_test(NAME ${test} COMMAND ${test})
         set_tests_properties(${test} PROPERTIES LABELS gpu)
