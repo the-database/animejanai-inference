@@ -16,7 +16,7 @@ struct HatBuffers {
         lt.add(&N1, M * CP * 2, {{10, 14}, {17, 19}, {20, 21}, {24, 25}, {30, 31}});  // 19: the MLP makes the next LN1
         lt.add(&T60, M * crp * 2, {{11, 12}});
         lt.add(&Y, M * CP * 2, {{12, 16}});
-        lt.add(&QKV, M * QS * 2, {{14, 15}, {21, 22}});
+        lt.add(&QKV, M * QS * 2, {{14, 15}, {21, 22}}, "QKV");
         lt.add(&AT, M * CP * 2, {{15, 16}, {22, 23}});
         lt.add(&H1, M * HS * 2, {{18, 19}, {25, 26}});
         lt.add(&S16, M * CP * 2, {{27, 28}});

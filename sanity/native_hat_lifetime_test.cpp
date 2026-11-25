@@ -25,9 +25,12 @@ static Output input_for(int w, int h)
 }
 
 static std::vector<Output> render(const OnnxGraph &graph, Shape built, const std::vector<Shape> &shapes,
-                                  bool separate, bool poison)
+                                  bool separate, bool poison, void (*edit)(LifetimePlan &) = nullptr)
 {
     LifetimeCheck check;
+    std::vector<LifetimeCheck::Workspace> launches, first_launches;
+    check.launches = &launches;
+    check.edit = edit;
     if (separate) check.workspace_arena_limit = 0;
     check.poison = poison;
     LifetimeCheck::active = &check;
@@ -35,6 +38,7 @@ static std::vector<Output> render(const OnnxGraph &graph, Shape built, const std
     auto net = ImgNet::create(graph, built.first, built.second, nullptr, &why);
     LifetimeCheck::active = nullptr;
     require(net && net->scale() == 4 && net->describe().find("HAT") != std::string::npos, "expected HAT-L: " + why);
+    require(launches.empty(), "build unexpectedly recorded a dispatch");
     std::vector<Output> results;
     for (auto [w,h] : shapes) {
         const auto input = input_for(w,h);
@@ -43,15 +47,32 @@ static std::vector<Output> render(const OnnxGraph &graph, Shape built, const std
         gpu(cudaMemcpy(in.p, input.data(), input.size() * 2, cudaMemcpyHostToDevice));
         // Exercise a second inference on the same allocations, including repeated groups and phase scatters.
         for (int i = 0; i < 2; ++i) {
+            launches.clear();
             const auto rc = net->run(in.p, false, out.p, false, w, h, nullptr);
             require(check.error.empty(), check.error);
             gpu(rc);
+            require(!launches.empty(), "no run-time workspace checks");
+            if (first_launches.empty()) first_launches = launches;
+            else require(launches == first_launches, "run-time GConv step, address or capacity changed on the same model");
+            if (i == 0 && Shape{w,h} != built && !edit)
+                std::printf("HAT check %s on %s: %zu identical run-time workspace ranges\n",
+                            dimensions({w,h}).c_str(), dimensions(built).c_str(), launches.size());
             gpu(cudaMemcpy(fp16.data(), out.p, fp16.size() * 2, cudaMemcpyDeviceToHost));
             if (i == 0) results.push_back(fp16);
             else require(results.back() == fp16, "fixed-order HAT output did not repeat at " + dimensions({w,h}));
         }
     }
     return results;
+}
+
+static void shorten_qkv(LifetimePlan &plan)
+{
+    for (auto &buffer : plan.buffers)
+        if (buffer.name && std::string(buffer.name) == "QKV") {
+            --buffer.live.front().second; // the HAB attention still reads QKV at step 15
+            return;
+        }
+    throw std::runtime_error("missing HAT QKV mutation target");
 }
 
 static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> &shapes)
@@ -84,6 +105,14 @@ static void exact(const OnnxGraph &graph, Shape built, const std::vector<Shape> 
             std::printf("HAT check %s built %s, %s: %zu FP16 values exact\n", dimensions(shapes[j]).c_str(),
                         dimensions(built).c_str(), separate ? "fallback" : "arena", a.size());
         }
+    }
+    if (shapes.back() != built) {
+        const auto broken = render(graph, built, {shapes.back()}, false, true, shorten_qkv);
+        const auto &stock = reference.back();
+        const auto diff = std::mismatch(stock.begin(), stock.end(), broken.front().begin());
+        require(diff.first != stock.end(), "poison failed to expose the shortened HAT QKV lifetime");
+        std::printf("HAT mutation %s, element %zu: stock %04x, shortened QKV %04x\n",
+                    dimensions(shapes.back()).c_str(), size_t(diff.first - stock.begin()), *diff.first, *diff.second);
     }
 }
 

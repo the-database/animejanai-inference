@@ -3,6 +3,7 @@
 #pragma once
 #include "native/lifetime_plan.h"
 #include <string>
+#include <tuple>
 
 namespace ajinative {
 class LifetimeCheck {
@@ -12,6 +13,8 @@ public:
     void (*edit)(LifetimePlan &) = nullptr; // test reference layout or deliberately incorrect lifetime
     bool poison = false;
     size_t workspace_arena_limit = size_t(-1); // test the build-time separate allocation with a smaller arena
+    using Workspace = std::tuple<int, const void *, size_t>;
+    std::vector<Workspace> *launches = nullptr; // optional trace of actual dispatch checks
     std::string error;
 
     void region(const void *base, size_t bytes)
@@ -53,6 +56,7 @@ public:
 
     bool workspace(int step, const void *ptr, size_t bytes)
     {
+        if (launches) launches->emplace_back(step, ptr, bytes);
         if (!bytes) return true;
         const auto w = span(ptr, bytes);
         if (!contains(w)) return fail("workspace outside allocation");
