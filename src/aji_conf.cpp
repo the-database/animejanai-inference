@@ -7,8 +7,8 @@
  *    in max_resolution means inf for that axis. min_px = w*h of min, etc.
  *  - chain_{c}_max_fps: missing -> inf, 0 -> inf. min_fps: missing -> 0.
  *  - models are chain_{c}_model_{m}_*, m = 1..count(distinct m).
- *  - built-in default profiles in slots 1001-1003 (Quality/Balanced/
- *    Performance) and 1010/1011 (benchmarks); a [slot_X] section in the
+ *  - built-in profiles in slots 1001-1004 (Quality, Balanced, Performance,
+ *    Super Performance) and 1010-1013 (benchmarks); a [slot_X] section in the
  *    file replaces the built-in for that slot entirely.
  *  - [global] quality/balanced/performance_preset=sharp swaps _HD_V3.1_
  *    models to _HD_V3.1Sharp1_ in the corresponding built-in slot.
@@ -272,6 +272,11 @@ void add_builtin_slots(AjiConf *conf)
         s.chains.push_back(builtin_chain(1, PX720, PX1080, "1280x720", "1920x1080", 31, HD_PERF));
         s.chains.push_back(builtin_chain(2, 0, PX720, "0x0", "1280x720", 31, SD));
         conf->slots[1003] = std::move(s);
+    }
+    {
+        AjiSlotConf s = parse_slot({{"profile_name", "Super Performance"}, {"native_span_precision", "fp8"}});
+        s.chains.push_back(builtin_chain(1, 0, PX1080, "0x0", "1920x1080", 120, HD_PERF));
+        conf->slots[1004] = std::move(s);
     }
     {
         AjiSlotConf s;

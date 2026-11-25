@@ -107,7 +107,7 @@ typedef struct aji_create_params {
     const char *model_dir;    /* dir with .onnx models + engine cache */
     const char *trtexec;      /* trtexec binary for on-first-play builds */
     const char *trtexec_env;  /* optional env prefix, e.g. "LD_LIBRARY_PATH=..." */
-    int slot;                 /* initial slot (1-9, 1001-1003, 1010-1011) */
+    int slot;                 /* initial slot (1-9, 1001-1004, 1010-1013) */
     const char *rife_model_dir; /* dir with rife_v*.onnx + engine cache;
                                    NULL disables RIFE even if a chain asks */
     int async_build;          /* 0: blocking builds; 1: background builds with

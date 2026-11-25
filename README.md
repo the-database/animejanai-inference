@@ -52,6 +52,21 @@ ffmpeg -i clip.mkv -frames:v 12 -pix_fmt p010le -f rawvideo in.raw
 Reports device-side ms/frame for the full pre+infer+post chain
 (RTX 5090 reference: ~3.8 ms at 1920x1080→4K fp16).
 
+## Super Performance video profile
+
+Select built-in slot `1004` for a 2× upscale with the full five-block AnimeJaNai HD V3.1 Performance model.
+It accepts sources up to 1920×1080 pixels by area and 120 fps. The CUDA video backends use an FP8 body
+on compatible GPUs and FP16 on Ampere. The native-kernel log reports the precision selected. The usual
+model directory must contain `2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16.onnx`.
+
+```sh
+aji_encode --input episode.mkv --output episode-2x.mkv --conf animejanai.conf --model-dir models --slot 1004 --backend tensorrt
+```
+
+Custom slots can select `native_span_precision=fp8` or `fp16` for the full HD V3.1 Performance or Balanced
+topology. Choose `fp16` for stock-precision arithmetic. Each slot selects its own precision when configured.
+For playback, set `slot=1004` on the mpv `animejanai` filter.
+
 ## Still images (`include/aji_image.h`)
 
 A separate C ABI for upscaling single images with any ONNX super-resolution
