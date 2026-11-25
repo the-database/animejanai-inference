@@ -1,37 +1,48 @@
-# Direct-buffer CUDA graph replay
+# CUDA graphs for regular frame inference
 
-Set `AJI_DIRECT_GRAPH=1` before creating a TensorRT backend to capture spatial
-preprocessing, inference and postprocessing against the caller's reusable frame
-buffers. This avoids the input/output staging copies used by the default graph
-path. Unset the variable to retain the default path; `AJI_NO_GRAPH` still disables
-both graph modes. No model, builder setting, engine-cache key or ABI changes.
+On a non-default CUDA stream, the TensorRT backend can capture preprocessing,
+the spatial model chain and postprocessing in one executable. This works with
+native models, TensorRT engines and mixed chains. The first call executes and
+synchronizes an eager warmup. Later calls update the captured conversion nodes
+with the current device addresses and byte pitches for every input and output
+plane. The caller must keep those allocations valid until the stream completes.
 
-The cache holds at most 128 input/output buffer pairs, keyed by pointers, pitches,
-dimensions, formats and color metadata. These are executable graphs, not cached
-frame contents. Reusing an address with new pixels still runs inference. Callers
-must retain their frame allocations through completion, as required by the ABI.
+The graph belongs to the current chain configuration. Input and output shape,
+format, matrix, range and chroma siting determine whether the conversion plans
+can be reused. A change to that information, the selected slot or the configured
+chain invalidates the graph before its dependencies can be replaced. Rotating
+surfaces or changing pitches reuses the executable.
 
-A new pair executes normally to initialize plans/TensorRT, then captures later
-replay. Conversion-plan changes drain the stream and clear graphs before the
-old device tables can be freed. Reconfiguration/destruction also releases the
-graphs. Temporal and RIFE entry points are unchanged. Capture/launch failures
-on this opt-in path are reported to the caller; the ordinary staged mode remains
-available by leaving the variable unset.
+If capture, conversion-node identification or instantiation fails, the warmup
+has already produced the requested frame. The next call uses staging. If an
+update fails during replay, the backend discards the executable and handles
+that same frame through the fallback. Staging buffers are allocated on first
+use of the fallback. The backend can run eagerly if staged capture is unavailable.
+Execution errors during direct warmup or launch reach the caller.
 
-The local research implementation matched three RGB48 movie frames and eight
-format-transition outputs. Its native 4K result was about +0.75% over the same
-optimized engine with staging, on one RTX 5090 setup. This is a small historical
-measurement, not a guaranteed gain for arbitrary workloads, unique frame buffers,
-other GPUs, or TensorRT-RTX. Frequent new buffer pairs pay capture/setup costs.
+Set `AJI_NO_GRAPH=1` before creating the backend to run eagerly. Default-stream
+calls run eagerly. The former `AJI_DIRECT_GRAPH` opt-in is no longer needed.
+This change applies to regular spatial inference. RIFE and temporal sequence
+entry points use their existing paths.
 
-The focused regression compares staged and direct capture/replay while changing
-NV12/P010 and chroma siting on reused buffer addresses. It requires NumPy, a built
-backend, matching CUDA/TensorRT libraries and a regular static 1080p-to-4K engine:
+## Checking replay
+
+Build `aji_trt`. The regression uses Python's standard library, a compatible CUDA
+runtime and either a chain configuration with its model directory or an engine
+built for the selected input dimensions. Supply a new output directory.
 
 ```text
-python sanity/direct_graph.py --backend BUILD/aji_trt.dll --engine MODEL.engine --cuda-runtime RUNTIME/cudart64_13.dll --output NEW_RESULTS_DIR
+python sanity/direct_graph.py --backend BUILD/aji_trt.dll --cuda-runtime RUNTIME/cudart64_13.dll --engine MODEL.engine --width 1920 --height 1080 --output NEW_RESULTS
+python sanity/direct_graph.py --backend BUILD/aji_trt.dll --cuda-runtime RUNTIME/cudart64_13.dll --conf CONFIG --models MODEL_DIR --slot 1 --width 320 --height 180 --output OTHER_RESULTS
 ```
 
-Use the corresponding library filenames/search path on Linux. GPU execution of
-this PR was checked on Windows/SM120; SM89 code support alone is not a 4090 test.
-Run without concurrent playback or benchmarks. The output directory must be new.
+For a mixed configuration that needs to build a TensorRT engine, pass
+`--trtexec PATH_TO_TRTEXEC`. Use the appropriate shared-library names on Linux.
+The test compares each output plane's active bytes with eager execution in a
+separate process. It rotates different pitches and addresses, queues frames
+before synchronization, changes color metadata and reconfigures at the same shape.
+
+To check failure handling, build a second test backend with
+`sanity/direct_graph_faults.h` forced into the `aji_trt.cpp` translation unit
+(`/FI` on MSVC, `-include` on GCC or Clang) and pass it as `--fault-backend`.
+The `aji_frame_graph_test` CTest also checks metadata keys and plane binding on a CPU.

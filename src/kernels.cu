@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "aji.h"
+#include "frame_graph.h"
 #include "frame_diff.h"
 #include "kernels.h"
 #include "resample.h"
@@ -642,6 +643,39 @@ extern "C" int aji_run_post(aji_plan *p, const void *src_f16,
     }
     return (int)cudaGetLastError();
 }
+
+namespace ajigraph {
+
+template<int Arg, int FirstPlane, int Planes, class... Args>
+static PlaneKernel plane_kernel(void (*fn)(Args...), bool output, bool expected)
+{
+    static_assert(Arg + 2 * Planes <= sizeof...(Args) && sizeof...(Args) <= KernelArgs{}.size());
+    return {reinterpret_cast<const void *>(fn), (int)sizeof...(Args), Arg, FirstPlane, Planes, output, expected};
+}
+
+template<class T>
+static void add_420_kernels(std::vector<PlaneKernel> &kernels, bool input, bool output, bool fused)
+{
+    kernels.push_back(plane_kernel<0, 1, 1>(k_uv_h<T>, false, input));
+    kernels.push_back(plane_kernel<0, 0, 1>(k_pre_v_combine<T>, false, input));
+    kernels.push_back(plane_kernel<6, 0, 2>(k_post_fused<T>, true, output && fused));
+    kernels.push_back(plane_kernel<6, 0, 1>(k_post_matrix<T>, true, output && !fused));
+    kernels.push_back(plane_kernel<6, 1, 1>(k_uv_v_store<T>, true, output && !fused));
+}
+
+// These are all kernels that touch caller planes. The RGB/model kernels see only internal buffers.
+std::vector<PlaneKernel> conversion_kernels(int in_fmt, int out_fmt, const aji_plan *post)
+{
+    std::vector<PlaneKernel> kernels;
+    const bool fused = post && post->fx;
+    add_420_kernels<uint8_t>(kernels, in_fmt == AJI_FMT_NV12, out_fmt == AJI_FMT_NV12, fused);
+    add_420_kernels<uint16_t>(kernels, in_fmt == AJI_FMT_P010, out_fmt == AJI_FMT_P010, fused);
+    kernels.push_back(plane_kernel<0, 0, 3>(k_pre444, false, aji_format_is_444(in_fmt)));
+    kernels.push_back(plane_kernel<6, 0, 3>(k_post444, true, aji_format_is_444(out_fmt)));
+    return kernels;
+}
+
+}  // namespace ajigraph
 
 extern "C" int aji_run_resize(aji_plan *p, const void *src_f16, void *dst_f16,
                               void *stream)

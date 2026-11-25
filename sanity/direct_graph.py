@@ -1,7 +1,5 @@
-"""Compare staged/direct CUDA graphs across NV12/P010 and chroma-siting changes.
-
-Requires numpy, a built TensorRT backend/runtime, and a static 1080p 2x engine.
-Run with no concurrent GPU/player benchmark. Output directories must be new.
+"""Compare caller-plane CUDA graph replay with eager inference through aji_infer.
+Supply a spatial chain config and its models, or a TensorRT engine of the input size.
 """
 import argparse
 import ctypes as C
@@ -9,168 +7,207 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import subprocess
 import sys
 
-import numpy as np
-
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--backend', type=Path, required=True)
-p.add_argument('--engine', type=Path, required=True)
 p.add_argument('--cuda-runtime', type=Path, required=True)
+model = p.add_mutually_exclusive_group(required=True)
+model.add_argument('--engine', type=Path)
+model.add_argument('--conf', type=Path)
+p.add_argument('--models', type=Path)
+p.add_argument('--trtexec', type=Path, help='builder for TensorRT steps in a configuration')
+p.add_argument('--slot', type=int, default=1)
+p.add_argument('--width', type=int, default=1920)
+p.add_argument('--height', type=int, default=1080)
 p.add_argument('--output', type=Path, required=True)
-p.add_argument('--fault-backend', type=Path,
-               help='test-only backend built with direct_graph_faults.h forced-included')
-p.add_argument('--worker', choices=['staged', 'direct', 'capacity', 'begin', 'body',
-                                   'end', 'instantiate', 'warmup', 'launch'])
+p.add_argument('--fault-backend', type=Path, help='test DLL built with direct_graph_faults.h')
+faults = ('begin', 'body', 'end', 'nodes', 'instantiate', 'update', 'warmup', 'launch')
+p.add_argument('--worker', choices=('eager', 'updated', *faults), help=argparse.SUPPRESS)
 a = p.parse_args()
-
+if a.conf and not a.models:
+    p.error('--conf requires --models')
 if not a.worker:
     a.output.mkdir(parents=True, exist_ok=False)
-    modes = ['staged', 'direct', 'capacity']
-    if a.fault_backend:
-        modes += ['begin', 'body', 'end', 'instantiate', 'warmup', 'launch']
-    for mode in modes:
+    for mode in ('eager', 'updated', *(faults if a.fault_backend else ())):
         env = os.environ.copy()
-        env.pop('AJI_NO_GRAPH', None)
-        env.pop('AJI_DIRECT_GRAPH', None)
-        env.pop('AJI_TEST_DIRECT_GRAPH_FAULT', None)
-        if mode != 'staged':
-            env['AJI_DIRECT_GRAPH'] = '1'
-        if mode not in ['staged', 'direct', 'capacity']:
+        for key in ('AJI_NO_GRAPH', 'AJI_TEST_DIRECT_GRAPH_FAULT'):
+            env.pop(key, None)
+        if mode == 'eager':
+            env['AJI_NO_GRAPH'] = '1'
+        if mode in faults:
             env['AJI_TEST_DIRECT_GRAPH_FAULT'] = mode
-        subprocess.run([sys.executable, __file__, *sys.argv[1:], '--worker', mode],
-                       env=env, check=True)
-    results = {mode: json.loads((a.output / (mode + '.json')).read_text())
-               for mode in modes}
-    for mode in modes:
-        if mode not in ['warmup', 'launch'] and results['staged'] != results[mode]:
-            raise RuntimeError(f'Output differs for {mode}')
-    print('PASS: capture/replay parity, bounded cache fallback' +
-          (', capture fault recovery and real-error propagation' if a.fault_backend else ''))
+        subprocess.run([sys.executable, __file__, *sys.argv[1:], '--worker', mode], env=env, check=True)
     sys.exit(0)
 
-# Keep handles alive for Windows dependency resolution; Linux uses its library path.
-directories = []
-fault = a.worker in ['begin', 'body', 'end', 'instantiate', 'warmup', 'launch']
-if fault:
-    a.backend = a.fault_backend
-if os.name == 'nt':
-    directories = [os.add_dll_directory(str(path.resolve()))
-                   for path in {a.backend.parent, a.cuda_runtime.parent}]
-cuda = C.CDLL(str(a.cuda_runtime.resolve()))
-backend = C.CDLL(str(a.backend.resolve()))
+P, I, S = C.c_void_p, C.c_int, C.c_size_t
+log_fn = C.CFUNCTYPE(None, P, I, C.c_char_p)
 
 class Params(C.Structure):
-    _fields_ = [('version', C.c_uint32), ('context', C.c_void_p),
-                ('conf', C.c_char_p), ('models', C.c_char_p),
-                ('trtexec', C.c_char_p), ('environment', C.c_char_p),
-                ('slot', C.c_int), ('rife', C.c_char_p), ('async_build', C.c_int),
-                ('d3d', C.c_void_p), ('engine', C.c_char_p),
-                ('width', C.c_int), ('height', C.c_int),
-                ('log', C.c_void_p), ('opaque', C.c_void_p)]
+    _fields_ = [('version', C.c_uint32), ('context', P), ('conf', C.c_char_p), ('models', C.c_char_p),
+                ('trtexec', C.c_char_p), ('environment', C.c_char_p), ('slot', I), ('rife', C.c_char_p),
+                ('async_build', I), ('d3d', P), ('engine', C.c_char_p), ('width', I), ('height', I),
+                ('log', log_fn), ('opaque', P)]
 
 class Frame(C.Structure):
-    _fields_ = [('width', C.c_int), ('height', C.c_int), ('format', C.c_int),
-                ('matrix', C.c_int), ('range', C.c_int), ('siting', C.c_int),
-                ('planes', C.c_void_p * 3), ('strides', C.c_ssize_t * 3)]
+    _fields_ = [(name, I) for name in ('width', 'height', 'format', 'matrix', 'range', 'siting')] + [
+        ('planes', P * 3), ('strides', C.c_ssize_t * 3)]
 
-cuda.cudaMalloc.argtypes = [C.POINTER(C.c_void_p), C.c_size_t]
-cuda.cudaMemcpy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int]
-cuda.cudaStreamCreate.argtypes = [C.POINTER(C.c_void_p)]
-cuda.cudaStreamSynchronize.argtypes = [C.c_void_p]
-cuda.cudaStreamDestroy.argtypes = [C.c_void_p]
-cuda.cudaFree.argtypes = [C.c_void_p]
-backend.aji_create.argtypes = [C.POINTER(Params)]
-backend.aji_create.restype = C.c_void_p
-backend.aji_configure.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_double,
-                                C.POINTER(C.c_int), C.POINTER(C.c_int)]
-backend.aji_infer.argtypes = [C.c_void_p, C.POINTER(Frame), C.POINTER(Frame), C.c_void_p]
-backend.aji_last_error.argtypes = [C.c_void_p]
-backend.aji_last_error.restype = C.c_char_p
-backend.aji_destroy.argtypes = [C.POINTER(C.c_void_p)]
+def bind(lib, name, result, *args):
+    f = getattr(lib, name)
+    f.argtypes, f.restype = args, result
+    return f
 
-def ck(code):
-    if code:
-        raise RuntimeError(f'CUDA error {code}')
+def ck(rc):
+    if rc:
+        raise RuntimeError(f'CUDA error {rc}')
 
+dll = a.fault_backend if a.worker in faults else a.backend
+if os.name == 'nt':
+    dirs = [os.add_dll_directory(str(d.resolve())) for d in {dll.parent, a.cuda_runtime.parent}]
+cuda, lib = C.CDLL(str(a.cuda_runtime.resolve())), C.CDLL(str(dll.resolve()))
+alloc = bind(cuda, 'cudaMalloc', I, C.POINTER(P), S)
+free = bind(cuda, 'cudaFree', I, P)
+copy = bind(cuda, 'cudaMemcpy2D', I, P, S, P, S, S, S, I)
+fill = bind(cuda, 'cudaMemsetAsync', I, P, I, S, P)
+stream = P()
+ck(bind(cuda, 'cudaStreamCreateWithFlags', I, C.POINTER(P), I)(C.byref(stream), 1))
+sync = bind(cuda, 'cudaStreamSynchronize', I, P)
+create = bind(lib, 'aji_create', P, C.POINTER(Params))
+configure = bind(lib, 'aji_configure', I, P, I, I, C.c_double, C.POINTER(I), C.POINTER(I))
+infer = bind(lib, 'aji_infer', I, P, C.POINTER(Frame), C.POINTER(Frame), P)
+last_error = bind(lib, 'aji_last_error', C.c_char_p, P)
 messages = []
-@C.CFUNCTYPE(None, C.c_void_p, C.c_int, C.c_char_p)
-def logger(opaque, level, message):
-    messages.append(message.decode('utf-8', errors='replace'))
+callback = log_fn(lambda _, level, line: messages.append(line.decode(errors='replace')))
+params = Params(version=9, width=a.width, height=a.height, slot=a.slot, log=callback,
+                engine=os.fsencode(a.engine) if a.engine else None, conf=os.fsencode(a.conf) if a.conf else None,
+                models=os.fsencode(a.models) if a.models else None,
+                trtexec=os.fsencode(a.trtexec) if a.trtexec else None)
+ctx = P(create(C.byref(params)))
+ow, oh = I(), I()
 
-ck(cuda.cudaSetDevice(0))
-stream = C.c_void_p()
-ck(cuda.cudaStreamCreate(C.byref(stream)))
-params = Params(version=9, engine=os.fsencode(a.engine.resolve()), width=1920,
-                height=1080, log=C.cast(logger, C.c_void_p))
-ctx = C.c_void_p(backend.aji_create(C.byref(params)))
-if not ctx:
-    raise RuntimeError('Could not create backend context')
-ow, oh = C.c_int(), C.c_int()
-if backend.aji_configure(ctx, 1920, 1080, 24, C.byref(ow), C.byref(oh)) != 1:
-    raise RuntimeError(backend.aji_last_error(ctx))
-if (ow.value, oh.value) != (3840, 2160):
-    raise RuntimeError('Use a static 1080p 2x engine')
-inp, out = C.c_void_p(), C.c_void_p()
-ck(cuda.cudaMalloc(C.byref(inp), 1920 * 1080 * 3))
-plane = 3840 * 2160 * 2
-ck(cuda.cudaMalloc(C.byref(out), plane * 3 + 130 * 256))
-output = Frame(3840, 2160, 3, 2, 1, 1,
-               (C.c_void_p * 3)(out.value, out.value + plane, out.value + 2 * plane),
-               (C.c_ssize_t * 3)(7680, 7680, 7680))
-host_out = np.empty(plane * 3, dtype=np.uint8)
-records = []
-for case, (fmt, siting) in enumerate([(1, 1), (2, 3), (1, 1), (1, 2)]):
-    bpp = 1 if fmt == 1 else 2
-    frame = Frame(1920, 1080, fmt, 2, 1, siting,
-                  (C.c_void_p * 3)(inp.value, inp.value + 1920 * 1080 * bpp, None),
-                  (C.c_ssize_t * 3)(1920 * bpp, 1920 * bpp, 0))
-    for replay in range(2):
-        rng = np.random.default_rng(100 + case * 2 + replay)
-        data = rng.integers(16, 236, 1920 * 1080 * 3 // 2, dtype=np.uint16)
-        data = (data << 8).astype(np.uint16) if bpp == 2 else data.astype(np.uint8)
-        ck(cuda.cudaMemcpy(inp, C.c_void_p(data.ctypes.data), data.nbytes, 1))
-        status = backend.aji_infer(ctx, C.byref(frame), C.byref(output), stream)
-        if a.worker in ['warmup', 'launch'] and status:
-            assert backend.aji_test_graph_failures() == 1
-            assert backend.aji_last_error(ctx)
-            (a.output / (a.worker + '.json')).write_text(json.dumps({'error_propagated': True}))
-            print(a.worker, ': genuine execution error propagated')
+def configure_chain():
+    if not ctx or configure(ctx, a.width, a.height, 24, C.byref(ow), C.byref(oh)) != 1:
+        raise RuntimeError(last_error(ctx) if ctx else 'aji_create failed')
+
+configure_chain()
+if a.conf and a.worker == 'updated':
+    print(bind(lib, 'aji_current_log', C.c_char_p, P)(ctx).decode(errors='replace'), flush=True)
+
+def geometry(w, h, fmt):
+    row = w * (1 if fmt == 1 else 2)
+    return [(row, h), (row, h // 2)] if fmt in (1, 2) else [(row, h)] * 3
+
+def surface(w, h, fmt, index, input_frame):
+    frame = Frame(w, h, fmt, 2, 1, 1)
+    for j, (row, rows) in enumerate(geometry(w, h, fmt)):
+        stride = row + 128 * ((index + j) % 3)
+        ptr = P()
+        ck(alloc(C.byref(ptr), (row + 256) * rows))
+        frame.planes[j], frame.strides[j] = ptr.value, stride
+        if input_frame:
+            # Pad with a different pattern so stale pitch is observable even on a flat chroma plane.
+            ck(fill(ptr, 0x3d, (row + 256) * rows, None))
+            data = random.Random(1234 + 79 * index + j).randbytes(row * rows)
+            if fmt == 2:  # P010 stores the ten significant bits at the top of each 16-bit word.
+                data = bytearray(data)
+                data[::2] = data[::2].translate(bytes(v & 0xc0 for v in range(256)))
+                data = bytes(data)
+            ck(copy(ptr, stride, C.c_char_p(data), row, row, rows, 1))
+    return frame
+
+def digest(frame):
+    h = hashlib.sha256()
+    for j, (row, rows) in enumerate(geometry(frame.width, frame.height, frame.format)):
+        buf = C.create_string_buffer(row * rows)
+        ck(copy(buf, row, frame.planes[j], frame.strides[j], row, rows, 2))
+        h.update(buf)
+    return h.hexdigest()
+
+reference_file = a.output / 'eager.json'
+reference = {} if a.worker == 'eager' else json.loads(reference_file.read_text())
+observed = {}
+def submit(fi, fo, chosen_stream):
+    rc = infer(ctx, C.byref(fi), C.byref(fo), chosen_stream)
+    if rc:
+        if a.worker in ('warmup', 'launch') and lib.aji_test_graph_failures() == 1 and last_error(ctx):
+            print(f'{a.worker}: genuine execution error propagated')
             sys.exit(0)
-        if status:
-            raise RuntimeError(backend.aji_last_error(ctx))
-        if fault and backend.aji_test_graph_last_error():
-            raise RuntimeError('Optional capture left a CUDA error pending')
-        ck(cuda.cudaStreamSynchronize(stream))
-        ck(cuda.cudaMemcpy(C.c_void_p(host_out.ctypes.data), out, host_out.nbytes, 2))
-        records.append(dict(input_format=fmt, siting=siting, replay=replay,
-                            sha256=hashlib.sha256(host_out).hexdigest()))
-if a.worker == 'direct' and sum('direct CUDA graph cached' in m for m in messages) != 4:
-    raise RuntimeError('Expected four direct-graph captures, each followed by replay')
-if a.worker == 'capacity':
-    # Distinct overlapping views of one allocation avoid allocating 130 full
-    # output frames. Calls are ordered, so these buffers are never concurrent.
-    for i in range(260):
-        offset = (i % 130 + 1) * 256
-        for j in range(3):
-            output.planes[j] = out.value + offset + plane * j
-        if backend.aji_infer(ctx, C.byref(frame), C.byref(output), stream):
-            raise RuntimeError(backend.aji_last_error(ctx))
-        ck(cuda.cudaStreamSynchronize(stream))
-        if i in (0, 126, 127, 128, 129, 259):
-            ck(cuda.cudaMemcpy(C.c_void_p(host_out.ctypes.data), out.value + offset, host_out.nbytes, 2))
-            assert hashlib.sha256(host_out).hexdigest() == records[-1]['sha256']
-    assert sum('cache limit reached' in m for m in messages) == 1
-    assert sum('direct CUDA graph cached' in m for m in messages) == 131
-if fault:
-    assert backend.aji_test_graph_failures() == 1
-    assert a.worker not in ['warmup', 'launch'], 'Expected execution failure was masked'
-    assert sum('direct CUDA graphs disabled: capture unavailable' in m for m in messages) == 1
-    assert not any('direct CUDA graph cached' in m for m in messages)
-backend.aji_destroy(C.byref(ctx))
-ck(cuda.cudaFree(inp))
-ck(cuda.cudaFree(out))
-ck(cuda.cudaStreamDestroy(stream))
-(a.output / (a.worker + '.json')).write_text(json.dumps(records, indent=2))
-print(f'{a.worker}: {len(records)} frames completed')
+        raise RuntimeError(last_error(ctx))
+
+def captures():
+    return sum('captured updatable frame graph' in m for m in messages)
+
+# Three distinct pitched surfaces on each side. Queue three launches before inspecting any output.
+for infmt, outfmt in ((1, 2), (1, 1), (1, 3), (2, 2), (3, 3)):
+    ins = [surface(a.width, a.height, infmt, k, True) for k in range(3)]
+    outs = [surface(ow.value, oh.value, outfmt, k, False) for k in range(3)]
+    ck(sync(None))
+    for batch, (shift, color_range) in enumerate(((0, 1), (1, 1), (2, 1), (0, 2), (1, 1))):
+        before = captures()
+        for k, fi in enumerate(ins):
+            fi.range = color_range
+            fo = outs[(k + shift) % 3]
+            for j, (row, rows) in enumerate(geometry(fo.width, fo.height, fo.format)):
+                ck(fill(fo.planes[j], 0xab, (row + 256) * rows, stream))
+            submit(fi, fo, stream)
+        ck(sync(stream))
+        for k, fi in enumerate(ins):
+            dest = (k + shift) % 3
+            key = f'{infmt}->{outfmt} batch={batch} in={k} out={dest} range={color_range}'
+            actual = digest(outs[dest])
+            if a.worker != 'eager' and actual != reference[key]:
+                raise RuntimeError(f'{key}: expected {reference[key][:16]}, got {actual[:16]}')
+            observed[key] = actual
+        if a.worker == 'updated' and captures() - before != int(batch in (0, 3, 4)):
+            raise RuntimeError(f'{infmt}->{outfmt} batch={batch}: unexpected capture count; {messages[-4:]}')
+        if (infmt, outfmt) == (1, 2) and batch < 3 and a.worker in faults:
+            staged = sum('captured as staged CUDA graph' in m for m in messages)
+            if staged != 1 or captures() != int(a.worker == 'update') or lib.aji_test_graph_last_error():
+                raise RuntimeError(f'{a.worker}: expected a clean staged fallback through surface rotation')
+    # A default-stream call may rebuild conversion plans. Returning to the old layout must recapture.
+    ins[0].siting = 2
+    before = captures()
+    submit(ins[0], outs[0], None)
+    ck(sync(None))
+    key = f'{infmt}->{outfmt} default stream'
+    observed[key] = digest(outs[0])
+    if a.worker != 'eager' and observed[key] != reference[key]:
+        raise RuntimeError(f'{key}: output mismatch')
+    if a.worker == 'updated' and captures() != before:
+        raise RuntimeError('default-stream call captured')
+    ins[0].siting = 1
+    for phase in ('restore layout', 'reconfigure'):
+        if phase == 'reconfigure':
+            configure_chain()
+        before = captures()
+        submit(ins[0], outs[0], stream)
+        ck(sync(stream))
+        key = f'{infmt}->{outfmt} {phase}'
+        observed[key] = digest(outs[0])
+        if a.worker != 'eager' and observed[key] != reference[key]:
+            raise RuntimeError(f'{key}: output mismatch')
+        if a.worker == 'updated' and captures() != before + 1:
+            raise RuntimeError(f'{phase}: expected a fresh capture')
+    for frame in ins + outs:
+        for ptr in frame.planes:
+            if ptr:
+                ck(free(ptr))
+if a.worker in faults:
+    if lib.aji_test_graph_failures() != 1 or lib.aji_test_graph_last_error() != 0:
+        raise RuntimeError(f'{a.worker}: fault was not consumed cleanly')
+    if a.worker in ('warmup', 'launch') or not any('captured as staged CUDA graph' in m for m in messages):
+        raise RuntimeError(f'{a.worker}: expected fallback or execution error')
+if a.worker == 'eager':
+    reference_file.write_text(json.dumps(observed, indent=2))
+else:
+    print(f'{a.worker}: {len(observed)} outputs matched eager inference; {captures()} direct captures', flush=True)
+    if a.worker == 'updated':
+        if any('using staged fallback' in m for m in messages):
+            raise RuntimeError('unexpected staged fallback on the rotating caller surfaces')
+        for message in sorted({m for m in messages if 'captured updatable frame graph' in m}):
+            print(message, flush=True)
+bind(lib, 'aji_destroy', None, C.POINTER(P))(C.byref(ctx))
+ck(bind(cuda, 'cudaStreamDestroy', I, P)(stream))
