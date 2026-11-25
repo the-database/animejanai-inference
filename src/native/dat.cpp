@@ -55,6 +55,7 @@ struct Block {
 
 class Dat : public ImgNet {
 public:
+    ~Dat() override { tmat_release(foldm); }
     static std::unique_ptr<ImgNet> build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why);
     cudaError_t run(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s) override;
     int scale() const override { return 4; }
