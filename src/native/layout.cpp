@@ -1,6 +1,7 @@
 // native/layout.cpp — see layout.h.
 #include "native/layout.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "native/ops.h"
@@ -74,6 +75,51 @@ bool layout(const Plan &plan, int in_w, int in_h, Layout *out, std::string *why)
     }
     *out = std::move(L);
     return true;
+}
+
+void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout)
+{
+    if (std::none_of(plan.steps.begin(), plan.steps.end(), [](const PlanStep &s) { return s.gate != 0; }))
+        return;
+
+    std::vector<int> last_reader(plan.channels.size(), -1);
+    for (int i = 0; i < (int)plan.steps.size(); ++i) {
+        const PlanStep &s = plan.steps[i];
+        if (s.src >= 0) last_reader[s.src] = i;
+        if (s.resid >= 0) last_reader[s.resid] = i;
+        if (s.kind == PlanStep::CONCAT)
+            for (int src : s.srcs)
+                if (src >= 0) last_reader[src] = i;
+    }
+
+    std::vector<size_t> sizes;
+    std::vector<int> busy_through;
+    for (int i = 0; i < (int)plan.steps.size(); ++i) {
+        const PlanStep &s = plan.steps[i];
+        if (s.dst < 0) continue;
+        // Each feature has one producer. Its original slot still gives its physical size here.
+        const size_t bytes = layout.buffer_bytes[layout.buffer[s.dst]];
+        const Gate gate = (Gate)s.gate;
+        int slot;
+        if (s.kind == PlanStep::CONV && s.in == (int)Input::NHWC && s.out == (int)Output::NHWC &&
+            (gate == Gate::Residual || gate == Gate::Tanh1x1 || gate == Gate::SigmoidHalf) &&
+            s.resid >= 0 && s.resid != s.src && last_reader[s.resid] == i &&
+            plan.channels[s.resid] == plan.channels[s.dst]) {
+            // Each CTA reads its own residual pixels before the barrier preceding its writes.
+            // The convolution source supplies a halo to other CTAs and must be a distinct tensor.
+            slot = layout.buffer[s.resid];
+        } else {
+            for (slot = 0; slot < (int)sizes.size(); ++slot)
+                if (busy_through[slot] < i && sizes[slot] == bytes) break;
+            if (slot == (int)sizes.size()) {
+                sizes.push_back(bytes);
+                busy_through.push_back(-1);
+            }
+        }
+        layout.buffer[s.dst] = slot;
+        busy_through[slot] = last_reader[s.dst];
+    }
+    layout.buffer_bytes.swap(sizes);
 }
 
 }  // namespace ajinative

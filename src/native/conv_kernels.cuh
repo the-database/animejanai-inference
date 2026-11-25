@@ -288,7 +288,7 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
                     const int ox = tx0 + g + h * 8;
                     half2 x = z2;
                     if (oy < H && ox < W)
-                        x = __ldg(reinterpret_cast<const half2 *>(p.resid + ((size_t)oy * W + ox) * COUTP + n * 8 + tq * 2));
+                        x = *reinterpret_cast<const half2 *>(p.resid + ((size_t)oy * W + ox) * COUTP + n * 8 + tq * 2);
                     const half2 o = u2h(o3[i][n][h]);
                     half2 v = __hadd2(x, o);
                     if constexpr (GATE == 2) v = __hmul2(v, tanh_h2(__hadd2(u2h(ga[i][n][h]), ab)));

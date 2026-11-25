@@ -1,6 +1,7 @@
 // native/layout: the size checks, channel padding and feature-buffer reuse of a lowered model,
 // on plans written here (the shapes native/lower emits). CPU only.
 #include <cstdio>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -122,6 +123,84 @@ int test_sizes_and_unread()
     return 0;
 }
 
+// Walk backwards from consumers. A write must spare every feature that survives the step.
+// Of the inputs that die here, only the named gate outputs may take their residual's slot.
+int check_live_slots(const Plan &p, const Layout &L, const std::set<int> &in_place_outputs)
+{
+    std::set<int> live;
+    for (int i = (int)p.steps.size() - 1; i >= 0; --i) {
+        const PlanStep &s = p.steps[i];
+        if (s.dst >= 0) {
+            live.erase(s.dst);
+            for (int t : live) CHECK(L.buffer[t] != L.buffer[s.dst]);
+        }
+        for (int t : {s.src, s.resid, s.srcs[0], s.srcs[1], s.srcs[2], s.srcs[3]}) {
+            if (t < 0) continue;
+            if (s.dst >= 0 && L.buffer[t] == L.buffer[s.dst] &&
+                !(in_place_outputs.count(s.dst) && t == s.resid && t != s.src)) {
+                std::fprintf(stderr, "step %d: output t%d overwrites input t%d in slot %d\n", i, s.dst, t, L.buffer[t]);
+                return 1;
+            }
+            live.insert(t);
+        }
+    }
+    return 0;
+}
+
+// Five SPAN blocks with the stem, last gate, first gate and last block's first conv kept for the join.
+int test_cuda_span_gates(Gate gate_type)
+{
+    Plan p;
+    p.unshuffle = 2;
+    p.depth_to_space = 4;
+    p.channels.assign(17, 48);
+    p.steps.push_back(conv(kModelInput, 0, 12, 48, Input::NCHW3Unshuffle2));
+    for (int block = 0; block < 5; ++block) {
+        const int input = 3 * block;
+        p.steps.push_back(conv(input, input + 1, 48, 48));
+        p.steps.push_back(conv(input + 1, input + 2, 48, 48));
+        PlanStep gate = conv(input + 2, input + 3, 48, 48);
+        gate.gate = (int)gate_type;
+        gate.resid = input;
+        p.steps.push_back(gate);
+    }
+    p.steps.push_back(concat({0, 15, 3, 13}, 16, 48));
+    p.steps.push_back(conv(16, kModelOutput, 48, 48, Input::NHWC, Output::DepthToSpace4));
+
+    Layout L;
+    std::string why;
+    CHECK(layout(p, 1920, 1080, &L, &why));
+    CHECK(L.buffer_bytes.size() == 6);
+    CHECK(check_live_slots(p, L, {}) == 0);
+    reuse_cuda_gate_buffers(p, L);
+    CHECK(check_live_slots(p, L, {9, 12, 15}) == 0);
+    CHECK(L.buffer_bytes.size() == 5);
+    CHECK(L.buffer[3] != L.buffer[6]);  // the join still needs block one's output
+    for (int dst : {9, 12, 15}) CHECK(L.buffer[dst] == L.buffer[p.steps[dst].resid]);
+    return 0;
+}
+
+int test_excluded_gate(int residual, int stem_channels, Output output)
+{
+    Plan p;
+    p.channels = {stem_channels, 48, 48};
+    p.steps.push_back(conv(kModelInput, 0, 3, stem_channels, Input::NCHW3));
+    p.steps.push_back(conv(0, 1, stem_channels, 48));
+    // Keep a feature destination even for depth-to-space to exercise the output-mode guard independently.
+    PlanStep gate = conv(1, 2, 48, 48, Input::NHWC, output);
+    gate.gate = (int)Gate::Residual;
+    gate.resid = residual;
+    p.steps.push_back(gate);
+    p.steps.push_back(conv(2, kModelOutput, 48, 3, Input::NHWC, Output::DepthToSpace1));
+
+    Layout L;
+    std::string why;
+    CHECK(layout(p, 64, 32, &L, &why));
+    reuse_cuda_gate_buffers(p, L);
+    CHECK(L.buffer[gate.dst] != L.buffer[residual]);
+    return check_live_slots(p, L, {});
+}
+
 }  // namespace
 
 int main()
@@ -129,6 +208,11 @@ int main()
     if (test_refusals()) return 1;
     if (test_span_chain()) return 1;
     if (test_sizes_and_unread()) return 1;
+    for (Gate gate : {Gate::Residual, Gate::Tanh1x1, Gate::SigmoidHalf})
+        if (test_cuda_span_gates(gate)) return 1;
+    if (test_excluded_gate(1, 48, Output::NHWC)) return 1;  // residual is the conv source
+    if (test_excluded_gate(0, 32, Output::NHWC)) return 1;  // residual and destination widths differ
+    if (test_excluded_gate(0, 48, Output::DepthToSpace4)) return 1;
     std::printf("native layout: all checks passed\n");
     return 0;
 }

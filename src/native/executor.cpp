@@ -1,8 +1,6 @@
 // native/executor.cpp — see executor.h.
 #include "native/executor.h"
 
-#include <cstdio>
-
 #include "native/layout.h"
 
 namespace ajinative {
@@ -20,7 +18,8 @@ const void *Executor::ptr(int t, const void *in, void *out) const
     return t >= 0 ? tensor_[t] : nullptr;
 }
 
-std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h, cudaStream_t s, std::string *why)
+std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h, cudaStream_t s, std::string *why,
+                                           bool reuse_gate_residuals)
 {
     auto fail = [&](const std::string &m) -> std::unique_ptr<Executor> {
         if (why) *why = m;
@@ -31,6 +30,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
     if (cudaGetDevice(&dev) != cudaSuccess || !device_supported(dev, &reason)) return fail(reason.empty() ? "no CUDA device" : reason);
     Layout L;
     if (!layout(plan, in_w, in_h, &L, &reason)) return fail(reason);
+    if (reuse_gate_residuals) reuse_cuda_gate_buffers(plan, L);
 
     std::unique_ptr<Executor> e(new Executor());
     e->u_ = L.u;

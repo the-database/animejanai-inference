@@ -22,7 +22,9 @@ class Executor {
 public:
     // Fails (null, *why says why) if the device, the size or a step is not supported. Runs on
     // stream s while it times the variants; s must not be capturing.
-    static std::unique_ptr<Executor> create(const Plan &plan, int in_w, int in_h, cudaStream_t s, std::string *why);
+    // Disabling gate reuse selects the backend-neutral layout for parity checks.
+    static std::unique_ptr<Executor> create(const Plan &plan, int in_w, int in_h, cudaStream_t s, std::string *why,
+                                            bool reuse_gate_residuals = true);
     ~Executor();
     Executor(const Executor &) = delete;
     Executor &operator=(const Executor &) = delete;
@@ -34,6 +36,7 @@ public:
     size_t device_bytes() const { return bytes_; }
     // Of device_bytes: the packed weights (the rest is the feature buffers, sized for the input).
     size_t weight_bytes() const { return weight_bytes_; }
+    size_t feature_buffer_count() const { return buffers_.size(); }
     cudaError_t run(const void *in, void *out, cudaStream_t s) const { return run(in, out, in_w(), in_h(), s); }
     // An input up to the size created for (w <= in_w(), h <= in_h(), multiples of the model's
     // pixel-unshuffle factor): the buffers and tile variants of the created size serve it.

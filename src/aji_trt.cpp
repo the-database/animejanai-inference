@@ -141,7 +141,7 @@ struct aji_ctx {
     int max_w = 0, max_h = 0;
 
     void *buf[2] = {nullptr, nullptr};
-    size_t buf_bytes = 0;
+    size_t buf_bytes[2] = {};
 
     // Background engine builds (async_build): one trtexec at a time on a
     // worker thread that touches no ctx state beyond build's atomics. The
@@ -469,21 +469,24 @@ bool first_resize_target(const AjiModelConf &m, int w, int h, int *ow, int *oh)
     return cw != w || ch != h;
 }
 
-bool ensure_buffers(aji_ctx *c, size_t bytes)
+bool ensure_buffers(aji_ctx *c, size_t first_bytes, size_t second_bytes)
 {
-    if (bytes <= c->buf_bytes && c->buf[0] && c->buf[1])
+    if (first_bytes <= c->buf_bytes[0] && second_bytes <= c->buf_bytes[1] && c->buf[0] && c->buf[1])
         return true;
     for (auto &b : c->buf) {
         cudaFree(b);
         b = nullptr;
     }
-    if (cudaMalloc(&c->buf[0], bytes) != cudaSuccess ||
-        cudaMalloc(&c->buf[1], bytes) != cudaSuccess) {
-        c->set_error("cudaMalloc(%zu) failed for chain buffers", bytes);
-        c->buf_bytes = 0;
+    if (cudaMalloc(&c->buf[0], first_bytes) != cudaSuccess ||
+        cudaMalloc(&c->buf[1], second_bytes) != cudaSuccess) {
+        cudaFree(c->buf[0]);
+        c->buf[0] = nullptr;
+        c->buf_bytes[0] = c->buf_bytes[1] = 0;
+        c->set_error("cudaMalloc failed for chain buffers (%zu and %zu bytes)", first_bytes, second_bytes);
         return false;
     }
-    c->buf_bytes = bytes;
+    c->buf_bytes[0] = first_bytes;
+    c->buf_bytes[1] = second_bytes;
     return true;
 }
 
@@ -1187,7 +1190,7 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
         c->scale = c->direct.out_w / pw;
         const size_t bytes =
             (size_t)3 * c->max_w * c->max_h * 2 * c->scale * c->scale;
-        if (!ensure_buffers(c.get(), bytes))
+        if (!ensure_buffers(c.get(), bytes, bytes))
             return nullptr;
     }
     return c.release();
@@ -1647,7 +1650,11 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
         return 0;
     }
 
-    if (!ensure_buffers(c, max_bytes))
+    // A single native step reads source-sized RGB from buf[0] and writes its result to buf[1].
+    const bool single_native = c->steps.size() == 1 && c->steps[0].kind == Step::NATIVE &&
+                               !c->has_pre_resize && !c->rife.enabled && c->temporal.st.empty();
+    const size_t first_bytes = single_native ? (size_t)3 * w * h * 2 : max_bytes;
+    if (!ensure_buffers(c, first_bytes, max_bytes))
         return AJI_ERR_CUDA;
     if (!c->temporal.st.empty() && !setup_temporal(c))
         return AJI_ERR_CUDA;
