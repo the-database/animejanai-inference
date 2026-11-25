@@ -17,6 +17,7 @@
 #include <cuda_fp16.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <algorithm>
@@ -42,33 +43,60 @@ namespace {
 
 using aji_resample::chroma_shifts;
 
+constexpr int BLOCK_X = 32;
+constexpr int BLOCK_Y = 8;
+
 struct pass {
     int taps = 0, src = 0, dst = 0;
     const int *start = nullptr;   // [dst] first source index per output
     const float *wt = nullptr;    // [dst * taps], normalized
 };
 
-bool build_pass(pass *p, int src, int dst, double shift, int filter)
+bool upload_pass(pass *p, const aji_resample::weights &w)
 {
-    aji_resample::weights w = aji_resample::compute(src, dst, shift, filter);
-
     int *d_start = nullptr;
     float *d_wt = nullptr;
-    if (cudaMalloc(&d_start, dst * sizeof(int)) != cudaSuccess ||
+    if (cudaMalloc(&d_start, w.dst * sizeof(int)) != cudaSuccess ||
         cudaMalloc(&d_wt, w.wt.size() * sizeof(float)) != cudaSuccess) {
         cudaFree(d_start);
         return false;
     }
-    cudaMemcpy(d_start, w.start.data(), dst * sizeof(int),
+    cudaMemcpy(d_start, w.start.data(), w.dst * sizeof(int),
                cudaMemcpyHostToDevice);
     cudaMemcpy(d_wt, w.wt.data(), w.wt.size() * sizeof(float),
                cudaMemcpyHostToDevice);
     p->taps = w.taps;
-    p->src = src;
-    p->dst = dst;
+    p->src = w.src;
+    p->dst = w.dst;
     p->start = d_start;
     p->wt = d_wt;
     return true;
+}
+
+bool build_pass(pass *p, int src, int dst, double shift, int filter)
+{
+    return upload_pass(p, aji_resample::compute(src, dst, shift, filter));
+}
+
+bool build_pre_vertical(pass *p, const aji_resample::weights &w, int &tile_rows)
+{
+    int max_advance = 0;
+    for (size_t y = 0; y < w.start.size(); ++y) {
+        if (y && w.start[y] < w.start[y - 1]) {
+            fprintf(stderr, "[aji-trt] fused input plan: vertical tap start decreases at row %zu\n", y);
+            return false;
+        }
+        const size_t first = y - y % BLOCK_Y;
+        const int64_t advance = int64_t(w.start[y]) - w.start[first];
+        if (advance > BLOCK_Y / 2) {
+            fprintf(stderr, "[aji-trt] fused input plan: vertical tap span exceeds %d rows of advance at row %zu\n",
+                    BLOCK_Y / 2, y);
+            return false;
+        }
+        max_advance = std::max(max_advance, int(advance));
+    }
+    tile_rows = w.taps + max_advance;
+    return upload_pass(p, w);
 }
 
 void free_pass(pass *p)
@@ -86,6 +114,7 @@ struct aji_plan {
     int w = 0, h = 0;          // pre/post luma dims; resize: src dims
     int dw = 0, dh = 0;        // resize: dst dims
     pass ph, pv;
+    int pre_rows = 0;          // maximum verified tap range of a fused input tile
     float *tmp0 = nullptr;     // after the first pass
     float *tmp1 = nullptr;     // after the horizontal pass (post only)
     // post in one kernel (k_post_fused): per tile column / row the luma range its taps read ([lo, hi],
@@ -110,52 +139,46 @@ __device__ __forceinline__ float quant(float v, float qdiv, float qmax)
 
 /* ---------------- pre: NV12/P010 -> RGB fp16 ---------------- */
 
-// horizontal resample of interleaved raw chroma -> 2 planar fp32 (raw units)
+// Each block owns a tile of RGB pixels. Store one fp32 horizontal sum per column and
+// unmirrored chroma row in the tile's vertical tap range (including its halo).
 template <typename T>
-__global__ void k_uv_h(const uint8_t *uv, ptrdiff_t stride, int ch, pass px,
-                       float *dst)
+__global__ void k_pre_fused(const uint8_t *y_plane, ptrdiff_t y_stride,
+                            const uint8_t *uv_plane, ptrdiff_t uv_stride,
+                            pass px, pass py, aji_csp csp, __half *dst)
 {
+    extern __shared__ float2 horizontal[];
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= px.dst || y >= ch)
-        return;
-    const T *row = (const T *)(uv + (size_t)y * stride);
-    const float *w = px.wt + (size_t)x * px.taps;
-    const int s0 = px.start[x];
-    float u = 0.0f, v = 0.0f;
-    for (int j = 0; j < px.taps; j++) {
-        const int sx = mirr(s0 + j, px.src);
-        u += w[j] * row[2 * sx];
-        v += w[j] * row[2 * sx + 1];
+    const int y0 = blockIdx.y * blockDim.y, y = y0 + threadIdx.y;
+    const int first = py.start[y0];
+    const int last_y = min(y0 + (int)blockDim.y, py.dst) - 1;
+    const int rows = py.start[last_y] - first + py.taps;
+    if (x < px.dst) {
+        const int s0 = px.start[x];
+        const float *wt = px.wt + (size_t)x * px.taps;
+        for (int r = threadIdx.y; r < rows; r += blockDim.y) {
+            const int sy = mirr(first + r, py.src);
+            const T *row = (const T *)(uv_plane + (size_t)sy * uv_stride);
+            float u = 0.0f, v = 0.0f;
+            for (int j = 0; j < px.taps; ++j) {
+                const int sx = mirr(s0 + j, px.src);
+                u += wt[j] * row[2 * sx];
+                v += wt[j] * row[2 * sx + 1];
+            }
+            horizontal[r * blockDim.x + threadIdx.x] = make_float2(u, v);
+        }
     }
-    const size_t plane = (size_t)px.dst * ch, idx = (size_t)y * px.dst + x;
-    dst[idx] = u;
-    dst[plane + idx] = v;
-}
+    __syncthreads();
+    if (x >= px.dst || y >= py.dst) return;
 
-// Vertical chroma resample + matrix. Keep both accumulators in fp32, in the
-// same tap order as the separate pass; only the final RGB is rounded to fp16.
-// This avoids writing and rereading two full-resolution fp32 chroma planes.
-template <typename T>
-__global__ void k_pre_v_combine(const uint8_t *y_plane, ptrdiff_t y_stride,
-                              const float *uvf, int w, pass py, aji_csp csp,
-                              __half *dst)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= py.dst)
-        return;
-    const size_t plane = (size_t)w * py.dst, idx = (size_t)y * w + x;
-
-    const size_t uv_plane = (size_t)w * py.src;
+    const int row0 = py.start[y] - first;
     const float *wt = py.wt + (size_t)y * py.taps;
-    const int s0 = py.start[y];
     float u = 0.0f, v = 0.0f;
-    for (int j = 0; j < py.taps; j++) {
-        const size_t pos = (size_t)mirr(s0 + j, py.src) * w + x;
-        u += wt[j] * uvf[pos];
-        v += wt[j] * uvf[uv_plane + pos];
+    for (int j = 0; j < py.taps; ++j) {
+        const float2 uv = horizontal[(row0 + j) * blockDim.x + threadIdx.x];
+        u += wt[j] * uv.x;
+        v += wt[j] * uv.y;
     }
+    const size_t plane = (size_t)px.dst * py.dst, idx = (size_t)y * px.dst + x;
 
     const T *yrow = (const T *)(y_plane + (size_t)y * y_stride);
     const float Y = ((float)yrow[x] - csp.yoff) / csp.yscale;
@@ -468,8 +491,7 @@ extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting,
     double sx, sy;
     chroma_shifts(siting, true, &sx, &sy);
     if (!build_pass(&p->ph, cw, w, sx, filter) ||
-        !build_pass(&p->pv, ch, h, sy, filter) ||
-        cudaMalloc(&p->tmp0, (size_t)2 * w * ch * sizeof(float)) != cudaSuccess) {
+        !build_pre_vertical(&p->pv, aji_resample::compute(ch, h, sy, filter), p->pre_rows)) {
         aji_plan_destroy(p);
         return nullptr;
     }
@@ -572,8 +594,6 @@ extern "C" aji_plan *aji_resize_plan_create(int sw, int sh, int dw, int dh)
 
 /* ---------------- runs ---------------- */
 
-#define BLOCK_X 32
-#define BLOCK_Y 8
 #define GRID(w, h, d) dim3(((w) + BLOCK_X - 1) / BLOCK_X, \
                            ((h) + BLOCK_Y - 1) / BLOCK_Y, (d)), \
                       dim3(BLOCK_X, BLOCK_Y)
@@ -584,23 +604,15 @@ extern "C" int aji_run_pre(aji_plan *p,
                            const aji_csp *csp, void *dst_f16, void *stream)
 {
     cudaStream_t s = (cudaStream_t)stream;
-    const int w = p->w, h = p->h, ch = h >> 1;
-    if (p->format == AJI_FMT_NV12) {
-        k_uv_h<uint8_t><<<GRID(w, ch, 1), 0, s>>>(
-            (const uint8_t *)uv_plane, uv_stride, ch, p->ph, p->tmp0);
-    } else {
-        k_uv_h<uint16_t><<<GRID(w, ch, 1), 0, s>>>(
-            (const uint8_t *)uv_plane, uv_stride, ch, p->ph, p->tmp0);
-    }
-    if (p->format == AJI_FMT_NV12) {
-        k_pre_v_combine<uint8_t><<<GRID(w, h, 1), 0, s>>>(
-            (const uint8_t *)y_plane, y_stride, p->tmp0, w, p->pv, *csp,
-            (__half *)dst_f16);
-    } else {
-        k_pre_v_combine<uint16_t><<<GRID(w, h, 1), 0, s>>>(
-            (const uint8_t *)y_plane, y_stride, p->tmp0, w, p->pv, *csp,
-            (__half *)dst_f16);
-    }
+    const size_t shared_bytes = size_t(p->pre_rows) * BLOCK_X * sizeof(float2);
+    if (p->format == AJI_FMT_NV12)
+        k_pre_fused<uint8_t><<<GRID(p->w, p->h, 1), shared_bytes, s>>>(
+            (const uint8_t *)y_plane, y_stride, (const uint8_t *)uv_plane, uv_stride,
+            p->ph, p->pv, *csp, (__half *)dst_f16);
+    else
+        k_pre_fused<uint16_t><<<GRID(p->w, p->h, 1), shared_bytes, s>>>(
+            (const uint8_t *)y_plane, y_stride, (const uint8_t *)uv_plane, uv_stride,
+            p->ph, p->pv, *csp, (__half *)dst_f16);
     return (int)cudaGetLastError();
 }
 
@@ -668,8 +680,7 @@ static PlaneKernel plane_kernel(void (*fn)(Args...), bool output, bool expected)
 template<class T>
 static void add_420_kernels(std::vector<PlaneKernel> &kernels, bool input, bool output, bool fused)
 {
-    kernels.push_back(plane_kernel<0, 1, 1>(k_uv_h<T>, false, input));
-    kernels.push_back(plane_kernel<0, 0, 1>(k_pre_v_combine<T>, false, input));
+    kernels.push_back(plane_kernel<0, 0, 2>(k_pre_fused<T>, false, input));
     kernels.push_back(plane_kernel<6, 0, 2>(k_post_fused<T>, true, output && fused));
     kernels.push_back(plane_kernel<6, 0, 1>(k_post_matrix<T>, true, output && !fused));
     kernels.push_back(plane_kernel<6, 1, 1>(k_uv_v_store<T>, true, output && !fused));

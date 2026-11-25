@@ -13,6 +13,7 @@ import sys
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--backend', type=Path, required=True)
+p.add_argument('--reference-backend', type=Path, help='use this backend for eager reference outputs')
 p.add_argument('--cuda-runtime', type=Path, required=True)
 model = p.add_mutually_exclusive_group(required=True)
 model.add_argument('--engine', type=Path)
@@ -65,6 +66,8 @@ def ck(rc):
         raise RuntimeError(f'CUDA error {rc}')
 
 dll = a.fault_backend if a.worker in faults else a.backend
+if a.worker == 'eager' and a.reference_backend:
+    dll = a.reference_backend
 if os.name == 'nt':
     dirs = [os.add_dll_directory(str(d.resolve())) for d in {dll.parent, a.cuda_runtime.parent}]
 cuda, lib = C.CDLL(str(a.cuda_runtime.resolve())), C.CDLL(str(dll.resolve()))
@@ -104,7 +107,7 @@ def geometry(w, h, fmt):
 def surface(w, h, fmt, index, input_frame):
     frame = Frame(w, h, fmt, 2, 1, 1)
     for j, (row, rows) in enumerate(geometry(w, h, fmt)):
-        stride = row + 128 * ((index + j) % 3)
+        stride = row + 64 * (1 + (index + j) % 3)
         ptr = P()
         ck(alloc(C.byref(ptr), (row + 256) * rows))
         frame.planes[j], frame.strides[j] = ptr.value, stride
@@ -157,6 +160,7 @@ for infmt, outfmt in ((1, 2), (1, 1), (1, 3), (2, 2), (3, 3)):
                 raise RuntimeError(last_error(ctx))
         for k, fi in enumerate(ins):
             fi.range = color_range
+            fi.siting = 3 if batch == 3 else 1  # top-left on the color change, left on restore
             fo = outs[(k + shift) % 3]
             for j, (row, rows) in enumerate(geometry(fo.width, fo.height, fo.format)):
                 ck(fill(fo.planes[j], 0xab, (row + 256) * rows, stream))
@@ -220,6 +224,8 @@ else:
         if any('using staged fallback' in m for m in messages):
             raise RuntimeError('unexpected staged fallback on the rotating caller surfaces')
         for message in sorted({m for m in messages if 'captured updatable frame graph' in m}):
+            if 'captured updatable frame graph (2 conversion nodes)' not in message:
+                raise RuntimeError(f'expected one input and one output conversion: {message}')
             print(message, flush=True)
 bind(lib, 'aji_destroy', None, C.POINTER(P))(C.byref(ctx))
 ck(bind(cuda, 'cudaStreamDestroy', I, P)(stream))
