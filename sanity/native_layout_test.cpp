@@ -1,5 +1,6 @@
 // native/layout: the size checks, channel padding and feature-buffer reuse of a lowered model,
 // on plans written here (the shapes native/lower emits). CPU only.
+#include <algorithm>
 #include <cstdio>
 #include <set>
 #include <string>
@@ -137,8 +138,9 @@ int check_live_slots(const Plan &p, const Layout &L, const std::set<int> &in_pla
         }
         for (int t : {s.src, s.resid, s.srcs[0], s.srcs[1], s.srcs[2], s.srcs[3]}) {
             if (t < 0) continue;
+            const bool retiring_input = s.kind == PlanStep::CONCAT ? t == s.srcs[1] : t == s.resid && t != s.src;
             if (s.dst >= 0 && L.buffer[t] == L.buffer[s.dst] &&
-                !(in_place_outputs.count(s.dst) && t == s.resid && t != s.src)) {
+                !(in_place_outputs.count(s.dst) && retiring_input)) {
                 std::fprintf(stderr, "step %d: output t%d overwrites input t%d in slot %d\n", i, s.dst, t, L.buffer[t]);
                 return 1;
             }
@@ -148,26 +150,47 @@ int check_live_slots(const Plan &p, const Layout &L, const std::set<int> &in_pla
     return 0;
 }
 
-// Five SPAN blocks with the stem, last gate, first gate and last block's first conv kept for the join.
-int test_cuda_span_gates(Gate gate_type)
+const std::vector<int> performance_slots{0, 1, 2, 1, 2, 3, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 4};
+
+// The stem, last gate, first gate and last block's first conv stay live until the join.
+Plan hd_span_plan(int blocks, int c, Gate gate_type)
 {
     Plan p;
     p.unshuffle = 2;
     p.depth_to_space = 4;
-    p.channels.assign(17, 48);
-    p.steps.push_back(conv(kModelInput, 0, 12, 48, Input::NCHW3Unshuffle2));
-    for (int block = 0; block < 5; ++block) {
+    const int last_gate = 3 * blocks;
+    p.channels.assign(last_gate + 2, c);
+    p.steps.push_back(conv(kModelInput, 0, 12, c, Input::NCHW3Unshuffle2));
+    for (int block = 0; block < blocks; ++block) {
         const int input = 3 * block;
-        p.steps.push_back(conv(input, input + 1, 48, 48));
-        p.steps.push_back(conv(input + 1, input + 2, 48, 48));
-        PlanStep gate = conv(input + 2, input + 3, 48, 48);
+        p.steps.push_back(conv(input, input + 1, c, c));
+        p.steps.push_back(conv(input + 1, input + 2, c, c));
+        PlanStep gate = conv(input + 2, input + 3, c, c);
         gate.gate = (int)gate_type;
         gate.resid = input;
         p.steps.push_back(gate);
     }
-    p.steps.push_back(concat({0, 15, 3, 13}, 16, 48));
-    p.steps.push_back(conv(16, kModelOutput, 48, 48, Input::NHWC, Output::DepthToSpace4));
+    p.steps.push_back(concat({0, last_gate, 3, last_gate - 2}, last_gate + 1, c));
+    p.steps.push_back(conv(last_gate + 1, kModelOutput, c, 48, Input::NHWC, Output::DepthToSpace4));
+    return p;
+}
 
+int check_hd_fp16_slots(const Plan &p, const std::vector<int> &main_slots)
+{
+    for (const auto &mask : {std::vector<bool>{}, std::vector<bool>(p.channels.size(), false)}) {
+        Layout l;
+        std::string why;
+        CHECK(layout(p, 1920, 1080, &l, &why));
+        reuse_cuda_gate_buffers(p, l, mask);
+        CHECK(l.buffer == main_slots);
+        CHECK(l.buffer_bytes == std::vector<size_t>(5, size_t(960) * 540 * p.channels[0] * 2));
+    }
+    return 0;
+}
+
+int test_cuda_span_gates(Gate gate_type)
+{
+    Plan p = hd_span_plan(5, 48, gate_type);
     Layout L;
     std::string why;
     CHECK(layout(p, 1920, 1080, &L, &why));
@@ -178,8 +201,7 @@ int test_cuda_span_gates(Gate gate_type)
     CHECK(L.buffer_bytes.size() == 5);
     CHECK(L.buffer[3] != L.buffer[6]);  // the join still needs block one's output
     for (int dst : {9, 12, 15}) CHECK(L.buffer[dst] == L.buffer[p.steps[dst].resid]);
-    const std::vector<int> main_slots{0, 1, 2, 1, 2, 3, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 4};
-    CHECK(L.buffer == main_slots);
+    CHECK(L.buffer == performance_slots);
     if (gate_type == Gate::Tanh1x1) {
         // The last block's first ReLU (t13) is also a projection input and stays FP16.
         std::vector<bool> packed(p.channels.size());
@@ -188,8 +210,18 @@ int test_cuda_span_gates(Gate gate_type)
             CHECK(layout(p, 1920, 1080, &L, &why));
             if (reuse) reuse_cuda_gate_buffers(p, L, packed);
             CHECK(L.buffer_bytes.size() == (reuse ? 5 : 6));
-            CHECK(check_live_slots(p, L, reuse ? std::set<int>{9, 12, 15} : std::set<int>{}) == 0);
-            for (size_t bytes : L.buffer_bytes) CHECK(bytes == size_t(960) * 540 * 48 * 2);
+            CHECK(check_live_slots(p, L, reuse ? std::set<int>{9, 12, 15, 16} : std::set<int>{}) == 0);
+            const size_t packed_bytes = size_t(960) * 540 * 48;
+            if (reuse) {
+                // t1 is packed. Its next occupant t3 writes a full FP16 map to the same slot.
+                CHECK(L.buffer[1] == L.buffer[3]);
+                CHECK(L.buffer_bytes[L.buffer[3]] == 2 * packed_bytes);
+                CHECK(L.buffer_bytes[L.buffer[15]] == 2 * packed_bytes);  // fused FP16 destination
+            }
+            CHECK(std::count(L.buffer_bytes.begin(), L.buffer_bytes.end(), packed_bytes) == (reuse ? 1 : 0));
+            for (size_t t = 0; t < L.buffer.size(); ++t)
+                CHECK(L.buffer_bytes[L.buffer[t]] >= packed_bytes * (packed[t] ? 1 : 2));
+            CHECK((L.buffer[16] == L.buffer[15]) == reuse);
             for (int dst : {9, 12, 15}) CHECK((L.buffer[dst] == L.buffer[p.steps[dst].resid]) == reuse);
         }
         // Step 9 can overwrite t6 only when both t6 and t9 hold FP16.
@@ -200,6 +232,11 @@ int test_cuda_span_gates(Gate gate_type)
             CHECK(L.buffer[9] != L.buffer[6]);
             packed[tensor] = false;
         }
+        // A projection input that still has a reader cannot be overwritten by the join.
+        p.steps.back().resid = 15;
+        CHECK(layout(p, 1920, 1080, &L, &why));
+        reuse_cuda_gate_buffers(p, L, packed);
+        CHECK(L.buffer[16] != L.buffer[15]);
     }
     return 0;
 }
@@ -242,6 +279,9 @@ int main()
     if (test_refusals()) return 1;
     if (test_span_chain()) return 1;
     if (test_sizes_and_unread()) return 1;
+    if (check_hd_fp16_slots(hd_span_plan(5, 48, Gate::Tanh1x1), performance_slots)) return 1;
+    if (check_hd_fp16_slots(hd_span_plan(8, 64, Gate::Tanh1x1),
+            {0, 1, 2, 1, 2, 3, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 4})) return 1;
     for (Gate gate : {Gate::Residual, Gate::Tanh1x1, Gate::SigmoidHalf})
         if (test_cuda_span_gates(gate)) return 1;
     if (test_excluded_gate(1, 48, Output::NHWC)) return 1;  // residual is the conv source

@@ -106,7 +106,8 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
             return false;
         }
         const size_t map_bytes = size_t(w / plan.unshuffle) * (h / plan.unshuffle) * channels * sizeof(uint16_t);
-        if (gate == Gate::Tanh1x1 && ex->device_bytes() - ex->weight_bytes() != slots * map_bytes) {
+        const size_t feature_bytes = slots * map_bytes - (fp8 && ex == candidate.get() ? map_bytes / 2 : 0);
+        if (gate == Gate::Tanh1x1 && ex->device_bytes() - ex->weight_bytes() != feature_bytes) {
             std::fprintf(stderr, "%s [%s]: unexpected feature buffer capacity\n", path, mode.c_str());
             return false;
         }
@@ -169,6 +170,27 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
         if (unfused) {
             read_output(*unfused, actual, 0xff);
             if (!bit_exact("unfused")) passed = false;
+        }
+    }
+    if (gate == Gate::Tanh1x1) {
+        // The image tiler passes the active geometry to an executor created for a larger tile.
+        // A separately sized, unfused reference cannot share a stale maximum-width stride.
+        constexpr int tile_w = 322, tile_h = 182;
+        auto tile_ref = Executor::create(plan, tile_w, tile_h, nullptr, &why, false, fp8);
+        if (!tile_ref) {
+            std::fprintf(stderr, "tile reference: %s\n", why.c_str());
+            passed = false;
+        } else {
+            const size_t n = size_t(3) * tile_ref->out_w() * tile_ref->out_h();
+            check_cuda(tile_ref->run(in, out, nullptr));
+            check_cuda(cudaMemcpy(expected.data(), out, n * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+            check_cuda(cudaMemset(out, 0xa5, out_bytes));
+            check_cuda(candidate->run(in, out, tile_w, tile_h, nullptr));
+            check_cuda(cudaMemcpy(actual.data(), out, (n + 1) * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+            if (!std::equal(expected.begin(), expected.begin() + n, actual.begin()) || actual[n] != 0xa5a5) {
+                std::fprintf(stderr, "%s [%s]: 322x182 tile output or trailing guard differs\n", path, mode.c_str());
+                passed = false;
+            }
         }
     }
     check_cuda(cudaFree(out));
