@@ -55,6 +55,10 @@
 namespace fs = std::filesystem;
 using namespace ajicore;
 
+#ifdef AJI_TEST_SINGLE_TILE_OUTPUT
+extern bool aji_test_force_tile_blend;
+#endif
+
 #ifdef AJI_TRTRTX
 #define AJI_IMG_THIS_BACKEND AJI_IMG_TENSORRT_RTX
 #else
@@ -873,9 +877,9 @@ template <typename T> bool grow(T **p, size_t *cap, size_t need)
 }
 
 // upscale_tiled's cover / pad / blend with the image data on the GPU (see
-// core/tiling_gpu.h): one upload, then per tile extract -> infer -> blend
-// queued on the model's stream with no host round trip, and per tile row
-// one flush to 8-bit plus a copy of those rows into `out`. Context pushed,
+// core/tiling_gpu.h): one upload, then extract and infer on the model's
+// stream. Pack a single tile directly to bytes or blend multiple tiles
+// and flush completed rows. Copy those bytes into `out`. Context pushed,
 // c->run_mu held. Bit-identical to upscale_tiled.
 int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
                 const aji_img_buffer *out, aji_img_progress_fn progress,
@@ -929,23 +933,29 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
     const int tow = Tw * s, toh = Th * s;
     const int cols = spw * s, band_rows = sph * s;
     const int total = (int)(ox.size() * oy.size());
+    bool single_tile = total == 1;
+#ifdef AJI_TEST_SINGLE_TILE_OUTPUT
+    if (aji_test_force_tile_blend) single_tile = false;
+#endif
     const GpuDtype in_t = gpu_dtype(m.in_dt), out_t = gpu_dtype(m.out_dt);
     cudaStream_t st = m.stream;
     GpuTileScratch &g = m.c->gpu;
 
     std::vector<float> wxf, wyf;
     try {
-        for (const auto &w : axis_weights(ox, W, Tw, s))
-            wxf.insert(wxf.end(), w.begin(), w.end());
-        for (const auto &w : axis_weights(oy, H, Th, s))
-            wyf.insert(wyf.end(), w.begin(), w.end());
+        if (!single_tile) {
+            for (const auto &w : axis_weights(ox, W, Tw, s))
+                wxf.insert(wxf.end(), w.begin(), w.end());
+            for (const auto &w : axis_weights(oy, H, Th, s))
+                wyf.insert(wyf.end(), w.begin(), w.end());
+        }
     } catch (const std::bad_alloc &) {
         *err = "out of host memory for tiling buffers";
         return AJI_IMG_ERR_NO_MEM;
     }
     const size_t band_bytes = (size_t)Co * band_rows * OW * sizeof(float);
     if (!grow(&g.img, &g.img_cap, (size_t)W * H * Ci) ||
-        !grow(&g.band, &g.band_cap, band_bytes) ||
+        (!single_tile && !grow(&g.band, &g.band_cap, band_bytes)) ||
         !grow(&g.rows, &g.rows_cap, (size_t)band_rows * OW * Co) ||
         !grow(&g.wx, &g.wx_cap, wxf.size() * sizeof(float)) ||
         !grow(&g.wy, &g.wy_cap, wyf.size() * sizeof(float))) {
@@ -972,13 +982,13 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
     cudaError_t e = cudaMemcpy2DAsync(g.img, (size_t)W * Ci, in->data,
                                       in->stride, (size_t)W * Ci, H,
                                       cudaMemcpyHostToDevice, st);
-    if (e == cudaSuccess)
+    if (e == cudaSuccess && !single_tile)
         e = cudaMemcpyAsync(g.wx, wxf.data(), wxf.size() * sizeof(float),
                             cudaMemcpyHostToDevice, st);
-    if (e == cudaSuccess)
+    if (e == cudaSuccess && !single_tile)
         e = cudaMemcpyAsync(g.wy, wyf.data(), wyf.size() * sizeof(float),
                             cudaMemcpyHostToDevice, st);
-    if (e == cudaSuccess)
+    if (e == cudaSuccess && !single_tile)
         e = cudaMemsetAsync(g.band, 0, band_bytes, st);
     if (e != cudaSuccess)
         return cuda_fail(e, "upload");
@@ -988,6 +998,14 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
     int band_y0 = 0;  // first image row not yet flushed
     for (size_t j = 0; j < oy.size(); j++) {
         for (size_t i = 0; i < ox.size(); i++) {
+            const auto store_output = [&](int tile_rows, int row0, int rows) {
+                if (single_tile)
+                    return gpu_tile_pack(m.d_out, out_t, m.out_ch, tow, tile_rows, cols, rows,
+                                         Co, g.rows + (size_t)row0 * OW * Co, st);
+                return gpu_tile_blend(m.d_out, out_t, m.out_ch, tow, tile_rows, g.wx + i * cols,
+                                      g.wy + j * band_rows + row0, cols, rows, ox[i] * s,
+                                      oy[j] * s + row0, g.band, Co, band_rows, OW, st);
+            };
             e = gpu_tile_extract(g.img, W, H, Ci, ox[i], oy[j], Tw, Th,
                                  m.in_ch, inv255, m.d_in, in_t, st);
             if (e != cudaSuccess)
@@ -995,17 +1013,14 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
             if (prof)
                 cudaEventRecord(m.tile_ev[2 * done], st);
             if (m.native && m.native->tail_rows() > 0) {
-                // the body over the tile, then its tail strip by strip into the band: the tile's
-                // weights for the strip's rows, and only rows inside the image
+                // The tail returns planar strips. Crop the last strip to the visible image.
                 const int tr = m.native->tail_rows();
                 e = m.native->body(m.d_in, in_t == GpuDtype::F32, Tw, Th, st);
                 for (int r0 = 0; r0 < Th && r0 * s < band_rows && e == cudaSuccess; r0 += tr) {
                     const int r1 = std::min(Th, r0 + tr);
                     e = m.native->tail(r0, r1, m.d_out, out_t == GpuDtype::F32, st);
                     if (e == cudaSuccess)
-                        e = gpu_tile_blend(m.d_out, out_t, m.out_ch, tow, (r1 - r0) * s, g.wx + i * cols,
-                                           g.wy + j * band_rows + r0 * s, cols, std::min(r1 * s, band_rows) - r0 * s,
-                                           ox[i] * s, oy[j] * s + r0 * s, g.band, Co, band_rows, OW, st);
+                        e = store_output((r1 - r0) * s, r0 * s, std::min(r1 * s, band_rows) - r0 * s);
                 }
                 if (e != cudaSuccess)
                     return cuda_fail(e, "native kernels");
@@ -1030,12 +1045,9 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
             }
             if (prof)
                 cudaEventRecord(m.tile_ev[2 * done + 1], st);
-            e = gpu_tile_blend(m.d_out, out_t, m.out_ch, tow, toh,
-                               g.wx + i * cols, g.wy + j * band_rows, cols,
-                               band_rows, ox[i] * s, oy[j] * s, g.band, Co,
-                               band_rows, OW, st);
+            e = store_output(toh, 0, band_rows);
             if (e != cudaSuccess)
-                return cuda_fail(e, "tile blend");
+                return cuda_fail(e, single_tile ? "tile pack" : "tile blend");
             done++;
             if (progress && progress(opaque, done, total)) {
                 cudaStreamSynchronize(st);
@@ -1046,14 +1058,15 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
         // Rows above the next tile row's top are final.
         const int next_y0 = j + 1 < oy.size() ? oy[j + 1] * s : OH;
         const int n = next_y0 - band_y0;
-        e = gpu_band_flush(g.band, Co, band_rows, OW, band_y0, n, g.rows, st);
+        if (!single_tile)
+            e = gpu_band_flush(g.band, Co, band_rows, OW, band_y0, n, g.rows, st);
         if (e == cudaSuccess)
             e = cudaMemcpy2DAsync(out->data + (ptrdiff_t)band_y0 * out->stride,
                                   out->stride, g.rows, (size_t)OW * Co,
                                   (size_t)OW * Co, n, cudaMemcpyDeviceToHost,
                                   st);
         if (e != cudaSuccess)
-            return cuda_fail(e, "band flush");
+            return cuda_fail(e, single_tile ? "output copy" : "band flush");
         band_y0 = next_y0;
     }
     e = cudaStreamSynchronize(st);

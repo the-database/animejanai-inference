@@ -231,12 +231,24 @@ typedef struct aji_img_memory {
                                pages out to make room, slowly: NVML's
                                free memory does */
     uint64_t device_total;
-    /* The context's memory that all its models share (CUDA backends; 0 on
-     * DirectML): one activation buffer as large as the largest loaded
-     * model's need, and the GPU tiling scratch, which grows to the largest
-     * image yet: about W*H*C + 5*C*(tile_h*scale)*(W*scale) for a W x H
-     * image of C channels. */
+    /* Shared CUDA activation buffer sized for the largest loaded model
+     * that uses it. DirectML reports zero. */
     uint64_t ctx_activations;
+    /* GPU tiling scratch in bytes (zero on DirectML). For the CUDA tiler,
+     * W x H is the input page, C is its channel count, s is the scale,
+     * and OW = W*s, OH = H*s. Let nx and ny be the tile column and row
+     * counts after overlap, and tw x th the actual input tile dimensions
+     * selected for this page (which can shrink with EVEN_TILES).
+     * One tile needs only img = W*H*C and rows = OW*OH*C bytes.
+     * For multiple tiles, let cw = min(W,tw)*s and rh = min(H,th)*s.
+     * The five buffer sizes in bytes are
+     *   img  = W*H*C       (packed input page)
+     *   band = 4*OW*rh*C   (FP32 blend band)
+     *   rows = OW*rh*C     (packed output rows)
+     *   wx   = 4*nx*cw     (horizontal FP32 weights)
+     *   wy   = 4*ny*rh     (vertical FP32 weights)
+     * The context retains the largest capacity each buffer has needed so
+     * far. ctx_scratch reports their sum, including after smaller pages. */
     uint64_t ctx_scratch;
     /* With a READY model (else 0): */
     uint64_t model_weights;     /* its weights (an estimate on DirectML) */

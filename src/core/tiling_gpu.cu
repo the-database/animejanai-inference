@@ -115,6 +115,29 @@ __global__ void k_blend(const void *tile, GpuDtype dt, int out_ch, int tow,
     }
 }
 
+__device__ __forceinline__ uint8_t d_output_byte(float value)
+{
+    const float f = __fadd_rn(__fmul_rn(value, 255.0f), 0.5f);
+    return f <= 0.0f ? 0 : f >= 255.0f ? 255 : (uint8_t)f;
+}
+
+__global__ void k_pack(const void *tile, GpuDtype dt, int out_ch, int tow,
+                       int toh, int cols, int rows, int co, uint8_t *dst)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= cols || y >= rows)
+        return;
+    const size_t plane = (size_t)tow * toh;
+    for (int c = 0; c < co; c++) {
+        const int mc = out_ch == 1 ? 0 : c;
+        const float v = d_load(tile, mc * plane + (size_t)y * tow + x, dt);
+        // A single tile has unit axis weights and a zero-initialized blend band.
+        const float blended = __fadd_rn(0.0f, __fmul_rn(1.0f, v));
+        dst[((size_t)y * cols + x) * co + c] = d_output_byte(blended);
+    }
+}
+
 __global__ void k_flush(float *band, int co, int band_rows, int OW, int y0,
                         int n, uint8_t *dst)
 {
@@ -125,9 +148,7 @@ __global__ void k_flush(float *band, int co, int band_rows, int OW, int y0,
     const int r = (y0 + k) % band_rows;
     for (int c = 0; c < co; c++) {
         float *b = band + ((size_t)c * band_rows + r) * OW + X;
-        const float f = __fadd_rn(__fmul_rn(*b, 255.0f), 0.5f);
-        dst[((size_t)k * OW + X) * co + c] =
-            f <= 0.0f ? 0 : f >= 255.0f ? 255 : (uint8_t)f;
+        dst[((size_t)k * OW + X) * co + c] = d_output_byte(*b);
         *b = 0.0f;
     }
 }
@@ -159,6 +180,16 @@ cudaError_t gpu_tile_blend(const void *tile, GpuDtype dt, int out_ch,
     k_blend<<<grid_for(cols, rows, block), block, 0, s>>>(
         tile, dt, out_ch, tow, toh, wx, wy, cols, rows, ux0, uy0, band, co,
         band_rows, OW);
+    return cudaGetLastError();
+}
+
+cudaError_t gpu_tile_pack(const void *tile, GpuDtype dt, int out_ch, int tow,
+                          int toh, int cols, int rows, int co, uint8_t *dst,
+                          cudaStream_t s)
+{
+    const dim3 block(32, 8);
+    k_pack<<<grid_for(cols, rows, block), block, 0, s>>>(tile, dt, out_ch,
+        tow, toh, cols, rows, co, dst);
     return cudaGetLastError();
 }
 

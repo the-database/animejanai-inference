@@ -60,6 +60,12 @@ cudaError_t gpu_tile_blend(const void *tile, GpuDtype dt, int out_ch,
                            int cols, int rows, int ux0, int uy0, float *band,
                            int co, int band_rows, int OW, cudaStream_t s);
 
+// Pack the visible upper-left rectangle of a single output tile or tail
+// strip into tightly packed interleaved bytes. tow and toh are tensor dimensions.
+cudaError_t gpu_tile_pack(const void *tile, GpuDtype dt, int out_ch, int tow,
+                          int toh, int cols, int rows, int co, uint8_t *dst,
+                          cudaStream_t s);
+
 // Convert image rows [y0, y0 + n) of the band to 8-bit interleaved rows in
 // `dst` (n x OW x co) and zero them in the band for reuse.
 cudaError_t gpu_band_flush(float *band, int co, int band_rows, int OW,
