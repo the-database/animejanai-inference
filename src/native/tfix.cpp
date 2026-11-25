@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "native/netres.h"
+#include "native/temporal_workspace.h"
 #include "native/tfix_kernels.h"
 #include "native/vidnet.h"
 
@@ -268,9 +269,6 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
     f->frb = M * 8 * 2;
     f->FR[0] = r.alloc(NF * f->frb);
     for (int i = 1; i < NF; i++) f->FR[i] = f->FR[0] ? (char *)f->FR[0] + i * f->frb : nullptr;
-    f->E1 = r.alloc(M1 * 16 * 2);
-    f->E2 = r.alloc(M1 * 16 * 2);
-    f->EP = r.alloc(M1 * 16 * 2);
     for (int k = 0; k < 3; k++) {
         Stage &S = f->st[k];
         f->pyb[k] = (size_t)S.h * S.w * 8 * 2;
@@ -337,12 +335,25 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
             b.F = k < 2 ? (float *)(blk + at[k][7]) : nullptr;
         }
     };
-    if (f->kb) {  // the batched stages
+    const size_t encoder_bytes = M1 * 16 * sizeof(uint16_t);
+    if (f->kb) {
         size_t o = 0, at[3][8] = {};
         layoutA(o, 0, f->kb, 6, at);
-        char *blk = (char *)r.alloc(o);
+        const auto workspace = ping_pong_layout(o, encoder_bytes);
+        char *blk = (char *)r.alloc(workspace.size);
         if (!blk) return refuse(why, "out of GPU memory"), nullptr;
+        // e2 finishes reading E2 before the projection writes EP. tx_frame consumes EP
+        // before stage 0 can overwrite this span on the same stream. Only FR and the
+        // pyramids survive an encode, including when a window holds/repeats a cache entry.
+        // In the other direction stage 2's tx_assemble is the last reader of batched F/ST
+        // on each support stream. exec joins all c.done events before the next encode.
+        f->E1 = blk;
+        f->E2 = f->EP = blk + workspace.second_offset;
         setA(f->ba, blk, 0, f->kb, at);
+    } else {
+        f->E1 = r.alloc(encoder_bytes);
+        f->E2 = r.alloc(encoder_bytes);
+        f->EP = r.alloc(encoder_bytes);
     }
     size_t oA = 0, at[3][8] = {}, oB = 0, pb[5] = {};
     layoutA(oA, f->kb, 3, 1, at);
