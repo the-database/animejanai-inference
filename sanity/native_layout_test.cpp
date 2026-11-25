@@ -6,6 +6,7 @@
 
 #include "native/layout.h"
 #include "native/ops.h"
+#include "native/temporal_workspace.h"
 
 #define CHECK(x) do { if (!(x)) { \
     std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; \
@@ -126,6 +127,16 @@ int test_sizes_and_unread()
 
 int main()
 {
+    const auto batch = ping_pong_layout(96, 32);
+    CHECK(batch.size == 96 && batch.second_offset == 32);
+    const auto two_lanes = ping_pong_layout(48, 32);
+    CHECK(two_lanes.size == 64 && two_lanes.second_offset == 32);
+    const auto cached = temporal_input_layout(7, 7, true);
+    CHECK(cached.input_frames == 1 && cached.cache_entries == 7);
+    for (auto full : {temporal_input_layout(7, 7, false), temporal_input_layout(7, 6, true),
+                      temporal_input_layout(7, 0, true)}) {
+        CHECK(full.input_frames == 7 && full.cache_entries == 0);
+    }
     if (test_refusals()) return 1;
     if (test_span_chain()) return 1;
     if (test_sizes_and_unread()) return 1;

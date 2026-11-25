@@ -59,6 +59,7 @@
 #include "native/onnx_graph.h"
 #include "native/rife.h"
 #include "native/vidnet.h"
+#include "native/temporal_workspace.h"
 
 namespace fs = std::filesystem;
 
@@ -271,7 +272,7 @@ struct aji_ctx {
         std::vector<int64_t> seq;    // per slot, -1 = empty
         std::vector<uint64_t> gen;   // per slot: which store put the frame there (never reused)
         std::vector<int> matrix, range;
-        void *in_tensor = nullptr;   // 3t * pw*ph fp16
+        void *in_tensor = nullptr;   // one padded RGB frame with sel, a full window otherwise
         void *out_tensor = nullptr;  // 3 * pow*poh fp16
         std::shared_ptr<ajinative::VidNet> native;  // native kernels in place of the engine
         // native models that keep per-frame work (TemporalFix's encoder): the gen of the frame
@@ -1049,10 +1050,15 @@ bool setup_temporal(aji_ctx *c)
         // their own window held.
         T.nslots = &T == &TT.st[0] ? 2 * TT.r + 5 : T.t + 4;
         const size_t frame = (size_t)3 * T.w * T.h * 2;
+        static const bool fcache = !getenv("AJI_NATIVE_FRAME_CACHE") || strcmp(getenv("AJI_NATIVE_FRAME_CACHE"), "off") != 0;
+        // The cached path gathers a single RGB frame at offset zero. encode() consumes it
+        // on this stream before the next gather. Held frames and run_cached use entry IDs
+        // and persistent features. The uncached gather/run path needs the full window.
+        const auto input = ajinative::temporal_input_layout(T.t, T.native ? T.native->cache_entries() : 0, fcache);
         if (cudaMalloc(&T.ring, frame * T.nslots) != cudaSuccess ||
             cudaMalloc((void **)&T.diff, sizeof(float) * T.nslots) !=
                 cudaSuccess ||
-            cudaMalloc(&T.in_tensor, (size_t)3 * T.t * T.pw * T.ph * 2) !=
+            cudaMalloc(&T.in_tensor, (size_t)3 * input.input_frames * T.pw * T.ph * 2) !=
                 cudaSuccess ||
             cudaMalloc(&T.out_tensor, (size_t)3 * T.pow * T.poh * 2) !=
                 cudaSuccess) {
@@ -1062,14 +1068,12 @@ bool setup_temporal(aji_ctx *c)
         cudaMemset(T.diff, 0, sizeof(float) * T.nslots);
         T.seq.assign(T.nslots, -1);
         T.gen.assign(T.nslots, 0);
-        // AJI_NATIVE_FRAME_CACHE=off: every window encodes all its frames (for comparisons)
-        static const bool fcache = !getenv("AJI_NATIVE_FRAME_CACHE") || strcmp(getenv("AJI_NATIVE_FRAME_CACHE"), "off") != 0;
-        if (fcache && T.native && T.native->cache_entries() >= T.t) {
+        if (input.cache_entries) {
             if (cudaMalloc((void **)&T.sel, sizeof(int) * T.t) != cudaSuccess) {
                 c->set_error("temporal buffer allocation failed");
                 return false;
             }
-            T.cgen.assign(T.native->cache_entries(), 0);
+            T.cgen.assign(input.cache_entries, 0);
         }
         T.matrix.assign(T.nslots, AJI_MATRIX_BT709);
         T.range.assign(T.nslots, AJI_RANGE_LIMITED);
