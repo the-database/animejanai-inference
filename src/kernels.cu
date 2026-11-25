@@ -110,52 +110,46 @@ __device__ __forceinline__ float quant(float v, float qdiv, float qmax)
 
 /* ---------------- pre: NV12/P010 -> RGB fp16 ---------------- */
 
-// horizontal resample of interleaved raw chroma -> 2 planar fp32 (raw units)
+// Each block owns a tile of RGB pixels. Store one fp32 horizontal sum per column and
+// unmirrored chroma row in the tile's vertical tap range (including its halo).
 template <typename T>
-__global__ void k_uv_h(const uint8_t *uv, ptrdiff_t stride, int ch, pass px,
-                       float *dst)
+__global__ void k_pre_fused(const uint8_t *y_plane, ptrdiff_t y_stride,
+                            const uint8_t *uv_plane, ptrdiff_t uv_stride,
+                            pass px, pass py, aji_csp csp, __half *dst)
 {
+    extern __shared__ float2 horizontal[];
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= px.dst || y >= ch)
-        return;
-    const T *row = (const T *)(uv + (size_t)y * stride);
-    const float *w = px.wt + (size_t)x * px.taps;
-    const int s0 = px.start[x];
-    float u = 0.0f, v = 0.0f;
-    for (int j = 0; j < px.taps; j++) {
-        const int sx = mirr(s0 + j, px.src);
-        u += w[j] * row[2 * sx];
-        v += w[j] * row[2 * sx + 1];
+    const int y0 = blockIdx.y * blockDim.y, y = y0 + threadIdx.y;
+    const int first = py.start[y0];
+    const int last_y = min(y0 + (int)blockDim.y, py.dst) - 1;
+    const int rows = py.start[last_y] - first + py.taps;
+    if (x < px.dst) {
+        const int s0 = px.start[x];
+        const float *wt = px.wt + (size_t)x * px.taps;
+        for (int r = threadIdx.y; r < rows; r += blockDim.y) {
+            const int sy = mirr(first + r, py.src);
+            const T *row = (const T *)(uv_plane + (size_t)sy * uv_stride);
+            float u = 0.0f, v = 0.0f;
+            for (int j = 0; j < px.taps; ++j) {
+                const int sx = mirr(s0 + j, px.src);
+                u += wt[j] * row[2 * sx];
+                v += wt[j] * row[2 * sx + 1];
+            }
+            horizontal[r * blockDim.x + threadIdx.x] = make_float2(u, v);
+        }
     }
-    const size_t plane = (size_t)px.dst * ch, idx = (size_t)y * px.dst + x;
-    dst[idx] = u;
-    dst[plane + idx] = v;
-}
+    __syncthreads();
+    if (x >= px.dst || y >= py.dst) return;
 
-// Vertical chroma resample + matrix. Keep both accumulators in fp32, in the
-// same tap order as the separate pass; only the final RGB is rounded to fp16.
-// This avoids writing and rereading two full-resolution fp32 chroma planes.
-template <typename T>
-__global__ void k_pre_v_combine(const uint8_t *y_plane, ptrdiff_t y_stride,
-                              const float *uvf, int w, pass py, aji_csp csp,
-                              __half *dst)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= py.dst)
-        return;
-    const size_t plane = (size_t)w * py.dst, idx = (size_t)y * w + x;
-
-    const size_t uv_plane = (size_t)w * py.src;
+    const int row0 = py.start[y] - first;
     const float *wt = py.wt + (size_t)y * py.taps;
-    const int s0 = py.start[y];
     float u = 0.0f, v = 0.0f;
-    for (int j = 0; j < py.taps; j++) {
-        const size_t pos = (size_t)mirr(s0 + j, py.src) * w + x;
-        u += wt[j] * uvf[pos];
-        v += wt[j] * uvf[uv_plane + pos];
+    for (int j = 0; j < py.taps; ++j) {
+        const float2 uv = horizontal[(row0 + j) * blockDim.x + threadIdx.x];
+        u += wt[j] * uv.x;
+        v += wt[j] * uv.y;
     }
+    const size_t plane = (size_t)px.dst * py.dst, idx = (size_t)y * px.dst + x;
 
     const T *yrow = (const T *)(y_plane + (size_t)y * y_stride);
     const float Y = ((float)yrow[x] - csp.yoff) / csp.yscale;
@@ -468,8 +462,7 @@ extern "C" aji_plan *aji_pre_plan_create(int format, int w, int h, int siting,
     double sx, sy;
     chroma_shifts(siting, true, &sx, &sy);
     if (!build_pass(&p->ph, cw, w, sx, filter) ||
-        !build_pass(&p->pv, ch, h, sy, filter) ||
-        cudaMalloc(&p->tmp0, (size_t)2 * w * ch * sizeof(float)) != cudaSuccess) {
+        !build_pass(&p->pv, ch, h, sy, filter)) {
         aji_plan_destroy(p);
         return nullptr;
     }
@@ -584,23 +577,17 @@ extern "C" int aji_run_pre(aji_plan *p,
                            const aji_csp *csp, void *dst_f16, void *stream)
 {
     cudaStream_t s = (cudaStream_t)stream;
-    const int w = p->w, h = p->h, ch = h >> 1;
-    if (p->format == AJI_FMT_NV12) {
-        k_uv_h<uint8_t><<<GRID(w, ch, 1), 0, s>>>(
-            (const uint8_t *)uv_plane, uv_stride, ch, p->ph, p->tmp0);
-    } else {
-        k_uv_h<uint16_t><<<GRID(w, ch, 1), 0, s>>>(
-            (const uint8_t *)uv_plane, uv_stride, ch, p->ph, p->tmp0);
-    }
-    if (p->format == AJI_FMT_NV12) {
-        k_pre_v_combine<uint8_t><<<GRID(w, h, 1), 0, s>>>(
-            (const uint8_t *)y_plane, y_stride, p->tmp0, w, p->pv, *csp,
-            (__half *)dst_f16);
-    } else {
-        k_pre_v_combine<uint16_t><<<GRID(w, h, 1), 0, s>>>(
-            (const uint8_t *)y_plane, y_stride, p->tmp0, w, p->pv, *csp,
-            (__half *)dst_f16);
-    }
+    // py.src = floor(h / 2). Across BLOCK_Y output rows the monotone tap start
+    // advances by at most ceil((BLOCK_Y - 1) / 2), for either vertical siting.
+    const size_t shared_bytes = (BLOCK_Y / 2 + p->pv.taps) * BLOCK_X * sizeof(float2);
+    if (p->format == AJI_FMT_NV12)
+        k_pre_fused<uint8_t><<<GRID(p->w, p->h, 1), shared_bytes, s>>>(
+            (const uint8_t *)y_plane, y_stride, (const uint8_t *)uv_plane, uv_stride,
+            p->ph, p->pv, *csp, (__half *)dst_f16);
+    else
+        k_pre_fused<uint16_t><<<GRID(p->w, p->h, 1), shared_bytes, s>>>(
+            (const uint8_t *)y_plane, y_stride, (const uint8_t *)uv_plane, uv_stride,
+            p->ph, p->pv, *csp, (__half *)dst_f16);
     return (int)cudaGetLastError();
 }
 
@@ -668,8 +655,7 @@ static PlaneKernel plane_kernel(void (*fn)(Args...), bool output, bool expected)
 template<class T>
 static void add_420_kernels(std::vector<PlaneKernel> &kernels, bool input, bool output, bool fused)
 {
-    kernels.push_back(plane_kernel<0, 1, 1>(k_uv_h<T>, false, input));
-    kernels.push_back(plane_kernel<0, 0, 1>(k_pre_v_combine<T>, false, input));
+    kernels.push_back(plane_kernel<0, 0, 2>(k_pre_fused<T>, false, input));
     kernels.push_back(plane_kernel<6, 0, 2>(k_post_fused<T>, true, output && fused));
     kernels.push_back(plane_kernel<6, 0, 1>(k_post_matrix<T>, true, output && !fused));
     kernels.push_back(plane_kernel<6, 1, 1>(k_uv_v_store<T>, true, output && !fused));
