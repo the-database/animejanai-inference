@@ -29,7 +29,10 @@ inline std::vector<Output> render(const char *family, int scale, const OnnxGraph
     std::vector<LifetimeCheck::Workspace> launches, first_launches;
     check.launches = &launches;
     check.edit = edit;
-    if (separate) check.workspace_arena_limit = 0;
+    if (separate) {
+        check.workspace_arena_limit = 0;
+        check.disjoint_features = true;
+    }
     check.poison = poison;
     LifetimeCheck::active = &check;
     std::string why;

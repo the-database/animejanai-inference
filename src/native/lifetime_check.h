@@ -12,6 +12,7 @@ public:
     inline static thread_local LifetimeCheck *active = nullptr;
     void (*edit)(LifetimePlan &) = nullptr; // test reference layout or deliberately incorrect lifetime
     bool poison = false;
+    bool disjoint_features = false; // test reference for phase-carved features
     size_t workspace_arena_limit = size_t(-1); // test the build-time separate allocation with a smaller arena
     using Workspace = std::tuple<int, const void *, size_t>;
     std::vector<Workspace> *launches = nullptr; // optional trace of actual dispatch checks
