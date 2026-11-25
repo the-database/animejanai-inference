@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include "native/gconv.h"
+#include "native/lifetime_check.h"
 #include "native/onnx_read.h"
 #include "native/tfm.h"
 
@@ -149,59 +150,22 @@ struct Bump {
 // no range of one meets a range of the other. Placed largest first at the lowest offset that fits
 // (greedy by size). AJI_NATIVE_POISON fills the arena with 0xFF (NaN in fp16 and fp32) instead of zeros,
 // so a read of anything a step didn't write in this run (another buffer's leftovers) shows in the output.
-class Lifetimes {
+class Lifetimes : public LifetimePlan {
 public:
-    using Range = std::pair<int, int>;
-    void add(void **slot, size_t bytes, std::vector<Range> live) { bufs.push_back({slot, (bytes + 255) / 256 * 256, std::move(live), 0}); }
-    // Lays the buffers out, allocates the arena from r and points each slot into it.
-    bool assign(DevRes &r) { return assign([&](size_t n) { return r.alloc(n); }); }
-    // The same with any allocator: alloc(bytes) returns device memory or null.
+    bool assign(DevRes &r, LifetimeCheck *check = nullptr) { return assign([&](size_t n) { return r.alloc(n); }, check); }
     template <class Alloc>
-    bool assign(Alloc alloc)
+    bool assign(Alloc alloc, LifetimeCheck *check = nullptr)
     {
-        std::vector<size_t> order(bufs.size());
-        for (size_t i = 0; i < order.size(); i++) order[i] = i;
-        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return bufs[a].bytes > bufs[b].bytes; });
-        std::vector<size_t> placed;
-        size_t total = 0;
-        for (size_t i : order) {
-            Buf &b = bufs[i];
-            std::vector<std::pair<size_t, size_t>> taken;  // [offset, end) of placed buffers live with this one
-            for (size_t j : placed)
-                if (meets(b, bufs[j])) taken.push_back({bufs[j].off, bufs[j].off + bufs[j].bytes});
-            std::sort(taken.begin(), taken.end());
-            size_t off = 0;
-            for (auto &t : taken) {
-                if (off + b.bytes <= t.first) break;
-                off = std::max(off, t.second);
-            }
-            b.off = off;
-            total = std::max(total, off + b.bytes);
-            placed.push_back(i);
-        }
-        static const bool poison = std::getenv("AJI_NATIVE_POISON") != nullptr;
-        char *base = (char *)alloc(total);
+        if (check && check->edit) check->edit(*this);
+        const size_t total = arrange();
+        void *base = alloc(total);
         if (!base) return false;
+        static const bool poison = std::getenv("AJI_NATIVE_POISON") != nullptr;
         if (poison) cudaMemset(base, 0xFF, total);
-        for (Buf &b : bufs) *b.slot = base + b.off;
+        bind(base);
+        if (check) check->capture(*this, base, total);
         return true;
     }
-
-private:
-    struct Buf {
-        void **slot;
-        size_t bytes;
-        std::vector<Range> live;
-        size_t off;
-    };
-    static bool meets(const Buf &a, const Buf &b)
-    {
-        for (const Range &x : a.live)
-            for (const Range &y : b.live)
-                if (x.first <= y.second && y.first <= x.second) return true;
-        return false;
-    }
-    std::vector<Buf> bufs;
 };
 
 // Checks the ops are supported and sets each one's kernel variant (gvariant_for; no timing).

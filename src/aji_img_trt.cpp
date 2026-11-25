@@ -23,6 +23,7 @@
 #include <algorithm>
 #include "native/conv.h"
 #include "native/imgnet.h"
+#include "native/allocation_count.h"
 #include "native/guard.h"
 #include "native/onnx_graph.h"
 #include <chrono>
@@ -632,7 +633,8 @@ bool load_native(aji_img_model *m, const std::vector<char> &blob, std::string *w
     m->weights = (int64_t)m->native->weight_bytes();
     m->native_act = (int64_t)(m->native->device_bytes() - m->native->weight_bytes());
     m->buf_bytes = ib + ob;
-    if (cudaMalloc(&m->d_in, ib) != cudaSuccess || cudaMalloc(&m->d_out, ob) != cudaSuccess ||
+    if (ajinative::model_malloc(&m->d_in, ib, ajinative::AllocationKind::TileIO) != cudaSuccess ||
+        ajinative::model_malloc(&m->d_out, ob, ajinative::AllocationKind::TileIO) != cudaSuccess ||
         cudaMallocHost(&m->h_in, ib) != cudaSuccess || cudaMallocHost(&m->h_out, ob) != cudaSuccess) {
         cudaGetLastError();
         *why = "out of memory for the tile buffers";

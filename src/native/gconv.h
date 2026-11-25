@@ -22,16 +22,17 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include "native/gact.h"
 
 namespace ajinative {
 
-enum class GAct { None = 0, Relu = 1, LRelu = 2, Gelu = 3 };  // GELU: exact (erf), divisor 1.4140625
 
 // Packed weights of one conv (all output chunks), device memory.
 struct GWeights {
     void *frag = nullptr;      // per output chunk: uint4[9][cin_pad/16][coutp/16][32]
     void *bias = nullptr;      // half2[cout_pad/2]
     int cin = 0, cin_pad = 0, cout = 0, cout_pad = 0, coutp = 0;  // coutp: channels per launch
+    size_t device_bytes = 0;  // successful packed coefficient and bias allocations
 };
 
 // w: [9][cin][cout] fp16 bits (taps ky*3+kx; ONNX OIHW transposed). bias: cout floats or null.

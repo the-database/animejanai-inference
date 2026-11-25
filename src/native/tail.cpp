@@ -8,20 +8,6 @@
 
 namespace ajinative {
 
-int Tail::scale_after(int k) const
-{
-    int sc = 1;
-    for (int i = 0; i <= k; i++)
-        if (steps_[i].ps || steps_[i].up2) sc *= 2;
-    return sc;
-}
-
-size_t Tail::bytes(int k, int bw, int rows) const
-{
-    const size_t sc = (size_t)scale_after(k);
-    return sc * sc * bw * rows * steps_[k].out_stride * 2;
-}
-
 void Tail::plan(const void *src, int src_stride, int bw, int t0, int tn, std::vector<std::pair<GOp *, GConvArgs>> *ops) const
 {
     const void *in = (const uint16_t *)src + (size_t)t0 * bw * src_stride;
