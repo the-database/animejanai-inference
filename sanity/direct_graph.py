@@ -77,6 +77,7 @@ ck(bind(cuda, 'cudaStreamCreateWithFlags', I, C.POINTER(P), I)(C.byref(stream), 
 sync = bind(cuda, 'cudaStreamSynchronize', I, P)
 create = bind(lib, 'aji_create', P, C.POINTER(Params))
 configure = bind(lib, 'aji_configure', I, P, I, I, C.c_double, C.POINTER(I), C.POINTER(I))
+set_slot = bind(lib, 'aji_set_slot', I, P, I)
 infer = bind(lib, 'aji_infer', I, P, C.POINTER(Frame), C.POINTER(Frame), P)
 last_error = bind(lib, 'aji_last_error', C.c_char_p, P)
 messages = []
@@ -144,9 +145,16 @@ def captures():
 for infmt, outfmt in ((1, 2), (1, 1), (1, 3), (2, 2), (3, 3)):
     ins = [surface(a.width, a.height, infmt, k, True) for k in range(3)]
     outs = [surface(ow.value, oh.value, outfmt, k, False) for k in range(3)]
+    # Vary output color tags (including unset tags) across the pool. The chain uses input colorimetry.
+    for fo, tags in zip(outs, ((2, 1, 1), (1, 2, 2), (0, 0, 0))):
+        fo.matrix, fo.range, fo.siting = tags
     ck(sync(None))
     for batch, (shift, color_range) in enumerate(((0, 1), (1, 1), (2, 1), (0, 2), (1, 1))):
         before = captures()
+        if a.conf and (infmt, outfmt) == (1, 2) and batch in (1, 2):
+            # Slot selection takes effect at configure. These frames still use the active chain.
+            if set_slot(ctx, 0 if batch == 1 else a.slot) != 0:
+                raise RuntimeError(last_error(ctx))
         for k, fi in enumerate(ins):
             fi.range = color_range
             fo = outs[(k + shift) % 3]
@@ -161,8 +169,12 @@ for infmt, outfmt in ((1, 2), (1, 1), (1, 3), (2, 2), (3, 3)):
             if a.worker != 'eager' and actual != reference[key]:
                 raise RuntimeError(f'{key}: expected {reference[key][:16]}, got {actual[:16]}')
             observed[key] = actual
-        if a.worker == 'updated' and captures() - before != int(batch in (0, 3, 4)):
-            raise RuntimeError(f'{infmt}->{outfmt} batch={batch}: unexpected capture count; {messages[-4:]}')
+        if a.worker == 'updated':
+            expected_captures = int(batch in (0, 3, 4))
+            capture_count = captures() - before
+            if capture_count != expected_captures:
+                raise RuntimeError(f'{infmt}->{outfmt} batch={batch}: expected {expected_captures} capture(s), '
+                                   f'observed {capture_count}')
         if (infmt, outfmt) == (1, 2) and batch < 3 and a.worker in faults:
             staged = sum('captured as staged CUDA graph' in m for m in messages)
             if staged != 1 or captures() != int(a.worker == 'update') or lib.aji_test_graph_last_error():

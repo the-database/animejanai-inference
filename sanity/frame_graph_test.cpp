@@ -9,12 +9,19 @@ int main()
     aji_frame in{}, out{};
     const auto original = ajigraph::frame_key(in, out);
     for (aji_frame *frame : {&in, &out}) {
-        for (int aji_frame::*field : {&aji_frame::width, &aji_frame::height, &aji_frame::format,
-                                      &aji_frame::matrix, &aji_frame::range, &aji_frame::siting}) {
+        for (auto field : {&aji_frame::width, &aji_frame::height, &aji_frame::format}) {
             ++(frame->*field);
             CHECK(ajigraph::frame_key(in, out) != original);
             --(frame->*field);
         }
+    }
+    for (auto field : {&aji_frame::matrix, &aji_frame::range, &aji_frame::siting}) {
+        ++(in.*field);
+        CHECK(ajigraph::frame_key(in, out) != original);
+        --(in.*field);
+        ++(out.*field);
+        CHECK(ajigraph::frame_key(in, out) == original);
+        --(out.*field);
     }
     int pixels[4]{};
     out.plane[1] = &pixels[0]; out.stride[1] = 128;

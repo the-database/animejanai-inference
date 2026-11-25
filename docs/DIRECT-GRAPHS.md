@@ -7,11 +7,12 @@ synchronizes an eager warmup. Later calls update the captured conversion nodes
 with the current device addresses and byte pitches for every input and output
 plane. The caller must keep those allocations valid until the stream completes.
 
-The graph belongs to the current chain configuration. Input and output shape,
-format, matrix, range and chroma siting determine whether the conversion plans
-can be reused. A change to that information, the selected slot or the configured
-chain invalidates the graph before its dependencies can be replaced. Rotating
-surfaces or changing pitches reuses the executable.
+The graph belongs to the current chain configuration. Its key includes input
+and output dimensions and formats, plus input matrix, range and chroma siting.
+Postprocessing uses the input matrix and range and places subsampled output
+chroma on the left. Callers can vary the output color tags, surfaces and pitches
+while reusing the executable. Selecting a slot takes effect at the next
+`aji_configure`, which invalidates the graph before replacing its dependencies.
 
 If capture, conversion-node identification or instantiation fails, the warmup
 has already produced the requested frame. The next call uses staging. If an
@@ -22,8 +23,10 @@ Execution errors during direct warmup or launch reach the caller.
 
 Set `AJI_NO_GRAPH=1` before creating the backend to run eagerly. Default-stream
 calls run eagerly. The former `AJI_DIRECT_GRAPH` opt-in is no longer needed.
-This change applies to regular spatial inference. RIFE and temporal sequence
-entry points use their existing paths.
+The updatable graph was validated for regular spatial inference. Validation
+with interleaved RIFE interpolation is still pending. RIFE-enabled chains
+therefore keep staging for graphed spatial inference and receive no staging
+VRAM savings. Temporal sequence entry points use their existing paths.
 
 ## Checking replay
 

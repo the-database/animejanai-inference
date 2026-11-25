@@ -20,6 +20,9 @@
 #include <string.h>
 
 #include <algorithm>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "aji.h"
@@ -646,10 +649,19 @@ extern "C" int aji_run_post(aji_plan *p, const void *src_f16,
 
 namespace ajigraph {
 
+template<int Arg, class Signature, size_t... J>
+constexpr bool has_plane_pitches(std::index_sequence<J...>)
+{
+    return ((std::is_pointer_v<std::tuple_element_t<Arg + 2 * J, Signature>> &&
+             std::is_same_v<std::tuple_element_t<Arg + 2 * J + 1, Signature>, ptrdiff_t>) && ...);
+}
+
 template<int Arg, int FirstPlane, int Planes, class... Args>
 static PlaneKernel plane_kernel(void (*fn)(Args...), bool output, bool expected)
 {
     static_assert(Arg + 2 * Planes <= sizeof...(Args) && sizeof...(Args) <= KernelArgs{}.size());
+    static_assert(has_plane_pitches<Arg, std::tuple<Args...>>(std::make_index_sequence<Planes>{}),
+                  "Each caller plane must be a pointer followed by a ptrdiff_t byte pitch");
     return {reinterpret_cast<const void *>(fn), (int)sizeof...(Args), Arg, FirstPlane, Planes, output, expected};
 }
 

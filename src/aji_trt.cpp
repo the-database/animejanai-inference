@@ -245,7 +245,7 @@ struct aji_ctx {
         }
     } frame_graph;
     ajigraph::FrameKey graph_key{};
-    bool graphs_enabled = true, update_ok = true, staged_ok = true, slot_changed = false;
+    bool graphs_enabled = true, update_ok = true, staged_ok = true;
     cudaGraphExec_t staged_exec = nullptr;
     void *stage_in = nullptr, *stage_out = nullptr;
     size_t stage_in_bytes = 0, stage_out_bytes = 0;
@@ -489,7 +489,6 @@ void reset_chain_graphs(aji_ctx *c)
     c->stage_in_bytes = c->stage_out_bytes = 0;
     c->graph_key = {};
     c->update_ok = c->staged_ok = true;
-    c->slot_changed = false;
 }
 
 bool ensure_buffers(aji_ctx *c, size_t first_bytes, size_t second_bytes)
@@ -1225,7 +1224,6 @@ extern "C" AJI_EXPORT int aji_set_slot(aji_ctx *c, int slot)
     // passthrough, which is exactly the wanted "off" behavior.
     if (!c || slot < 0)
         return AJI_ERR;
-    c->slot_changed |= c->slot != slot;
     c->slot = slot;
     return AJI_OK;
 }
@@ -1971,7 +1969,7 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
 
     if (c->graphs_enabled) {
         const auto key = ajigraph::frame_key(*in, *out);
-        if (c->slot_changed || c->graph_key != key) {
+        if (c->graph_key != key) {
             // Also invalidate on an eager/default-stream call: it may replace the pre/post plan.
             if (c->graph_key != ajigraph::FrameKey{} && cudaDeviceSynchronize() != cudaSuccess) {
                 c->set_error("could not drain previous frame graph");
@@ -1982,6 +1980,7 @@ extern "C" AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
         }
         if (stream && stream != cudaStreamLegacy && stream != cudaStreamPerThread) {
             int ret;
+            // RIFE-enabled chains keep staging until caller-plane replay is validated with interpolation.
             if (c->update_ok && !c->rife.enabled && infer_via_frame_graph(c, in, out, stream, &ret))
                 return ret;
             if (c->staged_ok && infer_via_staged_graph(c, in, out, stream, &ret))

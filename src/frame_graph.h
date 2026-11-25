@@ -11,12 +11,13 @@ struct aji_plan;
 
 namespace ajigraph {
 
-using FrameKey = std::array<int, 12>;
+using FrameKey = std::array<int, 9>;
 
 inline FrameKey frame_key(const aji_frame &in, const aji_frame &out)
 {
+    // run_post uses input colorimetry and fixed left siting for subsampled output.
     return {in.format, in.width, in.height, in.matrix, in.range, in.siting,
-            out.format, out.width, out.height, out.matrix, out.range, out.siting};
+            out.format, out.width, out.height};
 }
 
 struct PlaneKernel {
