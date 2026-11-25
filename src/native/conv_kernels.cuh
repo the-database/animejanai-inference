@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 #include <cuda_fp16.h>
 
 namespace ajinative {
@@ -34,12 +35,23 @@ struct ConvParams {
     int out_clamp;  // depth-to-space outputs: clamp to [0, 1] (after the input is added)
 };
 
+struct SpanConvParams : ConvParams {
+    bool reverse_tile_rows;
+};
+
 struct ConcatParams {
     const half *src[4];
     half *dst;
     const uint4 *w;
     const half2 *bias;
     int npx;
+};
+
+// Inputs to the four-map projection following the last SPANF3-48 gate.
+struct GateProjectParams : SpanConvParams {
+    const half *maps[4];
+    const uint4 *project_w;
+    const half2 *project_bias;
 };
 
 __device__ __forceinline__ half2 u2h(uint32_t u) { return *reinterpret_cast<half2 *>(&u); }
@@ -97,25 +109,40 @@ __host__ __device__ constexpr int conv_smem_bytes()
                : WARPS * WR * TW * smem_stride(COUTP) * 2;
 }
 
+#include "native/span_fp8_kernels.inl"
+#include "native/span48_project.inl"
+
 // IN/ACT/GATE/OUT take the integer values of Input/Act/Gate/Output.
-template <int CINP, int COUTP, int WARPS, int WR, int IN, int ACT, int GATE, int OUT>
-__global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
+template <int CINP, int COUTP, int WARPS, int WR, int IN, int ACT, int GATE, int OUT, bool FP8 = false,
+          bool PACKED_IN = false, bool PACKED_OUT = false, class Params = ConvParams>
+__global__ void __launch_bounds__(WARPS * 32) k_conv3x3(Params p)
 {
 #if AJI_NATIVE_ARCH_OK
-    constexpr int TH = WARPS * WR, CP = smem_stride(CINP), SP = smem_stride(COUTP), KC = CINP / 16, NT = COUTP / 8, NJ = NT / 2;
+    constexpr int TH = WARPS * WR, KC = CINP / 16, NT = COUTP / 8, NJ = NT / 2;
+    [[maybe_unused]] constexpr int CP = smem_stride(CINP), SP = smem_stride(COUTP);
     // 24-channel shapes: an 8-row K tail (m16n8k8) after the 16-row chunks, an odd last n8 tile
-    constexpr int K8 = (CINP % 16) / 8, NO = NT % 2, WK = NJ * 4 + NO * 2, WT = KC * WK + K8 * (NJ * 2 + NO);
+    constexpr int K8 = (CINP % 16) / 8, NO = NT % 2, WK = NJ * 4 + NO * 2;
+    [[maybe_unused]] constexpr int WT = KC * WK + K8 * (NJ * 2 + NO);
     constexpr int HP = (TH + 2) * (TW + 2);
     static_assert(CINP % 8 == 0 && COUTP % 8 == 0 && NJ > 0, "channel counts are multiples of 8, at least 16");
     static_assert(GATE != 2 || COUTP % 16 == 0, "the tanh gate's 1x1 conv takes 16-channel K chunks");
     static_assert(IN == 0 || CINP == 16, "NCHW inputs are padded to 16 channels");
     extern __shared__ __align__(16) unsigned char smraw[];
-    half *sm = reinterpret_cast<half *>(smraw);
+    [[maybe_unused]] half *sm = reinterpret_cast<half *>(smraw);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int tx0 = blockIdx.x * TW, ty0 = blockIdx.y * TH, H = p.H, W = p.W;
+    unsigned tile_y = blockIdx.y;
+    if constexpr (std::is_base_of_v<SpanConvParams, Params>) {
+        if (p.reverse_tile_rows) tile_y = gridDim.y - 1 - tile_y;
+    }
+    const int tx0 = blockIdx.x * TW, ty0 = tile_y * TH, H = p.H, W = p.W;
 
     // ---- input tile with halo -> shared [HP][CP]
-    if constexpr (IN == 0) {
+    static_assert(!(PACKED_IN || PACKED_OUT) || (FP8 && IN == 0 && OUT == 0));
+    if constexpr (PACKED_IN) {
+        load_packed_fp8_halo<CINP, WARPS, HP>(smraw, p, tx0, ty0);
+    } else if constexpr (FP8) {
+        load_fp8_halo<CINP,WARPS,HP>(smraw, p, tx0, ty0);
+    } else if constexpr (IN == 0) {
         constexpr int VPP = CINP / 8;
         for (int i = tid; i < HP * VPP; i += WARPS * 32) {
             const int px = i / VPP, v = i % VPP;
@@ -167,52 +194,56 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
 #pragma unroll
         for (int n = 0; n < NT; n++) acc[i][n][0] = acc[i][n][1] = 0u;
     const int row0 = warp * WR;
-    const uint32_t *wv = reinterpret_cast<const uint32_t *>(p.w);  // pack_fragments8's layout
+    if constexpr (FP8) {
+        fp8_product<CINP,COUTP>(acc, smraw, p, row0, lane);
+    } else {
+        [[maybe_unused]] const uint32_t *wv = reinterpret_cast<const uint32_t *>(p.w);  // pack_fragments8's layout
 #pragma unroll 1
-    for (int t = 0; t < 9; t++) {
-        const int dy = t / 3, dx = t % 3;
+        for (int t = 0; t < 9; t++) {
+            const int dy = t / 3, dx = t % 3;
 #pragma unroll
-        for (int kc = 0; kc < KC; kc++) {
-            uint4 b[NJ];
-            [[maybe_unused]] uint2 bo;
-            if constexpr (K8 || NO) {
-                const uint32_t *seg = wv + (t * WT + kc * WK) * 32;
+            for (int kc = 0; kc < KC; kc++) {
+                uint4 b[NJ];
+                [[maybe_unused]] uint2 bo;
+                if constexpr (K8 || NO) {
+                    const uint32_t *seg = wv + (t * WT + kc * WK) * 32;
 #pragma unroll
-                for (int j = 0; j < NJ; j++) b[j] = __ldg(reinterpret_cast<const uint4 *>(seg) + j * 32 + lane);
-                if constexpr (NO) bo = __ldg(reinterpret_cast<const uint2 *>(seg + NJ * 4 * 32) + lane);
-            } else {  // multiples of 16: pack_fragments' layout, addressed as it always was
+                    for (int j = 0; j < NJ; j++) b[j] = __ldg(reinterpret_cast<const uint4 *>(seg) + j * 32 + lane);
+                    if constexpr (NO) bo = __ldg(reinterpret_cast<const uint2 *>(seg + NJ * 4 * 32) + lane);
+                } else {  // multiples of 16: pack_fragments' layout, addressed as it always was
 #pragma unroll
-                for (int j = 0; j < NJ; j++) b[j] = __ldg(p.w + ((t * KC + kc) * NJ + j) * 32 + lane);
-            }
-#pragma unroll
-            for (int i = 0; i < WR; i++) {
-                uint32_t a[4];
-                ldsm_x4(a, sm + ((row0 + i + dy) * (TW + 2) + (lane & 15) + dx) * CP + kc * 16 + (lane >> 4) * 8);
-#pragma unroll
-                for (int j = 0; j < NJ; j++) {
-                    mma16816(acc[i][2 * j], a, b[j].x, b[j].y);
-                    mma16816(acc[i][2 * j + 1], a, b[j].z, b[j].w);
+                    for (int j = 0; j < NJ; j++) b[j] = __ldg(p.w + ((t * KC + kc) * NJ + j) * 32 + lane);
                 }
-                if constexpr (NO) mma16816(acc[i][NT - 1], a, bo.x, bo.y);
-            }
-        }
-        if constexpr (K8) {
-            const uint32_t *seg = wv + (t * WT + KC * WK) * 32;
-            uint2 b[NJ];
 #pragma unroll
-            for (int j = 0; j < NJ; j++) b[j] = __ldg(reinterpret_cast<const uint2 *>(seg) + j * 32 + lane);
-            [[maybe_unused]] uint32_t bo;
-            if constexpr (NO) bo = __ldg(seg + NJ * 2 * 32 + lane);
+                for (int i = 0; i < WR; i++) {
+                    uint32_t a[4];
+                    ldsm_x4(a, sm + ((row0 + i + dy) * (TW + 2) + (lane & 15) + dx) * CP + kc * 16 + (lane >> 4) * 8);
 #pragma unroll
-            for (int i = 0; i < WR; i++) {
-                uint32_t a[2];  // m16k8: rows 0-7 and 8-15 of the K tail
-                ldsm_x2(a, sm + ((row0 + i + dy) * (TW + 2) + (lane & 15) + dx) * CP + KC * 16);
-#pragma unroll
-                for (int j = 0; j < NJ; j++) {
-                    mma1688(acc[i][2 * j], a, b[j].x);
-                    mma1688(acc[i][2 * j + 1], a, b[j].y);
+                    for (int j = 0; j < NJ; j++) {
+                        mma16816(acc[i][2 * j], a, b[j].x, b[j].y);
+                        mma16816(acc[i][2 * j + 1], a, b[j].z, b[j].w);
+                    }
+                    if constexpr (NO) mma16816(acc[i][NT - 1], a, bo.x, bo.y);
                 }
-                if constexpr (NO) mma1688(acc[i][NT - 1], a, bo);
+            }
+            if constexpr (K8) {
+                const uint32_t *seg = wv + (t * WT + KC * WK) * 32;
+                uint2 b[NJ];
+#pragma unroll
+                for (int j = 0; j < NJ; j++) b[j] = __ldg(reinterpret_cast<const uint2 *>(seg) + j * 32 + lane);
+                [[maybe_unused]] uint32_t bo;
+                if constexpr (NO) bo = __ldg(seg + NJ * 2 * 32 + lane);
+#pragma unroll
+                for (int i = 0; i < WR; i++) {
+                    uint32_t a[2];  // m16k8: rows 0-7 and 8-15 of the K tail
+                    ldsm_x2(a, sm + ((row0 + i + dy) * (TW + 2) + (lane & 15) + dx) * CP + KC * 16);
+#pragma unroll
+                    for (int j = 0; j < NJ; j++) {
+                        mma1688(acc[i][2 * j], a, b[j].x);
+                        mma1688(acc[i][2 * j + 1], a, b[j].y);
+                    }
+                    if constexpr (NO) mma1688(acc[i][NT - 1], a, bo);
+                }
             }
         }
     }
@@ -239,7 +270,13 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
                         const half2 hf = __float2half2_rn(0.5f);
                         v = __hmul2(v, __hfma2(tanh_h2(__hmul2(v, hf)), hf, hf));
                     }
-                    *reinterpret_cast<half2 *>(sm + ((row0 + i) * TW + g + h * 8) * SP + n * 8 + tq * 2) = v;
+                    const int pixel = (row0 + i) * TW + g + h * 8;
+                    if constexpr (PACKED_OUT) {
+                        static_assert(ACT == 1 && GATE == 0);
+                        *reinterpret_cast<uint16_t *>(smraw + pixel * fp8_stride(COUTP) + n * 8 + tq * 2) = fp8_pair(h2u(v));
+                    } else {
+                        *reinterpret_cast<half2 *>(sm + pixel * SP + n * 8 + tq * 2) = v;
+                    }
                 }
             }
     } else {
@@ -296,21 +333,34 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(ConvParams p)
                         const half2 hf = __float2half2_rn(0.5f);
                         v = __hmul2(v, __hmul2(tanh_h2(__hmul2(o, hf)), hf));
                     }
-                    *reinterpret_cast<half2 *>(sm + ((row0 + i) * TW + g + h * 8) * SP + n * 8 + tq * 2) = v;
+                    if constexpr (std::is_same_v<Params, GateProjectParams>)
+                        acc[i][n][h] = h2u(v);
+                    else
+                        *reinterpret_cast<half2 *>(sm + ((row0 + i) * TW + g + h * 8) * SP + n * 8 + tq * 2) = v;
                 }
             }
+        }
+        if constexpr (std::is_same_v<Params, GateProjectParams>) {
+            static_assert(GATE == 2 && CINP == 48 && COUTP == 48 && OUT == 0 && !PACKED_OUT);
+            span48_project(p, acc, sm + row0 * TW * SP, tx0, ty0 + row0, lane);
         }
     }
     __syncthreads();
 
     if constexpr (OUT == 0) {
         // NHWC: each tile row is up to TW * COUTP contiguous halfs
-        constexpr int VPP = COUTP / 8, VPR = TW * VPP;
+        constexpr int elements = PACKED_OUT ? 16 : 8, VPP = COUTP / elements, VPR = TW * VPP;
         for (int q = tid; q < TH * VPR; q += WARPS * 32) {
             const int r = q / VPR, w = q % VPR, px = w / VPP, v = w % VPP, oy = ty0 + r, ox = tx0 + px;
             if (oy >= H || ox >= W) continue;
-            *reinterpret_cast<uint4 *>(p.dst + ((size_t)oy * W + ox) * COUTP + v * 8) =
-                *reinterpret_cast<const uint4 *>(sm + (r * TW + px) * SP + v * 8);
+            const size_t offset = ((size_t)oy * W + ox) * COUTP + v * elements;
+            if constexpr (PACKED_OUT) {
+                *reinterpret_cast<uint4 *>(reinterpret_cast<unsigned char *>(p.dst) + offset) =
+                    *reinterpret_cast<const uint4 *>(smraw + (r * TW + px) * fp8_stride(COUTP) + v * elements);
+            } else {
+                *reinterpret_cast<uint4 *>(p.dst + offset) =
+                    *reinterpret_cast<const uint4 *>(sm + (r * TW + px) * SP + v * elements);
+            }
         }
     } else {
         // depth-to-space by R (PyTorch PixelShuffle / ONNX DepthToSpace CRD): channel

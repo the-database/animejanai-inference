@@ -62,6 +62,7 @@ struct Conv3x3 {
     bool in_norm = false;
     float in_mean[3] = {0.f, 0.f, 0.f}, in_scale[3] = {1.f, 1.f, 1.f};
     bool out_clamp = false;  // depth-to-space outputs: clamp to [0, 1]
+    bool reverse_tile_rows = false;
 };
 
 // H, W: the conv's resolution (an unshuffled input is 2H x 2W). src: NHWC [H][W][cin] or NCHW
@@ -92,6 +93,9 @@ const char *variant_name(const Conv3x3 &op, int variant);
 
 cudaError_t launch(const Conv3x3 &op, const Tensors &t, int H, int W, int variant, cudaStream_t s);
 cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, int npx, int variant, cudaStream_t s);
+cudaError_t span48_gate_project(const Conv3x3 &op, const Tensors &io, const ConcatConv1x1 &project,
+                                const void *const *maps, const void *fp8_weights, int height, int width,
+                                cudaStream_t stream);
 
 // The tile variant to run op with, from its shape (AJI_NATIVE_CONV_VARIANT=n overrides).
 int tile_variant(const Conv3x3 &op);

@@ -785,6 +785,11 @@ bool lower(const OnnxGraph &g, Plan *plan, std::string *why, const std::vector<i
 
 std::string describe(const Plan &p)
 {
+    return describe(p, p.steps.size());
+}
+
+std::string describe(const Plan &p, size_t kernel_count)
+{
     auto list = [](const std::vector<int> &v) {
         std::set<int> cs(v.begin(), v.end());
         std::string s;
@@ -794,7 +799,7 @@ std::string describe(const Plan &p)
     std::string ch = list(p.model_channels.empty() ? p.channels : p.model_channels);
     if (!p.model_channels.empty()) ch += " ch padded to " + list(p.channels);
     char buf[200];
-    std::snprintf(buf, sizeof(buf), "%zu kernels, %s ch%s%s, depth-to-space %d%s", p.steps.size(), ch.c_str(),
+    std::snprintf(buf, sizeof(buf), "%zu kernels, %s ch%s%s, depth-to-space %d%s", kernel_count, ch.c_str(),
                   p.in_norm ? ", input normalized" : "", p.unshuffle > 1 ? ", pixel-unshuffle 2" : "", p.depth_to_space,
                   p.fp32_weights ? ", fp32 model computed in fp16" : "");
     return buf;

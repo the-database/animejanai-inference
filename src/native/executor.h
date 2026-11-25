@@ -20,11 +20,14 @@ namespace ajinative {
 
 class Executor {
 public:
-    // Fails (null, *why says why) if the device, the size or a step is not supported. Runs on
-    // stream s while it times the variants; s must not be capturing.
-    // Disabling gate reuse selects the backend-neutral layout for parity checks.
+    // Gate reuse can be disabled for a same-precision reference with distinct residuals.
+    // use_fp8 is requested only for a full SPANF3 video plan. Device and kernel support are checked at load.
     static std::unique_ptr<Executor> create(const Plan &plan, int in_w, int in_h, cudaStream_t s, std::string *why,
-                                            bool reuse_gate_residuals = true);
+                                            bool reuse_gate_residuals = true, bool use_fp8 = false);
+    bool uses_fp8() const { return !fp8_owned_.empty(); }
+    int packed_links() const { return packed_links_; }
+    bool enable_fp16_cache_order();
+    bool enable_gate_projection();
     ~Executor();
     Executor(const Executor &) = delete;
     Executor &operator=(const Executor &) = delete;
@@ -46,6 +49,8 @@ private:
     Executor() = default;
     struct Step {
         bool concat = false;
+        bool packed_input = false, packed_output = false;
+        void *fp8_weights = nullptr;
         Conv3x3 op;
         ConcatConv1x1 cop;
         int src = -1, resid = -1, dst = -1, variant = 0;
@@ -58,6 +63,9 @@ private:
     std::vector<void *> tensor_;   // feature id -> buffer
     int H_ = 0, W_ = 0, out_w_ = 0, out_h_ = 0, u_ = 1;
     size_t bytes_ = 0, weight_bytes_ = 0;
+    std::vector<void *> fp8_owned_;
+    int packed_links_ = 0;
+    bool fused_projection_ = false;
 };
 
 }  // namespace ajinative

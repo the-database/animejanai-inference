@@ -32,8 +32,9 @@ struct Layout {
 // Fails (false, *why says why) for an empty plan or a size the plan can't take.
 bool layout(const Plan &plan, int in_w, int in_h, Layout *out, std::string *why);
 
-// Apply once to a freshly computed layout for CUDA kernels that can overwrite a gate's residual.
-void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout);
+// Apply once to a fresh CUDA layout. Dead slots keep full capacity for either representation.
+// An in-place gate reads an FP16 residual and writes an FP16 destination.
+void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout, const std::vector<bool> &packed = {});
 
 }  // namespace ajinative
 

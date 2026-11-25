@@ -178,6 +178,29 @@ int test_cuda_span_gates(Gate gate_type)
     CHECK(L.buffer_bytes.size() == 5);
     CHECK(L.buffer[3] != L.buffer[6]);  // the join still needs block one's output
     for (int dst : {9, 12, 15}) CHECK(L.buffer[dst] == L.buffer[p.steps[dst].resid]);
+    const std::vector<int> main_slots{0, 1, 2, 1, 2, 3, 2, 3, 4, 2, 3, 4, 2, 3, 4, 2, 4};
+    CHECK(L.buffer == main_slots);
+    if (gate_type == Gate::Tanh1x1) {
+        // The last block's first ReLU (t13) is also a projection input and stays FP16.
+        std::vector<bool> packed(p.channels.size());
+        for (int t : {1, 2, 4, 5, 7, 8, 10, 11, 14}) packed[t] = true;
+        for (bool reuse : {false, true}) {
+            CHECK(layout(p, 1920, 1080, &L, &why));
+            if (reuse) reuse_cuda_gate_buffers(p, L, packed);
+            CHECK(L.buffer_bytes.size() == (reuse ? 5 : 6));
+            CHECK(check_live_slots(p, L, reuse ? std::set<int>{9, 12, 15} : std::set<int>{}) == 0);
+            for (size_t bytes : L.buffer_bytes) CHECK(bytes == size_t(960) * 540 * 48 * 2);
+            for (int dst : {9, 12, 15}) CHECK((L.buffer[dst] == L.buffer[p.steps[dst].resid]) == reuse);
+        }
+        // Step 9 can overwrite t6 only when both t6 and t9 hold FP16.
+        for (int tensor : {6, 9}) {
+            CHECK(layout(p, 1920, 1080, &L, &why));
+            packed[tensor] = true;
+            reuse_cuda_gate_buffers(p, L, packed);
+            CHECK(L.buffer[9] != L.buffer[6]);
+            packed[tensor] = false;
+        }
+    }
     return 0;
 }
 

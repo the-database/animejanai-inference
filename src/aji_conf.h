@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "native/ops.h"
+
 struct AjiModelConf {
     std::string name;                          // onnx base name; empty = none
     double resize_factor_before_upscale = 100.0;
@@ -42,6 +44,7 @@ struct AjiChainConf {
 
 struct AjiSlotConf {
     std::string profile_name = "New Profile";
+    ajinative::SpanPrecision span_precision = ajinative::SpanPrecision::Default;
     std::vector<AjiChainConf> chains;          // ordered by chain number
 };
 

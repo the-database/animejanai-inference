@@ -131,7 +131,7 @@ set_target_properties(aji_trt_common PROPERTIES
 
 # Native tensor-core kernels and their ONNX lowering/executor (src/native), linked into both
 # TensorRT backends (used with [global] native=on) and the native tests.
-add_library(aji_native OBJECT src/native/conv.cu src/native/gconv.cu src/native/tfm.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/esrgan.cpp src/native/tail.cpp src/native/fdat.cpp src/native/fdat_body.cpp src/native/fdat_kernels.cu src/native/tfdat.cpp src/native/tfdat_kernels.cu src/native/hat.cpp src/native/dat.cpp src/native/dat_kernels.cu src/native/sst.cpp src/native/sst_kernels.cu src/native/tfix.cpp src/native/tfix_kernels.cu src/native/img_kernels.cu
+add_library(aji_native OBJECT src/native/span48_project.cu src/native/span_fp8.cu src/native/conv.cu src/native/gconv.cu src/native/tfm.cu src/native/rife.cpp src/native/rife_kernels.cu src/native/esrgan.cpp src/native/tail.cpp src/native/fdat.cpp src/native/fdat_body.cpp src/native/fdat_kernels.cu src/native/tfdat.cpp src/native/tfdat_kernels.cu src/native/hat.cpp src/native/dat.cpp src/native/dat_kernels.cu src/native/sst.cpp src/native/sst_kernels.cu src/native/tfix.cpp src/native/tfix_kernels.cu src/native/img_kernels.cu
     ${AJI_NATIVE_HOST_SOURCES} src/native/executor.cpp src/native/framenet.cpp)
 target_include_directories(aji_native PRIVATE src)
 target_link_libraries(aji_native PRIVATE CUDA::cudart)
@@ -646,7 +646,9 @@ add_executable(aji_frame_graph_test sanity/frame_graph_test.cpp)
 target_include_directories(aji_frame_graph_test PRIVATE src include)
 add_executable(aji_rife_conf_test sanity/rife_conf_test.cpp src/aji_conf.cpp)
 target_include_directories(aji_rife_conf_test PRIVATE src)
-set(_cpu_tests aji_frame_graph_test aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test
+add_executable(aji_span_profile_test sanity/span_profile_test.cpp src/aji_conf.cpp)
+target_include_directories(aji_span_profile_test PRIVATE src)
+set(_cpu_tests aji_frame_graph_test aji_half_test aji_tiling_test aji_runtime_packs_test aji_rife_conf_test aji_span_profile_test
                aji_held_test aji_native_pack_test aji_native_lower_test aji_native_layout_test aji_native_forms_test)
 if(AJI_CUDA)
     # CPU-only, but compiled with nvcc

@@ -77,7 +77,7 @@ bool layout(const Plan &plan, int in_w, int in_h, Layout *out, std::string *why)
     return true;
 }
 
-void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout)
+void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout, const std::vector<bool> &packed)
 {
     if (std::none_of(plan.steps.begin(), plan.steps.end(), [](const PlanStep &s) { return s.gate != 0; }))
         return;
@@ -99,12 +99,13 @@ void reuse_cuda_gate_buffers(const Plan &plan, Layout &layout)
         if (s.dst < 0) continue;
         // Each feature has one producer. Its original slot still gives its physical size here.
         const size_t bytes = layout.buffer_bytes[layout.buffer[s.dst]];
+        const bool packed_dst = !packed.empty() && packed[s.dst];
         const Gate gate = (Gate)s.gate;
         int slot;
         if (s.kind == PlanStep::CONV && s.in == (int)Input::NHWC && s.out == (int)Output::NHWC &&
             (gate == Gate::Residual || gate == Gate::Tanh1x1 || gate == Gate::SigmoidHalf) &&
             s.resid >= 0 && s.resid != s.src && last_reader[s.resid] == i &&
-            plan.channels[s.resid] == plan.channels[s.dst]) {
+            plan.channels[s.resid] == plan.channels[s.dst] && !packed_dst && (packed.empty() || !packed[s.resid])) {
             // Each CTA reads its own residual pixels before the barrier preceding its writes.
             // The convolution source supplies a halo to other CTAs and must be a distinct tensor.
             slot = layout.buffer[s.resid];
