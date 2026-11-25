@@ -23,8 +23,9 @@ static void check_cuda(cudaError_t err)
 
 static bool compare(const char *path, int channels, Gate gate)
 {
-    // Multiple CTAs and partial tiles in both dimensions, including after the HD models' unshuffle.
-    constexpr int w = 130, h = 74;
+    // Use more CTAs than can run at once so a later CTA can still need a neighbor's source
+    // halo when that neighbor writes. Both dimensions also leave partial tiles after unshuffle.
+    constexpr int w = 1922, h = 1082;
     std::ifstream file(path, std::ios::binary);
     const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), {});
     OnnxGraph graph;
