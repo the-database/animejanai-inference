@@ -47,7 +47,7 @@ struct ConcatParams {
     int npx;
 };
 
-// Inputs to the four-map projection following the last SPANF3-48 gate.
+// Inputs to the four-map projection following the last SPANF3 gate.
 struct GateProjectParams : SpanConvParams {
     const half *maps[4];
     const uint4 *project_w;
@@ -110,7 +110,7 @@ __host__ __device__ constexpr int conv_smem_bytes()
 }
 
 #include "native/span_fp8_kernels.inl"
-#include "native/span48_project.inl"
+#include "native/span_project.inl"
 
 // IN/ACT/GATE/OUT take the integer values of Input/Act/Gate/Output.
 template <int CINP, int COUTP, int WARPS, int WR, int IN, int ACT, int GATE, int OUT, bool FP8 = false,
@@ -341,8 +341,8 @@ __global__ void __launch_bounds__(WARPS * 32) k_conv3x3(Params p)
             }
         }
         if constexpr (std::is_same_v<Params, GateProjectParams>) {
-            static_assert(GATE == 2 && CINP == 48 && COUTP == 48 && OUT == 0 && !PACKED_OUT);
-            span48_project(p, acc, sm + row0 * TW * SP, tx0, ty0 + row0, lane);
+            static_assert(GATE == 2 && CINP == COUTP && (COUTP == 48 || COUTP == 64) && OUT == 0 && !PACKED_OUT);
+            span_project<COUTP>(p, acc, sm + row0 * TW * SP, tx0, ty0 + row0, lane);
         }
     }
     __syncthreads();

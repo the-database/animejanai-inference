@@ -86,10 +86,10 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
         return false;
     }
     const bool fp8 = mode == "fp8", tuned = mode != "default";
-    const bool fuse = tuned && sm120 && channels == 48;
+    const bool fuse = tuned && sm120 && gate == Gate::Tanh1x1;
     auto reference = Executor::create(plan, w, h, nullptr, &why, false, fp8);
     auto candidate = Executor::create(plan, w, h, nullptr, &why, true, fp8);
-    // Also compare the fused 48-channel paths to the separate convolution + concat kernels.
+    // Also compare the fused HD paths to the separate convolution + concat kernels.
     auto unfused = fuse ? Executor::create(plan, w, h, nullptr, &why, false, fp8) : nullptr;
     auto stock = fp8 ? Executor::create(plan, w, h, nullptr, &why, false, false) : nullptr;
     if (!reference || !candidate || (fuse && !unfused) || (fp8 && !stock)) {

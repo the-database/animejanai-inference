@@ -3,22 +3,24 @@
 
 namespace ajinative {
 namespace {
-template<bool FP8>
+template<int C, bool FP8>
 cudaError_t project_tile(const dev::GateProjectParams &p, cudaStream_t stream)
 {
     constexpr int WARPS = 4, ROWS = 2;
     constexpr int height = WARPS * ROWS;
-    constexpr int halo = (height + 2) * (dev::TW + 2) * (FP8 ? dev::fp8_stride(48) : 2 * dev::smem_stride(48));
-    constexpr int stage = height * dev::TW * 2 * dev::smem_stride(48);
+    constexpr int halo = (height + 2) * (dev::TW + 2) * (FP8 ? dev::fp8_stride(C) : 2 * dev::smem_stride(C));
+    constexpr int stage = height * dev::TW * 2 * dev::smem_stride(C);
+    constexpr int shared_bytes = halo > stage ? halo : stage;
+    static_assert(shared_bytes <= 48 * 1024, "gate/projection tile exceeds the default shared-memory limit");
     const dim3 grid((p.W + dev::TW - 1) / dev::TW, (p.H + height - 1) / height);
-    dev::k_conv3x3<48,48,WARPS,ROWS,0,0,2,0,FP8,FP8,false,dev::GateProjectParams>
-        <<<grid,WARPS*32,(halo > stage ? halo : stage),stream>>>(p);
+    dev::k_conv3x3<C,C,WARPS,ROWS,0,0,2,0,FP8,FP8,false,dev::GateProjectParams>
+        <<<grid,WARPS*32,shared_bytes,stream>>>(p);
     return cudaGetLastError();
 }
 
 } // namespace
 
-cudaError_t span48_gate_project(const Conv3x3 &op, const Tensors &io, const ConcatConv1x1 &project,
+cudaError_t span_gate_project(const Conv3x3 &op, const Tensors &io, const ConcatConv1x1 &project,
                                 const void *const *maps, const void *fp8_weights, int height, int width,
                                 cudaStream_t stream)
 {
@@ -36,6 +38,8 @@ cudaError_t span48_gate_project(const Conv3x3 &op, const Tensors &io, const Conc
     for (int i = 0; i < 4; ++i) p.maps[i] = static_cast<const half *>(maps[i]);
     p.project_w = static_cast<const uint4 *>(project.w->frag);
     p.project_bias = static_cast<const half2 *>(project.w->bias);
-    return fp8_weights ? project_tile<true>(p,stream) : project_tile<false>(p,stream);
+    if (op.cin == 64)
+        return fp8_weights ? project_tile<64,true>(p,stream) : project_tile<64,false>(p,stream);
+    return fp8_weights ? project_tile<48,true>(p,stream) : project_tile<48,false>(p,stream);
 }
 } // namespace ajinative

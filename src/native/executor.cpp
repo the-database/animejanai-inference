@@ -178,12 +178,14 @@ bool Executor::enable_fp16_cache_order()
 
 bool Executor::enable_gate_projection()
 {
-    if (steps_.size() != 18 || u_ != 2 || out_w_ != 4 * W_ || !is_sm120()) return false;
-    const Step &gate = steps_[15], &proj = steps_[16];
-    Step &tail = steps_[17];
+    const size_t count = steps_.size();
+    if ((count != 18 && count != 27) || u_ != 2 || out_w_ != 4 * W_ || !is_sm120()) return false;
+    const int channels = count == 18 ? 48 : 64;
+    const Step &gate = steps_[count - 3], &proj = steps_[count - 2];
+    Step &tail = steps_.back();
     if (gate.concat || gate.op.in != Input::NHWC || gate.op.out != Output::NHWC || gate.op.gate != Gate::Tanh1x1 ||
-        gate.op.cin != 48 || gate.op.cout != 48 || gate.resid < 0 || gate.dst < 0 || (gate.fp8_weights && !gate.packed_input) ||
-        !proj.concat || proj.cop.c != 48 || proj.cop.nsrc != 4 || proj.srcs[1] != gate.dst ||
+        gate.op.cin != channels || gate.op.cout != channels || gate.resid < 0 || gate.dst < 0 || (gate.fp8_weights && !gate.packed_input) ||
+        !proj.concat || proj.cop.c != channels || proj.cop.nsrc != 4 || proj.srcs[1] != gate.dst ||
         tail.concat || tail.src != proj.dst || tail.op.out != Output::DepthToSpace4 || tail.resid != -1 || tail.dst != kModelOutput)
         return false;
     // A neighbor CTA may still need the convolution source halo when this CTA stores.
@@ -218,7 +220,7 @@ cudaError_t Executor::run(const void *in, void *out, int w, int h, cudaStream_t 
                 const Step &project = steps_[++i];
                 const void *maps[4];
                 for (int j = 0; j < 4; ++j) maps[j] = ptr(project.srcs[j], in, out);
-                ce = span48_gate_project(st.op, t, project.cop, maps, st.fp8_weights, H, W, s);
+                ce = span_gate_project(st.op, t, project.cop, maps, st.fp8_weights, H, W, s);
             } else if (st.fp8_weights) {
                 ce = span_fp8_run(st.op, t, st.fp8_weights, H, W, st.variant, st.packed_input, st.packed_output, s);
             } else {
