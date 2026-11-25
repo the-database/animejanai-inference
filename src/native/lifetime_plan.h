@@ -46,17 +46,42 @@ public:
             total = std::max(total, off + b.bytes);
             placed.push_back(i);
         }
+        capacity = total;
         return total;
     }
 
-    void bind(void *base) const
+    void bind(void *base)
     {
+        origin = reinterpret_cast<uintptr_t>(base);
         for (const Buffer &b : buffers) *b.slot = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(base) + b.offset);
+    }
+
+    // A free range at one dispatch step. limit can restrict the arena in a fallback test.
+    void *vacant(int step, size_t bytes, size_t limit) const
+    {
+        const size_t end = std::min(capacity, limit);
+        if (!origin || !bytes || bytes > end) return nullptr;
+        std::vector<std::pair<size_t, size_t>> occupied;
+        for (const auto &b : buffers)
+            for (auto r : b.live)
+                if (r.first <= step && step <= r.second) {
+                    occupied.push_back({b.offset, b.offset + b.bytes});
+                    break;
+                }
+        std::sort(occupied.begin(), occupied.end());
+        size_t offset = 0;
+        for (auto r : occupied) {
+            if (r.first >= offset && r.first - offset >= bytes) break;
+            offset = std::max(offset, r.second);
+        }
+        return offset <= end - bytes ? reinterpret_cast<void *>(origin + offset) : nullptr;
     }
 
     std::vector<Buffer> buffers;
 
 private:
+    uintptr_t origin = 0;
+    size_t capacity = 0;
     static bool meets(const Buffer &a, const Buffer &b)
     {
         for (const Range &x : a.live)

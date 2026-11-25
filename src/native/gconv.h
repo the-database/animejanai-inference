@@ -78,6 +78,10 @@ struct GConvArgs {
 // gvariant_for's, or with all_variants every variant's split.
 size_t gworkspace(const GWeights &w, const GConvArgs &a, bool all_variants = false);
 
+// Largest scratch a launch can use for any sub-tile up to largest, with the existing split cutoff.
+size_t gworkspace_for_subtiles(const GWeights &w, const GConvArgs &largest, size_t stock_limit);
+int gvariant_rows(int variant);
+
 bool gsupported(const GWeights &w, const GConvArgs &a, std::string *why = nullptr);
 int gvariant_count();
 // Runs all output chunks. variant < 0 picks the default.

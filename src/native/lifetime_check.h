@@ -3,6 +3,7 @@
 #pragma once
 #include "native/lifetime_plan.h"
 #include <string>
+#include <tuple>
 
 namespace ajinative {
 class LifetimeCheck {
@@ -11,6 +12,9 @@ public:
     inline static thread_local LifetimeCheck *active = nullptr;
     void (*edit)(LifetimePlan &) = nullptr; // test reference layout or deliberately incorrect lifetime
     bool poison = false;
+    size_t workspace_arena_limit = size_t(-1); // test the build-time separate allocation with a smaller arena
+    using Workspace = std::tuple<int, const void *, size_t>;
+    std::vector<Workspace> *launches = nullptr; // optional trace of actual dispatch checks
     std::string error;
 
     void region(const void *base, size_t bytes)
@@ -24,7 +28,7 @@ public:
             if (b.offset > bytes || b.bytes > bytes - b.offset ||
                 reinterpret_cast<uintptr_t>(*b.slot) != reinterpret_cast<uintptr_t>(base) + b.offset)
                 fail("slot does not match its arena offset");
-            features.push_back({span(*b.slot, b.bytes), b.live});
+            features.push_back({span(*b.slot, b.bytes), b.live, b.slot});
         }
     }
 
@@ -52,6 +56,7 @@ public:
 
     bool workspace(int step, const void *ptr, size_t bytes)
     {
+        if (launches) launches->emplace_back(step, ptr, bytes);
         if (!bytes) return true;
         const auto w = span(ptr, bytes);
         if (!contains(w)) return fail("workspace outside allocation");
@@ -61,16 +66,22 @@ public:
     }
 
     template<class Fill>
-    bool enter(int next, Fill fill)
+    bool enter(int next, Fill fill, void **forwarded = nullptr)
     {
         if (!poison) return true;
         std::vector<Span> keep;
-        for (const auto &f : features)
+        for (const auto &f : features) {
+            // A fused writer can produce the next block's input before the numbered steps wrap.
+            if (forwarded == f.slot && f.at(previous) && f.at(next)) {
+                keep.push_back(f.mem);
+                continue;
+            }
             for (auto r : f.live)
                 if (r.first <= std::min(previous, next) && std::max(previous, next) <= r.second) {
                     keep.push_back(f.mem);
                     break;
                 }
+        }
         std::sort(keep.begin(), keep.end());
         for (const auto &r : regions) {
             uintptr_t pos = r.first;
@@ -90,6 +101,7 @@ private:
     struct Feature {
         Span mem;
         std::vector<LifetimePlan::Range> live;
+        void **slot;
         bool at(int step) const {
             for (auto r : live) if (r.first <= step && step <= r.second) return true;
             return false;
