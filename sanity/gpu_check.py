@@ -370,6 +370,9 @@ def cases(sm):
              ('SD Compact', ['--slot', 1002, '--width', 720, '--height', 480], 'video')]
     video += [(f'TemporalFix S{i+1}', ['--case', 'temporal', '--conf', ROOT/'tfix.conf', '--slot', i+1], 'video') for i in range(3)]
     video += [(n, ['--case', 'rife', '--conf', ROOT/'rife.conf', '--slot', i+1], 'rife') for i, n in enumerate(RIFE)]
+    # the decoder's other surface formats go through their own input kernels
+    video += [(f'Balanced {label}', ['--slot', 1002, '--input-format', fmt], 'video') for label, fmt in (
+        ('P010 in', 'p010'), ('444p16 in', 'yuv444p16'), ('444p10 in', 'yuv444p10msb'), ('444p12 in', 'yuv444p12msb'))]
     video.append(('SuperUltraCompact', ['--conf', ROOT/'compact.conf', '--slot', 1, '--width', 1280, '--height', 720], 'compact-v1'))
     catalog = [(n, a, VIDEO, 'video', {need}, False, None) for n, a, need in video]
     catalog.append(('RIFE 4.26 Heavy', ['--case', 'rife', '--conf', ROOT/'rife.conf', '--slot', 1], HEAVY, 'video', {'rife'}, False, None))
@@ -453,7 +456,11 @@ def compare(identity, title, ref, cand, selected, both_orders, rows):
     block = []
     for name, args, model_dir, group, _, fp8, call in selected:
         label = f'{ref.parent.name}-vs-{cand.parent.name}-{name}'.replace(' ', '_')
-        if call and not has(ref, call):  # an older reference without this call or setting: nothing to compare
+        harness = (ROOT/'tools'/'sanity'/'paired_bench.py').read_text()
+        missing = [x for x in map(str, args) if x.startswith('--') and f"'{x}'" not in harness]
+        if missing:  # timing scripts older than an option this case needs
+            block.append({'case': name, 'skipped': f'the timing scripts at {SCRIPTS[:7]} have no {missing[0]}; use --tools'})
+        elif call and not has(ref, call):  # an older reference without this call or setting: nothing to compare
             block.append({'case': name, 'skipped': f'{ref.parent.name} has no {call}'})
         elif call and not has(cand, call):  # the candidate lost something the reference has
             block.append({'case': name, 'error': f'{cand.parent.name} has no {call}, which {ref.parent.name} has'})
