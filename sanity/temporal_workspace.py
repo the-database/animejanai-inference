@@ -24,6 +24,11 @@ class Frame(C.Structure):
     _fields_ = [(s, I) for s in ('width', 'height', 'fmt', 'matrix', 'range', 'siting')] + [
         ('planes', P * 3), ('strides', C.c_ssize_t * 3)]
 
+    @property
+    def nbytes(self):
+        plane = self.strides[0] * self.height
+        return plane * 3 // 2 if self.fmt in (1, 2) else plane * 3
+
 
 def bind(lib, name, result, *args):
     f = getattr(lib, name)
@@ -49,18 +54,24 @@ class Device:
 
     def frame(self, w, h, fmt, stack):
         pitch = w if fmt == 1 else 2 * w
+        plane = pitch * h
+        planar = fmt in (3, 5, 6)
+        frame = Frame(w, h, fmt, 2, 1, 1)
+        frame.strides[:] = (pitch, pitch, pitch if planar else 0)
         ptr = P()
-        check(self.malloc(C.byref(ptr), pitch * h * 3 // 2))
+        check(self.malloc(C.byref(ptr), frame.nbytes))
         stack.callback(self.free, ptr)
-        return Frame(w, h, fmt, 2, 1, 1, (P * 3)(ptr.value, ptr.value + pitch * h, None),
-                     (C.c_ssize_t * 3)(pitch, pitch, 0))
+        frame.planes[:] = (ptr.value, ptr.value + plane, ptr.value + 2 * plane if planar else None)
+        return frame
 
     def upload(self, frame, data):
+        if len(data) != frame.nbytes:
+            raise ValueError(f'frame needs {frame.nbytes} bytes, got {len(data)}')
         check(self.copy(frame.planes[0], C.c_char_p(data), len(data), 1, self.stream))
         check(self.sync(self.stream))
 
     def read(self, frame):
-        data = C.create_string_buffer(frame.strides[0] * frame.height * 3 // 2)
+        data = C.create_string_buffer(frame.nbytes)
         check(self.copy(data, frame.planes[0], len(data), 2, self.stream))
         check(self.sync(self.stream))
         return data.raw
@@ -101,17 +112,31 @@ class Backend:
             raise RuntimeError(f'aji status {rc}: {self.error(self.ctx)!r}')
 
 
-def pixels(w, h, number, bright):
+def pixels(w, h, number, bright, fmt=1):
     # A moving texture in two non-overlapping luma bands gives the built-in detector a definite cut.
+    pitch = w if fmt == 1 else 2 * w
+    if fmt != 1:
+        # Expand each 8-bit code to a little-endian word and clear the unused low bits.
+        shift = {2: 6, 3: 0, 5: 6, 6: 4}[fmt]
+        words = [((v * 257 >> shift) << shift).to_bytes(2, 'little') for v in range(256)]
+
     def tiled(rows, height):
-        chunk = b''.join((row * ((w + len(row) - 1) // len(row)))[:w] for row in rows)
-        return (chunk * ((height + len(rows) - 1) // len(rows)))[:w * height]
+        if fmt != 1:
+            rows = [b''.join(words[v] for v in row) for row in rows]
+        chunk = b''.join((row * ((pitch + len(row) - 1) // len(row)))[:pitch] for row in rows)
+        return (chunk * ((height + len(rows) - 1) // len(rows)))[:pitch * height]
 
     base = 154 if bright else 22
     luma = [bytes(base + ((x + 3*y + number*7) % 54) + 14*((x//9 ^ y//5) & 1)
                   for x in range(128)) for y in range(32)]
     chroma = [bytes(64 + ((3*x + y + number*11) % 126) for x in range(128)) for y in range(16)]
-    return tiled(luma, h) + tiled(chroma, h//2)
+    if fmt in (1, 2):
+        return tiled(luma, h) + tiled(chroma, h//2)
+    # Expand each Cb/Cr sample over its 2x2 luma footprint, one full-size plane per component.
+    def chroma_plane(component):
+        rows = [bytes(row[(x // 2) * 2 + component] for x in range(128)) for row in chroma]
+        return tiled([row for row in rows for _ in range(2)], h)
+    return tiled(luma, h) + chroma_plane(0) + chroma_plane(1)
 
 
 def same(label, expected, actual):

@@ -2,8 +2,8 @@
 
 Video defaults to 1080p NV12 -> 4K P010, built-in HD Balanced, four rotating
 surfaces, 32 warmup frames and 40 balanced-order pairs of eight frames.
-Temporal and RIFE cases take a configuration selecting the corresponding model
-and produce same-size NV12. Image cases time synchronous public RGB8 upscales.
+Temporal and RIFE cases take a configuration and default to same-size NV12 output.
+Use --case temporal --scale 2 for a 2x temporal upscaler. Image cases time synchronous public RGB8 upscales.
 Warm VRAM is measured in a fresh process per build after caller surfaces exist.
 """
 import argparse
@@ -21,6 +21,8 @@ from tempfile import TemporaryDirectory
 import time
 
 from temporal_workspace import Backend, Device, I, P, S, bind, check, pixels
+
+INPUT_FORMATS = {'nv12': 1, 'p010': 2, 'yuv444p16': 3, 'yuv444p10msb': 5, 'yuv444p12msb': 6}
 
 
 class ImageParams(C.Structure):
@@ -76,15 +78,19 @@ def image_arm(args, path, stack):
 
 def surfaces(args, dev, stack):
     w, h = args.width, args.height
-    scale = args.scale if args.case == 'video' else 1
+    scale = args.scale if args.case in ('video', 'temporal') else 1
     count = 4 if args.case == 'video' else 8
-    ins = [dev.frame(w, h, 1, stack) for _ in range(count)]
+    if args.case == 'temporal' and scale > 1:
+        count = 9  # Give TFDAT nine distinct input frames per window.
+    fmt = INPUT_FORMATS[args.input_format]
+    ins = [dev.frame(w, h, fmt, stack) for _ in range(count)]
     outs = [dev.frame(w*scale, h*scale, 2 if args.case == 'video' else 1, stack) for _ in ins]
-    stream = stack.enter_context(args.nv12.open('rb')) if args.nv12 else None
+    clip = args.raw_input or args.nv12
+    stream = stack.enter_context(clip.open('rb')) if clip else None
     for i, frame in enumerate(ins):
-        data = stream.read(w*h*3//2) if stream else pixels(w, h, i, False)
-        if len(data) != w*h*3//2:
-            raise ValueError(f'NV12 file needs {count} full input frames')
+        data = stream.read(frame.nbytes) if stream else pixels(w, h, i, False, fmt)
+        if len(data) != frame.nbytes:
+            raise ValueError(f'{clip} needs {count} full {args.input_format} frames of {frame.nbytes} bytes')
         dev.upload(frame, data)
     return ins, outs
 
@@ -95,6 +101,8 @@ def video_arm(args, path, dev, frames, stack):
     rc = api.configure(api.ctx, args.width, args.height, 24000/1001, C.byref(ow), C.byref(oh))
     ins, outs = frames
     want_rife = args.case.startswith('rife')
+    if args.case == 'rife-ids' and api.rife_ids is None:
+        raise ValueError(f'{path} does not export aji_infer_rife_ids')
     if rc != (0 if want_rife else 1) or (ow.value, oh.value) != (outs[0].width, outs[0].height):
         raise RuntimeError(f'configure returned {rc}, {ow.value}x{oh.value}: {api.error(api.ctx)!r}')
     radius = api.radius(api.ctx)
@@ -194,7 +202,9 @@ def run(args):
         if is_image:
             result.update(model=args.image_model, tile=args.tile or [args.width, args.height], overlap=args.overlap)
         else:
-            result.update(slot=args.slot, gpu=summarize(gpu), gpu_pairs_ms=gpu)
+            out = frames[1][0]
+            result.update(slot=args.slot, input_format=args.input_format, output_size=[out.width, out.height],
+                          output_format='p010' if args.case == 'video' else 'nv12', gpu=summarize(gpu), gpu_pairs_ms=gpu)
         return result
 
 
@@ -205,11 +215,14 @@ def main():
     p.add_argument('--case', choices=('video', 'temporal', 'rife', 'rife-ids', 'image'), default='video')
     p.add_argument('--width', type=int, default=1920)
     p.add_argument('--height', type=int, default=1080)
-    p.add_argument('--scale', type=int, default=2, help='spatial video output scale')
+    p.add_argument('--scale', type=int, help='output scale for video (default 2) or temporal (default 1)')
     p.add_argument('--slot', type=int, default=1002)
     p.add_argument('--conf', type=Path, help='optional configuration, required for temporal and RIFE-only chains')
     p.add_argument('--trtexec', type=Path, help='TensorRT builder if the selected configuration needs an engine')
-    p.add_argument('--nv12', type=Path, help='input clip in tightly packed NV12, otherwise use deterministic texture')
+    p.add_argument('--input-format', choices=INPUT_FORMATS, default='nv12', help='video input surface format (default nv12)')
+    clips = p.add_mutually_exclusive_group()
+    clips.add_argument('--raw-input', type=Path, help='tightly packed frames in --input-format, little-endian for 16-bit words')
+    clips.add_argument('--nv12', type=Path, help='tightly packed NV12 input clip')
     p.add_argument('--image-model', help='image ONNX filename under --models')
     p.add_argument('--tile', type=int, help='maximum square image tile, defaults to the page dimensions')
     p.add_argument('--overlap', type=int, default=32)
@@ -220,6 +233,12 @@ def main():
     p.add_argument('--output', type=Path, help='also save raw pairs and dispatch logs as JSON')
     p.add_argument('--memory-worker', choices=('reference','candidate'), help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.scale is None:
+        args.scale = 2 if args.case == 'video' else 1
+    if args.nv12 and args.input_format != 'nv12':
+        p.error('use --raw-input with non-NV12 formats')
+    if args.case == 'image' and (args.raw_input or args.input_format != 'nv12'):
+        p.error('--input-format and --raw-input apply to video frames')
     for name in ('reference','candidate','cuda_runtime','models'):
         setattr(args, name, getattr(args, name).resolve(strict=True))
     if args.batch is None:
@@ -227,7 +246,7 @@ def main():
     if args.pairs < 6 or args.pairs % 2 or min(args.width,args.height,args.batch,args.scale) <= 0:
         p.error('use positive dimensions and batch size, and an even pair count of at least six')
     if args.case != 'image' and (args.width % 2 or args.height % 2):
-        p.error('NV12 needs even width and height')
+        p.error('video frames need even width and height')
     if args.case == 'image' and not args.image_model:
         p.error('--case image needs --image-model')
     if args.case in ('temporal','rife','rife-ids') and not args.conf:
