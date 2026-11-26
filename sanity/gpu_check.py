@@ -2,12 +2,13 @@
 """Qualify libaji's native CUDA backend on whatever NVIDIA GPU this Linux machine has.
 
 Fetches the CUDA 12.9 compiler and TensorRT 11.4 into a work folder, builds the backend for this
-GPU's architecture only at each revision asked for, downloads the shipped models, and times the
-builds against each other with sanity/paired_bench.py. Prints one summary table and saves it with
-the raw pairs of every comparison. Uses only the Python standard library.
+GPU's architecture only at each revision asked for, downloads the shipped models the chosen cases
+need, and times the builds against each other with sanity/paired_bench.py. Prints one summary
+table and saves it with the raw pairs of every comparison. Uses only the Python standard library.
 
     gpu_check.py --expect-sm 89 --base REVISION             # has anything regressed since REVISION?
-    gpu_check.py --pull 153                                 # main against a pull request
+    gpu_check.py --pull 153                                 # main against a pull request, video cases
+    gpu_check.py --compare head:pr153                       # the same on every case, images included
     gpu_check.py --compare head:all:HD --parity head:all    # is the tuned HD policy worth enabling here?
 
 A build is named base (--base), head (--head, default origin/main), prN (a pull request), or one of
@@ -16,7 +17,9 @@ row order, the gate/projection fusion, both, or both plus the packed FP8 tiles f
 the GPU. Those five exist to measure a policy on an architecture that does not have it yet.
 
 Without --compare, --base is timed against head on every case and head against each --pull on the
-video cases. Re-running skips finished steps; results are cached per pair of builds.
+video cases. Re-running skips finished steps: builds are kept per architecture and commit, timings
+per GPU, driver, pair of builds and benchmark arguments. The exit status is nonzero when a requested
+timing or check failed or did not run on the native kernels.
 Needs Linux x86-64, compute capability 8.0, 8.6, 8.9 or 12.0, a driver for CUDA 12.9, g++, git, curl.
 """
 import argparse
@@ -32,7 +35,7 @@ import time
 
 REPO = 'https://github.com/the-database/animejanai-inference.git'
 NVIDIA = 'https://developer.download.nvidia.com/compute/cuda'
-CUDA_PARTS = [
+CUDA_PARTS = [  # redistrib_12.9.1.json
     ('cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-12.9.86-archive.tar.xz',
      '7a1a5b652e5ef85c82b721d10672fc9a2dbaab44e9bd3c65a69517bf53998c35'),
     ('cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-12.9.79-archive.tar.xz',
@@ -41,22 +44,38 @@ CUDA_PARTS = [
      '8b1a5095669e94f2f9afd7715533314d418179e9452be61e2fde4c82a3e542aa'),
 ]
 TRT = '11.4.0.106-1+cuda12.9'
-SEVENZIP = 'https://github.com/ip7z/7zip/releases/download/26.05/7z2605-linux-x64.tar.xz'
+TRT_PARTS = [  # the ubuntu2204 package index
+    ('libnvinfer11', '734884ec92a3a6a42466c85016b540aef200b87637b061d90ab0d8f8f26b6e13'),
+    ('libnvinfer-dev', '2bd7281b4d3acbd88e18697fb69cd8009935a03e8b20c67c0669719c453900a4'),
+    ('libnvinfer-headers-dev', 'dbf415605b40fccfb68defa4373434b933210998b7183316dfdc120feab3acdc'),
+]
+SEVENZIP = ('https://github.com/ip7z/7zip/releases/download/26.05/7z2605-linux-x64.tar.xz',
+            '22cf82fcc6eb7474f1d5bb4f02c0f8ebd573a718089d6833dc30f8350a3b232e')
 PLAYER = 'https://github.com/the-database/mpv-AnimeJaNai/releases/download/3.12.5'
 MANGA = 'https://github.com/the-database/MangaJaNai/releases/download'
 
 HD_BAL = '2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16'
 HD_PERF = '2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16'
+SD = '2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo'
 TFIX = ['temporalfix_s1_v1.1_op18_fp16', 'temporalfix_s2_v1_op18_fp16', 'temporalfix_s3_v1_op18_fp16']
-VIDEO_FILES = [HD_BAL, HD_PERF, *TFIX, '2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo']
 ESRGAN = '2x_MangaJaNai_2048p_V1_ESRGAN_95k_fp16.onnx'
 FDAT_M = '2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16.onnx'
 SPAN_S = '2x_IllustrationJaNai_V3denoise_SPAN_S_30k_fp16.onnx'
 HAT_L = '4x_IllustrationJaNai_V3detail_HAT_L_28k_bf16.onnx'
 DAT2 = '4x_IllustrationJaNai_V3detail_DAT2_28k_bf16.onnx'
-IMAGE_PACKS = [(f'{MANGA}/1.0.0/MangaJaNai_V1_ONNX_fp16.7z', [ESRGAN]),
-               (f'{MANGA}/3.0.0/IllustrationJaNai_V3_ONNX_fp16.7z', [FDAT_M, SPAN_S]),
-               (f'{MANGA}/3.0.0/IllustrationJaNai_V3_ONNX_bf16.7z', [HAT_L, DAT2])]
+# name: (url, sha256 as published with the release, folder under models/, files)
+ARCHIVES = {
+    'video': (f'{PLAYER}/mpv-upscale-2x_animejanai-overlay-3.12.5-linux-x64.7z',
+              '961ba4a54488d2b8d8d91db556db21fe65b5d806ae09a283f71c7bc7fcc7d28c', 'video', [f'{n}.onnx' for n in (HD_BAL, HD_PERF, SD, *TFIX)]),
+    'rife': (f'{PLAYER}/component-rife-linux-x64.7z',
+             'e30f50c2671f4020af46a66334d3b4443e4b5c0e3f1310ba7a94ee505b18b684', 'video', ['rife_v4.26.onnx']),
+    'manga': (f'{MANGA}/1.0.0/MangaJaNai_V1_ONNX_fp16.7z',
+              '2c3809d712e3e96d107e2a59802186c284fac49d91a211435c8c896432ba27ab', 'img', [ESRGAN]),
+    'illustration': (f'{MANGA}/3.0.0/IllustrationJaNai_V3_ONNX_fp16.7z',
+                     'bd7db0632b37b95b06410e99f95347980010b2ccc54730e2d68501f25bae898c', 'img', [FDAT_M, SPAN_S]),
+    'illustration-bf16': (f'{MANGA}/3.0.0/IllustrationJaNai_V3_ONNX_bf16.7z',
+                          '48e292c3f92aa2df79f9f83c6318a6c2052c29e6ea9fe2ed23b61cc526900247', 'img', [HAT_L, DAT2]),
+}
 # FP16 row order, gate/projection fusion, packed FP8 tiles
 TUNING = {'untuned': (False, False, False), 'order': (True, False, False), 'fuse': (False, True, False),
           'both': (True, True, False), 'all': (True, True, True)}
@@ -93,25 +112,43 @@ def last_line(error):
     return [l for l in str(error).splitlines() if l.strip()][-1][:150]
 
 
-def fetch(url, dest, sha256=None):
-    if not dest.exists():
-        tmp = dest.with_name(dest.name + '.part')
-        run(['curl', '-fL', '--retry', '4', '--retry-delay', '3', '-sS', '-o', tmp, url], 'download')
-        if sha256:
-            h = hashlib.sha256()
-            with tmp.open('rb') as f:
-                for chunk in iter(lambda: f.read(1 << 22), b''):
-                    h.update(chunk)
-            if h.hexdigest() != sha256:
-                raise Failed(f'{url}: checksum mismatch')
-        tmp.rename(dest)
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1 << 22), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch(url, dest, sha256):
+    """Download to dest unless a file with the pinned checksum is already there."""
+    if dest.exists() and digest(dest) == sha256:
+        return dest
+    tmp = dest.with_name(dest.name + '.part')
+    run(['curl', '-fL', '--retry', '4', '--retry-delay', '3', '-sS', '-o', tmp, url], 'download')
+    if digest(tmp) != sha256:
+        tmp.unlink()
+        raise Failed(f'{url}: checksum mismatch')
+    tmp.replace(dest)
     return dest
 
 
 def gpu():
-    line = capture(['nvidia-smi', '--query-gpu=name,driver_version,compute_cap,memory.total', '--format=csv,noheader']).splitlines()[0]
-    name, driver, cap, mem = (s.strip() for s in line.split(','))
-    return name, driver, int(cap.replace('.', '')), mem
+    """The GPU CUDA will use as device 0: name, driver, compute capability x10, memory, UUID."""
+    rows = [[s.strip() for s in line.split(',')] for line in capture(
+        ['nvidia-smi', '--query-gpu=index,uuid,name,driver_version,compute_cap,memory.total', '--format=csv,noheader']).splitlines()]
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',')[0].strip()
+    if visible:
+        by_index = visible.isdigit()
+        if by_index and len(rows) > 1 and os.environ.get('CUDA_DEVICE_ORDER') != 'PCI_BUS_ID':
+            raise Failed('several GPUs: put a GPU UUID in CUDA_VISIBLE_DEVICES, or also set CUDA_DEVICE_ORDER=PCI_BUS_ID')
+        rows = [r for r in rows if (r[0] == visible if by_index else r[1].startswith(visible))]
+        if not rows:
+            raise Failed(f'CUDA_VISIBLE_DEVICES={visible} matches no GPU that nvidia-smi lists')
+    elif len({tuple(r[2:5]) for r in rows}) > 1:
+        raise Failed('several different GPUs: choose one with CUDA_VISIBLE_DEVICES=<GPU UUID>')
+    _, uuid, name, driver, cap, mem = rows[0]
+    return name, driver, int(cap.replace('.', '')), mem, uuid
 
 
 def tools():
@@ -127,7 +164,7 @@ def tools():
     seven = SDK/'7z'/'7zz'
     if not seven.exists():
         seven.parent.mkdir(parents=True, exist_ok=True)
-        archive = fetch(SEVENZIP, SDK/'7z.tar.xz')
+        archive = fetch(SEVENZIP[0], SDK/'7z.tar.xz', SEVENZIP[1])
         run(['tar', '-xf', archive, '-C', seven.parent, '7zz'], 'tools')
         archive.unlink()
     return seven
@@ -146,29 +183,25 @@ def toolkits():
         os.symlink('lib', CUDA/'lib64')  # nvcc links from lib64, the redistributable archives use lib
     if not (SDK/'trt'/'.done').exists():
         (SDK/'trt').mkdir(parents=True, exist_ok=True)
-        repo = f'{NVIDIA}/repos/ubuntu2204/x86_64'
-        # the runtime package is about 1.9 GB of per-GPU builder resources; only libnvinfer.so is used
-        deb = fetch(f'{repo}/libnvinfer11_{TRT}_amd64.deb', SDK/'libnvinfer11.deb')
-        run(['bash', '-c', f'set -o pipefail; dpkg-deb --fsys-tarfile "{deb}" | tar -C "{SDK/"trt"}" -x --wildcards '
-             f'"./usr/lib/x86_64-linux-gnu/libnvinfer.so.*"'], 'toolkits')
-        deb.unlink()
-        for pkg in ('libnvinfer-dev', 'libnvinfer-headers-dev'):
-            deb = fetch(f'{repo}/{pkg}_{TRT}_amd64.deb', SDK/f'{pkg}.deb')
-            run(['dpkg-deb', '-x', deb, SDK/'trt'], 'toolkits')
+        for pkg, sha in TRT_PARTS:
+            deb = fetch(f'{NVIDIA}/repos/ubuntu2204/x86_64/{pkg}_{TRT}_amd64.deb', SDK/f'{pkg}.deb', sha)
+            if pkg == 'libnvinfer11':  # 1.4 GB, mostly per-GPU builder resources; only libnvinfer.so is used
+                run(['bash', '-c', f'set -o pipefail; dpkg-deb --fsys-tarfile "{deb}" | tar -C "{SDK/"trt"}" -x --wildcards '
+                     f'"./usr/lib/x86_64-linux-gnu/libnvinfer.so.*"'], 'toolkits')
+            else:
+                run(['dpkg-deb', '-x', deb, SDK/'trt'], 'toolkits')
             deb.unlink()
         (SDK/'trt'/'.done').touch()
 
 
-def models(seven):
-    VIDEO.mkdir(parents=True, exist_ok=True)
-    IMAGES.mkdir(parents=True, exist_ok=True)
-    jobs = [(f'{PLAYER}/mpv-upscale-2x_animejanai-overlay-3.12.5-linux-x64.7z', VIDEO, [f'{n}.onnx' for n in VIDEO_FILES]),
-            (f'{PLAYER}/component-rife-linux-x64.7z', VIDEO, ['rife_v4.26.onnx'])]
-    jobs += [(url, IMAGES, names) for url, names in IMAGE_PACKS]
-    for url, folder, names in jobs:
+def models(seven, needed):
+    for name in sorted(needed):
+        url, sha, folder, names = ARCHIVES[name]
+        folder = ROOT/'models'/folder
+        folder.mkdir(parents=True, exist_ok=True)
         if all((folder/n).exists() for n in names):
             continue
-        archive = fetch(url, ROOT/'models'/url.rsplit('/', 1)[1])
+        archive = fetch(url, ROOT/'models'/url.rsplit('/', 1)[1], sha)
         run([seven, 'e', '-y', '-bd', f'-o{folder}', archive, *names, '-r'], 'models')
         archive.unlink()
         missing = [n for n in names if not (folder/n).exists()]
@@ -183,7 +216,7 @@ def environment():
 
 
 class Builds:
-    """libaji_trt.so for this GPU only, per named build, kept as libs/<name>-<commit>/libaji_trt.so."""
+    """libaji_trt.so for this architecture, per named build: libs/sm<N>/<name>-<commit>/libaji_trt.so."""
 
     def __init__(self, sm, base, head):
         self.sm, self.src, self.libs = sm, ROOT/'src', {}
@@ -200,19 +233,22 @@ class Builds:
         except subprocess.CalledProcessError:
             raise Failed(f'no commit {revision} in {REPO}')
 
-    def tree(self, name, sha):
-        """A worktree per kind of build, moved to the commit, so later builds of that kind are incremental."""
-        tree = ROOT/name
+    def tree(self, kind, sha):
+        """A worktree per kind of build, at the commit and with its tracked files as committed."""
+        tree = ROOT/kind
         if not (tree/'.git').exists():
             run(['git', 'worktree', 'add', '-f', '--detach', tree, sha], 'sources', cwd=self.src)
-        elif capture(['git', 'rev-parse', 'HEAD'], cwd=tree) != sha:
+        # a build that was killed while its source was patched leaves the patch behind
+        if capture(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=tree):
+            run(['git', 'checkout', '-q', '--', '.'], 'sources', cwd=tree)
+        if capture(['git', 'rev-parse', 'HEAD'], cwd=tree) != sha:
             run(['git', 'checkout', '-q', '--detach', sha], 'sources', cwd=tree)
         return tree
 
     def resolve(self, name):
-        """(worktree name, commit, tuning flags or None) of a named build."""
+        """(worktree, commit, tuning flags or None) of a named build."""
         if name in TUNING:
-            return 'head', self.revisions['head'], TUNING[name]
+            return 'forced', self.revisions['head'], TUNING[name]  # never patched in the tree head is built from
         if re.fullmatch(r'pr\d+', name):
             if name not in self.revisions:
                 run(['git', 'fetch', '-q', 'origin', f'pull/{name[2:]}/head'], 'sources', cwd=self.src)
@@ -222,8 +258,11 @@ class Builds:
             raise Failed(f'unknown build "{name}"; use base (with --base), head, prN or one of {", ".join(TUNING)}')
         return name, self.revisions[name], None
 
+    def describe(self, name):
+        return f'{name} ({self.resolve(name)[1][:7]})'
+
     def make(self, tree, log, target):
-        bld = tree/'build'
+        bld = tree/f'build-sm{self.sm}'
         if not (bld/'build.ninja').exists():
             run(['cmake', '-S', tree, '-B', bld, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
                  f'-DCMAKE_CUDA_COMPILER={CUDA}/bin/nvcc', f'-DCUDAToolkit_ROOT={CUDA}', f'-DAJI_TRT_ROOT={TRT_ROOT}',
@@ -235,37 +274,39 @@ class Builds:
         if name in self.libs:
             return self.libs[name]
         kind, sha, flags = self.resolve(name)
-        target = LIBS/f'{name}-{sha[:7]}'/'libaji_trt.so'
+        target = LIBS/f'sm{self.sm}'/f'{name}-{sha[:7]}'/'libaji_trt.so'
         if not target.exists():
-            say(f'building {name} ({sha[:7]}) for sm_{self.sm}')
+            say(f'building {self.describe(name)} for sm_{self.sm}')
             tree = self.tree(kind, sha)
             source = tree/'src'/'native'/'executor.cpp'
-            original = source.read_text()
             try:
                 if flags:
-                    source.write_text(forced(original, *flags))
+                    source.write_text(forced(source.read_text(), *flags))
                 bld = self.make(tree, f'build-{name}', 'aji_trt')
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(bld/'libaji_trt.so', target.with_suffix('.tmp'))
-                target.with_suffix('.tmp').rename(target)
+                target.with_suffix('.tmp').replace(target)
             finally:
                 if flags:
-                    source.write_text(original)
+                    run(['git', 'checkout', '-q', '--', 'src/native/executor.cpp'], 'sources', cwd=tree)
         self.libs[name] = target
         return target
 
     def gate_test(self, name):
-        """Build and run the repository's own GPU test of the HD kernels at that build's commit."""
+        """Build and run the repository's own GPU test of the HD kernels at that build's commit: (passed, text)."""
         kind, sha, flags = self.resolve(name)
         if flags:
             raise Failed('--gate-test takes base, head or prN')
+        label, log = f'aji_native_gate_reuse_test at {self.describe(name)}', f'gate-test-{name}-run'
+        (LOGS/f'{log}.log').unlink(missing_ok=True)
         try:
             bld = self.make(self.tree(kind, sha), f'gate-test-{name}', 'aji_native_gate_reuse_test')
             run([bld/'aji_native_gate_reuse_test', VIDEO/f'{HD_BAL}.onnx', VIDEO/f'{HD_PERF}.onnx', IMAGES/SPAN_S, 'all'],
-                f'gate-test-{name}', env=environment())
+                log, env=environment())
         except Failed as e:
-            return f'aji_native_gate_reuse_test at {name} ({sha[:7]}): FAILED: {last_line(e)}'
-        return f'aji_native_gate_reuse_test at {name} ({sha[:7]}): passed (default, fp16 and fp8 modes)'
+            return False, f'{label}: FAILED: {last_line(e)}'
+        skipped = re.search(r'\[fp8\]: [^\n]*(unavailable|unsupported)[^\n]*', (LOGS/f'{log}.log').read_text(errors='replace'))
+        return True, f'{label}: passed' + (f'; FP8 SKIPPED ({skipped[0]})' if skipped else ' in default, fp16 and fp8 modes')
 
 
 def forced(text, order, fuse, packed):
@@ -276,12 +317,12 @@ def forced(text, order, fuse, packed):
         text, count = re.subn(pattern, r'\1' + ('true' if on else 'false'), text)
         if count != 1:
             raise Failed(f'executor.cpp no longer matches {pattern}; update forced() in this script')
-    # the helper is now unused in most variants; keep the compiler quiet about it
+    # the helper is now unused; keep the compiler quiet about it
     return re.sub(r'\nbool (is_sm120|use_hd_span_tuning)\(\)', r'\n[[maybe_unused]] bool \1()', text, count=1)
 
 
 def cases(sm):
-    """(name, paired_bench arguments, model folder, group)"""
+    """(name, paired_bench arguments, model folder, group, archives needed, runs FP8)"""
     (ROOT/'builtins.conf').write_text('[global]\nconfig_version=2\nnative=on\nlogging=yes\n')
     head = '[global]\nconfig_version=2\nbackend=TensorRT\nnative=on\nlogging=yes\n'
     slot = '[slot_{}]\nchain_1_max_fps=120\n'
@@ -290,81 +331,106 @@ def cases(sm):
                                   'chain_1_rife_factor_denominator=1\nchain_1_rife_before_upscale=yes\n')
     (ROOT/'fp8.conf').write_text(head + ''.join(slot.format(i) + f'chain_1_model_1_name={m}\nnative_span_precision=fp8\n'
                                                  for i, m in ((1, HD_PERF), (2, HD_BAL))))
-    video = [('HD Quality', ['--slot', 1001]), ('HD Balanced', ['--slot', 1002]), ('HD Performance', ['--slot', 1003]),
-             ('SD Compact', ['--slot', 1002, '--width', 720, '--height', 480])]
-    video += [(f'TemporalFix S{i+1}', ['--case', 'temporal', '--conf', ROOT/'tfix.conf', '--slot', i+1]) for i in range(3)]
-    video += [('RIFE 4.26', ['--case', 'rife', '--conf', ROOT/'rife.conf', '--slot', 1]),
-              ('RIFE 4.26 ids', ['--case', 'rife-ids', '--conf', ROOT/'rife.conf', '--slot', 1])]
+    video = [('HD Quality', ['--slot', 1001], 'video'), ('HD Balanced', ['--slot', 1002], 'video'), ('HD Performance', ['--slot', 1003], 'video'),
+             ('SD Compact', ['--slot', 1002, '--width', 720, '--height', 480], 'video')]
+    video += [(f'TemporalFix S{i+1}', ['--case', 'temporal', '--conf', ROOT/'tfix.conf', '--slot', i+1], 'video') for i in range(3)]
+    video += [('RIFE 4.26', ['--case', 'rife', '--conf', ROOT/'rife.conf', '--slot', 1], 'rife'),
+              ('RIFE 4.26 ids', ['--case', 'rife-ids', '--conf', ROOT/'rife.conf', '--slot', 1], 'rife')]
+    catalog = [(n, a, VIDEO, 'video', {need}, False) for n, a, need in video]
     if sm >= 89:  # FP8 needs the SM 89 instruction set
-        video += [('FP8 Performance', ['--conf', ROOT/'fp8.conf', '--slot', 1]), ('FP8 Balanced', ['--conf', ROOT/'fp8.conf', '--slot', 2])]
+        catalog += [(n, ['--conf', ROOT/'fp8.conf', '--slot', s], VIDEO, 'video', {'video'}, True)
+                    for n, s in (('FP8 Performance', 1), ('FP8 Balanced', 2))]
     image = lambda model, size, pairs: ['--case', 'image', '--image-model', model, '--width', size, '--height', size,
                                         '--tile', size, '--pairs', pairs]
-    images = [('ESRGAN 1536', image(ESRGAN, 1536, 20)), ('FDAT-M 1536', image(FDAT_M, 1536, 20)),
-              ('SPAN-S 1536', image(SPAN_S, 1536, 20)), ('HAT-L 512', image(HAT_L, 512, 16)), ('DAT2 512', image(DAT2, 512, 16))]
-    return [(n, a, VIDEO, 'video') for n, a in video] + [(n, a, IMAGES, 'image') for n, a in images]
+    catalog += [(n, a, IMAGES, 'image', {need}, False) for n, a, need in (
+        ('ESRGAN 1536', image(ESRGAN, 1536, 20), 'manga'), ('FDAT-M 1536', image(FDAT_M, 1536, 20), 'illustration'),
+        ('SPAN-S 1536', image(SPAN_S, 1536, 20), 'illustration'), ('HAT-L 512', image(HAT_L, 512, 16), 'illustration-bf16'),
+        ('DAT2 512', image(DAT2, 512, 16), 'illustration-bf16'))]
+    return catalog
 
 
-def bench(label, ref, cand, args, model_dir, swap=False):
-    """One paired comparison; returns a result row. Raw pairs are kept in results/<label>.json."""
-    label += '-swapped' if swap else ''
-    out = OUT/f'{label}.json'
+def bench(identity, label, ref, cand, args, model_dir, fp8, swap):
+    """One paired comparison. Raw pairs are kept in results/, keyed by GPU, driver, both builds and the arguments."""
+    key = hashlib.sha256(json.dumps([identity, ref.parent.name, cand.parent.name, list(map(str, args)), swap]).encode()).hexdigest()[:12]
+    out = OUT/f'{label}{"-swapped" if swap else ""}-{key}.json'
     if not out.exists():
         cmd = [sys.executable, ROOT/'head'/'sanity'/'paired_bench.py', '--reference', ref, '--candidate', cand,
                '--cuda-runtime', CUDA/'lib'/'libcudart.so.12', '--models', model_dir, '--output', out.with_suffix('.tmp'), *args]
         try:
-            run(cmd + (['--swap-load-order'] if swap else []), f'bench-{label}', env=environment())
+            run(cmd + (['--swap-load-order'] if swap else []), f'bench-{out.stem}', env=environment())
         except Failed as e:
             return {'error': last_line(e)}
-        out.with_suffix('.tmp').rename(out)
+        out.with_suffix('.tmp').replace(out)
     j = json.loads(out.read_text())
     stats = j.get('gpu') or j['wall']
-    dispatch = j['memory']['candidate'].get('dispatch', '')
+    problems = []
+    for arm in ('reference', 'candidate'):
+        log = j['memory'][arm].get('dispatch', '')
+        if not re.search(r'[Nn]ative kernels: ', log) or re.search(r'[Nn]ative kernels not used', log):
+            problems.append(f'{arm} NOT NATIVE')
+        elif fp8 and 'FP8 SPANF3 body' not in log:
+            problems.append(f'{arm} NOT FP8')
     return {'ref_ms': stats['reference_ms'], 'cand_ms': stats['candidate_ms'], 'pct': stats['paired_change_pct'],
-            'lo': stats['interval95_pct'][0], 'hi': stats['interval95_pct'][1],
-            'ref_mib': j['memory']['reference']['warm_bytes']/2**20, 'cand_mib': j['memory']['candidate']['warm_bytes']/2**20,
-            'native': 'native' in dispatch.lower()}
+            'lo': stats['interval95_pct'][0], 'hi': stats['interval95_pct'][1], 'problems': problems,
+            'ref_mib': j['memory']['reference']['warm_bytes']/2**20, 'cand_mib': j['memory']['candidate']['warm_bytes']/2**20}
 
 
-def compare(title, ref, cand, selected, both_orders, rows):
+def compare(identity, title, ref, cand, selected, both_orders, rows):
     """Time every case; a video case that moved by 1% or more is timed again with the load order swapped."""
     say(f'timing: {title}')
     block = []
-    for name, args, model_dir, group in selected:
-        tag = f'{ref.parent.name}-vs-{cand.parent.name}-{name}'.replace(' ', '_')
-        row = bench(tag, ref, cand, args, model_dir)
+    for name, args, model_dir, group, _, fp8 in selected:
+        label = f'{ref.parent.name}-vs-{cand.parent.name}-{name}'.replace(' ', '_')
+        row = bench(identity, label, ref, cand, args, model_dir, fp8, False)
         row['case'] = name
         if 'error' not in row and (both_orders or (group == 'video' and abs(row['pct']) >= 1)):
-            row['swapped_pct'] = bench(tag, ref, cand, args, model_dir, swap=True).get('pct')
+            row['swapped'] = bench(identity, label, ref, cand, args, model_dir, fp8, True)
         block.append(row)
         say('   ' + line(row))
     rows.append((title, block))
 
 
+def direction(r):
+    return 'SLOWER' if r['pct'] >= 1 and r['lo'] > 0 else 'faster' if r['pct'] <= -1 and r['hi'] < 0 else 'same'
+
+
+def broken(r):
+    """Why a row cannot be trusted, or an empty list."""
+    runs = [r] + ([r['swapped']] if 'swapped' in r else [])
+    return [x['error'] for x in runs if 'error' in x] + [p for x in runs for p in x.get('problems', [])]
+
+
 def line(r):
     if 'error' in r:
         return f'{r["case"]:<15} FAILED: {r["error"]}'
-    verdict = 'SLOWER' if r['pct'] >= 1 and r['lo'] > 0 else 'faster' if r['pct'] <= -1 and r['hi'] < 0 else 'same'
-    swapped = f' sw {r["swapped_pct"]:+.2f}%' if r.get('swapped_pct') is not None else ''
-    return (f'{r["case"]:<15}{r["ref_ms"]:8.3f} ->{r["cand_ms"]:8.3f} ms {r["pct"]:+6.2f}% [{r["lo"]:+.2f},{r["hi"]:+.2f}]{swapped}'
-            f' | {r["ref_mib"]:.0f}->{r["cand_mib"]:.0f} MiB | {verdict}{"" if r["native"] else " (NOT NATIVE)"}')
+    change = lambda x: f'{x["pct"]:+6.2f}% [{x["lo"]:+.2f},{x["hi"]:+.2f}]'
+    verdict, swapped = direction(r), ''
+    if 'swapped' in r:
+        s = r['swapped']
+        swapped = ' | sw FAILED' if 'error' in s else f' | sw {change(s)}'
+        # the two load orders have to agree before a direction is reported
+        verdict = 'inconclusive' if 'error' in s or direction(s) != verdict else verdict
+    notes = ''.join(f' ({p})' for p in dict.fromkeys(broken(r)))
+    return (f'{r["case"]:<15}{r["ref_ms"]:8.3f} ->{r["cand_ms"]:8.3f} ms {change(r)}{swapped}'
+            f' | {r["ref_mib"]:.0f}->{r["cand_mib"]:.0f} MiB | {verdict}{notes}')
 
 
 def parity(label, ref, cand, conf, slot):
-    """Outputs of one build against another: sanity/direct_graph.py compares 90 outputs per slot."""
+    """Outputs of one build against another with sanity/direct_graph.py, 90 outputs per slot: (passed, text)."""
     out = OUT/'parity-tmp'
     shutil.rmtree(out, ignore_errors=True)
-    log = f'parity-{label}'.replace(' ', '_')
+    log = f'parity-{label}'.replace(' ', '_').replace('>', '')
     (LOGS/f'{log}.log').unlink(missing_ok=True)
     try:
         run([sys.executable, ROOT/'head'/'sanity'/'direct_graph.py', '--backend', cand, '--reference-backend', ref,
              '--cuda-runtime', CUDA/'lib'/'libcudart.so.12', '--conf', conf, '--models', VIDEO, '--slot', slot,
              '--width', 1920, '--height', 1080, '--output', out], log, env=environment())
     except Failed as e:
-        return f'{label}: FAILED: {last_line(e)}'
+        return False, f'{label}: FAILED: {last_line(e)}'
     finally:
         shutil.rmtree(out, ignore_errors=True)
     found = re.findall(r'\d+ outputs matched[^\n]*', (LOGS/f'{log}.log').read_text(errors='replace'))
-    return f'{label}: {found[-1] if found else "ran, but printed no match line"}'
+    return bool(found), f'{label}: {found[-1] if found else "FAILED: ran, but printed no match line"}'
 
 
 def pair(text, parts):
@@ -380,9 +446,9 @@ def main():
     p.add_argument('--expect-sm', type=int, help='stop before downloading anything unless the GPU is this architecture, e.g. 89')
     p.add_argument('--base', help='revision to compare head against')
     p.add_argument('--head', default='origin/main', help='revision under test (default origin/main)')
-    p.add_argument('--pull', type=int, action='append', default=[], help='pull request to time against head; repeatable')
+    p.add_argument('--pull', type=int, action='append', default=[], help='pull request to time against head on the video cases; repeatable')
     p.add_argument('--compare', type=lambda s: pair(s, 3), action='append', default=[], metavar='REF:CAND[:REGEX]',
-                   help='time two named builds on the cases whose name matches REGEX (default all); replaces the default comparisons')
+                   help='time two named builds on the cases whose name matches REGEX (default every case); replaces the default comparisons')
     p.add_argument('--parity', type=lambda s: pair(s, 2), action='append', default=[], metavar='REF:CAND',
                    help='compare HD outputs of two named builds, FP16 and where available FP8')
     p.add_argument('--gate-test', action='append', default=[], metavar='BUILD', help='build and run aji_native_gate_reuse_test at base, head or prN')
@@ -395,7 +461,7 @@ def main():
     CUDA, TRT_ROOT = SDK/'cuda', SDK/'trt'/'usr'
     TRT_LIB, VIDEO, IMAGES = TRT_ROOT/'lib'/'x86_64-linux-gnu', ROOT/'models'/'video', ROOT/'models'/'img'
 
-    name, driver, sm, mem = gpu()
+    name, driver, sm, mem, uuid = gpu()
     say(f'GPU: {name} ({mem}), compute capability {sm/10:.1f}, driver {driver}')
     if a.expect_sm and sm != a.expect_sm:
         raise Failed(f'expected compute capability {a.expect_sm/10:.1f}; this is not the GPU that was asked for')
@@ -403,46 +469,61 @@ def main():
         raise Failed(f'the native backend has no kernels for compute capability {sm/10:.1f}')
     for folder in (SDK, LOGS, LIBS, OUT):
         folder.mkdir(parents=True, exist_ok=True)
+
+    catalog = cases(sm)
+    comparisons = [(ref, cand, [c for c in catalog if re.search(pattern, c[0])]) for ref, cand, pattern in a.compare]
+    if not a.compare:
+        comparisons = ([('base', 'head', catalog)] if a.base else []) + [
+            ('head', f'pr{n}', [c for c in catalog if c[3] == 'video']) for n in a.pull]
+    if not (comparisons or a.parity or a.gate_test):
+        raise Failed('nothing to do: give --base, --pull, --compare, --parity or --gate-test')
+    empty = [f'{ref}:{cand}' for ref, cand, selected in comparisons if not selected]
+    if empty:
+        raise Failed(f'no case matches the pattern of --compare {empty[0]}; cases: {", ".join(c[0] for c in catalog)}')
+    needed = {archive for _, _, selected in comparisons for c in selected for archive in c[4]}
+    needed |= ({'video'} if a.parity or a.gate_test else set()) | ({'illustration'} if a.gate_test else set())
+
     say('tools, CUDA 12.9 compiler and TensorRT 11.4 headers'); seven = tools(); toolkits()
     say('sources'); builds = Builds(sm, a.base, a.head)
     builds.tree('head', builds.revisions['head'])  # the timing and parity scripts are taken from head
-    say('models'); models(seven)
-
-    comparisons = a.compare
-    if not comparisons:
-        comparisons = ([['base', 'head', '']] if a.base else []) + [['head', f'pr{n}', '^(?!.*(1536|512))'] for n in a.pull]
-    if not (comparisons or a.parity or a.gate_test):
-        raise Failed('nothing to do: give --base, --pull, --compare, --parity or --gate-test')
+    say('models: ' + ', '.join(sorted(needed))); models(seven, needed)
     libs = {n: builds.lib(n) for c in comparisons + a.parity for n in c[:2]}  # build everything before timing anything
-    catalog = cases(sm)
-    rows, checks = [], []
+
+    rows, checks, failed = [], [], 0
     for build in a.gate_test:
-        say(f'running the GPU test at {build}'); checks.append(builds.gate_test(build)); say('   ' + checks[-1])
+        say(f'running the GPU test at {build}')
+        ok, text = builds.gate_test(build)
+        checks.append(text); failed += not ok; say('   ' + text)
     for ref, cand in a.parity:
         say(f'comparing outputs: {ref} -> {cand}')
         slots = [('Balanced FP16', ROOT/'builtins.conf', 1002), ('Performance FP16', ROOT/'builtins.conf', 1003)]
         slots += [('Performance FP8', ROOT/'fp8.conf', 1), ('Balanced FP8', ROOT/'fp8.conf', 2)] if sm >= 89 else []
         for label, conf, slot in slots:
-            checks.append(parity(f'{ref} -> {cand} {label}', libs[ref], libs[cand], conf, slot)); say('   ' + checks[-1])
-    describe = lambda n: f'{n} ({builds.resolve(n)[1][:7]})'
-    for ref, cand, pattern in comparisons:
-        selected = [c for c in catalog if re.search(pattern, c[0])]
-        compare(f'{describe(ref)} -> {describe(cand)}', libs[ref], libs[cand], selected, a.both_orders, rows)
+            ok, text = parity(f'{ref} -> {cand} {label}', libs[ref], libs[cand], conf, slot)
+            checks.append(text); failed += not ok; say('   ' + text)
+        if sm < 89:
+            checks.append(f'{ref} -> {cand} FP8: SKIPPED, this GPU has no FP8 kernels')
+    for ref, cand, selected in comparisons:
+        compare([uuid, driver, sm], f'{builds.describe(ref)} -> {builds.describe(cand)}', libs[ref], libs[cand], selected, a.both_orders, rows)
+    failed += sum(bool(broken(r)) for _, block in rows for r in block)
 
     text = [f'GPU {name} ({mem}) sm_{sm}, driver {driver} | CUDA 12.9, TensorRT {TRT.split("-")[0]} | {int(time.time()-T0)//60} min',
             'ms per frame (video: GPU time; image: wall time), change with 95% interval,',
-            '"sw" = the same comparison with the load order swapped, then warm VRAM']
+            '"sw" = the same comparison with the load order swapped, then warm VRAM.',
+            'faster/SLOWER needs 1% or more with an interval clear of zero, in both orders when both ran.']
     for title, block in rows:
         text += ['', f'== {title}'] + [line(r) for r in block]
     text += (['', '== checks'] + checks) if checks else []
+    text += ['', f'{failed} requested timing(s) or check(s) FAILED'] if failed else []
     (ROOT/'summary.txt').write_text('\n'.join(text) + '\n')
-    (ROOT/'summary.json').write_text(json.dumps({'gpu': [name, mem, sm, driver], 'rows': rows, 'checks': checks}, indent=1))
+    (ROOT/'summary.json').write_text(json.dumps({'gpu': [name, mem, sm, driver, uuid], 'rows': rows, 'checks': checks, 'failed': failed}, indent=1))
     print('\n' + '=' * 30 + ' SUMMARY ' + '=' * 30 + '\n' + '\n'.join(text), flush=True)
+    return 1 if failed else 0
 
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main())
     except Failed as e:
         print(f'\nSTOPPED: {e}', flush=True)
         sys.exit(1)
