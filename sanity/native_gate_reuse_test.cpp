@@ -18,6 +18,8 @@
 
 using namespace ajinative;
 
+static_assert(hd_span_fuses_sm(8, 6) && hd_span_fuses_sm(8, 9) && hd_span_fuses_sm(12, 0));
+static_assert(!hd_span_fuses_sm(8, 0) && !hd_span_fuses_sm(9, 0));
 static_assert(hd_span_tuned_sm(8, 9) && hd_span_tuned_sm(12, 0));
 static_assert(!hd_span_tuned_sm(8, 0) && !hd_span_tuned_sm(8, 6) && !hd_span_tuned_sm(9, 0));
 
@@ -121,7 +123,7 @@ static bool check_body_launches(FrameNet &video, void *in, void *out, int featur
     return true;
 }
 
-static bool compare(const char *path, int channels, Gate gate, const std::string &mode, bool expect_tuning)
+static bool compare(const char *path, int channels, Gate gate, const std::string &mode, bool expect_tuning, bool expect_fusion)
 {
     // Use more CTAs than can run at once so a later CTA can still need a neighbor's source
     // halo when that neighbor writes. Both dimensions also leave partial tiles after unshuffle.
@@ -143,7 +145,7 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
     }
     const bool fp8 = mode == "fp8";
     const bool hd = gate == Gate::Tanh1x1;
-    const bool fuse = hd && expect_tuning;
+    const bool fuse = hd && expect_fusion;
     const SpanPrecision precision = fp8 ? SpanPrecision::FP8 :
                                     mode == "fp16" ? SpanPrecision::FP16 : SpanPrecision::Default;
     auto video = FrameNet::lowered(plan, w, h, nullptr, &why, precision);
@@ -152,7 +154,7 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
     const std::string label = video->describe();
     if (label.find(std::to_string(operations - size_t(fuse)) + " kernels, ") != 0 ||
         (label.find("fused gate and projection") != std::string::npos) != fuse ||
-        (label.find("FP16 alternating tile rows") != std::string::npos) != (fuse && !fp8) ||
+        (label.find("FP16 alternating tile rows") != std::string::npos) != (hd && expect_tuning && !fp8) ||
         (label.find("FP8 SPANF3 body") != std::string::npos) != fp8) {
         std::fprintf(stderr, "%s [%s]: unexpected video dispatch: %s\n", path, mode.c_str(), label.c_str());
         return false;
@@ -301,6 +303,7 @@ int main(int argc, char **argv)
     check_cuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
     check_cuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
     const bool expect_tuning = hd_span_tuned_sm(major, minor);
+    const bool expect_fusion = hd_span_fuses_sm(major, minor);
     for (const std::string profile : {"default", "fp16", "fp8"}) {
         if (mode != "all" && mode != profile) continue;
         if (profile == "fp8" && !span_fp8_available()) {
@@ -308,9 +311,9 @@ int main(int argc, char **argv)
             if (expect_tuning || mode != "all") return 1;
             continue;
         }
-        const bool balanced = compare(argv[1], 64, Gate::Tanh1x1, profile, expect_tuning);
-        const bool performance = compare(argv[2], 48, Gate::Tanh1x1, profile, expect_tuning);
-        if (!balanced || !performance || (profile == "default" && !compare(argv[3], 48, Gate::SigmoidHalf, profile, expect_tuning))) return 1;
+        const bool balanced = compare(argv[1], 64, Gate::Tanh1x1, profile, expect_tuning, expect_fusion);
+        const bool performance = compare(argv[2], 48, Gate::Tanh1x1, profile, expect_tuning, expect_fusion);
+        if (!balanced || !performance || (profile == "default" && !compare(argv[3], 48, Gate::SigmoidHalf, profile, expect_tuning, expect_fusion))) return 1;
     }
     return 0;
 }
