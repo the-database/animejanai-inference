@@ -459,12 +459,17 @@ def dispatch(lib, conf, slot):
     done = subprocess.run(list(map(str, [sys.executable, ROOT/'tools'/'sanity'/'paired_bench.py', '--reference', lib, '--candidate', lib,
                                          '--cuda-runtime', CUDA/'lib'/'libcudart.so.12', '--models', VIDEO, '--conf', conf, '--slot', slot,
                                          '--memory-worker', 'reference'])), capture_output=True, text=True, env=environment())
-    try:
-        log = json.loads(done.stdout.splitlines()[-1])['dispatch']
-    except (IndexError, KeyError, ValueError):
+    if done.returncode:
         raise Failed(f'{lib.parent.name} could not be probed (exit {done.returncode}):\n' + (done.stderr.strip() or done.stdout.strip() or 'no output'))
-    if done.returncode or 'Native kernels: ' not in log or 'Native kernels not used' in log:
-        raise Failed(f'{lib.parent.name} did not run this slot on the native kernels:\n' + (log.strip() or done.stderr.strip() or 'empty model log'))
+    try:
+        reply = json.loads(done.stdout.splitlines()[-1])
+    except (IndexError, ValueError):
+        reply = None
+    log = reply.get('dispatch') if isinstance(reply, dict) else None
+    if not isinstance(log, str):
+        raise Failed(f'{lib.parent.name} could not be probed, its worker printed no model log:\n' + (done.stdout.strip()[-300:] or 'no output'))
+    if 'Native kernels: ' not in log or 'Native kernels not used' in log:
+        raise Failed(f'{lib.parent.name} did not run this slot on the native kernels:\n' + (log.strip() or 'empty model log'))
     return log
 
 
