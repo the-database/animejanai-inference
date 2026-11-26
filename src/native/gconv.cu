@@ -138,12 +138,8 @@ int ksplit_for(const GWeights &w, const GConvArgs &a, int rows, int cap = 64)
 {
     const int kch = kch_for(w, a, cap);
     if (!kch) return 1;
-    const long ctas = (long)((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + rows - 1) / rows) * (w.cout_pad / w.coutp) * a.nb;
-    const long want = 2L * sm_count();
-    if (ctas >= want) return 1;
-    const int units = (a.nchw ? 1 : w.cin_pad / kch) * 9;
-    int k = (int)((want + ctas - 1) / ctas);
-    return k < units ? k : units;
+    const size_t ctas = size_t((a.W + gdev::TW - 1) / gdev::TW) * ((a.H + rows - 1) / rows) * (w.cout_pad / w.coutp) * a.nb;
+    return gconv_split_count(ctas, (a.nchw ? 1 : w.cin_pad / kch) * 9, sm_count());
 }
 
 gdev::GParams params(const GWeights &w, const GConvArgs &a, int ksplit, int cap)
@@ -437,6 +433,52 @@ cudaError_t glaunch(const GWeights &w, const GConvArgs &a, int variant, cudaStre
     const size_t n = (size_t)pr.H * a.W * (w.cout_pad / 2);
     gdev::k_gconv_reduce<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(pr);
     return cudaGetLastError();
+}
+
+RowPhasePlan gplan_row_phases(const GWeights &w, const GConvArgs &a, int variant, size_t available)
+{
+    // The measured specialization is NHWC -> phase scatter, four warps, one row per warp.
+    if (variant % kGShapes != 1 || a.R != 4 || a.nchw || a.stride != 1 || a.nb != 1 ||
+        a.acc32 || a.out_f32 || a.sums || w.coutp != 64 || kch_for(w, a, vcap(variant)) != 32)
+        return {};
+    const int splits = ksplit_for(w, a, 4, vcap(variant));
+    return row_phase_plan(splits, size_t(a.H) * a.W, w.cout_pad, std::min(available, a.ws_floats));
+}
+
+namespace {
+using gdev::RowPhases;
+
+template<int N>
+cudaError_t launch_phases(const GWeights *const weights[4], const GConvArgs &a, const RowPhasePlan &plan, cudaStream_t s)
+{
+    const GWeights &w = *weights[0];
+    const dim3 grid((a.W + gdev::TW - 1) / gdev::TW, (a.H + 3) / 4, N * (w.cout_pad / w.coutp) * plan.splits);
+    constexpr int smem = gdev::gconv_smem_bytes<32, 64, 1, 4, 1>();
+    for (int first = 0; first < 4; first += N) {
+        RowPhases<N> phases{};
+        for (int j = 0; j < N; ++j) {
+            auto &row = phases.row[j];
+            row = params(*weights[first + j], a, plan.splits, 32);
+            row.sy = first + j;
+            if (plan.phase_floats) row.ws += j * plan.phase_floats;
+        }
+        gdev::k_row_phases<<<grid, 128, smem, s>>>(phases);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return err;
+        if (plan.splits > 1) {
+            const size_t pairs = size_t(a.H) * a.W * (w.cout_pad / 2);
+            gdev::k_reduce_phases<<<dim3((unsigned)((pairs + 255) / 256), N), 256, 0, s>>>(phases);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) return err;
+        }
+    }
+    return cudaSuccess;
+}
+}  // namespace
+
+cudaError_t glaunch_row_phases(const GWeights *const weights[4], const GConvArgs &a, const RowPhasePlan &plan, cudaStream_t s)
+{
+    return plan.batch == 4 ? launch_phases<4>(weights, a, plan, s) : launch_phases<2>(weights, a, plan, s);
 }
 
 int gpick(const GWeights &w, const GConvArgs &a, cudaStream_t s, float *best_ms)

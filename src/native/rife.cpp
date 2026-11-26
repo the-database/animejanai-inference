@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "native/gconv.h"
+#include "native/gconv_workspace.h"
 #include "native/onnx_graph.h"
 #include "native/pack.h"
 #include "native/onnx_read.h"
@@ -23,12 +24,14 @@ namespace {
 using namespace onnxread;
 
 struct Step {
-    enum Kind { GCONV, GATHER, MERGE, FINAL } kind;
+    enum Kind { GCONV, ROW_PHASES, GATHER, MERGE, FINAL } kind;
     RifeBlockOut mo;
     const void *mr = nullptr;
     GWeights *w = nullptr;
     GConvArgs a;
     int variant = 0;
+    RowPhasePlan phase_plan;
+    const GWeights *phase_weights[4] = {};
     RifeGather g;
 };
 
@@ -89,7 +92,7 @@ struct Rife::Impl {
     }
 };
 
-std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_t s, std::string *why)
+std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_t s, std::string *why, size_t phase_workspace_limit)
 {
     RifePlan plan;
     if (!rife_plan(g, W, H, &plan, why)) return nullptr;
@@ -358,7 +361,6 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     }
     d.nb = nb;
     d.steps.push_back(Step{Step::FINAL});
-    d.part[3] = d.steps.size();
 
     size_t wsf = 0;
     for (Step &st : d.steps)
@@ -384,6 +386,21 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
         if (!st.a.nchw) st.variant = v;
         else st.a.sy = st.variant, st.variant = v;  // remember the frame index in sy (unused for NHWC output)
     }
+    // The four consecutive lastconv steps were constructed together from one tensor. They
+    // read the same completed input (including its halo) and scatter to rows 4*y + sy.
+    int batched = 0;
+    for (size_t i = d.part[2]; i + 3 < d.steps.size(); ++i) {
+        Step &st = d.steps[i];
+        if (st.kind != Step::GCONV || st.a.R != 4 || st.a.sy != 0) continue;
+        const auto plan = gplan_row_phases(*st.w, st.a, st.variant, phase_workspace_limit);
+        if (plan.batch == 1) continue;
+        st.kind = Step::ROW_PHASES;
+        st.phase_plan = plan;
+        for (int sy = 0; sy < 4; ++sy) st.phase_weights[sy] = d.steps[i + sy].w;
+        d.steps.erase(d.steps.begin() + i + 1, d.steps.begin() + i + 4);
+        ++batched;
+    }
+    d.part[3] = d.steps.size();
     if (cudaStreamSynchronize(s) != cudaSuccess) return refuse(why, "CUDA error during setup"), nullptr;
 
     char buf[160];
@@ -391,6 +408,7 @@ std::unique_ptr<Rife> Rife::create(const OnnxGraph &g, int W, int H, cudaStream_
     for (size_t i = 0; i < d.scales.size(); i++) sc += (i ? "/" : "") + std::to_string(d.scales[i]);
     snprintf(buf, sizeof(buf), "%d blocks, scales %s, %d feature channels%s", nb, sc.c_str(), F, ens ? ", ensemble" : "");
     d.what = buf;
+    if (batched) d.what += ", row-phase groups " + std::to_string(batched);
     return r;
 }
 
@@ -424,6 +442,9 @@ cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bo
             }
             break;
         }
+        case Step::ROW_PHASES:
+            e = glaunch_row_phases(st.phase_weights, st.a, st.phase_plan, s);
+            break;
         case Step::GATHER: {
             RifeGather g = st.g;
             g.t = d.dt;
@@ -448,6 +469,7 @@ cudaError_t Rife::Impl::enqueue(const void *in11, void *out3, cudaStream_t s, bo
             cudaEventElapsedTime(&ms, ev[i - b], ev[i - b + 1]);
             const Step &st = d.steps[i];
             std::string k = st.kind == Step::GATHER ? "gather s" + std::to_string(st.g.s)
+                          : st.kind == Step::ROW_PHASES ? "row phases x" + std::to_string(st.phase_plan.batch)
                           : st.kind == Step::FINAL ? "final"
                           : st.kind == Step::MERGE ? "merge"
                           : "conv " + std::to_string(st.w->cin) + "->" + std::to_string(st.w->cout) + " " +

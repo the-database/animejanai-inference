@@ -127,8 +127,51 @@ static bool fdat_fixture(int w, int h)
            !check.workspace(5, body.CF, 256);
 }
 
+// The final stride-4 heads see one quarter of each block dimension. A 1080p
+// or 4K input is first padded to a multiple of 64. These fixtures use 64 input channels.
+static bool rife_phase_bounds()
+{
+    struct Case { int sms, width, height, splits[3]; };
+    for (auto t : {Case{24, 1920, 1088, {1, 1, 2}},
+                   Case{58, 1920, 1088, {1, 1, 4}},
+                   Case{82, 1920, 1088, {1, 2, 5}},
+                   Case{108, 1920, 1088, {1, 2, 6}},
+                   Case{128, 1920, 1088, {1, 2, 8}},
+                   Case{170, 1920, 1088, {1, 3, 10}},
+                   Case{24, 3840, 2176, {1, 1, 1}},
+                   Case{58, 3840, 2176, {1, 1, 1}},
+                   Case{82, 3840, 2176, {1, 1, 2}},
+                   Case{108, 3840, 2176, {1, 1, 2}},
+                   Case{128, 3840, 2176, {1, 1, 2}},
+                   Case{170, 3840, 2176, {1, 1, 3}}}) {
+        for (int i = 0; i < 3; ++i) {
+            const int divisor = 8 << i, w = t.width / divisor, h = t.height / divisor;
+            const int splits = gconv_split_count(size_t((w + 15) / 16) * ((h + 3) / 4), 18, t.sms);
+            if (splits != t.splits[i]) return false;
+            const size_t pixels = size_t(w) * h;
+            if (splits == 1) {
+                const auto plan = row_phase_plan(splits, pixels, 64, 0);
+                if (plan.batch != 4 || plan.phase_floats != 0) return false;
+                continue;
+            }
+            const size_t one = size_t(splits) * pixels * 64;
+            for (auto [budget, expected] : {std::pair<size_t,int>{one, 1}, {2*one-1, 1}, {2*one, 2},
+                                           {4*one-1, 2}, {4*one, 4}}) {
+                const auto plan = row_phase_plan(splits, pixels, 64, budget);
+                if (plan.batch != expected || (expected > 1 &&
+                    (plan.splits != splits || plan.phase_floats != one || plan.batch * plan.phase_floats > budget))) return false;
+            }
+        }
+    }
+    return true;
+}
+
 int main()
 {
+    if (!rife_phase_bounds()) {
+        std::fprintf(stderr, "RIFE row-phase scratch bound failed\n");
+        return 1;
+    }
     for (int rows : {0, 256})
         for (const auto &shape : {std::pair<int,int>{1536,1536}, {2048,2048}, {896,640}})
             if (!esrgan_2x_fixture(shape.first, shape.second, rows)) {

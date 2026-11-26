@@ -6,6 +6,29 @@
 namespace ajinative {
 inline constexpr int gconv_tile_width = 16;
 
+// The stock split policy targets two CTAs per SM, bounded by the number of tap/chunk units.
+inline int gconv_split_count(size_t ctas, int units, int sms)
+{
+    const size_t target = size_t(2) * sms;
+    return ctas >= target ? 1 : std::min(units, int((target + ctas - 1) / ctas));
+}
+
+struct RowPhasePlan {
+    int batch = 1;
+    int splits = 1;
+    size_t phase_floats = 0;
+};
+
+// Prefer four disjoint partial-sum ranges, then two. One means keep the original launches.
+// Compare by division before multiplying. An unsplit convolution writes directly to its output.
+inline RowPhasePlan row_phase_plan(int splits, size_t pixels, int channels, size_t available)
+{
+    if (splits == 1) return {4, 1, 0};
+    if (available / 2 / splits / channels < pixels) return {};
+    const size_t phase = pixels * channels * splits;
+    return {available / phase >= 4 ? 4 : 2, splits, phase};
+}
+
 // In floats. For q unsplit CTAs and k > 1, q < 2*SM and k <= ceil(2*SM/q).
 // Thus q*k <= 2*SM + q - 1 <= 4*SM - 2. Each CTA covers at most
 // tile_width * rows * output_chunk floats. An unsplit FP32 output has its own full-map bound.

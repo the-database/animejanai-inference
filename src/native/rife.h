@@ -30,7 +30,8 @@ struct OnnxGraph;
 class Rife {
 public:
     // Parses and uploads; why explains a refusal. Builds buffers for w x h.
-    static std::unique_ptr<Rife> create(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why);
+    static std::unique_ptr<Rife> create(const OnnxGraph &g, int w, int h, cudaStream_t s, std::string *why,
+                                        size_t phase_workspace_limit = size_t(-1));
     ~Rife();
     // in11: the NCHW fp16 input tensor; out3: NCHW fp16 RGB. t: the timestep.
     cudaError_t run(const void *in11, float t, void *out3, cudaStream_t s);
