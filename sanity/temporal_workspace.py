@@ -7,6 +7,7 @@ import ctypes as C
 import os
 from pathlib import Path
 import random
+import re
 from tempfile import TemporaryDirectory
 
 P, I, S = C.c_void_p, C.c_int, C.c_size_t
@@ -154,10 +155,10 @@ def temporal(device, backends):
     return count
 
 
-def rife(device, backends, use_ids):
+def rife(device, backends, use_ids, model_name):
     w, h = 1920, 1080
     for api in backends:
-        api.shape(w, h, 'Native kernels: rife_v4.26', spatial_status=0)  # RIFE-only spatial passthrough
+        api.shape(w, h, f'Native kernels: {model_name} (', spatial_status=0)  # RIFE-only spatial passthrough
     with ExitStack() as surfaces:
         a, b = [device.frame(w, h, 1, surfaces) for _ in range(2)]
         outs = [device.frame(w, h, 1, surfaces) for _ in backends]
@@ -200,22 +201,27 @@ def rife(device, backends, use_ids):
             pair(11, 12, 0.5, 1)  # caller-supplied cut and retry of a cached pair
             pair(11, 12, 0.5, 0)
             pair(5, 6, 0.5, 0)  # caller explicitly requests interpolation across the cut
-    if use_ids:
-        # A residual-lane overlap survived the 1080p NV12 sequence on the test GPU.
-        # This larger P010 pair exposed it. Force interpolation of the independent textures.
-        w, h = 3840, 2160
-        for api in backends:
-            api.shape(w, h, 'Native kernels: rife_v4.26', spatial_status=0)
-        with ExitStack() as surfaces:
-            a, b, ref, result = [device.frame(w, h, 2, surfaces) for _ in range(4)]
-            for seed, frame in enumerate((a, b)):
-                data = bytearray(w * h * 3)
-                data[1::2] = random.Random(seed).randbytes(len(data) // 2)
-                device.upload(frame, bytes(data))
-            for api, out in zip(backends, (ref, result)):
+    # A residual-lane overlap survived the 1080p NV12 sequence on the test GPU.
+    # This larger P010 pair exposed it. Force interpolation of the independent textures.
+    w, h = 3840, 2160
+    for api in backends:
+        api.shape(w, h, f'Native kernels: {model_name} (', spatial_status=0)
+    with ExitStack() as surfaces:
+        a, b, ref, result = [device.frame(w, h, 2, surfaces) for _ in range(4)]
+        for seed, frame in enumerate((a, b)):
+            data = bytearray(w * h * 3)
+            data[1::2] = random.Random(seed).randbytes(len(data) // 2)
+            if not use_ids:
+                # Keep both luma textures in the same scene for the API that detects cuts itself.
+                data[1::2] = data[1::2].translate(bytes(80 + (x >> 3) for x in range(256)))
+            device.upload(frame, bytes(data))
+        for api, out in zip(backends, (ref, result)):
+            if use_ids:
                 api.ok(api.rife_ids(api.ctx, C.byref(a), 0, C.byref(b), 1, 0.37, C.byref(out), device.stream, 0))
-            same('3840x2160 P010 residuals', device.read(ref), device.read(result))
-            count += 1
+            else:
+                api.ok(api.rife(api.ctx, C.byref(a), C.byref(b), 0.37, C.byref(out), device.stream))
+        same('3840x2160 P010 residuals', device.read(ref), device.read(result))
+        count += 1
     return count
 
 
@@ -225,14 +231,20 @@ def main():
     p.add_argument('--reference', type=Path, required=True, help='backend built from main')
     p.add_argument('--backend', type=Path, required=True, help='backend under test')
     p.add_argument('--cuda-runtime', type=Path, required=True)
-    p.add_argument('--model', type=Path, required=True, help='TemporalFix S1 ONNX or rife_v4.26.onnx')
+    p.add_argument('--model', type=Path, required=True, help='shipped TemporalFix or RIFE ONNX file')
     a = p.parse_args()
     os.environ['AJI_NATIVE_FRAME_CACHE'] = 'off' if a.case == 'temporal-no-cache' else 'on'
     os.environ['AJI_RIFE_IDS'] = '1'
     model = a.model.resolve(strict=True)
     is_rife = a.case.startswith('rife')
     if is_rife:
-        chain = ('chain_1_rife=yes\nchain_1_rife_model=426\nchain_1_rife_factor_numerator=2\n'
+        name = re.fullmatch(r'rife_v(\d+)\.(\d+)(_lite|_heavy)?(_ensemble)?', model.stem)
+        if not name:
+            p.error(f'unrecognized RIFE filename: {model.name}')
+        major, minor, variant, ensemble = name.groups()
+        code = major + minor + {None: '', '_lite': '1', '_heavy': '2'}[variant]
+        chain = (f'chain_1_rife=yes\nchain_1_rife_model={code}\nchain_1_rife_ensemble={"yes" if ensemble else "no"}\n'
+                 'chain_1_rife_factor_numerator=2\n'
                  'chain_1_rife_factor_denominator=1\nchain_1_rife_before_upscale=yes\n')
     else:
         chain = f'chain_1_temporal_fix_model={model.stem}\n'
@@ -246,7 +258,7 @@ def main():
         device = Device(a.cuda_runtime, stack)
         backends = [Backend(path, conf, model.parent, stack) for path in (a.reference, a.backend)]
         if is_rife:
-            count = rife(device, backends, a.case == 'rife-ids')
+            count = rife(device, backends, a.case == 'rife-ids', model.stem)
             print(f'{a.case}: {count} pair calls matched main, including untouched scene-cut outputs')
         else:
             count = temporal(device, backends)

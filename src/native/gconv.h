@@ -86,6 +86,12 @@ bool gsupported(const GWeights &w, const GConvArgs &a, std::string *why = nullpt
 int gvariant_count();
 // Runs all output chunks. variant < 0 picks the default.
 cudaError_t glaunch(const GWeights &w, const GConvArgs &a, int variant, cudaStream_t s);
+struct RowPhasePlan;
+// Plan four stride-1 R=4 output phases at model creation using the stock tile and scratch budget.
+RowPhasePlan gplan_row_phases(const GWeights &w, const GConvArgs &a, int variant, size_t available);
+cudaError_t glaunch_row_phases(const GWeights *const weights[4], const GConvArgs &a,
+                               const RowPhasePlan &plan, cudaStream_t s);
+
 // The variant the backends run for a, from its kernel bucket and the GPU generation (nothing is timed;
 // see gconv.cu).
 // AJI_NATIVE_GVARIANT=n overrides.

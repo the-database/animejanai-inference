@@ -1,4 +1,4 @@
-// aji_native_rife_run MODEL.onnx IN.f16 W H T OUT.f16 [ITERS]
+// aji_native_rife_run MODEL.onnx IN.f16 W H T OUT.f16 [ITERS] [--check-phase-fallback]
 // Runs native RIFE on a raw fp16 NCHW 11-channel tensor (libaji's input layout), writes the fp16
 // NCHW RGB output, and prints the median GPU time over ITERS runs (default 30). Built on request.
 #include <algorithm>
@@ -24,7 +24,7 @@ static std::vector<char> slurp(const char *p)
 int main(int argc, char **argv)
 {
     if (argc < 7) {
-        fprintf(stderr, "usage: %s MODEL.onnx IN.f16 W H T OUT.f16 [ITERS]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.onnx IN.f16 W H T OUT.f16 [ITERS] [--check-phase-fallback]\n", argv[0]);
         return 2;
     }
     const int W = atoi(argv[3]), H = atoi(argv[4]), iters = argc > 7 ? atoi(argv[7]) : 30;
@@ -71,6 +71,22 @@ int main(int argc, char **argv)
     std::sort(ms.begin(), ms.end());
     std::vector<char> out(plane * 3 * 2);
     cudaMemcpy(out.data(), dout, out.size(), cudaMemcpyDeviceToHost);
+    if (argc > 8 && std::string(argv[8]) == "--check-phase-fallback") {
+        // Cap only the batched planner. The four ordinary calls keep their original split-K workspace.
+        auto limited = Rife::create(g, W, H, s, &why, 0);
+        if (!limited || limited->describe() == r->describe() || limited->device_bytes() != r->device_bytes()) {
+            fprintf(stderr, "expected a split row-phase group to fall back with equal device bytes: %s\n", why.c_str());
+            return 1;
+        }
+        std::vector<char> fallback(out.size());
+        if (cudaMemsetAsync(dout, 0xa5, out.size(), s) != cudaSuccess || limited->run(din, t, dout, s) != cudaSuccess ||
+            cudaMemcpyAsync(fallback.data(), dout, out.size(), cudaMemcpyDeviceToHost, s) != cudaSuccess ||
+            cudaStreamSynchronize(s) != cudaSuccess || fallback != out) {
+            fprintf(stderr, "row-phase fallback output differed\n");
+            return 1;
+        }
+        printf("scratch fallback matched %zu bytes (%s -> %s)\n", out.size(), r->describe().c_str(), limited->describe().c_str());
+    }
     std::ofstream(argv[6], std::ios::binary).write(out.data(), out.size());
     printf("%s: %s, %.1f MB; median %.3f ms (min %.3f)\n", argv[1], r->describe().c_str(), r->device_bytes() / 1e6,
            ms[ms.size() / 2], ms[0]);
