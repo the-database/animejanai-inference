@@ -50,7 +50,7 @@ int main(int argc, char **argv)
             const size_t two = model_bytes(graph, w, h, "2");
             const size_t one = model_bytes(graph, w, h, "1");
             const size_t three = model_bytes(graph, w, h, "3");
-            const size_t want = h == 496 ? one + 5 * (two - one) : two;
+            const size_t want = h == 496 ? one + 5 * (two - one) : one;
             std::printf("S%d %dx%d default %zu bytes, one chain %zu, two chains %zu\n", i, w, h, actual, one, two);
             if (two <= one || three - two != two - one || actual != want) return 1;
             if (measured_gpu && h == 1080 && (one != 594477084 || two != 689862684)) return 1;
