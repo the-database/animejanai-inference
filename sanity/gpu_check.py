@@ -95,6 +95,7 @@ TUNING = {'untuned': (False, False, False), 'order': (True, False, False), 'fuse
 
 ROOT = SDK = LOGS = LIBS = OUT = CUDA = TRT_ROOT = TRT_LIB = VIDEO = IMAGES = HEAVY = None
 SCRIPTS = None  # the commit whose sanity/ scripts do the timing
+OPTIONS = set()  # the options that commit's paired_bench.py accepts
 T0 = time.time()
 
 
@@ -456,8 +457,7 @@ def compare(identity, title, ref, cand, selected, both_orders, rows):
     block = []
     for name, args, model_dir, group, _, fp8, call in selected:
         label = f'{ref.parent.name}-vs-{cand.parent.name}-{name}'.replace(' ', '_')
-        harness = (ROOT/'tools'/'sanity'/'paired_bench.py').read_text()
-        missing = [x for x in map(str, args) if x.startswith('--') and f"'{x}'" not in harness]
+        missing = [x for x in map(str, args) if x.startswith('--') and x not in OPTIONS]
         if missing:  # timing scripts older than an option this case needs
             block.append({'case': name, 'skipped': f'the timing scripts at {SCRIPTS[:7]} have no {missing[0]}; use --tools'})
         elif call and not has(ref, call):  # an older reference without this call or setting: nothing to compare
@@ -556,7 +556,7 @@ def main():
     p.add_argument('--both-orders', action='store_true', help='time every comparison in both load orders')
     a = p.parse_args()
 
-    global ROOT, SDK, LOGS, LIBS, OUT, CUDA, TRT_ROOT, TRT_LIB, VIDEO, IMAGES, HEAVY, SCRIPTS
+    global ROOT, SDK, LOGS, LIBS, OUT, CUDA, TRT_ROOT, TRT_LIB, VIDEO, IMAGES, HEAVY, SCRIPTS, OPTIONS
     ROOT = a.root.resolve()
     SDK, LOGS, LIBS, OUT = ROOT/'sdk', ROOT/'logs', ROOT/'libs', ROOT/'results'
     CUDA, TRT_ROOT = SDK/'cuda', SDK/'trt'/'usr'
@@ -589,6 +589,10 @@ def main():
     say('sources'); builds = Builds(sm, a.base, a.head)
     SCRIPTS = builds.resolve(a.tools)[1] if re.fullmatch(r'pr\d+|head|base', a.tools) else builds.commit(a.tools)
     builds.tree('tools', SCRIPTS)  # sanity/paired_bench.py and sanity/direct_graph.py are run from this revision
+    harness = ROOT/'tools'/'sanity'/'paired_bench.py'
+    if not harness.exists():
+        raise Failed(f'{a.tools} ({SCRIPTS[:7]}) has no sanity/paired_bench.py; pass --tools a revision that has it, such as origin/main')
+    OPTIONS = set(re.findall(r'(?<![\w-])--[a-z][a-z0-9-]*', capture([sys.executable, harness, '--help'])))
     say('models: ' + ', '.join(sorted(needed))); models(seven, needed)
     libs = {n: builds.lib(n) for c in comparisons + a.parity for n in c[:2]}  # build everything before timing anything
 
