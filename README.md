@@ -24,11 +24,13 @@ Used by [mpv-AnimeJaNai](https://github.com/the-database/mpv-AnimeJaNai) (real-t
 
 ### HD video precision
 
-On SM 120, the native HD V3.1 Balanced and Performance SPANF3 video models use
-FP16 with alternating tile rows and a fused final gate and projection. The
-built-in slots select this path automatically. Existing slot configurations
-can still set `native_span_precision=fp16` explicitly for the same result.
-FP8 requires `native_span_precision=fp8` in a configured slot and a supported GPU.
+On SM 89 (Ada) and SM 120, the native HD V3.1 Balanced and Performance SPANF3
+video models use alternating FP16 tile rows and a fused final gate and projection.
+The built-in HD slots select this path automatically. An explicit
+`native_span_precision=fp16` setting selects the same path. FP8 requires
+`native_span_precision=fp8` in a configured slot and a supported GPU. On SM 89
+and SM 120 it uses tuned tiles for packed body convolutions and the fused final
+gate and projection.
 
 ## Build (Linux)
 
