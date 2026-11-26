@@ -8,6 +8,12 @@
 
 namespace ajinative {
 
+// HD SPANF3 launch policies measured on the L4 and RTX 5090.
+inline constexpr bool hd_span_tuned_sm(int major, int minor)
+{
+    return (major == 8 && minor == 9) || (major == 12 && minor == 0);
+}
+
 // Whether the current device's L2 is 32 MB or more (RTX 4090 72 MB, 5090 96 MB; RTX A5000 / 30-series
 // 6 MB). With a small L2, rows prefetched ahead of use are evicted again before they are read.
 inline bool large_l2()

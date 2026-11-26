@@ -1,19 +1,20 @@
 // native/executor.cpp — see executor.h.
 #include "native/executor.h"
 
+#include "native/device.h"
 #include "native/layout.h"
 #include "native/span_fp8.h"
 
 namespace ajinative {
 namespace {
 
-bool is_sm120()
+bool use_hd_span_tuning()
 {
     int device, major, minor;
     return cudaGetDevice(&device) == cudaSuccess &&
            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
-           major == 12 && minor == 0;
+           hd_span_tuned_sm(major, minor);
 }
 
 }  // namespace
@@ -149,7 +150,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
         if (L.buffer[t] >= 0) e->tensor_[t] = e->buffers_[L.buffer[t]];
 
     // tile variants from the ops' shapes
-    const bool tune_packed_tiles = e->packed_links_ && is_sm120();
+    const bool tune_packed_tiles = e->packed_links_ && use_hd_span_tuning();
     int body_index = 0;
     for (Step &st : e->steps_) {
         if (st.concat) continue;
@@ -160,7 +161,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
         st.variant = 3;
         ++body_index;
         if (tune_packed_tiles && (st.packed_input || st.packed_output)) {
-            // Measured on SM120. Packed ReLU outputs fit a 16-row tile in shared memory.
+            // Packed ReLU outputs fit a 16-row tile in shared memory.
             if (st.packed_output) st.variant = st.packed_input ? 0 : 1;
             st.op.reverse_tile_rows = body_index % 2 == 0;
         }
@@ -171,7 +172,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
 
 bool Executor::enable_fp16_cache_order()
 {
-    if (uses_fp8() || !is_sm120()) return false;
+    if (uses_fp8() || !use_hd_span_tuning()) return false;
     for (size_t i = 1; i + 2 < steps_.size(); i += 2) steps_[i].op.reverse_tile_rows = true;
     return true;
 }
@@ -179,7 +180,7 @@ bool Executor::enable_fp16_cache_order()
 bool Executor::enable_gate_projection()
 {
     const size_t count = steps_.size();
-    if ((count != 18 && count != 27) || u_ != 2 || out_w_ != 4 * W_ || !is_sm120()) return false;
+    if ((count != 18 && count != 27) || u_ != 2 || out_w_ != 4 * W_ || !use_hd_span_tuning()) return false;
     const int channels = count == 18 ? 48 : 64;
     const Step &gate = steps_[count - 3], &proj = steps_[count - 2];
     Step &tail = steps_.back();
