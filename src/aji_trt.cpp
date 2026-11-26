@@ -735,22 +735,6 @@ int ensure_engine(aji_ctx *c, const std::string &name,
     return load_engine(c, build_epath, me, w, h, ch, rank5_t) ? 1 : -1;
 }
 
-// rife model code -> file basename: 414 -> rife_v4.14, 4141 -> _lite,
-// ensemble appends _ensemble (rife_cuda.py's mapping).
-std::string rife_model_name(int code, bool ensemble)
-{
-    std::string s = std::to_string(code);
-    if (s.size() < 2)
-        return "";
-    std::string dec = s.size() == 2 ? s.substr(1, 1) : s.substr(1, 2);
-    std::string name = "rife_v" + s.substr(0, 1) + "." + dec;
-    if (s.size() == 4 && s.back() == '1')
-        name += "_lite";
-    if (ensemble)
-        name += "_ensemble";
-    return name;
-}
-
 void rife_teardown(aji_ctx *c)
 {
     auto &R = c->rife;
@@ -790,7 +774,11 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
     R.scene_detect_enhanced = chain->rife_scene_detect_enhanced;
 
     const std::string model =
-        rife_model_name(chain->rife_model, chain->rife_ensemble);
+        aji_rife_model_name(chain->rife_model, chain->rife_ensemble);
+    if (model.empty()) {
+        c->set_error("unsupported RIFE model code %d%s", chain->rife_model, chain->rife_ensemble ? " with ensemble" : "");
+        return false;
+    }
     char dims[64];
     snprintf(dims, sizeof(dims), "1x11x%dx%d", R.ph, R.pw);
     // strongly-typed build from the fp16-typed rife onnx (the shipped

@@ -343,6 +343,21 @@ void apply_sharp_presets(AjiConf *conf, const Section &global)
 
 } // namespace
 
+std::string aji_rife_model_name(int code, bool ensemble)
+{
+    if (code == 4262)
+        return ensemble ? "" : "rife_v4.26_heavy";
+    const std::string digits = std::to_string(code);
+    if (digits.size() < 2)
+        return "";
+    std::string name = "rife_v" + digits.substr(0, 1) + "." + digits.substr(1, 2);
+    if (digits.size() == 4 && digits.back() == '1')
+        name += "_lite";
+    if (ensemble)
+        name += "_ensemble";
+    return name;
+}
+
 std::string aji_chain_missing_model(const std::string &model_dir,
                                     const AjiChainConf &chain)
 {
