@@ -72,37 +72,47 @@ static bool check_fidelity(const std::vector<uint16_t> &fp16, const std::vector<
     return pass;
 }
 
-// The first two HD body convolutions are identical ReLUs apart from their launch policy.
-// Their pixels match under either policy, so inspect the actual captured kernels.
-static bool check_body_launches(FrameNet &video, void *in, void *out, int feature_h, bool fp8, bool tuned)
+// Follow the dependencies in stream order. CUDA does not promise launch order in a node list.
+template<class Net>
+static std::vector<cudaKernelNodeParams> capture_launches(Net &net, void *in, void *out)
 {
     cudaStream_t stream{};
     cudaGraph_t graph{};
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    check_cuda(video.run(in, out, stream));
+    check_cuda(net.run(in, out, stream));
     check_cuda(cudaStreamEndCapture(stream, &graph));
-    cudaGraphNode_t node{};
-    size_t count = 1;
-    check_cuda(cudaGraphGetRootNodes(graph, &node, &count));
-    cudaKernelNodeParams body[2]{};
-    for (auto &launch : body) {
-        if (count != 1) break;
-        cudaGraphNode_t next{};
+    std::vector<cudaKernelNodeParams> launches;
+    cudaGraphNode_t next[2]{};
+    size_t count = 2;
+    check_cuda(cudaGraphGetRootNodes(graph, next, &count));
+    while (count == 1) {
+        const cudaGraphNode_t node = next[0];
+        check_cuda(cudaGraphKernelNodeGetParams(node, &launches.emplace_back()));
+        count = 2;
 #if CUDART_VERSION >= 13000
-        check_cuda(cudaGraphNodeGetDependentNodes(node, &next, nullptr, &count));
+        check_cuda(cudaGraphNodeGetDependentNodes(node, next, nullptr, &count));
 #else
-        check_cuda(cudaGraphNodeGetDependentNodes(node, &next, &count));
+        check_cuda(cudaGraphNodeGetDependentNodes(node, next, &count));
 #endif
-        if (count == 1) check_cuda(cudaGraphKernelNodeGetParams(next, &launch));
-        node = next;
     }
     check_cuda(cudaGraphDestroy(graph));
     check_cuda(cudaStreamDestroy(stream));
-    if (count != 1) {
+    if (count != 0) {
+        std::fprintf(stderr, "Expected a single chain of HD kernel launches\n");
+        launches.clear();
+    }
+    return launches;
+}
+
+// The first two HD body convolutions are identical ReLUs apart from their launch policy.
+static bool check_body_launches(const std::vector<cudaKernelNodeParams> &launches, int feature_h, bool fp8, bool tuned)
+{
+    if (launches.size() < 3) {
         std::fprintf(stderr, "Missing HD body convolution in captured graph\n");
         return false;
     }
+    const auto *body = launches.data() + 1;  // Skip the stem.
     if (!fp8) {
         // Reversed FP16 rows use a different kernel specialization from ordinary rows.
         const bool alternating = body[0].func != body[1].func;
@@ -117,6 +127,32 @@ static bool check_body_launches(FrameNet &video, void *in, void *out, int featur
         if (body[i].gridDim.y != grid_y || body[i].blockDim.x != threads) {
             std::fprintf(stderr, "FP8 body %d: grid.y %u, threads %u, expected %u and %u\n",
                          i + 1, body[i].gridDim.y, body[i].blockDim.x, grid_y, threads);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool check_gate_launches(const Plan &plan, const std::vector<cudaKernelNodeParams> &video,
+                                const std::vector<cudaKernelNodeParams> &plain, bool fused, bool expect_read_only)
+{
+    const size_t expected = plan.steps.size() - size_t(fused);
+    if (video.size() != expected || plain.size() != expected) {
+        std::fprintf(stderr, "HD gate capture: expected %zu launches, got %zu video and %zu plain\n",
+                     expected, video.size(), plain.size());
+        return false;
+    }
+    // Each body step has one launch. Fusion replaces the last gate and the following projection
+    // with one kernel at the gate's index. The plain control has the same row order and fusion.
+    for (size_t i = 1; i + 2 < plan.steps.size(); ++i) {
+        if (plan.steps[i].gate != int(Gate::Tanh1x1)) continue;
+        const bool differs_from_plain = video[i].func != plain[i].func;
+        if (differs_from_plain != expect_read_only) {
+            const bool fused_gate = fused && i + 3 == plan.steps.size();
+            std::fprintf(stderr, "HD 64-channel %s at step %zu: expected %s, %s the plain kernel\n",
+                         fused_gate ? "fused gate/projection" : "gate", i,
+                         expect_read_only ? "read-only residual" : "plain residual",
+                         differs_from_plain ? "differed from" : "matched");
             return false;
         }
     }
@@ -212,7 +248,14 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
         check_cuda(cudaMemcpy(samples.data(), out, out_bytes, cudaMemcpyDeviceToHost));
     };
     std::mt19937 rng(42);
-    bool passed = !hd || check_body_launches(*video, in, out, h / plan.unshuffle, fp8, expect_tuning);
+    bool passed = true;
+    if (hd) {
+        const auto launches = capture_launches(*video, in, out);
+        passed = check_body_launches(launches, h / plan.unshuffle, fp8, expect_tuning);
+        if (channels == 64 && !check_gate_launches(plan, launches, capture_launches(*candidate, in, out),
+                                                  fuse, separate_video && !fp8))
+            passed = false;
+    }
     const int frames = fp8 ? 3 : 2;
     for (int frame = 0; frame < frames; ++frame) {
         const bool gradient = fp8 && frame == 0;
