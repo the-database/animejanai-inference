@@ -338,8 +338,12 @@ class Builds:
                 log, env=environment())
         except Failed as e:
             return False, f'{label}: FAILED: {last_line(e)}'
-        skipped = re.search(r'\[fp8\]: [^\n]*(unavailable|unsupported)[^\n]*', (LOGS/f'{log}.log').read_text(errors='replace'))
-        return True, f'{label}: passed' + (f'; FP8 SKIPPED ({skipped[0]})' if skipped else ' in default, fp16 and fp8 modes')
+        # the executable names each precision it skips on this GPU; only the others passed
+        skipped = dict(re.findall(r'\[(default|fp16|fp8)\]: ([^\n]*(?:unavailable|unsupported)[^\n]*)',
+                                  (LOGS/f'{log}.log').read_text(errors='replace')))
+        ran = [m for m in ('default', 'fp16', 'fp8') if m not in skipped]
+        return True, (f'{label}: passed in {", ".join(ran) or "no"} mode{"s" if len(ran) != 1 else ""}' +
+                      ''.join(f'; {m} SKIPPED ({why})' for m, why in skipped.items()))
 
 
 def forced(text, order, fuse, packed):
@@ -450,14 +454,18 @@ def selects_fp8(lib, conf, slot, seen={}):
 
 
 def dispatch(lib, conf, slot):
-    """The model log a build prints for a slot, from paired_bench's per-build worker; empty if it could not run."""
+    """The model log a build prints for a slot, from paired_bench's per-build worker. A worker that fails, prints no
+    log or did not run the slot on the native kernels raises: only a build that ran can be said to lack a feature."""
     done = subprocess.run(list(map(str, [sys.executable, ROOT/'tools'/'sanity'/'paired_bench.py', '--reference', lib, '--candidate', lib,
                                          '--cuda-runtime', CUDA/'lib'/'libcudart.so.12', '--models', VIDEO, '--conf', conf, '--slot', slot,
                                          '--memory-worker', 'reference'])), capture_output=True, text=True, env=environment())
     try:
-        return json.loads(done.stdout.splitlines()[-1])['dispatch']
+        log = json.loads(done.stdout.splitlines()[-1])['dispatch']
     except (IndexError, KeyError, ValueError):
-        return ''
+        raise Failed(f'{lib.parent.name} could not be probed (exit {done.returncode}):\n' + (done.stderr.strip() or done.stdout.strip() or 'no output'))
+    if done.returncode or 'Native kernels: ' not in log or 'Native kernels not used' in log:
+        raise Failed(f'{lib.parent.name} did not run this slot on the native kernels:\n' + (log.strip() or done.stderr.strip() or 'empty model log'))
+    return log
 
 
 def compare(identity, title, ref, cand, selected, both_orders, rows):
@@ -473,10 +481,14 @@ def compare(identity, title, ref, cand, selected, both_orders, rows):
             block.append({'case': name, 'skipped': f'{ref.parent.name} has no {call}'})
         elif call and not has(cand, call):  # the candidate lost something the reference has
             block.append({'case': name, 'error': f'{cand.parent.name} has no {call}, which {ref.parent.name} has'})
-        elif fp8 and not selects_fp8(ref, args[1], args[3]):
-            block.append({'case': name, 'skipped': f'{ref.parent.name} does not run FP8 for this slot'})
-        elif fp8 and not selects_fp8(cand, args[1], args[3]):
-            block.append({'case': name, 'error': f'{cand.parent.name} does not run FP8 for this slot, {ref.parent.name} does'})
+        elif fp8:
+            try:  # a probe that fails is a failure, never a skip
+                if not selects_fp8(ref, args[1], args[3]):
+                    block.append({'case': name, 'skipped': f'{ref.parent.name} does not run FP8 for this slot'})
+                elif not selects_fp8(cand, args[1], args[3]):
+                    block.append({'case': name, 'error': f'{cand.parent.name} does not run FP8 for this slot, {ref.parent.name} does'})
+            except Failed as e:
+                block.append({'case': name, 'error': f'{str(e).splitlines()[0]} {last_line(e)}'[:200]})
         if block and block[-1]['case'] == name:
             say('   ' + line(block[-1]))
             continue
@@ -626,12 +638,15 @@ def main():
         for label, conf, slot in slots:
             label, ok, text = f'{ref} -> {cand} {label}', True, ''
             if 'FP8' in label:  # the same outputs prove nothing about FP8 unless both builds selected it
-                if not harness.exists():  # its per-build worker is what reports the precision a build selected
-                    ok, text = False, f'{label}: FAILED: cannot confirm FP8, {lacks("paired_bench.py")}'
-                elif not selects_fp8(libs[ref], conf, slot):
-                    text = f'{label}: SKIPPED, {ref} does not run FP8 for this slot'
-                elif not selects_fp8(libs[cand], conf, slot):
-                    ok, text = False, f'{label}: FAILED: {cand} does not run FP8 for this slot, {ref} does'
+                try:
+                    if not harness.exists():  # its per-build worker is what reports the precision a build selected
+                        ok, text = False, f'{label}: FAILED: cannot confirm FP8, {lacks("paired_bench.py")}'
+                    elif not selects_fp8(libs[ref], conf, slot):
+                        text = f'{label}: SKIPPED, {ref} does not run FP8 for this slot'
+                    elif not selects_fp8(libs[cand], conf, slot):
+                        ok, text = False, f'{label}: FAILED: {cand} does not run FP8 for this slot, {ref} does'
+                except Failed as e:
+                    ok, text = False, f'{label}: FAILED: {str(e).splitlines()[0]} {last_line(e)}'[:220]
             if not text:
                 ok, text = parity(label, libs[ref], libs[cand], conf, slot)
             checks.append(text); failed += not ok; say('   ' + text)
