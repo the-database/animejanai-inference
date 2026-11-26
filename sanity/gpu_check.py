@@ -329,7 +329,7 @@ def forced(text, order, fuse, packed):
 
 
 def cases(sm):
-    """(name, paired_bench arguments, model folder, group, archives needed, runs FP8, exported call it needs)"""
+    """(name, paired_bench arguments, model folder, group, archives needed, runs FP8, call or setting both builds must have)"""
     (ROOT/'builtins.conf').write_text('[global]\nconfig_version=2\nnative=on\nlogging=yes\n')
     head = '[global]\nconfig_version=2\nbackend=TensorRT\nnative=on\nlogging=yes\n'
     slot = '[slot_{}]\nchain_1_max_fps=120\n'
@@ -347,7 +347,7 @@ def cases(sm):
     catalog.append(('RIFE 4.26 ids', ['--case', 'rife-ids', '--conf', ROOT/'rife.conf', '--slot', 1], VIDEO, 'video', {'rife'}, False,
                     'aji_infer_rife_ids'))
     if sm >= 89:  # FP8 needs the SM 89 instruction set
-        catalog += [(n, ['--conf', ROOT/'fp8.conf', '--slot', s], VIDEO, 'video', {'video'}, True, None)
+        catalog += [(n, ['--conf', ROOT/'fp8.conf', '--slot', s], VIDEO, 'video', {'video'}, True, 'native_span_precision')
                     for n, s in (('FP8 Performance', 1), ('FP8 Balanced', 2))]
     image = lambda model, size, pairs: ['--case', 'image', '--image-model', model, '--width', size, '--height', size,
                                         '--tile', size, '--pairs', pairs]
@@ -392,7 +392,7 @@ def compare(identity, title, ref, cand, selected, both_orders, rows):
     for name, args, model_dir, group, _, fp8, call in selected:
         label = f'{ref.parent.name}-vs-{cand.parent.name}-{name}'.replace(' ', '_')
         lacking = [lib.parent.name for lib in (ref, cand) if call and call.encode() not in lib.read_bytes()]
-        if lacking:  # an older build without this call: nothing to compare, and not a failure
+        if lacking:  # an older build without this call or setting: nothing to compare, and not a failure
             block.append({'case': name, 'skipped': f'{lacking[0]} has no {call}'})
             say('   ' + line(block[-1]))
             continue
