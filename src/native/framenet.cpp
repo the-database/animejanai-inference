@@ -157,16 +157,16 @@ std::unique_ptr<ImgNet> build_lowered(const OnnxGraph &g, int max_w, int max_h, 
 std::unique_ptr<FrameNet> FrameNet::lowered(const Plan &plan, int w, int h, cudaStream_t s, std::string *why,
                                             SpanPrecision precision)
 {
-    const bool optimize = precision != SpanPrecision::Default && full_spanf3(plan);
-    auto ex = Executor::create(plan, w, h, s, why, true, optimize && precision == SpanPrecision::FP8);
+    const bool hd = full_spanf3(plan);
+    auto ex = Executor::create(plan, w, h, s, why, true, hd && precision == SpanPrecision::FP8);
     if (!ex) return nullptr;
-    const bool fused = optimize && ex->enable_gate_projection();
+    const bool fused = hd && ex->enable_gate_projection();
+    const bool reordered = hd && ex->enable_fp16_cache_order();
     std::string description = ajinative::describe(plan, plan.steps.size() - (fused ? 1 : 0));
     if (ex->uses_fp8()) description += ", FP8 SPANF3 body";
-    else if (optimize) description += ", FP16 SPANF3 body";
+    else if (reordered || (hd && precision != SpanPrecision::Default)) description += ", FP16 SPANF3 body";
     if (ex->packed_links()) description += ", " + std::to_string(ex->packed_links()) + " packed feature maps";
-    if (optimize && ex->enable_fp16_cache_order())
-        description += ", FP16 alternating tile rows";
+    if (reordered) description += ", FP16 alternating tile rows";
     if (fused) description += ", fused gate and projection";
     return std::make_unique<LoweredFrame>(std::move(ex), std::move(description));
 }

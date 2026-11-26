@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "native/executor.h"
+#include "native/framenet.h"
 #include "native/pack.h"
 #include "native/span_fp8.h"
 
@@ -85,8 +86,22 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
         std::fprintf(stderr, "%s: expected a %d-channel gate of type %d\n", path, channels, (int)gate);
         return false;
     }
-    const bool fp8 = mode == "fp8", tuned = mode != "default";
-    const bool fuse = tuned && sm120 && gate == Gate::Tanh1x1;
+    const bool fp8 = mode == "fp8";
+    const bool hd = gate == Gate::Tanh1x1;
+    const bool fuse = hd && sm120;
+    const SpanPrecision precision = fp8 ? SpanPrecision::FP8 :
+                                    mode == "fp16" ? SpanPrecision::FP16 : SpanPrecision::Default;
+    auto video = FrameNet::lowered(plan, w, h, nullptr, &why, precision);
+    if (!video) { std::fprintf(stderr, "%s: %s\n", path, why.c_str()); return false; }
+    const size_t operations = hd ? (channels == 64 ? 27 : 18) : plan.steps.size();
+    const std::string label = video->describe();
+    if (label.find(std::to_string(operations - size_t(fuse)) + " kernels, ") != 0 ||
+        (label.find("fused gate and projection") != std::string::npos) != fuse ||
+        (label.find("FP16 alternating tile rows") != std::string::npos) != (fuse && !fp8) ||
+        (label.find("FP8 SPANF3 body") != std::string::npos) != fp8) {
+        std::fprintf(stderr, "%s [%s]: unexpected video dispatch: %s\n", path, mode.c_str(), label.c_str());
+        return false;
+    }
     auto reference = Executor::create(plan, w, h, nullptr, &why, false, fp8);
     auto candidate = Executor::create(plan, w, h, nullptr, &why, true, fp8);
     // Also compare the fused HD paths to the separate convolution + concat kernels.
@@ -111,7 +126,10 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
             std::fprintf(stderr, "%s [%s]: unexpected feature buffer capacity\n", path, mode.c_str());
             return false;
         }
-        if (tuned && ((!fp8 && !ex->enable_fp16_cache_order()) ||
+        // Keep the full-frame FP16 reference on ordinary kernels and row order.
+        // FP8 selects its body tiles in create() and retains the fused reference.
+        if (!fp8 && ex == reference.get()) continue;
+        if (hd && ((!fp8 && ex->enable_fp16_cache_order() != sm120) ||
                       (ex != unfused.get() && ex->enable_gate_projection() != fuse))) {
             std::fprintf(stderr, "%s [%s]: unexpected kernel selection\n", path, mode.c_str());
             return false;
@@ -125,7 +143,7 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
     void *in, *out;
     check_cuda(cudaMalloc(&in, in_bytes));
     check_cuda(cudaMalloc(&out, out_bytes));
-    auto read_output = [&](Executor &ex, std::vector<uint16_t> &samples, int fill) {
+    auto read_output = [&](auto &ex, std::vector<uint16_t> &samples, int fill) {
         check_cuda(cudaMemset(out, fill, out_bytes));
         check_cuda(ex.run(in, out, nullptr));
         check_cuda(cudaMemcpy(samples.data(), out, out_bytes, cudaMemcpyDeviceToHost));
@@ -167,6 +185,8 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
             return false;
         };
         if (!bit_exact("reuse")) passed = false;
+        read_output(*video, actual, 0x5a);
+        if (!bit_exact("video profile")) passed = false;
         if (unfused) {
             read_output(*unfused, actual, 0xff);
             if (!bit_exact("unfused")) passed = false;
@@ -222,7 +242,7 @@ int main(int argc, char **argv)
     const bool sm120 = major == 12 && minor == 0;
     for (const std::string profile : {"default", "fp16", "fp8"}) {
         if (mode != "all" && mode != profile) continue;
-        if ((profile == "fp16" && !sm120) || (profile == "fp8" && !span_fp8_available())) {
+        if (profile == "fp8" && !span_fp8_available()) {
             std::printf("[%s]: unsupported on SM%d%d\n", profile.c_str(), major, minor);
             if (mode != "all") return 1;
             continue;
