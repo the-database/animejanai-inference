@@ -60,6 +60,9 @@ struct AjiConf {
     std::map<int, AjiSlotConf> slots;
 };
 
+// ONNX basename for a RIFE selector. An empty result means the combination is unsupported.
+std::string aji_rife_model_name(int code, bool ensemble);
+
 // Loads path (missing file = built-in defaults only). Returns false only on
 // hard errors; *err gets the message.
 bool aji_conf_load(const char *path, AjiConf *out, std::string *err);

@@ -8,6 +8,17 @@
 
 int main()
 {
+    if (aji_rife_model_name(426, false) != "rife_v4.26" ||
+        aji_rife_model_name(426, true) != "rife_v4.26_ensemble" ||
+        aji_rife_model_name(4261, false) != "rife_v4.26_lite" ||
+        aji_rife_model_name(4121, true) != "rife_v4.12_lite_ensemble" ||
+        aji_rife_model_name(4262, false) != "rife_v4.26_heavy" ||
+        !aji_rife_model_name(4262, true).empty()) {
+        std::fputs("RIFE selector resolved to the wrong model\n", stderr);
+        return 1;
+    }
+    std::puts("PASS RIFE standard, Lite, Heavy and ensemble selectors");
+
     const char *path = "rife-conf-test.ini";
     std::ofstream(path) <<
         "[slot_1]\nchain_1_rife=yes\n"

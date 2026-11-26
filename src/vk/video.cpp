@@ -183,18 +183,6 @@ void VkVideo::rife_teardown()
     R = RifeState{};
 }
 
-// "414" -> rife_v4.14, a trailing 1 on four digits -> _lite (aji_dml.cpp's rife_model_name)
-static std::string rife_name(int code, bool ensemble)
-{
-    std::string s = std::to_string(code);
-    if (s.size() < 2) return "";
-    const std::string dec = s.size() == 2 ? s.substr(1, 1) : s.substr(1, 2);
-    std::string name = "rife_v" + s.substr(0, 1) + "." + dec;
-    if (s.size() == 4 && s.back() == '1') name += "_lite";
-    if (ensemble) name += "_ensemble";
-    return name;
-}
-
 bool VkVideo::rife_setup(const AjiChainConf &chain, int w, int h, double fps)
 {
     RifeState &R = rife_;
@@ -209,11 +197,11 @@ bool VkVideo::rife_setup(const AjiChainConf &chain, int w, int h, double fps)
     R.den = chain.rife_factor_den;
     R.threshold = chain.rife_scd_threshold;
     R.enhanced = chain.rife_scene_detect_enhanced;
-    const std::string model = rife_name(chain.rife_model, chain.rife_ensemble);
+    const std::string model = aji_rife_model_name(chain.rife_model, chain.rife_ensemble);
     std::string why;
     std::vector<char> bytes;
     ajinative::OnnxGraph g;
-    if (model.empty()) why = "invalid rife model code " + std::to_string(chain.rife_model);
+    if (model.empty()) why = "unsupported RIFE model code " + std::to_string(chain.rife_model) + (chain.rife_ensemble ? " with ensemble" : "");
     else if (!ajicore::read_file_bytes(rife_dir_ + "/" + model + ".onnx", &bytes)) why = model + ".onnx can't be read";
     else if (ajinative::parse_onnx(bytes.data(), bytes.size(), &g, &why)) R.net = Rife::create(*dev_, g, R.pw, R.ph, &why);
     if (!R.net) {
