@@ -66,8 +66,11 @@ order-balanced pairs. Negative paired percentages mean lower latency on the
 candidate. Each arm's warm VRAM delta is measured in its own process with
 the caller's surfaces already allocated. The JSON includes raw pairs,
 wall-clock and stream-event medians, a 95% interval for the median paired
-percentage, and the selected model log. Use `--help` for image, temporal and
-RIFE measurements or to supply the same NV12 clip on different machines.
+percentage, and the selected model log. Use `--input-format` to time P010 or
+planar 4:4:4 input (`yuv444p16`, `yuv444p10msb`, or `yuv444p12msb`).
+`--raw-input` reads a tightly packed clip in the selected format. Without a clip
+both arms use the same deterministic texture. A 2× temporal model takes
+`--case temporal --scale 2 --conf model.conf --slot 1`. TemporalFix defaults to 1×.
 A same-build RTX 5090 control measured 0.18% lower latency for Balanced and 0.16% for Performance on the second-loaded arm, so use `--swap-load-order` to check this effect and treat differences under 1% as unresolved.
 
 ```sh
