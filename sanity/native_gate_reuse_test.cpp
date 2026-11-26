@@ -126,6 +126,9 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
             std::fprintf(stderr, "%s [%s]: unexpected feature buffer capacity\n", path, mode.c_str());
             return false;
         }
+        // Keep the full-frame FP16 reference on ordinary kernels and row order.
+        // FP8 selects its body tiles in create() and retains the fused reference.
+        if (!fp8 && ex == reference.get()) continue;
         if (hd && ((!fp8 && ex->enable_fp16_cache_order() != sm120) ||
                       (ex != unfused.get() && ex->enable_gate_projection() != fuse))) {
             std::fprintf(stderr, "%s [%s]: unexpected kernel selection\n", path, mode.c_str());
