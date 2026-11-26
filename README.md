@@ -73,6 +73,20 @@ both arms use the same deterministic texture. A 2× temporal model takes
 `--case temporal --scale 2 --conf model.conf --slot 1`. TemporalFix defaults to 1×.
 A same-build RTX 5090 control measured 0.18% lower latency for Balanced and 0.16% for Performance on the second-loaded arm, so use `--swap-load-order` to check this effect and treat differences under 1% as unresolved.
 
+To qualify a GPU you only have on a rented or hosted Linux machine, `sanity/gpu_check.py`
+does the whole job there: it fetches the CUDA 12.9 compiler and TensorRT 11.4 into a work
+folder, builds the backend for that GPU's architecture only at the revisions you name,
+downloads the shipped models, and runs the paired comparison over the HD, SD, TemporalFix,
+RIFE and image cases. It prints one summary table and keeps the raw pairs.
+
+```sh
+python3 sanity/gpu_check.py --root ~/aji-check --expect-sm 89 --base "$OLD_REVISION" --pull 153
+```
+
+`--expect-sm` stops before any download when the machine is not the GPU you asked for.
+`--compare head:all:HD --parity head:all` measures the tuned HD SPANF3 launch policy on an
+architecture that does not have it yet; `--help` lists the named builds.
+
 ```sh
 ffmpeg -i clip.mkv -frames:v 12 -pix_fmt p010le -f rawvideo in.raw
 ./build/aji_harness --engine models/<model>.engine --input in.raw \
