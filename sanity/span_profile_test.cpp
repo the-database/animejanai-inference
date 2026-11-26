@@ -12,7 +12,10 @@ int main()
     if (!aji_conf_load(nullptr, &conf, &error)) throw std::runtime_error(error);
     for (const auto &[slot, entry] : conf.slots)
         if (entry.span_precision != SpanPrecision::Default)
-            throw std::runtime_error("Existing built-in profile opted into SPAN precision");
+            throw std::runtime_error("Built-in slots must use the FP16 default; FP8 requires an explicit slot setting");
+    if (conf.slots.at(1002).chains.front().models.front().name.find("Balanced_SPANF3_b8f64") == std::string::npos ||
+        conf.slots.at(1003).chains.front().models.front().name.find("Performance_SPANF3_b5f48") == std::string::npos)
+        throw std::runtime_error("Expected the built-in HD Balanced and Performance SPANF3 layouts");
 
     const char *path = "span-profile-test.ini";
     std::ofstream(path) << "[slot_3]\nprofile_name=My own slot\n"

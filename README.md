@@ -22,6 +22,14 @@ Used by [mpv-AnimeJaNai](https://github.com/the-database/mpv-AnimeJaNai) (real-t
 [MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI) (manga and images), and
 [yosh](https://github.com/the-database/yosh)'s AI upscaling add-on.
 
+### HD video precision
+
+On SM 120, the native HD V3.1 Balanced and Performance SPANF3 video models use
+FP16 with alternating tile rows and a fused final gate and projection. The
+built-in slots select this path automatically. Existing slot configurations
+can still set `native_span_precision=fp16` explicitly for the same result.
+FP8 requires `native_span_precision=fp8` in a configured slot and a supported GPU.
+
 ## Build (Linux)
 
 Needs CUDA toolkit 13.x and TensorRT 11.x (default path:
