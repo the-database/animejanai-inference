@@ -269,7 +269,8 @@ against a CPU reference, with guard bands. `aji_native_bench` (built on request)
 SPANF3 / Compact models from `conv.h` calls on data from `experimental/native-span/v2/prep_*.py`;
 on an RTX 5090 it runs SPANF3 Performance 1080p→4K in ~2.0 ms vs ~3.6 ms on TensorRT 11.4, at
 58.6 dB vs ORT fp16 (`experimental/native-span/README.md` has the numbers and the NeoRTX
-comparison). Tile variants are only tuned on the 5090.
+comparison). HD SPANF3 uses its tuned row order, gate/projection fusion and packed FP8 tile choices
+on SM 89 and SM 120, measured on the L4 and RTX 5090.
 
 ### The Vulkan backend (`aji_vk`, in development)
 

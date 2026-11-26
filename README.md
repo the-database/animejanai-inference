@@ -24,11 +24,13 @@ Used by [mpv-AnimeJaNai](https://github.com/the-database/mpv-AnimeJaNai) (real-t
 
 ### HD video precision
 
-On SM 120, the native HD V3.1 Balanced and Performance SPANF3 video models use
-FP16 with alternating tile rows and a fused final gate and projection. The
-built-in slots select this path automatically. Existing slot configurations
-can still set `native_span_precision=fp16` explicitly for the same result.
-FP8 requires `native_span_precision=fp8` in a configured slot and a supported GPU.
+On SM 89 (Ada) and SM 120, the native HD V3.1 Balanced and Performance SPANF3
+video models use alternating FP16 tile rows and a fused final gate and projection.
+The built-in HD slots select this path automatically. An explicit
+`native_span_precision=fp16` setting selects the same path. FP8 requires
+`native_span_precision=fp8` in a configured slot and a supported GPU. On SM 89
+and SM 120 it uses tuned tiles for packed body convolutions and the fused final
+gate and projection.
 
 ## Build (Linux)
 
@@ -64,9 +66,26 @@ order-balanced pairs. Negative paired percentages mean lower latency on the
 candidate. Each arm's warm VRAM delta is measured in its own process with
 the caller's surfaces already allocated. The JSON includes raw pairs,
 wall-clock and stream-event medians, a 95% interval for the median paired
-percentage, and the selected model log. Use `--help` for image, temporal and
-RIFE measurements or to supply the same NV12 clip on different machines.
+percentage, and the selected model log. Use `--input-format` to time P010 or
+planar 4:4:4 input (`yuv444p16`, `yuv444p10msb`, or `yuv444p12msb`).
+`--raw-input` reads a tightly packed clip in the selected format. Without a clip
+both arms use the same deterministic texture. A 2× temporal model takes
+`--case temporal --scale 2 --conf model.conf --slot 1`. TemporalFix defaults to 1×.
 A same-build RTX 5090 control measured 0.18% lower latency for Balanced and 0.16% for Performance on the second-loaded arm, so use `--swap-load-order` to check this effect and treat differences under 1% as unresolved.
+
+To qualify a GPU you only have on a rented or hosted Linux machine, `sanity/gpu_check.py`
+does the whole job there: it fetches the CUDA 12.9 compiler and TensorRT 11.4 into a work
+folder, builds the backend for that GPU's architecture only at the revisions you name,
+downloads the shipped models, and runs the paired comparison over the HD, SD, TemporalFix,
+RIFE and image cases. It prints one summary table and keeps the raw pairs.
+
+```sh
+python3 sanity/gpu_check.py --root ~/aji-check --expect-sm 89 --base "$OLD_REVISION" --pull 153
+```
+
+`--expect-sm` stops before any download when the machine is not the GPU you asked for.
+`--compare head:all:HD --parity head:all` measures the tuned HD SPANF3 launch policy on an
+architecture that does not have it yet; `--help` lists the named builds.
 
 ```sh
 ffmpeg -i clip.mkv -frames:v 12 -pix_fmt p010le -f rawvideo in.raw
