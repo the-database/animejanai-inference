@@ -267,9 +267,12 @@ class Builds:
                 common = ''
             if not common or Path(common).resolve() != (self.src/'.git').resolve():
                 raise Failed(f'{tree} exists and is not a worktree of {self.src}; choose another --root')
-        # a build that was killed while its source was patched leaves the patch behind
+        # A build that was killed while its source was patched leaves the patch behind. Restore index and files
+        # from the commit, then refuse to build anything that still differs from it.
         if capture(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=tree):
-            run(['git', 'checkout', '-q', '--', '.'], 'sources', cwd=tree)
+            run(['git', 'reset', '-q', '--hard', 'HEAD'], 'sources', cwd=tree)
+        if capture(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=tree):
+            raise Failed(f'{tree} still differs from its commit after a reset; remove the folder and run again')
         if capture(['git', 'rev-parse', 'HEAD'], cwd=tree) != sha:
             run(['git', 'checkout', '-q', '--detach', sha], 'sources', cwd=tree)
         return tree
@@ -317,7 +320,7 @@ class Builds:
                 target.with_suffix('.tmp').replace(target)
             finally:
                 if flags:
-                    run(['git', 'checkout', '-q', '--', 'src/native/executor.cpp'], 'sources', cwd=tree)
+                    run(['git', 'reset', '-q', '--hard', 'HEAD'], 'sources', cwd=tree)
         self.libs[name] = target
         return target
 
@@ -398,6 +401,11 @@ def bench(identity, label, ref, cand, args, model_dir, fp8, swap):
                 'environment': {k: v for k, v in sorted(os.environ.items()) if k.startswith('AJI_') and k != 'AJI_ROOT'}}
     key = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:12]
     out = OUT/f'{label}{"-swapped" if swap else ""}-{key}.json'
+    if out.exists():
+        try:
+            json.loads(out.read_text())
+        except ValueError:
+            out.unlink()  # damaged by something outside this script: measure again
     if not out.exists():
         cmd = [sys.executable, ROOT/'tools'/'sanity'/'paired_bench.py', '--reference', ref, '--candidate', cand,
                '--cuda-runtime', CUDA/'lib'/'libcudart.so.12', '--models', model_dir, '--output', out.with_suffix('.tmp'), *args]
@@ -407,8 +415,8 @@ def bench(identity, label, ref, cand, args, model_dir, fp8, swap):
             return {'error': last_line(e)}
         j = json.loads(out.with_suffix('.tmp').read_text())
         j['gpu_check'] = settings
-        out.write_text(json.dumps(j, indent=1))
-        out.with_suffix('.tmp').unlink()
+        out.with_suffix('.tmp').write_text(json.dumps(j, indent=1))
+        out.with_suffix('.tmp').replace(out)  # the final name only ever holds a complete result
     j = json.loads(out.read_text())
     stats = j.get('gpu') or j['wall']
     problems = []
