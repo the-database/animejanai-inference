@@ -505,8 +505,8 @@ def main():
 
     say('tools, CUDA 12.9 compiler and TensorRT 11.4 headers'); seven = tools(); toolkits()
     say('sources'); builds = Builds(sm, a.base, a.head)
-    tools = builds.resolve(a.tools)[1] if re.fullmatch(r'pr\d+|head|base', a.tools) else builds.commit(a.tools)
-    builds.tree('tools', tools)  # sanity/paired_bench.py and sanity/direct_graph.py are run from this revision
+    scripts = builds.resolve(a.tools)[1] if re.fullmatch(r'pr\d+|head|base', a.tools) else builds.commit(a.tools)
+    builds.tree('tools', scripts)  # sanity/paired_bench.py and sanity/direct_graph.py are run from this revision
     say('models: ' + ', '.join(sorted(needed))); models(seven, needed)
     libs = {n: builds.lib(n) for c in comparisons + a.parity for n in c[:2]}  # build everything before timing anything
 
