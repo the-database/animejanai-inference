@@ -63,6 +63,7 @@ struct Conv3x3 {
     float in_mean[3] = {0.f, 0.f, 0.f}, in_scale[3] = {1.f, 1.f, 1.f};
     bool out_clamp = false;  // depth-to-space outputs: clamp to [0, 1]
     bool reverse_tile_rows = false;
+    bool read_only_residual = false;  // 64-channel HD gates with distinct residual and destination
 };
 
 // H, W: the conv's resolution (an unshuffled input is 2H x 2W). src: NHWC [H][W][cin] or NCHW

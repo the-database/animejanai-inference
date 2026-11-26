@@ -34,7 +34,7 @@ const void *Executor::ptr(int t, const void *in, void *out) const
 }
 
 std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h, cudaStream_t s, std::string *why,
-                                           bool reuse_gate_residuals, bool use_fp8)
+                                           GateBuffers gates, bool use_fp8)
 {
     auto fail = [&](const std::string &m) -> std::unique_ptr<Executor> {
         if (why) *why = m;
@@ -81,6 +81,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
             for (int k = 0; k < 4; k++) st.srcs[k] = ps.srcs[k];
             if (!supported(st.cop, &reason)) return fail("concat: " + reason);
         } else {
+            st.op.read_only_residual = gates == GateBuffers::ReadOnlyResidual;
             st.op.in = (Input)ps.in;
             st.op.act = (Act)ps.act;
             st.op.gate = (Gate)ps.gate;
@@ -136,7 +137,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
         }
     }
 
-    if (reuse_gate_residuals) reuse_cuda_gate_buffers(plan, L, packed);
+    if (gates == GateBuffers::Reuse) reuse_cuda_gate_buffers(plan, L, packed);
     // feature buffers, as the layout assigned them
     for (size_t need : L.buffer_bytes) {
         void *b = nullptr;

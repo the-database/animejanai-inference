@@ -157,13 +157,19 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
         std::fprintf(stderr, "%s [%s]: unexpected video dispatch: %s\n", path, mode.c_str(), label.c_str());
         return false;
     }
-    auto reference = Executor::create(plan, w, h, nullptr, &why, false, fp8);
-    auto candidate = Executor::create(plan, w, h, nullptr, &why, true, fp8);
+    auto reference = Executor::create(plan, w, h, nullptr, &why, GateBuffers::Separate, fp8);
+    auto candidate = Executor::create(plan, w, h, nullptr, &why, GateBuffers::Reuse, fp8);
     // Also compare the fused HD paths to the separate convolution + concat kernels.
-    auto unfused = fuse ? Executor::create(plan, w, h, nullptr, &why, false, fp8) : nullptr;
-    auto stock = fp8 ? Executor::create(plan, w, h, nullptr, &why, false, false) : nullptr;
+    auto unfused = fuse ? Executor::create(plan, w, h, nullptr, &why, GateBuffers::Separate, fp8) : nullptr;
+    auto stock = fp8 ? Executor::create(plan, w, h, nullptr, &why, GateBuffers::Separate, false) : nullptr;
     if (!reference || !candidate || (fuse && !unfused) || (fp8 && !stock)) {
         std::fprintf(stderr, "%s [%s]: %s\n", path, mode.c_str(), why.c_str());
+        return false;
+    }
+    // The production 64-channel SM86 video path has one more full FP16 map than the in-place executor.
+    const bool separate_video = hd && channels == 64 && current_cuda_sm() == 86;
+    if (video->device_bytes() != (separate_video ? reference : candidate)->device_bytes()) {
+        std::fprintf(stderr, "%s [%s]: unexpected video feature allocation\n", path, mode.c_str());
         return false;
     }
     const int links = fp8 ? (channels == 48 ? 9 : 15) : 0;
@@ -251,7 +257,7 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
         // The image tiler passes the active geometry to an executor created for a larger tile.
         // A separately sized, unfused reference cannot share a stale maximum-width stride.
         constexpr int tile_w = 322, tile_h = 182;
-        auto tile_ref = Executor::create(plan, tile_w, tile_h, nullptr, &why, false, fp8);
+        auto tile_ref = Executor::create(plan, tile_w, tile_h, nullptr, &why, GateBuffers::Separate, fp8);
         if (!tile_ref) {
             std::fprintf(stderr, "tile reference: %s\n", why.c_str());
             passed = false;

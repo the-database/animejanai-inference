@@ -12,22 +12,30 @@
 namespace ajinative {
 namespace {
 
-using LaunchFn = cudaError_t (*)(const dev::ConvParams &, bool, cudaStream_t);
+using LaunchFn = cudaError_t (*)(const dev::ConvParams &, const Conv3x3 &, cudaStream_t);
 constexpr int kVariants = 4;
 // Tile shapes: (warps, rows per warp), picked per op at load. 16-row tiles fit 2 CTAs per SM at 48-64
 // channels; the 8-row ones (more halo per pixel) fit 4-5, so one CTA's halo load overlaps another's MMAs.
 const char *const kVariantNames[kVariants] = {"8 warps x 2 rows", "4 warps x 4 rows", "8 warps x 1 row", "4 warps x 2 rows"};
 
 template <int CINP, int COUTP, int WARPS, int WR, int IN, int ACT, int GATE, int OUT>
-cudaError_t run_conv(const dev::ConvParams &p, bool reverse_tile_rows, cudaStream_t s)
+cudaError_t run_conv(const dev::ConvParams &p, const Conv3x3 &op, cudaStream_t s)
 {
     constexpr int TH = WARPS * WR, smem = dev::conv_smem_bytes<CINP, COUTP, WARPS, WR>();
     static_assert(smem <= 48 * 1024, "keep tiles within the default shared-memory limit");
     const dim3 grid((p.W + dev::TW - 1) / dev::TW, (p.H + TH - 1) / TH);
+    if constexpr (IN == 0 && OUT == 0 && CINP == 64 && COUTP == 64 && GATE == 2) {
+        if (op.read_only_residual && p.resid != p.dst) {
+            const dev::SpanConvParams span{p, op.reverse_tile_rows};
+            dev::k_conv3x3<64, 64, WARPS, WR, IN, ACT, GATE, OUT, false, false, false, dev::SpanConvParams, true>
+                <<<grid, WARPS * 32, smem, s>>>(span);
+            return cudaGetLastError();
+        }
+    }
     // Only custom HD SPAN bodies need a kernel that can reverse tile rows.
     if constexpr (IN == 0 && OUT == 0 && CINP == COUTP && (CINP == 48 || CINP == 64) &&
                   ((ACT == 1 && GATE == 0) || (ACT == 0 && GATE == 2))) {
-        if (reverse_tile_rows) {
+        if (op.reverse_tile_rows) {
             const dev::SpanConvParams span{p, true};
             dev::k_conv3x3<CINP, COUTP, WARPS, WR, IN, ACT, GATE, OUT><<<grid, WARPS * 32, smem, s>>>(span);
             return cudaGetLastError();
@@ -259,7 +267,7 @@ cudaError_t launch(const Conv3x3 &op, const Tensors &t, int H, int W, int varian
         p.in_mean[c] = op.in_mean[c];
         p.in_scale[c] = op.in_scale[c];
     }
-    return e->fn[variant](p, op.reverse_tile_rows, s);
+    return e->fn[variant](p, op, s);
 }
 
 cudaError_t launch(const ConcatConv1x1 &op, const void *const *srcs, void *dst, int npx, int variant, cudaStream_t s)
