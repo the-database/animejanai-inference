@@ -59,9 +59,13 @@ HD_PERF = '2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16'
 SD = '2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo'
 TFIX = ['temporalfix_s1_v1.1_op18_fp16', 'temporalfix_s2_v1_op18_fp16', 'temporalfix_s3_v1_op18_fp16']
 # case name: (configuration code, file); 4.14 is the configuration default
+# 4.7 has the two-convolution encoder, 4.12 lite its own widths, 4.20 ensemble the reverse pass and a 384-channel first block
 RIFE = {'RIFE 4.26': (426, 'rife_v4.26'), 'RIFE 4.14': (414, 'rife_v4.14'), 'RIFE 4.14 lite': (4141, 'rife_v4.14_lite'),
         'RIFE 4.18': (418, 'rife_v4.18'), 'RIFE 4.22': (422, 'rife_v4.22'), 'RIFE 4.22 lite': (4221, 'rife_v4.22_lite'),
-        'RIFE 4.25': (425, 'rife_v4.25')}
+        'RIFE 4.25': (425, 'rife_v4.25'), 'RIFE 4.7': (47, 'rife_v4.7'), 'RIFE 4.12 lite': (4121, 'rife_v4.12_lite'),
+        'RIFE 4.20 ensemble': (420, 'rife_v4.20_ensemble')}
+RIFE_HEAVY = 'rife_v4.26_heavy'
+SUPER_ULTRA = '2x_AnimeJaNai_Strong_V1_SuperUltraCompact_net_g_100000'
 ESRGAN = '2x_MangaJaNai_2048p_V1_ESRGAN_95k_fp16.onnx'
 ESRGAN_4X = '4x_MangaJaNai_2048p_V1_ESRGAN_70k_fp16.onnx'
 FDAT_M = '2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16.onnx'
@@ -75,7 +79,9 @@ ARCHIVES = {
     'video': (f'{PLAYER}/mpv-upscale-2x_animejanai-overlay-3.12.5-linux-x64.7z',
               '961ba4a54488d2b8d8d91db556db21fe65b5d806ae09a283f71c7bc7fcc7d28c', 'video', [f'{n}.onnx' for n in (HD_BAL, HD_PERF, SD, *TFIX)]),
     'rife': (f'{PLAYER}/component-rife-linux-x64.7z',
-             'e30f50c2671f4020af46a66334d3b4443e4b5c0e3f1310ba7a94ee505b18b684', 'video', [f'{f}.onnx' for _, f in RIFE.values()]),
+             'e30f50c2671f4020af46a66334d3b4443e4b5c0e3f1310ba7a94ee505b18b684', 'video', [f'{f}.onnx' for f in (*(f for _, f in RIFE.values()), RIFE_HEAVY)]),
+    'compact-v1': ('https://github.com/the-database/mpv-AnimeJaNai/releases/download/1.0.0/mpv-upscale-2x_animejanai_v1.zip',
+                   'b19e6a782626bbf433da3aba0063b95b0bc18efc2bed52980029b3505000ad78', 'video', [f'{SUPER_ULTRA}.onnx']),  # computed here
     'manga': (f'{MANGA}/1.0.0/MangaJaNai_V1_ONNX_fp16.7z',
               '2c3809d712e3e96d107e2a59802186c284fac49d91a211435c8c896432ba27ab', 'img', [ESRGAN, ESRGAN_4X]),
     'illustration': (f'{MANGA}/3.0.0/IllustrationJaNai_V3_ONNX_fp16.7z',
@@ -87,7 +93,8 @@ ARCHIVES = {
 TUNING = {'untuned': (False, False, False), 'order': (True, False, False), 'fuse': (False, True, False),
           'both': (True, True, False), 'all': (True, True, True)}
 
-ROOT = SDK = LOGS = LIBS = OUT = CUDA = TRT_ROOT = TRT_LIB = VIDEO = IMAGES = None
+ROOT = SDK = LOGS = LIBS = OUT = CUDA = TRT_ROOT = TRT_LIB = VIDEO = IMAGES = HEAVY = None
+SCRIPTS = None  # the commit whose sanity/ scripts do the timing
 T0 = time.time()
 
 
@@ -144,14 +151,17 @@ def gpu():
     """The GPU CUDA will use as device 0: name, driver, compute capability x10, memory, UUID."""
     rows = [[s.strip() for s in line.split(',')] for line in capture(
         ['nvidia-smi', '--query-gpu=index,uuid,name,driver_version,compute_cap,memory.total', '--format=csv,noheader']).splitlines()]
-    visible = os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',')[0].strip()
-    if visible:
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible is not None:
+        visible = visible.split(',')[0].strip()
+        if not visible:
+            raise Failed('CUDA_VISIBLE_DEVICES is set but empty, so CUDA sees no GPU')
         by_index = visible.isdigit()
         if by_index and len(rows) > 1 and os.environ.get('CUDA_DEVICE_ORDER') != 'PCI_BUS_ID':
             raise Failed('several GPUs: put a GPU UUID in CUDA_VISIBLE_DEVICES, or also set CUDA_DEVICE_ORDER=PCI_BUS_ID')
         rows = [r for r in rows if (r[0] == visible if by_index else r[1].startswith(visible))]
-        if not rows:
-            raise Failed(f'CUDA_VISIBLE_DEVICES={visible} matches no GPU that nvidia-smi lists')
+        if len(rows) != 1:
+            raise Failed(f'CUDA_VISIBLE_DEVICES={visible} matches {len(rows)} of the GPUs nvidia-smi lists; give one full GPU UUID')
     elif len({tuple(r[2:5]) for r in rows}) > 1:
         raise Failed('several different GPUs: choose one with CUDA_VISIBLE_DEVICES=<GPU UUID>')
     _, uuid, name, driver, cap, mem = rows[0]
@@ -214,6 +224,11 @@ def models(seven, needed):
         missing = [n for n in names if not (folder/n).exists()]
         if missing:
             raise Failed(f'{url} has no {missing}')
+    if 'rife' in needed and not (HEAVY/'rife_v4.26.onnx').exists():
+        # Releases before the Heavy selector resolve code 4262 to the standard model, so Heavy is timed through
+        # code 426 from a folder in which it has the standard model's name.
+        HEAVY.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(VIDEO/f'{RIFE_HEAVY}.onnx', HEAVY/'rife_v4.26.onnx')
 
 
 def environment():
@@ -243,8 +258,15 @@ class Builds:
     def tree(self, kind, sha):
         """A worktree per kind of build, at the commit and with its tracked files as committed."""
         tree = ROOT/kind
-        if not (tree/'.git').exists():
+        if not tree.exists():
             run(['git', 'worktree', 'add', '-f', '--detach', tree, sha], 'sources', cwd=self.src)
+        else:  # never touch a folder that is not a worktree of this script's own clone
+            try:
+                common = capture(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'], cwd=tree)
+            except (subprocess.CalledProcessError, OSError):
+                common = ''
+            if not common or Path(common).resolve() != (self.src/'.git').resolve():
+                raise Failed(f'{tree} exists and is not a worktree of {self.src}; choose another --root')
         # a build that was killed while its source was patched leaves the patch behind
         if capture(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=tree):
             run(['git', 'checkout', '-q', '--', '.'], 'sources', cwd=tree)
@@ -336,32 +358,45 @@ def cases(sm):
     (ROOT/'tfix.conf').write_text(head + ''.join(slot.format(i+1) + f'chain_1_temporal_fix_model={m}\n' for i, m in enumerate(TFIX)))
     (ROOT/'rife.conf').write_text(head + ''.join(
         slot.format(i+1) + f'chain_1_rife=yes\nchain_1_rife_model={code}\nchain_1_rife_factor_numerator=2\n'
-        'chain_1_rife_factor_denominator=1\nchain_1_rife_before_upscale=yes\n' for i, (code, _) in enumerate(RIFE.values())))
+        'chain_1_rife_factor_denominator=1\nchain_1_rife_before_upscale=yes\n' + ('chain_1_rife_ensemble=yes\n' if 'ensemble' in f else '')
+        for i, (code, f) in enumerate(RIFE.values())))
+    (ROOT/'compact.conf').write_text(head + slot.format(1) + f'chain_1_model_1_name={SUPER_ULTRA}\n')
     (ROOT/'fp8.conf').write_text(head + ''.join(slot.format(i) + f'chain_1_model_1_name={m}\nnative_span_precision=fp8\n'
                                                  for i, m in ((1, HD_PERF), (2, HD_BAL))))
     video = [('HD Quality', ['--slot', 1001], 'video'), ('HD Balanced', ['--slot', 1002], 'video'), ('HD Performance', ['--slot', 1003], 'video'),
              ('SD Compact', ['--slot', 1002, '--width', 720, '--height', 480], 'video')]
     video += [(f'TemporalFix S{i+1}', ['--case', 'temporal', '--conf', ROOT/'tfix.conf', '--slot', i+1], 'video') for i in range(3)]
     video += [(n, ['--case', 'rife', '--conf', ROOT/'rife.conf', '--slot', i+1], 'rife') for i, n in enumerate(RIFE)]
+    video.append(('SuperUltraCompact', ['--conf', ROOT/'compact.conf', '--slot', 1, '--width', 1280, '--height', 720], 'compact-v1'))
     catalog = [(n, a, VIDEO, 'video', {need}, False, None) for n, a, need in video]
+    catalog.append(('RIFE 4.26 Heavy', ['--case', 'rife', '--conf', ROOT/'rife.conf', '--slot', 1], HEAVY, 'video', {'rife'}, False, None))
     catalog.append(('RIFE 4.26 ids', ['--case', 'rife-ids', '--conf', ROOT/'rife.conf', '--slot', 1], VIDEO, 'video', {'rife'}, False,
                     'aji_infer_rife_ids'))
     if sm >= 89:  # FP8 needs the SM 89 instruction set
         catalog += [(n, ['--conf', ROOT/'fp8.conf', '--slot', s], VIDEO, 'video', {'video'}, True, 'native_span_precision')
                     for n, s in (('FP8 Performance', 1), ('FP8 Balanced', 2))]
-    image = lambda model, size, pairs: ['--case', 'image', '--image-model', model, '--width', size, '--height', size,
-                                        '--tile', size, '--pairs', pairs]
+    image = lambda model, size, pairs, tile=None, height=None: [
+        '--case', 'image', '--image-model', model, '--width', size, '--height', height or size, '--tile', tile or size, '--pairs', pairs]
     catalog += [(n, a, IMAGES, 'image', {need}, False, None) for n, a, need in (
         ('ESRGAN 1536', image(ESRGAN, 1536, 20), 'manga'), ('ESRGAN 4x 512', image(ESRGAN_4X, 512, 16), 'manga'),
         ('SPAN-S 1536', image(SPAN_S, 1536, 20), 'illustration'), ('FDAT-M 1536', image(FDAT_M, 1536, 20), 'illustration'),
         ('FDAT-M 4x 512', image(FDAT_M_4X, 512, 16), 'illustration'), ('FDAT-XL 4x 512', image(FDAT_XL, 512, 16), 'illustration'),
-        ('HAT-L 512', image(HAT_L, 512, 16), 'illustration-bf16'), ('DAT2 512', image(DAT2, 512, 16), 'illustration-bf16'))]
+        ('HAT-L 512', image(HAT_L, 512, 16), 'illustration-bf16'), ('DAT2 512', image(DAT2, 512, 16), 'illustration-bf16'),
+        # a page of overlapping, blended tiles, and a page that DAT pads to its 32-pixel attention windows
+        ('ESRGAN 256 tiles', image(ESRGAN, 1200, 16, tile=256, height=1000), 'manga'),
+        ('DAT2 320x272', image(DAT2, 320, 16, tile=512, height=272), 'illustration-bf16'))]
     return catalog
 
 
 def bench(identity, label, ref, cand, args, model_dir, fp8, swap):
-    """One paired comparison. Raw pairs are kept in results/, keyed by GPU, driver, both builds and the arguments."""
-    key = hashlib.sha256(json.dumps([identity, ref.parent.name, cand.parent.name, list(map(str, args)), swap]).encode()).hexdigest()[:12]
+    """One paired comparison. Raw pairs are kept in results/ with everything that decides a timing, and reused only
+    when all of it is the same: GPU, driver, both builds, the timing scripts, the arguments, the configuration file's
+    contents, the model folder and the AJI_* variables."""
+    settings = {'gpu': identity, 'reference': ref.parent.name, 'candidate': cand.parent.name, 'scripts': SCRIPTS,
+                'arguments': list(map(str, args)), 'swapped': swap, 'models': model_dir.name,
+                'configurations': [digest(Path(str(x))) for x in args if str(x).endswith('.conf')],
+                'environment': {k: v for k, v in sorted(os.environ.items()) if k.startswith('AJI_') and k != 'AJI_ROOT'}}
+    key = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:12]
     out = OUT/f'{label}{"-swapped" if swap else ""}-{key}.json'
     if not out.exists():
         cmd = [sys.executable, ROOT/'tools'/'sanity'/'paired_bench.py', '--reference', ref, '--candidate', cand,
@@ -370,7 +405,10 @@ def bench(identity, label, ref, cand, args, model_dir, fp8, swap):
             run(cmd + (['--swap-load-order'] if swap else []), f'bench-{out.stem}', env=environment())
         except Failed as e:
             return {'error': last_line(e)}
-        out.with_suffix('.tmp').replace(out)
+        j = json.loads(out.with_suffix('.tmp').read_text())
+        j['gpu_check'] = settings
+        out.write_text(json.dumps(j, indent=1))
+        out.with_suffix('.tmp').unlink()
     j = json.loads(out.read_text())
     stats = j.get('gpu') or j['wall']
     problems = []
@@ -385,15 +423,33 @@ def bench(identity, label, ref, cand, args, model_dir, fp8, swap):
             'ref_mib': j['memory']['reference']['warm_bytes']/2**20, 'cand_mib': j['memory']['candidate']['warm_bytes']/2**20}
 
 
+def has(lib, token):
+    """Whether a build contains an exported call or a setting name."""
+    return token.encode() in lib.read_bytes()
+
+
+def dispatch(lib, conf, slot):
+    """The model log a build prints for a slot, from paired_bench's per-build worker; empty if it could not run."""
+    done = subprocess.run(list(map(str, [sys.executable, ROOT/'tools'/'sanity'/'paired_bench.py', '--reference', lib, '--candidate', lib,
+                                         '--cuda-runtime', CUDA/'lib'/'libcudart.so.12', '--models', VIDEO, '--conf', conf, '--slot', slot,
+                                         '--memory-worker', 'reference'])), capture_output=True, text=True, env=environment())
+    try:
+        return json.loads(done.stdout.splitlines()[-1])['dispatch']
+    except (IndexError, KeyError, ValueError):
+        return ''
+
+
 def compare(identity, title, ref, cand, selected, both_orders, rows):
     """Time every case; a video case that moved by 1% or more is timed again with the load order swapped."""
     say(f'timing: {title}')
     block = []
     for name, args, model_dir, group, _, fp8, call in selected:
         label = f'{ref.parent.name}-vs-{cand.parent.name}-{name}'.replace(' ', '_')
-        lacking = [lib.parent.name for lib in (ref, cand) if call and call.encode() not in lib.read_bytes()]
-        if lacking:  # an older build without this call or setting: nothing to compare, and not a failure
-            block.append({'case': name, 'skipped': f'{lacking[0]} has no {call}'})
+        if call and not has(ref, call):  # an older reference without this call or setting: nothing to compare
+            block.append({'case': name, 'skipped': f'{ref.parent.name} has no {call}'})
+        elif call and not has(cand, call):  # the candidate lost something the reference has
+            block.append({'case': name, 'error': f'{cand.parent.name} has no {call}, which {ref.parent.name} has'})
+        if block and block[-1]['case'] == name:
             say('   ' + line(block[-1]))
             continue
         row = bench(identity, label, ref, cand, args, model_dir, fp8, False)
@@ -406,7 +462,15 @@ def compare(identity, title, ref, cand, selected, both_orders, rows):
 
 
 def direction(r):
-    return 'SLOWER' if r['pct'] >= 1 and r['lo'] > 0 else 'faster' if r['pct'] <= -1 and r['hi'] < 0 else 'same'
+    """faster or SLOWER: 1% or more with the interval clear of zero. same: the whole interval within 1%.
+    not slower: possibly faster, but the interval rules out a 1% slowdown. Anything else is inconclusive."""
+    if r['pct'] <= -1 and r['hi'] < 0:
+        return 'faster'
+    if r['pct'] >= 1 and r['lo'] > 0:
+        return 'SLOWER'
+    if r['lo'] > -1 and r['hi'] < 1:
+        return 'same'
+    return 'not slower' if r['hi'] < 1 else 'inconclusive'
 
 
 def broken(r):
@@ -419,18 +483,20 @@ def broken(r):
 
 def line(r):
     if 'skipped' in r:
-        return f'{r["case"]:<16}SKIPPED: {r["skipped"]}'
+        return f'{r["case"]:<18}SKIPPED: {r["skipped"]}'
     if 'error' in r:
-        return f'{r["case"]:<16}FAILED: {r["error"]}'
+        return f'{r["case"]:<18}FAILED: {r["error"]}'
     change = lambda x: f'{x["pct"]:+6.2f}% [{x["lo"]:+.2f},{x["hi"]:+.2f}]'
     verdict, swapped = direction(r), ''
     if 'swapped' in r:
         s = r['swapped']
         swapped = ' | sw FAILED' if 'error' in s else f' | sw {change(s)}'
         # the two load orders have to agree before a direction is reported
-        verdict = 'inconclusive' if 'error' in s or direction(s) != verdict else verdict
+        both = {verdict} if 'error' in s else {verdict, direction(s)}
+        verdict = ('inconclusive' if 'error' in s else verdict if len(both) == 1 else
+                   'not slower' if both <= {'faster', 'same', 'not slower'} else 'inconclusive')
     notes = ''.join(f' ({p})' for p in dict.fromkeys(broken(r)))
-    return (f'{r["case"]:<16}{r["ref_ms"]:8.3f} ->{r["cand_ms"]:8.3f} ms {change(r)}{swapped}'
+    return (f'{r["case"]:<18}{r["ref_ms"]:8.3f} ->{r["cand_ms"]:8.3f} ms {change(r)}{swapped}'
             f' | {r["ref_mib"]:.0f}->{r["cand_mib"]:.0f} MiB | {verdict}{notes}')
 
 
@@ -475,11 +541,12 @@ def main():
     p.add_argument('--both-orders', action='store_true', help='time every comparison in both load orders')
     a = p.parse_args()
 
-    global ROOT, SDK, LOGS, LIBS, OUT, CUDA, TRT_ROOT, TRT_LIB, VIDEO, IMAGES
+    global ROOT, SDK, LOGS, LIBS, OUT, CUDA, TRT_ROOT, TRT_LIB, VIDEO, IMAGES, HEAVY, SCRIPTS
     ROOT = a.root.resolve()
     SDK, LOGS, LIBS, OUT = ROOT/'sdk', ROOT/'logs', ROOT/'libs', ROOT/'results'
     CUDA, TRT_ROOT = SDK/'cuda', SDK/'trt'/'usr'
     TRT_LIB, VIDEO, IMAGES = TRT_ROOT/'lib'/'x86_64-linux-gnu', ROOT/'models'/'video', ROOT/'models'/'img'
+    HEAVY = ROOT/'models'/'heavy'
 
     name, driver, sm, mem, uuid = gpu()
     say(f'GPU: {name} ({mem}), compute capability {sm/10:.1f}, driver {driver}')
@@ -505,8 +572,8 @@ def main():
 
     say('tools, CUDA 12.9 compiler and TensorRT 11.4 headers'); seven = tools(); toolkits()
     say('sources'); builds = Builds(sm, a.base, a.head)
-    scripts = builds.resolve(a.tools)[1] if re.fullmatch(r'pr\d+|head|base', a.tools) else builds.commit(a.tools)
-    builds.tree('tools', scripts)  # sanity/paired_bench.py and sanity/direct_graph.py are run from this revision
+    SCRIPTS = builds.resolve(a.tools)[1] if re.fullmatch(r'pr\d+|head|base', a.tools) else builds.commit(a.tools)
+    builds.tree('tools', SCRIPTS)  # sanity/paired_bench.py and sanity/direct_graph.py are run from this revision
     say('models: ' + ', '.join(sorted(needed))); models(seven, needed)
     libs = {n: builds.lib(n) for c in comparisons + a.parity for n in c[:2]}  # build everything before timing anything
 
@@ -520,7 +587,19 @@ def main():
         slots = [('Balanced FP16', ROOT/'builtins.conf', 1002), ('Performance FP16', ROOT/'builtins.conf', 1003)]
         slots += [('Performance FP8', ROOT/'fp8.conf', 1), ('Balanced FP8', ROOT/'fp8.conf', 2)] if sm >= 89 else []
         for label, conf, slot in slots:
-            ok, text = parity(f'{ref} -> {cand} {label}', libs[ref], libs[cand], conf, slot)
+            label, ok, text = f'{ref} -> {cand} {label}', True, ''
+            if 'FP8' in label:  # the same outputs prove nothing about FP8 unless both builds selected it
+                setting, marker = 'native_span_precision', 'FP8 SPANF3 body'
+                if not has(libs[ref], setting):
+                    text = f'{label}: SKIPPED, {ref} has no {setting}'
+                elif not has(libs[cand], setting):
+                    ok, text = False, f'{label}: FAILED: {cand} has no {setting}, which {ref} has'
+                else:
+                    plain = [n for n in (ref, cand) if marker not in dispatch(libs[n], conf, slot)]
+                    if plain:
+                        ok, text = False, f'{label}: FAILED: {plain[0]} did not select FP8'
+            if not text:
+                ok, text = parity(label, libs[ref], libs[cand], conf, slot)
             checks.append(text); failed += not ok; say('   ' + text)
         if sm < 89:
             checks.append(f'{ref} -> {cand} FP8: SKIPPED, this GPU has no FP8 kernels')
@@ -531,7 +610,8 @@ def main():
     text = [f'GPU {name} ({mem}) sm_{sm}, driver {driver} | CUDA 12.9, TensorRT {TRT.split("-")[0]} | {int(time.time()-T0)//60} min',
             'ms per frame (video: GPU time; image: wall time), change with 95% interval,',
             '"sw" = the same comparison with the load order swapped, then warm VRAM.',
-            'faster/SLOWER needs 1% or more with an interval clear of zero, in both orders when both ran.']
+            'faster/SLOWER: 1% or more, interval clear of zero. same: interval within 1%. not slower: interval rules out',
+            'a 1% slowdown. Both load orders have to agree when both ran; anything else is inconclusive.']
     for title, block in rows:
         text += ['', f'== {title}'] + [line(r) for r in block]
     text += (['', '== checks'] + checks) if checks else []
