@@ -79,8 +79,9 @@ class Backend:
         self.reset = bind(lib, 'aji_temporal_reset', None, P)
         self.rife = bind(lib, 'aji_infer_rife', I, P, C.POINTER(Frame), C.POINTER(Frame),
                          C.c_double, C.POINTER(Frame), P)
-        self.rife_ids = bind(lib, 'aji_infer_rife_ids', I, P, C.POINTER(Frame), C.c_int64,
-                             C.POINTER(Frame), C.c_int64, C.c_double, C.POINTER(Frame), P, I)
+        # absent from builds older than the frame-ID call; such a build still times every other case
+        self.rife_ids = bind(lib, 'aji_infer_rife_ids', I, P, C.POINTER(Frame), C.c_int64, C.POINTER(Frame),
+                             C.c_int64, C.c_double, C.POINTER(Frame), P, I) if hasattr(lib, 'aji_infer_rife_ids') else None
         params = Params(version=9, conf=os.fsencode(conf) if conf else None, models=os.fsencode(model_dir), slot=slot,
                         rife=os.fsencode(model_dir), trtexec=os.fsencode(trtexec) if trtexec else None)
         self.ctx = P(bind(lib, 'aji_create', P, C.POINTER(Params))(C.byref(params)))

@@ -58,9 +58,16 @@ HD_BAL = '2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16'
 HD_PERF = '2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16'
 SD = '2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo'
 TFIX = ['temporalfix_s1_v1.1_op18_fp16', 'temporalfix_s2_v1_op18_fp16', 'temporalfix_s3_v1_op18_fp16']
+# case name: (configuration code, file); 4.14 is the configuration default
+RIFE = {'RIFE 4.26': (426, 'rife_v4.26'), 'RIFE 4.14': (414, 'rife_v4.14'), 'RIFE 4.14 lite': (4141, 'rife_v4.14_lite'),
+        'RIFE 4.18': (418, 'rife_v4.18'), 'RIFE 4.22': (422, 'rife_v4.22'), 'RIFE 4.22 lite': (4221, 'rife_v4.22_lite'),
+        'RIFE 4.25': (425, 'rife_v4.25')}
 ESRGAN = '2x_MangaJaNai_2048p_V1_ESRGAN_95k_fp16.onnx'
+ESRGAN_4X = '4x_MangaJaNai_2048p_V1_ESRGAN_70k_fp16.onnx'
 FDAT_M = '2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16.onnx'
 SPAN_S = '2x_IllustrationJaNai_V3denoise_SPAN_S_30k_fp16.onnx'
+FDAT_M_4X = '4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16.onnx'
+FDAT_XL = '4x_IllustrationJaNai_V3denoise_FDAT_XL_32k_fp16.onnx'
 HAT_L = '4x_IllustrationJaNai_V3detail_HAT_L_28k_bf16.onnx'
 DAT2 = '4x_IllustrationJaNai_V3detail_DAT2_28k_bf16.onnx'
 # name: (url, sha256 as published with the release, folder under models/, files)
@@ -68,11 +75,11 @@ ARCHIVES = {
     'video': (f'{PLAYER}/mpv-upscale-2x_animejanai-overlay-3.12.5-linux-x64.7z',
               '961ba4a54488d2b8d8d91db556db21fe65b5d806ae09a283f71c7bc7fcc7d28c', 'video', [f'{n}.onnx' for n in (HD_BAL, HD_PERF, SD, *TFIX)]),
     'rife': (f'{PLAYER}/component-rife-linux-x64.7z',
-             'e30f50c2671f4020af46a66334d3b4443e4b5c0e3f1310ba7a94ee505b18b684', 'video', ['rife_v4.26.onnx']),
+             'e30f50c2671f4020af46a66334d3b4443e4b5c0e3f1310ba7a94ee505b18b684', 'video', [f'{f}.onnx' for _, f in RIFE.values()]),
     'manga': (f'{MANGA}/1.0.0/MangaJaNai_V1_ONNX_fp16.7z',
-              '2c3809d712e3e96d107e2a59802186c284fac49d91a211435c8c896432ba27ab', 'img', [ESRGAN]),
+              '2c3809d712e3e96d107e2a59802186c284fac49d91a211435c8c896432ba27ab', 'img', [ESRGAN, ESRGAN_4X]),
     'illustration': (f'{MANGA}/3.0.0/IllustrationJaNai_V3_ONNX_fp16.7z',
-                     'bd7db0632b37b95b06410e99f95347980010b2ccc54730e2d68501f25bae898c', 'img', [FDAT_M, SPAN_S]),
+                     'bd7db0632b37b95b06410e99f95347980010b2ccc54730e2d68501f25bae898c', 'img', [FDAT_M, SPAN_S, FDAT_M_4X, FDAT_XL]),
     'illustration-bf16': (f'{MANGA}/3.0.0/IllustrationJaNai_V3_ONNX_bf16.7z',
                           '48e292c3f92aa2df79f9f83c6318a6c2052c29e6ea9fe2ed23b61cc526900247', 'img', [HAT_L, DAT2]),
 }
@@ -322,30 +329,33 @@ def forced(text, order, fuse, packed):
 
 
 def cases(sm):
-    """(name, paired_bench arguments, model folder, group, archives needed, runs FP8)"""
+    """(name, paired_bench arguments, model folder, group, archives needed, runs FP8, exported call it needs)"""
     (ROOT/'builtins.conf').write_text('[global]\nconfig_version=2\nnative=on\nlogging=yes\n')
     head = '[global]\nconfig_version=2\nbackend=TensorRT\nnative=on\nlogging=yes\n'
     slot = '[slot_{}]\nchain_1_max_fps=120\n'
     (ROOT/'tfix.conf').write_text(head + ''.join(slot.format(i+1) + f'chain_1_temporal_fix_model={m}\n' for i, m in enumerate(TFIX)))
-    (ROOT/'rife.conf').write_text(head + slot.format(1) + 'chain_1_rife=yes\nchain_1_rife_model=426\nchain_1_rife_factor_numerator=2\n'
-                                  'chain_1_rife_factor_denominator=1\nchain_1_rife_before_upscale=yes\n')
+    (ROOT/'rife.conf').write_text(head + ''.join(
+        slot.format(i+1) + f'chain_1_rife=yes\nchain_1_rife_model={code}\nchain_1_rife_factor_numerator=2\n'
+        'chain_1_rife_factor_denominator=1\nchain_1_rife_before_upscale=yes\n' for i, (code, _) in enumerate(RIFE.values())))
     (ROOT/'fp8.conf').write_text(head + ''.join(slot.format(i) + f'chain_1_model_1_name={m}\nnative_span_precision=fp8\n'
                                                  for i, m in ((1, HD_PERF), (2, HD_BAL))))
     video = [('HD Quality', ['--slot', 1001], 'video'), ('HD Balanced', ['--slot', 1002], 'video'), ('HD Performance', ['--slot', 1003], 'video'),
              ('SD Compact', ['--slot', 1002, '--width', 720, '--height', 480], 'video')]
     video += [(f'TemporalFix S{i+1}', ['--case', 'temporal', '--conf', ROOT/'tfix.conf', '--slot', i+1], 'video') for i in range(3)]
-    video += [('RIFE 4.26', ['--case', 'rife', '--conf', ROOT/'rife.conf', '--slot', 1], 'rife'),
-              ('RIFE 4.26 ids', ['--case', 'rife-ids', '--conf', ROOT/'rife.conf', '--slot', 1], 'rife')]
-    catalog = [(n, a, VIDEO, 'video', {need}, False) for n, a, need in video]
+    video += [(n, ['--case', 'rife', '--conf', ROOT/'rife.conf', '--slot', i+1], 'rife') for i, n in enumerate(RIFE)]
+    catalog = [(n, a, VIDEO, 'video', {need}, False, None) for n, a, need in video]
+    catalog.append(('RIFE 4.26 ids', ['--case', 'rife-ids', '--conf', ROOT/'rife.conf', '--slot', 1], VIDEO, 'video', {'rife'}, False,
+                    'aji_infer_rife_ids'))
     if sm >= 89:  # FP8 needs the SM 89 instruction set
-        catalog += [(n, ['--conf', ROOT/'fp8.conf', '--slot', s], VIDEO, 'video', {'video'}, True)
+        catalog += [(n, ['--conf', ROOT/'fp8.conf', '--slot', s], VIDEO, 'video', {'video'}, True, None)
                     for n, s in (('FP8 Performance', 1), ('FP8 Balanced', 2))]
     image = lambda model, size, pairs: ['--case', 'image', '--image-model', model, '--width', size, '--height', size,
                                         '--tile', size, '--pairs', pairs]
-    catalog += [(n, a, IMAGES, 'image', {need}, False) for n, a, need in (
-        ('ESRGAN 1536', image(ESRGAN, 1536, 20), 'manga'), ('FDAT-M 1536', image(FDAT_M, 1536, 20), 'illustration'),
-        ('SPAN-S 1536', image(SPAN_S, 1536, 20), 'illustration'), ('HAT-L 512', image(HAT_L, 512, 16), 'illustration-bf16'),
-        ('DAT2 512', image(DAT2, 512, 16), 'illustration-bf16'))]
+    catalog += [(n, a, IMAGES, 'image', {need}, False, None) for n, a, need in (
+        ('ESRGAN 1536', image(ESRGAN, 1536, 20), 'manga'), ('ESRGAN 4x 512', image(ESRGAN_4X, 512, 16), 'manga'),
+        ('SPAN-S 1536', image(SPAN_S, 1536, 20), 'illustration'), ('FDAT-M 1536', image(FDAT_M, 1536, 20), 'illustration'),
+        ('FDAT-M 4x 512', image(FDAT_M_4X, 512, 16), 'illustration'), ('FDAT-XL 4x 512', image(FDAT_XL, 512, 16), 'illustration'),
+        ('HAT-L 512', image(HAT_L, 512, 16), 'illustration-bf16'), ('DAT2 512', image(DAT2, 512, 16), 'illustration-bf16'))]
     return catalog
 
 
@@ -354,7 +364,7 @@ def bench(identity, label, ref, cand, args, model_dir, fp8, swap):
     key = hashlib.sha256(json.dumps([identity, ref.parent.name, cand.parent.name, list(map(str, args)), swap]).encode()).hexdigest()[:12]
     out = OUT/f'{label}{"-swapped" if swap else ""}-{key}.json'
     if not out.exists():
-        cmd = [sys.executable, ROOT/'head'/'sanity'/'paired_bench.py', '--reference', ref, '--candidate', cand,
+        cmd = [sys.executable, ROOT/'tools'/'sanity'/'paired_bench.py', '--reference', ref, '--candidate', cand,
                '--cuda-runtime', CUDA/'lib'/'libcudart.so.12', '--models', model_dir, '--output', out.with_suffix('.tmp'), *args]
         try:
             run(cmd + (['--swap-load-order'] if swap else []), f'bench-{out.stem}', env=environment())
@@ -379,8 +389,13 @@ def compare(identity, title, ref, cand, selected, both_orders, rows):
     """Time every case; a video case that moved by 1% or more is timed again with the load order swapped."""
     say(f'timing: {title}')
     block = []
-    for name, args, model_dir, group, _, fp8 in selected:
+    for name, args, model_dir, group, _, fp8, call in selected:
         label = f'{ref.parent.name}-vs-{cand.parent.name}-{name}'.replace(' ', '_')
+        lacking = [lib.parent.name for lib in (ref, cand) if call and call.encode() not in lib.read_bytes()]
+        if lacking:  # an older build without this call: nothing to compare, and not a failure
+            block.append({'case': name, 'skipped': f'{lacking[0]} has no {call}'})
+            say('   ' + line(block[-1]))
+            continue
         row = bench(identity, label, ref, cand, args, model_dir, fp8, False)
         row['case'] = name
         if 'error' not in row and (both_orders or (group == 'video' and abs(row['pct']) >= 1)):
@@ -396,13 +411,17 @@ def direction(r):
 
 def broken(r):
     """Why a row cannot be trusted, or an empty list."""
+    if 'skipped' in r:
+        return []
     runs = [r] + ([r['swapped']] if 'swapped' in r else [])
     return [x['error'] for x in runs if 'error' in x] + [p for x in runs for p in x.get('problems', [])]
 
 
 def line(r):
+    if 'skipped' in r:
+        return f'{r["case"]:<16}SKIPPED: {r["skipped"]}'
     if 'error' in r:
-        return f'{r["case"]:<15} FAILED: {r["error"]}'
+        return f'{r["case"]:<16}FAILED: {r["error"]}'
     change = lambda x: f'{x["pct"]:+6.2f}% [{x["lo"]:+.2f},{x["hi"]:+.2f}]'
     verdict, swapped = direction(r), ''
     if 'swapped' in r:
@@ -411,7 +430,7 @@ def line(r):
         # the two load orders have to agree before a direction is reported
         verdict = 'inconclusive' if 'error' in s or direction(s) != verdict else verdict
     notes = ''.join(f' ({p})' for p in dict.fromkeys(broken(r)))
-    return (f'{r["case"]:<15}{r["ref_ms"]:8.3f} ->{r["cand_ms"]:8.3f} ms {change(r)}{swapped}'
+    return (f'{r["case"]:<16}{r["ref_ms"]:8.3f} ->{r["cand_ms"]:8.3f} ms {change(r)}{swapped}'
             f' | {r["ref_mib"]:.0f}->{r["cand_mib"]:.0f} MiB | {verdict}{notes}')
 
 
@@ -422,7 +441,7 @@ def parity(label, ref, cand, conf, slot):
     log = f'parity-{label}'.replace(' ', '_').replace('>', '')
     (LOGS/f'{log}.log').unlink(missing_ok=True)
     try:
-        run([sys.executable, ROOT/'head'/'sanity'/'direct_graph.py', '--backend', cand, '--reference-backend', ref,
+        run([sys.executable, ROOT/'tools'/'sanity'/'direct_graph.py', '--backend', cand, '--reference-backend', ref,
              '--cuda-runtime', CUDA/'lib'/'libcudart.so.12', '--conf', conf, '--models', VIDEO, '--slot', slot,
              '--width', 1920, '--height', 1080, '--output', out], log, env=environment())
     except Failed as e:
@@ -446,6 +465,7 @@ def main():
     p.add_argument('--expect-sm', type=int, help='stop before downloading anything unless the GPU is this architecture, e.g. 89')
     p.add_argument('--base', help='revision to compare head against')
     p.add_argument('--head', default='origin/main', help='revision under test (default origin/main)')
+    p.add_argument('--tools', default='head', help='revision or prN whose sanity/ scripts do the timing (default head)')
     p.add_argument('--pull', type=int, action='append', default=[], help='pull request to time against head on the video cases; repeatable')
     p.add_argument('--compare', type=lambda s: pair(s, 3), action='append', default=[], metavar='REF:CAND[:REGEX]',
                    help='time two named builds on the cases whose name matches REGEX (default every case); replaces the default comparisons')
@@ -485,7 +505,8 @@ def main():
 
     say('tools, CUDA 12.9 compiler and TensorRT 11.4 headers'); seven = tools(); toolkits()
     say('sources'); builds = Builds(sm, a.base, a.head)
-    builds.tree('head', builds.revisions['head'])  # the timing and parity scripts are taken from head
+    tools = builds.resolve(a.tools)[1] if re.fullmatch(r'pr\d+|head|base', a.tools) else builds.commit(a.tools)
+    builds.tree('tools', tools)  # sanity/paired_bench.py and sanity/direct_graph.py are run from this revision
     say('models: ' + ', '.join(sorted(needed))); models(seven, needed)
     libs = {n: builds.lib(n) for c in comparisons + a.parity for n in c[:2]}  # build everything before timing anything
 
