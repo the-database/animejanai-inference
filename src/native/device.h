@@ -8,6 +8,16 @@
 
 namespace ajinative {
 
+// Exact compute capability of the current device at model construction.
+inline int current_cuda_sm()
+{
+    int device, major, minor;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) return 0;
+    return 10 * major + minor;
+}
+
 // HD SPANF3 launch policies measured on the L4 and RTX 5090.
 inline constexpr bool hd_span_tuned_sm(int major, int minor)
 {

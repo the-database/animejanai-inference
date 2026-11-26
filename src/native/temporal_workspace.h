@@ -5,6 +5,13 @@
 
 namespace ajinative {
 
+// RTX 3090 benefits from overlapping two large alignment chains. L4 and RTX 5090 can share one.
+inline constexpr int tfix_alignment_chains(size_t pixels, int sm)
+{
+    if (pixels <= 500000) return 6;
+    return (sm == 89 || sm == 120) ? 1 : 2;
+}
+
 // One phase uses a single span, the other uses two disjoint equal spans.
 // Sizes and offsets use the caller's units (bytes or fp16 elements).
 struct PingPongLayout {

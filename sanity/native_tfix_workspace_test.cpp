@@ -1,5 +1,6 @@
 // aji_native_tfix_workspace_test S1.onnx S2.onnx S3.onnx
 #include "native/onnx_graph.h"
+#include "native/temporal_workspace.h"
 #include "native/vidnet.h"
 
 #include <cstdio>
@@ -10,6 +11,10 @@
 #include <vector>
 
 using namespace ajinative;
+
+static_assert(tfix_alignment_chains(500000, 89) == 6 && tfix_alignment_chains(500000, 86) == 6);
+static_assert(tfix_alignment_chains(500001, 80) == 2 && tfix_alignment_chains(500001, 86) == 2);
+static_assert(tfix_alignment_chains(500001, 89) == 1 && tfix_alignment_chains(500001, 120) == 1);
 
 static size_t model_bytes(const OnnxGraph &graph, int w, int h, const char *chains)
 {
@@ -31,8 +36,10 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "usage: %s S1.onnx S2.onnx S3.onnx\n", argv[0]);
         return 2;
     }
+    int device;
     cudaDeviceProp gpu{};
-    if (cudaGetDeviceProperties(&gpu, 0) != cudaSuccess) return 1;
+    if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&gpu, device) != cudaSuccess) return 1;
+    const bool one_large_chain = (gpu.major == 8 && gpu.minor == 9) || (gpu.major == 12 && gpu.minor == 0);
     const bool measured_gpu = gpu.major == 12 && gpu.minor == 0 && gpu.multiProcessorCount == 170;
     for (int i = 1; i <= 3; ++i) {
         std::ifstream input(argv[i], std::ios::binary);
@@ -50,7 +57,7 @@ int main(int argc, char **argv)
             const size_t two = model_bytes(graph, w, h, "2");
             const size_t one = model_bytes(graph, w, h, "1");
             const size_t three = model_bytes(graph, w, h, "3");
-            const size_t want = h == 496 ? one + 5 * (two - one) : one;
+            const size_t want = h == 496 ? one + 5 * (two - one) : (one_large_chain ? one : two);
             std::printf("S%d %dx%d default %zu bytes, one chain %zu, two chains %zu\n", i, w, h, actual, one, two);
             if (two <= one || three - two != two - one || actual != want) return 1;
             if (measured_gpu && h == 1080 && (one != 594477084 || two != 689862684)) return 1;

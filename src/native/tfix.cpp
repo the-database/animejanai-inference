@@ -17,6 +17,7 @@
 #include <memory>
 #include <vector>
 
+#include "native/device.h"
 #include "native/netres.h"
 #include "native/temporal_workspace.h"
 #include "native/tfix_kernels.h"
@@ -285,9 +286,7 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
     // faster for much more memory; batching everything (the head too, all on one stream) was 10-13% slower at
     // every size. At 4K a batch of the first two stages buys ~1% for ~490 MB: none there.
     f->kb = M <= (size_t)2200000 ? 2 : 0;
-    // A single alignment chain reuses its scratch across the six larger supports.
-    constexpr int kLargeFrameChains = 1;
-    int nch = M <= (size_t)500000 ? 6 : kLargeFrameChains;
+    int nch = tfix_alignment_chains(M, current_cuda_sm());
     if (const char *e = std::getenv("AJI_NATIVE_TFIX_CHAINS")) nch = std::max(1, std::min(6, std::atoi(e)));  // for benchmarks
     f->ch.resize(nch);
     // A chain's scratch is one block in two overlapping layouts, as a support runs on its stream: the
