@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include "native/conv.h"
+#include "native/device.h"
 #include "native/executor.h"
 #include "native/img_kernels.h"
 #include "native/imgnet.h"
@@ -158,7 +159,10 @@ std::unique_ptr<FrameNet> FrameNet::lowered(const Plan &plan, int w, int h, cuda
                                             SpanPrecision precision)
 {
     const bool hd = full_spanf3(plan);
-    auto ex = Executor::create(plan, w, h, s, why, true, hd && precision == SpanPrecision::FP8);
+    // On the RTX 3090 the 64-channel gates recover throughput with one extra feature map for distinct residuals.
+    const auto gates = hd && plan.steps.front().cout == 64 && current_cuda_sm() == 86
+        ? GateBuffers::ReadOnlyResidual : GateBuffers::Reuse;
+    auto ex = Executor::create(plan, w, h, s, why, gates, hd && precision == SpanPrecision::FP8);
     if (!ex) return nullptr;
     const bool fused = hd && ex->enable_gate_projection();
     const bool reordered = hd && ex->enable_fp16_cache_order();

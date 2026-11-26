@@ -18,6 +18,8 @@
 
 using namespace ajinative;
 
+static_assert(hd_span_fuses_sm(8, 6) && hd_span_fuses_sm(8, 9) && hd_span_fuses_sm(12, 0));
+static_assert(!hd_span_fuses_sm(8, 0) && !hd_span_fuses_sm(9, 0));
 static_assert(hd_span_tuned_sm(8, 9) && hd_span_tuned_sm(12, 0));
 static_assert(!hd_span_tuned_sm(8, 0) && !hd_span_tuned_sm(8, 6) && !hd_span_tuned_sm(9, 0));
 
@@ -70,37 +72,47 @@ static bool check_fidelity(const std::vector<uint16_t> &fp16, const std::vector<
     return pass;
 }
 
-// The first two HD body convolutions are identical ReLUs apart from their launch policy.
-// Their pixels match under either policy, so inspect the actual captured kernels.
-static bool check_body_launches(FrameNet &video, void *in, void *out, int feature_h, bool fp8, bool tuned)
+// Follow the dependencies in stream order. CUDA does not promise launch order in a node list.
+template<class Net>
+static std::vector<cudaKernelNodeParams> capture_launches(Net &net, void *in, void *out)
 {
     cudaStream_t stream{};
     cudaGraph_t graph{};
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    check_cuda(video.run(in, out, stream));
+    check_cuda(net.run(in, out, stream));
     check_cuda(cudaStreamEndCapture(stream, &graph));
-    cudaGraphNode_t node{};
-    size_t count = 1;
-    check_cuda(cudaGraphGetRootNodes(graph, &node, &count));
-    cudaKernelNodeParams body[2]{};
-    for (auto &launch : body) {
-        if (count != 1) break;
-        cudaGraphNode_t next{};
+    std::vector<cudaKernelNodeParams> launches;
+    cudaGraphNode_t next[2]{};
+    size_t count = 2;
+    check_cuda(cudaGraphGetRootNodes(graph, next, &count));
+    while (count == 1) {
+        const cudaGraphNode_t node = next[0];
+        check_cuda(cudaGraphKernelNodeGetParams(node, &launches.emplace_back()));
+        count = 2;
 #if CUDART_VERSION >= 13000
-        check_cuda(cudaGraphNodeGetDependentNodes(node, &next, nullptr, &count));
+        check_cuda(cudaGraphNodeGetDependentNodes(node, next, nullptr, &count));
 #else
-        check_cuda(cudaGraphNodeGetDependentNodes(node, &next, &count));
+        check_cuda(cudaGraphNodeGetDependentNodes(node, next, &count));
 #endif
-        if (count == 1) check_cuda(cudaGraphKernelNodeGetParams(next, &launch));
-        node = next;
     }
     check_cuda(cudaGraphDestroy(graph));
     check_cuda(cudaStreamDestroy(stream));
-    if (count != 1) {
+    if (count != 0) {
+        std::fprintf(stderr, "Expected a single chain of HD kernel launches\n");
+        launches.clear();
+    }
+    return launches;
+}
+
+// The first two HD body convolutions are identical ReLUs apart from their launch policy.
+static bool check_body_launches(const std::vector<cudaKernelNodeParams> &launches, int feature_h, bool fp8, bool tuned)
+{
+    if (launches.size() < 3) {
         std::fprintf(stderr, "Missing HD body convolution in captured graph\n");
         return false;
     }
+    const auto *body = launches.data() + 1;  // Skip the stem.
     if (!fp8) {
         // Reversed FP16 rows use a different kernel specialization from ordinary rows.
         const bool alternating = body[0].func != body[1].func;
@@ -121,7 +133,33 @@ static bool check_body_launches(FrameNet &video, void *in, void *out, int featur
     return true;
 }
 
-static bool compare(const char *path, int channels, Gate gate, const std::string &mode, bool expect_tuning)
+static bool check_gate_launches(const Plan &plan, const std::vector<cudaKernelNodeParams> &video,
+                                const std::vector<cudaKernelNodeParams> &plain, bool fused, bool expect_read_only)
+{
+    const size_t expected = plan.steps.size() - size_t(fused);
+    if (video.size() != expected || plain.size() != expected) {
+        std::fprintf(stderr, "HD gate capture: expected %zu launches, got %zu video and %zu plain\n",
+                     expected, video.size(), plain.size());
+        return false;
+    }
+    // Each body step has one launch. Fusion replaces the last gate and the following projection
+    // with one kernel at the gate's index. The plain control has the same row order and fusion.
+    for (size_t i = 1; i + 2 < plan.steps.size(); ++i) {
+        if (plan.steps[i].gate != int(Gate::Tanh1x1)) continue;
+        const bool differs_from_plain = video[i].func != plain[i].func;
+        if (differs_from_plain != expect_read_only) {
+            const bool fused_gate = fused && i + 3 == plan.steps.size();
+            std::fprintf(stderr, "HD 64-channel %s at step %zu: expected %s, %s the plain kernel\n",
+                         fused_gate ? "fused gate/projection" : "gate", i,
+                         expect_read_only ? "read-only residual" : "plain residual",
+                         differs_from_plain ? "differed from" : "matched");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool compare(const char *path, int channels, Gate gate, const std::string &mode, bool expect_tuning, bool expect_fusion)
 {
     // Use more CTAs than can run at once so a later CTA can still need a neighbor's source
     // halo when that neighbor writes. Both dimensions also leave partial tiles after unshuffle.
@@ -143,7 +181,7 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
     }
     const bool fp8 = mode == "fp8";
     const bool hd = gate == Gate::Tanh1x1;
-    const bool fuse = hd && expect_tuning;
+    const bool fuse = hd && expect_fusion;
     const SpanPrecision precision = fp8 ? SpanPrecision::FP8 :
                                     mode == "fp16" ? SpanPrecision::FP16 : SpanPrecision::Default;
     auto video = FrameNet::lowered(plan, w, h, nullptr, &why, precision);
@@ -152,18 +190,24 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
     const std::string label = video->describe();
     if (label.find(std::to_string(operations - size_t(fuse)) + " kernels, ") != 0 ||
         (label.find("fused gate and projection") != std::string::npos) != fuse ||
-        (label.find("FP16 alternating tile rows") != std::string::npos) != (fuse && !fp8) ||
+        (label.find("FP16 alternating tile rows") != std::string::npos) != (hd && expect_tuning && !fp8) ||
         (label.find("FP8 SPANF3 body") != std::string::npos) != fp8) {
         std::fprintf(stderr, "%s [%s]: unexpected video dispatch: %s\n", path, mode.c_str(), label.c_str());
         return false;
     }
-    auto reference = Executor::create(plan, w, h, nullptr, &why, false, fp8);
-    auto candidate = Executor::create(plan, w, h, nullptr, &why, true, fp8);
+    auto reference = Executor::create(plan, w, h, nullptr, &why, GateBuffers::Separate, fp8);
+    auto candidate = Executor::create(plan, w, h, nullptr, &why, GateBuffers::Reuse, fp8);
     // Also compare the fused HD paths to the separate convolution + concat kernels.
-    auto unfused = fuse ? Executor::create(plan, w, h, nullptr, &why, false, fp8) : nullptr;
-    auto stock = fp8 ? Executor::create(plan, w, h, nullptr, &why, false, false) : nullptr;
+    auto unfused = fuse ? Executor::create(plan, w, h, nullptr, &why, GateBuffers::Separate, fp8) : nullptr;
+    auto stock = fp8 ? Executor::create(plan, w, h, nullptr, &why, GateBuffers::Separate, false) : nullptr;
     if (!reference || !candidate || (fuse && !unfused) || (fp8 && !stock)) {
         std::fprintf(stderr, "%s [%s]: %s\n", path, mode.c_str(), why.c_str());
+        return false;
+    }
+    // The production 64-channel SM86 video path has one more full FP16 map than the in-place executor.
+    const bool separate_video = hd && channels == 64 && current_cuda_sm() == 86;
+    if (video->device_bytes() != (separate_video ? reference : candidate)->device_bytes()) {
+        std::fprintf(stderr, "%s [%s]: unexpected video feature allocation\n", path, mode.c_str());
         return false;
     }
     const int links = fp8 ? (channels == 48 ? 9 : 15) : 0;
@@ -204,7 +248,14 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
         check_cuda(cudaMemcpy(samples.data(), out, out_bytes, cudaMemcpyDeviceToHost));
     };
     std::mt19937 rng(42);
-    bool passed = !hd || check_body_launches(*video, in, out, h / plan.unshuffle, fp8, expect_tuning);
+    bool passed = true;
+    if (hd) {
+        const auto launches = capture_launches(*video, in, out);
+        passed = check_body_launches(launches, h / plan.unshuffle, fp8, expect_tuning);
+        if (channels == 64 && !check_gate_launches(plan, launches, capture_launches(*candidate, in, out),
+                                                  fuse, separate_video && !fp8))
+            passed = false;
+    }
     const int frames = fp8 ? 3 : 2;
     for (int frame = 0; frame < frames; ++frame) {
         const bool gradient = fp8 && frame == 0;
@@ -251,7 +302,7 @@ static bool compare(const char *path, int channels, Gate gate, const std::string
         // The image tiler passes the active geometry to an executor created for a larger tile.
         // A separately sized, unfused reference cannot share a stale maximum-width stride.
         constexpr int tile_w = 322, tile_h = 182;
-        auto tile_ref = Executor::create(plan, tile_w, tile_h, nullptr, &why, false, fp8);
+        auto tile_ref = Executor::create(plan, tile_w, tile_h, nullptr, &why, GateBuffers::Separate, fp8);
         if (!tile_ref) {
             std::fprintf(stderr, "tile reference: %s\n", why.c_str());
             passed = false;
@@ -295,6 +346,7 @@ int main(int argc, char **argv)
     check_cuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
     check_cuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
     const bool expect_tuning = hd_span_tuned_sm(major, minor);
+    const bool expect_fusion = hd_span_fuses_sm(major, minor);
     for (const std::string profile : {"default", "fp16", "fp8"}) {
         if (mode != "all" && mode != profile) continue;
         if (profile == "fp8" && !span_fp8_available()) {
@@ -302,9 +354,9 @@ int main(int argc, char **argv)
             if (expect_tuning || mode != "all") return 1;
             continue;
         }
-        const bool balanced = compare(argv[1], 64, Gate::Tanh1x1, profile, expect_tuning);
-        const bool performance = compare(argv[2], 48, Gate::Tanh1x1, profile, expect_tuning);
-        if (!balanced || !performance || (profile == "default" && !compare(argv[3], 48, Gate::SigmoidHalf, profile, expect_tuning))) return 1;
+        const bool balanced = compare(argv[1], 64, Gate::Tanh1x1, profile, expect_tuning, expect_fusion);
+        const bool performance = compare(argv[2], 48, Gate::Tanh1x1, profile, expect_tuning, expect_fusion);
+        if (!balanced || !performance || (profile == "default" && !compare(argv[3], 48, Gate::SigmoidHalf, profile, expect_tuning, expect_fusion))) return 1;
     }
     return 0;
 }

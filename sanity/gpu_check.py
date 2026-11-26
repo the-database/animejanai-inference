@@ -349,13 +349,14 @@ class Builds:
 def forced(text, order, fuse, packed):
     """executor.cpp with each use of the device check for the HD launch policy replaced by a constant."""
     check = r'(?:is_sm120|use_hd_span_tuning)\(\)'
+    fusion = r'(?:is_sm120|use_hd_span_tuning|use_hd_gate_projection)\(\)'
     for pattern, on in ((r'(packed_links_ && )' + check, packed), (r'(uses_fp8\(\) \|\| !)' + check, order),
-                        (r'(4 \* W_ \|\| !)' + check, fuse)):
+                        (r'(4 \* W_ \|\| !)' + fusion, fuse)):
         text, count = re.subn(pattern, r'\1' + ('true' if on else 'false'), text)
         if count != 1:
             raise Failed(f'executor.cpp no longer matches {pattern}; update forced() in this script')
-    # the helper is now unused; keep the compiler quiet about it
-    return re.sub(r'\nbool (is_sm120|use_hd_span_tuning)\(\)', r'\n[[maybe_unused]] bool \1()', text, count=1)
+    # These helpers are unused after forcing the policy.
+    return re.sub(r'\nbool (is_sm120|use_hd_span_tuning|use_hd_gate_projection)\(\)', r'\n[[maybe_unused]] bool \1()', text)
 
 
 def cases(sm):

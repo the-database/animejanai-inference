@@ -18,12 +18,14 @@
 
 namespace ajinative {
 
+enum class GateBuffers { Reuse, Separate, ReadOnlyResidual };
+
 class Executor {
 public:
-    // Gate reuse can be disabled for a same-precision reference with distinct residuals.
+    // Separate keeps distinct buffers for reference runs. ReadOnlyResidual also uses cached gate loads.
     // use_fp8 is requested only for a full SPANF3 video plan. Device and kernel support are checked at load.
     static std::unique_ptr<Executor> create(const Plan &plan, int in_w, int in_h, cudaStream_t s, std::string *why,
-                                            bool reuse_gate_residuals = true, bool use_fp8 = false);
+                                            GateBuffers gates = GateBuffers::Reuse, bool use_fp8 = false);
     bool uses_fp8() const { return !fp8_owned_.empty(); }
     int packed_links() const { return packed_links_; }
     bool enable_fp16_cache_order();

@@ -8,10 +8,26 @@
 
 namespace ajinative {
 
+// Exact compute capability of the current device at model construction.
+inline int current_cuda_sm()
+{
+    int device, major, minor;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) return 0;
+    return 10 * major + minor;
+}
+
 // HD SPANF3 launch policies measured on the L4 and RTX 5090.
 inline constexpr bool hd_span_tuned_sm(int major, int minor)
 {
     return (major == 8 && minor == 9) || (major == 12 && minor == 0);
+}
+
+// The RTX 3090 also benefits from fusing the last gate and projection, with ordinary row order.
+inline constexpr bool hd_span_fuses_sm(int major, int minor)
+{
+    return (major == 8 && minor == 6) || hd_span_tuned_sm(major, minor);
 }
 
 // Whether the current device's L2 is 32 MB or more (RTX 4090 72 MB, 5090 96 MB; RTX A5000 / 30-series

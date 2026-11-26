@@ -10,11 +10,14 @@ namespace {
 
 bool use_hd_span_tuning()
 {
-    int device, major, minor;
-    return cudaGetDevice(&device) == cudaSuccess &&
-           cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
-           cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
-           hd_span_tuned_sm(major, minor);
+    const int sm = current_cuda_sm();
+    return hd_span_tuned_sm(sm / 10, sm % 10);
+}
+
+bool use_hd_gate_projection()
+{
+    const int sm = current_cuda_sm();
+    return hd_span_fuses_sm(sm / 10, sm % 10);
 }
 
 }  // namespace
@@ -34,7 +37,7 @@ const void *Executor::ptr(int t, const void *in, void *out) const
 }
 
 std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h, cudaStream_t s, std::string *why,
-                                           bool reuse_gate_residuals, bool use_fp8)
+                                           GateBuffers gates, bool use_fp8)
 {
     auto fail = [&](const std::string &m) -> std::unique_ptr<Executor> {
         if (why) *why = m;
@@ -81,6 +84,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
             for (int k = 0; k < 4; k++) st.srcs[k] = ps.srcs[k];
             if (!supported(st.cop, &reason)) return fail("concat: " + reason);
         } else {
+            st.op.read_only_residual = gates == GateBuffers::ReadOnlyResidual;
             st.op.in = (Input)ps.in;
             st.op.act = (Act)ps.act;
             st.op.gate = (Gate)ps.gate;
@@ -136,7 +140,7 @@ std::unique_ptr<Executor> Executor::create(const Plan &plan, int in_w, int in_h,
         }
     }
 
-    if (reuse_gate_residuals) reuse_cuda_gate_buffers(plan, L, packed);
+    if (gates == GateBuffers::Reuse) reuse_cuda_gate_buffers(plan, L, packed);
     // feature buffers, as the layout assigned them
     for (size_t need : L.buffer_bytes) {
         void *b = nullptr;
@@ -180,7 +184,7 @@ bool Executor::enable_fp16_cache_order()
 bool Executor::enable_gate_projection()
 {
     const size_t count = steps_.size();
-    if ((count != 18 && count != 27) || u_ != 2 || out_w_ != 4 * W_ || !use_hd_span_tuning()) return false;
+    if ((count != 18 && count != 27) || u_ != 2 || out_w_ != 4 * W_ || !use_hd_gate_projection()) return false;
     const int channels = count == 18 ? 48 : 64;
     const Step &gate = steps_[count - 3], &proj = steps_[count - 2];
     Step &tail = steps_.back();

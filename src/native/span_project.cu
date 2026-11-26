@@ -3,7 +3,7 @@
 
 namespace ajinative {
 namespace {
-template<int C, bool FP8>
+template<int C, bool FP8, bool READ_ONLY_RESIDUAL = false>
 cudaError_t project_tile(const dev::GateProjectParams &p, cudaStream_t stream)
 {
     constexpr int WARPS = 4, ROWS = 2;
@@ -13,7 +13,7 @@ cudaError_t project_tile(const dev::GateProjectParams &p, cudaStream_t stream)
     constexpr int shared_bytes = halo > stage ? halo : stage;
     static_assert(shared_bytes <= 48 * 1024, "gate/projection tile exceeds the default shared-memory limit");
     const dim3 grid((p.W + dev::TW - 1) / dev::TW, (p.H + height - 1) / height);
-    dev::k_conv3x3<C,C,WARPS,ROWS,0,0,2,0,FP8,FP8,false,dev::GateProjectParams>
+    dev::k_conv3x3<C,C,WARPS,ROWS,0,0,2,0,FP8,FP8,false,dev::GateProjectParams,READ_ONLY_RESIDUAL>
         <<<grid,WARPS*32,shared_bytes,stream>>>(p);
     return cudaGetLastError();
 }
@@ -38,6 +38,8 @@ cudaError_t span_gate_project(const Conv3x3 &op, const Tensors &io, const Concat
     for (int i = 0; i < 4; ++i) p.maps[i] = static_cast<const half *>(maps[i]);
     p.project_w = static_cast<const uint4 *>(project.w->frag);
     p.project_bias = static_cast<const half2 *>(project.w->bias);
+    if (op.cin == 64 && !fp8_weights && op.read_only_residual && p.resid != p.dst)
+        return project_tile<64,false,true>(p,stream);
     if (op.cin == 64)
         return fp8_weights ? project_tile<64,true>(p,stream) : project_tile<64,false>(p,stream);
     return fp8_weights ? project_tile<48,true>(p,stream) : project_tile<48,false>(p,stream);
