@@ -45,19 +45,10 @@ cudaError_t tx_assemble(TxMap cen, TxMap sup, const float *pf, const void *pst, 
 // An MCBlock head's outputs (O: fp16 [ih][iw][16]) resized to oh x ow in one pass: F (fp32 [oh][ow][2]) =
 // (or += with add) channels 0..1; ST (fp16 [oh][ow][16]) 0..8 = channels 2..10, the rest 0.
 cudaError_t tx_head_up(const void *O, int ih, int iw, float *F, void *ST, int oh, int ow, bool add, int n, cudaStream_t s);
-// One support at full resolution from its coarser flow F (fp32 [h][w][2]) and logit (fp16 [h][w][ls],
-// channel 0): the flow resized (scaled by W/w, H/h), the logit resized, and the frame (fr: rgb 0..2 of an
-// 8-channel map) warped by the flow; downsized in the same pass to the half resolution oh x ow the
-// confidence head reads (nothing at full resolution is stored): fh (fp32 [oh][ow][2]) = the flow (scaled by
-// ow/W, oh/H), wh (fp16 [oh][ow][8], 0..3) = warped rgb and logit.
-cudaError_t tx_full_down(const float *F, const void *logit, int ls, int h, int w, TxMap fr, float *fh, void *wh, int H, int W, int oh, int ow,
-                         const TxBat &bt, cudaStream_t s);
-// The confidence head's input out [h][w][32] from the centre (cen: rgb 0..2, features 3..6), the half-res
-// warped support and raw logit (wh: rgb 0..2, logit 3), the support's features (sup: 3..6) warped here by
-// flow (fp32 [h][w][2]): [c, wr, |wr-c|, fc, fw, |fw-fc|, flow, |flow|, dt, 0...]; and rch (fp16 [h][w][16])
-// = the raw logit in channel 0, the rest 0 (the head's residual).
-cudaError_t tx_conf_in_warp(TxMap cen, TxMap wh, TxMap sup, const float *flow, const TxBat &bt, void *out, void *rch, int h, int w,
-                            cudaStream_t s);
+// At exactly half resolution, filter the full-resolution warp and construct the confidence inputs.
+// Flow stays FP32. Warped RGB and raw logit are rounded to FP16 before the confidence calculation.
+cudaError_t tx_full_conf(const float *flow, const void *logit, int h, int w, TxMap frame, TxMap center, TxMap support,
+                         void *cin, void *residual, const TxBat &bt, cudaStream_t s);
 // A depthwise 3x3 conv (zero padding) plus bias [C], fp16 NHWC, over n images; C a multiple of 8.
 cudaError_t tx_dw(const void *in, int sin, void *out, int sout, int H, int W, int C, const float *w, const float *bias, int n, cudaStream_t s);
 // The last stage's tx_head_up: F += the flow resized; lg (fp16, every other element) = the raw logit resized.
@@ -70,7 +61,7 @@ struct TxBlend {
     TxMap fr[6], center;        // the supports' and the centre's 8-channel frame maps
     float thresh = 0, gslope = 0, minsup = 0, cslope = 0, eps = 0;
 };
-// The blend, per pixel over the 6 supports in order: each support warped as tx_full_down does (from pf and
+// The blend, per pixel over the 6 supports in order: each support warped as tx_full_conf does (from pf and
 // the raw logit), conf = sigmoid(resize(confidence logit)) * valid; gate = sigmoid((conf - thresh) * gslope);
 // w = conf * gate; sums of w * warped, w and gate. out (3 fp16 planes) = c + r * ((c + sum w*warped) /
 // max(1 + sum w, eps) - c), r = sigmoid((sum gate - minsup + 0.5) * cslope). Nothing is accumulated in memory.

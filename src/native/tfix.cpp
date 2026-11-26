@@ -47,8 +47,8 @@ struct Chain {
         void *X = nullptr, *A = nullptr, *B = nullptr, *B2 = nullptr, *T = nullptr, *O = nullptr, *ST = nullptr;
         float *F = nullptr;
     } sb[3];
-    void *WH = nullptr, *RCH = nullptr, *CIN = nullptr, *C1 = nullptr, *C2 = nullptr, *C3 = nullptr;
-    float *FH = nullptr, *wsp = nullptr;
+    void *RCH = nullptr, *CIN = nullptr, *C1 = nullptr, *C2 = nullptr, *C3 = nullptr;
+    float *wsp = nullptr;
     cudaStream_t st = nullptr;
     cudaEvent_t done = nullptr;
 };
@@ -315,13 +315,6 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
             }
         }
     };
-    auto layoutB = [&](size_t &o, int n, size_t (&pb)[5]) {
-        pb[0] = bump(o, n * M1 * 8);
-        pb[1] = bump(o, n * M1 * 8 * 2);
-        pb[2] = bump(o, n * M1 * 16 * 2);
-        pb[3] = bump(o, n * M1 * 32 * 2);
-        pb[4] = bump(o, n * M1 * 32 * 2);
-    };
     auto setA = [&](Chain::Sb *sb, char *blk, int k0, int k1, const size_t (&at)[3][8]) {
         for (int k = k0; k < k1; k++) {
             Chain::Sb &b = sb[k];
@@ -355,19 +348,19 @@ std::unique_ptr<VidNet> Tfix::build(const OnnxGraph &g, int w, int h, cudaStream
         f->E2 = r.alloc(encoder_bytes);
         f->EP = r.alloc(encoder_bytes);
     }
-    size_t oA = 0, at[3][8] = {}, oB = 0, pb[5] = {};
+    size_t oA = 0, at[3][8] = {}, oB = 0;
     layoutA(oA, f->kb, 3, 1, at);
-    layoutB(oB, 1, pb);
+    const size_t rch = bump(oB, M1 * 16 * sizeof(uint16_t));
+    const size_t cin = bump(oB, M1 * 32 * sizeof(uint16_t));
+    const size_t c1 = bump(oB, M1 * 32 * sizeof(uint16_t));
     const size_t chain_bytes = std::max(oA, oB);
     for (Chain &c : f->ch) {
         char *blk = (char *)r.alloc(chain_bytes);
         if (!blk) return refuse(why, "out of GPU memory"), nullptr;
         setA(c.sb, blk, f->kb, 3, at);
-        c.FH = (float *)(blk + pb[0]);
-        c.WH = blk + pb[1];
-        c.RCH = blk + pb[2];
-        c.CIN = blk + pb[3];
-        c.C1 = blk + pb[4];
+        c.RCH = blk + rch;
+        c.CIN = blk + cin;
+        c.C1 = blk + c1;
         c.C2 = c.CIN;
         c.C3 = c.C1;
         if (cudaStreamCreateWithFlags(&c.st, cudaStreamNonBlocking) != cudaSuccess ||
@@ -535,7 +528,7 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
         return cudaSuccess;
     };
     // the full-resolution pass and confidence head for n supports from si on (their PF, PL)
-    auto head = [&](int si, const TxBat &bt, float *FH, void *WH, void *RCH, void *CIN, void *C1, cudaStream_t q, float *ws) -> cudaError_t {
+    auto head = [&](int si, const TxBat &bt, void *RCH, void *CIN, void *C1, cudaStream_t q, float *ws) -> cudaError_t {
         const Stage &L = st[2];
         float *pf = PF + (size_t)si * h1 * w1 * 2;
         void *pl = (char *)PL + (size_t)si * h1 * w1 * 4;
@@ -543,10 +536,7 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
             a.nb = bt.n;
             return a;
         };
-        // full resolution (flow, logit, the warped support and its validity), low-passed to 1/2 for the
-        // confidence head in the same pass
-        K(tx_full_down(pf, pl, 2, L.h, L.w, frm(0, 0), FH, WH, H, W, h1, w1, bt, q));  // WH: warped 0..2, raw logit 3
-        K(tx_conf_in_warp(pym(2, CEN, 0), tm(WH, 8, 0), pym(2, 0, 0), FH, bt, CIN, RCH, h1, w1, q));
+        K(tx_full_conf(pf, pl, L.h, L.w, frm(0, 0), pym(2, CEN, 0), pym(2, 0, 0), CIN, RCH, bt, q));
         CK(Gc(h0, nb(lrelu(ga(CIN, 32, h1, w1, C1, 32, h1, w1))), q, ws));
         CK(Gc(hh1, nb(lrelu(ga(C1, 32, h1, w1, CIN, 32, h1, w1))), q, ws));
         GConvArgs a = nb(ga(CIN, 32, h1, w1, C1, 16, h1, w1));
@@ -577,7 +567,7 @@ cudaError_t Tfix::exec(const void *const *fr_in, const int *sel, void *out, cuda
             }
             CK(stage(k, c.sb[k], pf, pst, k < 2 ? c.sb[k].F : PF + (size_t)si * h1 * w1 * 2, (char *)PL + (size_t)si * h1 * w1 * 4, one, q, c.wsp));
         }
-        CK(head(si, one, c.FH, c.WH, c.RCH, c.CIN, c.C1, q, c.wsp));
+        CK(head(si, one, c.RCH, c.CIN, c.C1, q, c.wsp));
     }
     for (Chain &c : ch) {
         K(cudaEventRecord(c.done, c.st));
