@@ -58,6 +58,7 @@ the caller's surfaces already allocated. The JSON includes raw pairs,
 wall-clock and stream-event medians, a 95% interval for the median paired
 percentage, and the selected model log. Use `--help` for image, temporal and
 RIFE measurements or to supply the same NV12 clip on different machines.
+A same-build RTX 5090 control measured 0.18% lower latency for Balanced and 0.16% for Performance on the second-loaded arm, so use `--swap-load-order` to check this effect and treat differences under 1% as unresolved.
 
 ```sh
 ffmpeg -i clip.mkv -frames:v 12 -pix_fmt p010le -f rawvideo in.raw

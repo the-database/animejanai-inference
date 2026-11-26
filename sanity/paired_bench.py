@@ -154,28 +154,31 @@ def run(args):
             stack.callback(bind(dev.lib, 'cudaEventDestroy', I, P), event)
         check(mem(C.byref(free), C.byref(total)))
         initial = free.value
-        arms, logs = [], []
-        for path in ([getattr(args, args.memory_worker)] if args.memory_worker else [args.reference, args.candidate]):
+        arm_names = ('reference', 'candidate')
+        load_order = arm_names[::-1] if args.swap_load_order else arm_names
+        arms = {}
+        for name in ((args.memory_worker,) if args.memory_worker else load_order):
+            path = getattr(args, name)
             issue, log = image_arm(args, path, stack) if is_image else video_arm(args, path, dev, frames, stack)
-            arms.append(issue)
+            arms[name] = issue
             for i in range(32):
                 issue(i)
             check(dev.sync(dev.stream))
-            logs.append(log())
-        if args.memory_worker:
-            check(mem(C.byref(free), C.byref(total)))
-            return {'warm_bytes': initial-free.value, 'dispatch': logs[0]}
+            if args.memory_worker:
+                check(mem(C.byref(free), C.byref(total)))
+                return {'warm_bytes': initial-free.value, 'dispatch': log()}
         order = [(0, 1), (1, 0)] * (args.pairs//2)
         random.Random(147).shuffle(order)
         wall, gpu = [], []
         for j, pair in enumerate(order):
             wall_ms, gpu_ms = [0, 0], [0, 0]
             for arm in pair:
+                issue = arms[arm_names[arm]]
                 if not is_image:
                     check(record(events[0], dev.stream))
                 start = time.perf_counter_ns()
                 for n in range(args.batch):
-                    arms[arm](32+j*args.batch+n)
+                    issue(32+j*args.batch+n)
                 if not is_image:
                     check(record(events[1], dev.stream))
                     check(done(events[1]))
@@ -187,7 +190,7 @@ def run(args):
             wall.append(wall_ms)
             gpu.append(gpu_ms)
         result = {'case': args.case, 'input_size': [args.width, args.height], 'pairs': args.pairs, 'frames_per_batch': args.batch,
-                  'wall': summarize(wall), 'wall_pairs_ms': wall}
+                  'load_order': load_order, 'wall': summarize(wall), 'wall_pairs_ms': wall}
         if is_image:
             result.update(model=args.image_model, tile=args.tile or [args.width, args.height], overlap=args.overlap)
         else:
@@ -211,6 +214,8 @@ def main():
     p.add_argument('--tile', type=int, help='maximum square image tile, defaults to the page dimensions')
     p.add_argument('--overlap', type=int, default=32)
     p.add_argument('--pairs', type=int, default=40)
+    p.add_argument('--swap-load-order', action='store_true',
+                   help='load and warm the candidate first; timing columns remain reference, candidate')
     p.add_argument('--batch', type=int, help='frames per arm per pair, default 8 for video or 1 for image')
     p.add_argument('--output', type=Path, help='also save raw pairs and dispatch logs as JSON')
     p.add_argument('--memory-worker', choices=('reference','candidate'), help=argparse.SUPPRESS)
