@@ -43,6 +43,22 @@ trtexec --onnx=models/<model>.onnx --fp16 \
 
 ## Harness (no player needed)
 
+For a headless before/after benchmark, run the same script on Windows or Linux:
+
+```sh
+python sanity/paired_bench.py --reference "$STOCK_LIB" --candidate "$NEW_LIB" \
+  --cuda-runtime "$CUDART" --models "$MODELS" --slot 1002 --output balanced.json
+```
+
+Pass the backend shared libraries directly (`aji_trt.dll` or `libaji_trt.so`).
+The default measures 1920×1080 NV12 to 3840×2160 P010 on 40 randomized,
+order-balanced pairs. Negative paired percentages mean lower latency on the
+candidate. Each arm's warm VRAM delta is measured in its own process with
+the caller's surfaces already allocated. The JSON includes raw pairs,
+wall-clock and stream-event medians, a 95% interval for the median paired
+percentage, and the selected model log. Use `--help` for image, temporal and
+RIFE measurements or to supply the same NV12 clip on different machines.
+
 ```sh
 ffmpeg -i clip.mkv -frames:v 12 -pix_fmt p010le -f rawvideo in.raw
 ./build/aji_harness --engine models/<model>.engine --input in.raw \

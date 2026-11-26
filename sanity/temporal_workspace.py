@@ -66,11 +66,13 @@ class Device:
 
 
 class Backend:
-    def __init__(self, path, conf, model_dir, stack):
+    def __init__(self, path, conf, model_dir, stack, slot=1, trtexec=None):
         lib = C.CDLL(str(path.resolve()))
         self.error = bind(lib, 'aji_last_error', C.c_char_p, P)
         self.log = bind(lib, 'aji_current_log', C.c_char_p, P)
         self.configure = bind(lib, 'aji_configure', I, P, I, I, C.c_double, C.POINTER(I), C.POINTER(I))
+        self.infer = bind(lib, 'aji_infer', I, P, C.POINTER(Frame), C.POINTER(Frame), P)
+        self.radius = bind(lib, 'aji_temporal_radius', I, P)
         self.ingest = bind(lib, 'aji_ingest', I, P, C.POINTER(Frame), C.c_uint64, P)
         self.seq = bind(lib, 'aji_infer_seq', I, P, C.c_uint64, C.POINTER(Frame), P)
         self.reset = bind(lib, 'aji_temporal_reset', None, P)
@@ -78,8 +80,8 @@ class Backend:
                          C.c_double, C.POINTER(Frame), P)
         self.rife_ids = bind(lib, 'aji_infer_rife_ids', I, P, C.POINTER(Frame), C.c_int64,
                              C.POINTER(Frame), C.c_int64, C.c_double, C.POINTER(Frame), P, I)
-        params = Params(version=9, conf=os.fsencode(conf), models=os.fsencode(model_dir), slot=1,
-                        rife=os.fsencode(model_dir))
+        params = Params(version=9, conf=os.fsencode(conf) if conf else None, models=os.fsencode(model_dir), slot=slot,
+                        rife=os.fsencode(model_dir), trtexec=os.fsencode(trtexec) if trtexec else None)
         self.ctx = P(bind(lib, 'aji_create', P, C.POINTER(Params))(C.byref(params)))
         if not self.ctx:
             raise RuntimeError(f'aji_create failed for {path.name}')
