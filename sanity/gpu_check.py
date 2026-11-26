@@ -355,7 +355,7 @@ def forced(text, order, fuse, packed):
 
 
 def cases(sm):
-    """(name, paired_bench arguments, model folder, group, archives needed, runs FP8, call or setting both builds must have)"""
+    """(name, paired_bench arguments, model folder, group, archives needed, runs FP8, exported call both builds must have)"""
     (ROOT/'builtins.conf').write_text('[global]\nconfig_version=2\nnative=on\nlogging=yes\n')
     head = '[global]\nconfig_version=2\nbackend=TensorRT\nnative=on\nlogging=yes\n'
     slot = '[slot_{}]\nchain_1_max_fps=120\n'
@@ -380,7 +380,7 @@ def cases(sm):
     catalog.append(('RIFE 4.26 ids', ['--case', 'rife-ids', '--conf', ROOT/'rife.conf', '--slot', 1], VIDEO, 'video', {'rife'}, False,
                     'aji_infer_rife_ids'))
     if sm >= 89:  # FP8 needs the SM 89 instruction set
-        catalog += [(n, ['--conf', ROOT/'fp8.conf', '--slot', s], VIDEO, 'video', {'video'}, True, 'native_span_precision')
+        catalog += [(n, ['--conf', ROOT/'fp8.conf', '--slot', s], VIDEO, 'video', {'video'}, True, None)
                     for n, s in (('FP8 Performance', 1), ('FP8 Balanced', 2))]
     image = lambda model, size, pairs, tile=None, height=None: [
         '--case', 'image', '--image-model', model, '--width', size, '--height', height or size, '--tile', tile or size, '--pairs', pairs]
@@ -435,9 +435,18 @@ def bench(identity, label, ref, cand, args, model_dir, fp8, swap):
             'ref_mib': j['memory']['reference']['warm_bytes']/2**20, 'cand_mib': j['memory']['candidate']['warm_bytes']/2**20}
 
 
-def has(lib, token):
-    """Whether a build contains an exported call or a setting name."""
-    return token.encode() in lib.read_bytes()
+def has(lib, call):
+    """Whether a build exports a call (its name is then in the dynamic string table)."""
+    return call.encode() in lib.read_bytes()
+
+
+def selects_fp8(lib, conf, slot, seen={}):
+    """Whether a build runs the FP8 body for a slot that asks for it. A build older than per-slot precision ignores the
+    setting, and the setting's name cannot be found in a binary, so this asks the build itself."""
+    key = (lib, str(conf), str(slot))
+    if key not in seen:
+        seen[key] = 'FP8 SPANF3 body' in dispatch(lib, conf, slot)
+    return seen[key]
 
 
 def dispatch(lib, conf, slot):
@@ -460,10 +469,14 @@ def compare(identity, title, ref, cand, selected, both_orders, rows):
         missing = [x for x in map(str, args) if x.startswith('--') and x not in OPTIONS]
         if missing:  # timing scripts older than an option this case needs
             block.append({'case': name, 'skipped': f'the timing scripts at {SCRIPTS[:7]} have no {missing[0]}; use --tools'})
-        elif call and not has(ref, call):  # an older reference without this call or setting: nothing to compare
+        elif call and not has(ref, call):  # an older reference without this call: nothing to compare
             block.append({'case': name, 'skipped': f'{ref.parent.name} has no {call}'})
         elif call and not has(cand, call):  # the candidate lost something the reference has
             block.append({'case': name, 'error': f'{cand.parent.name} has no {call}, which {ref.parent.name} has'})
+        elif fp8 and not selects_fp8(ref, args[1], args[3]):
+            block.append({'case': name, 'skipped': f'{ref.parent.name} does not run FP8 for this slot'})
+        elif fp8 and not selects_fp8(cand, args[1], args[3]):
+            block.append({'case': name, 'error': f'{cand.parent.name} does not run FP8 for this slot, {ref.parent.name} does'})
         if block and block[-1]['case'] == name:
             say('   ' + line(block[-1]))
             continue
@@ -590,9 +603,14 @@ def main():
     SCRIPTS = builds.resolve(a.tools)[1] if re.fullmatch(r'pr\d+|head|base', a.tools) else builds.commit(a.tools)
     builds.tree('tools', SCRIPTS)  # sanity/paired_bench.py and sanity/direct_graph.py are run from this revision
     harness = ROOT/'tools'/'sanity'/'paired_bench.py'
-    if not harness.exists():
-        raise Failed(f'{a.tools} ({SCRIPTS[:7]}) has no sanity/paired_bench.py; pass --tools a revision that has it, such as origin/main')
-    OPTIONS = set(re.findall(r'(?<![\w-])--[a-z][a-z0-9-]*', capture([sys.executable, harness, '--help'])))
+    lacks = lambda script: (f'{a.tools} ({SCRIPTS[:7]}) has no sanity/{script}; pass --tools a revision that has it, '
+                            'such as origin/main')
+    if comparisons:  # only timing needs the paired runner; the gate test and FP16 parity run without it
+        if not harness.exists():
+            raise Failed(lacks('paired_bench.py'))
+        OPTIONS = set(re.findall(r'(?<![\w-])--[a-z][a-z0-9-]*', capture([sys.executable, harness, '--help'])))
+    if a.parity and not (ROOT/'tools'/'sanity'/'direct_graph.py').exists():
+        raise Failed(lacks('direct_graph.py'))
     say('models: ' + ', '.join(sorted(needed))); models(seven, needed)
     libs = {n: builds.lib(n) for c in comparisons + a.parity for n in c[:2]}  # build everything before timing anything
 
@@ -608,15 +626,12 @@ def main():
         for label, conf, slot in slots:
             label, ok, text = f'{ref} -> {cand} {label}', True, ''
             if 'FP8' in label:  # the same outputs prove nothing about FP8 unless both builds selected it
-                setting, marker = 'native_span_precision', 'FP8 SPANF3 body'
-                if not has(libs[ref], setting):
-                    text = f'{label}: SKIPPED, {ref} has no {setting}'
-                elif not has(libs[cand], setting):
-                    ok, text = False, f'{label}: FAILED: {cand} has no {setting}, which {ref} has'
-                else:
-                    plain = [n for n in (ref, cand) if marker not in dispatch(libs[n], conf, slot)]
-                    if plain:
-                        ok, text = False, f'{label}: FAILED: {plain[0]} did not select FP8'
+                if not harness.exists():  # its per-build worker is what reports the precision a build selected
+                    ok, text = False, f'{label}: FAILED: cannot confirm FP8, {lacks("paired_bench.py")}'
+                elif not selects_fp8(libs[ref], conf, slot):
+                    text = f'{label}: SKIPPED, {ref} does not run FP8 for this slot'
+                elif not selects_fp8(libs[cand], conf, slot):
+                    ok, text = False, f'{label}: FAILED: {cand} does not run FP8 for this slot, {ref} does'
             if not text:
                 ok, text = parity(label, libs[ref], libs[cand], conf, slot)
             checks.append(text); failed += not ok; say('   ' + text)
