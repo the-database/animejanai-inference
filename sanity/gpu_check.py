@@ -396,6 +396,7 @@ def cases(sm):
         ('HAT-L 512', image(HAT_L, 512, 16), 'illustration-bf16'), ('DAT2 512', image(DAT2, 512, 16), 'illustration-bf16'),
         # a page of overlapping, blended tiles, and a page that DAT pads to its 32-pixel attention windows
         ('ESRGAN 256 tiles', image(ESRGAN, 1200, 16, tile=256, height=1000), 'manga'),
+        ('ESRGAN 512 tiles', image(ESRGAN, 2400, 16, tile=512, height=2000), 'manga'),
         ('DAT2 320x272', image(DAT2, 320, 16, tile=512, height=272), 'illustration-bf16'))]
     return catalog
 
