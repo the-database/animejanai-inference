@@ -1,5 +1,6 @@
 #include "aji_image.h"
 #include "core/tiling.h"
+#include "native/device.h"
 #include "native_lifetime_gpu.h"
 #include <cstdio>
 #include <cstdlib>
@@ -8,16 +9,18 @@
 
 using ajinative::lifetime_test::require;
 bool aji_test_force_tile_blend = false;
+unsigned aji_test_tile_graph_launches = 0;
 void test_tile_pack();
 
 namespace {
 struct Model {
     const char *file;
     int scale;
+    bool graph_on_sm120 = false;
 };
 constexpr Model models[] = {
     {"2x_IllustrationJaNai_V3denoise_SPAN_S_30k_fp16.onnx", 2},
-    {"2x_MangaJaNai_2048p_V1_ESRGAN_95k_fp16.onnx", 2},
+    {"2x_MangaJaNai_2048p_V1_ESRGAN_95k_fp16.onnx", 2, true},
     {"2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16.onnx", 2},
     {"4x_IllustrationJaNai_V3detail_DAT2_28k_bf16.onnx", 4},
     {"4x_IllustrationJaNai_V3detail_HAT_L_28k_bf16.onnx", 4}
@@ -34,17 +37,17 @@ struct Session {
 struct Page { int w, h, channels; };
 struct Progress {
     std::vector<std::pair<int,int>> calls;
-    bool cancel = false;
+    int cancel_at = 0;
     static int report(void *opaque, int done, int total) {
         auto &p = *static_cast<Progress *>(opaque);
         p.calls.emplace_back(done, total);
-        return p.cancel ? 1 : 0;
+        return done == p.cancel_at;
     }
 };
 
 using Bytes = std::vector<uint8_t>;
 std::vector<Bytes> pages(const std::string &path, int scale, int maximum, bool even,
-                         const std::vector<Page> &inputs, bool blend)
+                         const std::vector<Page> &inputs, bool blend, bool graphs)
 {
     Session session;
     aji_img_create_params cp{};
@@ -63,6 +66,7 @@ std::vector<Bytes> pages(const std::string &path, int scale, int maximum, bool e
     aji_test_force_tile_blend = blend;
     size_t img = 0, packed = 0, band = 0, wx = 0, wy = 0;
     std::vector<Bytes> outputs;
+    bool cancelled_replay = false;
     for (const auto &p : inputs) {
         int tw = maximum, th = maximum;
         auto xs = even ? ajicore::even_origins(p.w,maximum,overlap,&tw) : ajicore::tile_origins(p.w,tw,overlap);
@@ -79,15 +83,24 @@ std::vector<Bytes> pages(const std::string &path, int scale, int maximum, bool e
         aji_img_buffer out{ow,oh,p.channels,output_stride,output.data()};
         Progress count;
         // Cancellation happens before host delivery, including when the tail emits several strips.
-        if (outputs.empty()) {
-            count.cancel = true;
+        if (outputs.empty() || (graphs && tiles >= 3 && xs.size() >= 2 && !cancelled_replay)) {
+            count.cancel_at = outputs.empty() ? 1 : 2;
+            const auto before_cancel = aji_test_tile_graph_launches;
             require(aji_img_upscale(session.model,&in,&out,Progress::report,&count) == AJI_IMG_CANCELLED &&
-                    count.calls == std::vector<std::pair<int,int>>{{1,1}}, "single-tile cancellation callback");
+                    count.calls.size() == size_t(count.cancel_at) && count.calls.back() == std::make_pair(count.cancel_at,tiles),
+                    "wrong cancellation callback");
+            if (count.cancel_at == 2) {
+                require(aji_test_tile_graph_launches == before_cancel + 1, "cancelled tile did not replay");
+                cancelled_replay = true;
+            }
             require(std::all_of(output.begin(),output.end(),[=](uint8_t v){ return v == guard; }), "cancelled output changed");
             count = {};
         }
+        const auto before_graphs = aji_test_tile_graph_launches;
         require(aji_img_upscale(session.model,&in,&out,Progress::report,&count) == AJI_IMG_OK,
                 aji_img_last_error(session.ctx));
+        require(aji_test_tile_graph_launches - before_graphs == unsigned(graphs && tiles >= 3 ? tiles - 1 : 0),
+                "unexpected tile graph launch count");
         require(count.calls.size() == size_t(tiles), "wrong callback count");
         for (int t = 0; t < tiles; ++t)
             require(count.calls[t] == std::make_pair(t+1,tiles), "wrong callback arguments");
@@ -112,8 +125,8 @@ std::vector<Bytes> pages(const std::string &path, int scale, int maximum, bool e
 void compare(const std::filesystem::path &dir, Model model, int maximum, bool even, const std::vector<Page> &inputs)
 {
     const auto path = (dir / model.file).u8string();
-    const auto ref = pages(path,model.scale,maximum,even,inputs,true);
-    const auto got = pages(path,model.scale,maximum,even,inputs,false);
+    const auto ref = pages(path,model.scale,maximum,even,inputs,true,false);
+    const auto got = pages(path,model.scale,maximum,even,inputs,false,model.graph_on_sm120 && ajinative::current_cuda_sm() == 120);
     for (size_t i = 0; i < ref.size(); ++i) {
         const auto diff = std::mismatch(ref[i].begin(),ref[i].end(),got[i].begin());
         if (diff.first != ref[i].end()) {
@@ -143,6 +156,9 @@ int main(int argc, char **argv)
             const std::vector<Page> sequence{{121,117,3}, {207,183,3}, {121,117,3}, {119,109,1}};
             for (const auto &model : models) compare(directory, model, 128, true, sequence);
             compare(directory, models[0], 128, false, sequence);
+            // Split-tail ESRGAN: revisit a cached geometry after a single tile and after a different tiled page.
+            compare(directory, models[1], 512, true,
+                    {{121,117,3}, {751,561,3}, {123,119,1}, {751,561,3}, {751,820,1}, {950,820,1}, {751,561,3}});
         } else if (mode == "large") {
             for (const auto &model : models) {
                 const std::vector<int> sizes = model.scale == 4 ? std::vector<int>{512} : std::vector<int>{1536,2048};

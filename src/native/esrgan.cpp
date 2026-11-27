@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "native/gconv.h"
+#include "native/device.h"
 #include "native/img_kernels.h"
 #include "native/netres.h"
 #include "native/allocation_count.h"
@@ -50,6 +51,7 @@ public:
     static std::unique_ptr<ImgNet> build(const OnnxGraph &g, int max_w, int max_h, cudaStream_t s, std::string *why, int tail_rows);
     cudaError_t run(const void *in, bool in_f32, void *out, bool out_f32, int w, int h, cudaStream_t s) override;
     int tail_rows() const override { return split_rows; }
+    bool capture_tiles() const override { return current_cuda_sm() == 120; }
     cudaError_t body(const void *in, bool in_f32, int w, int h, cudaStream_t s) override;
     cudaError_t tail(int r0, int r1, void *out, bool out_f32, cudaStream_t s) override;
     int scale() const override { return scale_; }

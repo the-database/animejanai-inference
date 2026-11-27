@@ -57,6 +57,7 @@ using namespace ajicore;
 
 #ifdef AJI_TEST_SINGLE_TILE_OUTPUT
 extern bool aji_test_force_tile_blend;
+extern unsigned aji_test_tile_graph_launches;
 #endif
 
 #ifdef AJI_TRTRTX
@@ -187,6 +188,45 @@ struct aji_img_model : TileModel {
     int cur_w = 0, cur_h = 0;     // the input shape last set on the context
     std::vector<cudaEvent_t> tile_ev;  // AJI_IMG_PROFILE on the GPU path
     std::unique_ptr<ajinative::ImgNet> native;  // native kernels in place of the engine
+    cudaGraphExec_t tile_graph = nullptr;
+    int graph_w = 0, graph_h = 0;
+
+    cudaError_t native_tile(int w, int h, bool replay)
+    {
+        auto issue = [&] {
+            if (native->tail_rows()) return native->body(d_in, in_dt == nvinfer1::DataType::kFLOAT, w, h, stream);
+            return native->run(d_in, in_dt == nvinfer1::DataType::kFLOAT, d_out,
+                               out_dt == nvinfer1::DataType::kFLOAT, w, h, stream);
+        };
+        if (!replay) return issue();
+        if (w != graph_w || h != graph_h) {
+            if (tile_graph) cudaGraphExecDestroy(tile_graph);
+            tile_graph = nullptr;
+            graph_w = w;
+            graph_h = h;
+            // Tile I/O and native allocations belong to the model. Extraction, strip blending and
+            // caller buffers stay outside capture. Cache one shape, including a failed capture.
+            cudaGraph_t graph = nullptr;
+            if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+                cudaError_t issued;
+                try { issued = issue(); }
+                catch (const std::bad_alloc &) { issued = cudaErrorMemoryAllocation; }
+                const auto ended = cudaStreamEndCapture(stream, &graph);
+                if (issued == cudaSuccess && ended == cudaSuccess && graph) {
+                    cudaGraphExec_t exec = nullptr;
+                    if (cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess) tile_graph = exec;
+                }
+                if (graph) cudaGraphDestroy(graph);
+            }
+            if (!tile_graph) cudaGetLastError();  // run the ordinary path if capture is unavailable
+        }
+        if (!tile_graph) return issue();
+        const auto launched = cudaGraphLaunch(tile_graph, stream);
+#ifdef AJI_TEST_SINGLE_TILE_OUTPUT
+        if (launched == cudaSuccess) ++aji_test_tile_graph_launches;
+#endif
+        return launched;
+    }
 
     int run_tile(const float *in, float *out, std::string *err) override
     {
@@ -261,6 +301,9 @@ struct aji_img_model : TileModel {
         for (cudaEvent_t ev : tile_ev)
             cudaEventDestroy(ev);
         tile_ev.clear();
+        if (tile_graph) cudaGraphExecDestroy(tile_graph);
+        tile_graph = nullptr;
+        graph_w = graph_h = 0;
         cudaFree(d_in);
         cudaFree(d_out);
         cudaFreeHost(h_in);
@@ -933,9 +976,13 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
     const int tow = Tw * s, toh = Th * s;
     const int cols = spw * s, band_rows = sph * s;
     const int total = (int)(ox.size() * oy.size());
+    bool graph_tiles = total >= 3 && m.native && m.native->capture_tiles();
     bool single_tile = total == 1;
 #ifdef AJI_TEST_SINGLE_TILE_OUTPUT
-    if (aji_test_force_tile_blend) single_tile = false;
+    if (aji_test_force_tile_blend) {
+        single_tile = false;
+        graph_tiles = false;  // reference also issues every native kernel directly
+    }
 #endif
     const GpuDtype in_t = gpu_dtype(m.in_dt), out_t = gpu_dtype(m.out_dt);
     cudaStream_t st = m.stream;
@@ -1015,7 +1062,8 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
             if (m.native && m.native->tail_rows() > 0) {
                 // The tail returns planar strips. Crop the last strip to the visible image.
                 const int tr = m.native->tail_rows();
-                e = m.native->body(m.d_in, in_t == GpuDtype::F32, Tw, Th, st);
+                // Run the first tile directly to set the current body dimensions for tail().
+                e = m.native_tile(Tw, Th, graph_tiles && done > 0);
                 for (int r0 = 0; r0 < Th && r0 * s < band_rows && e == cudaSuccess; r0 += tr) {
                     const int r1 = std::min(Th, r0 + tr);
                     e = m.native->tail(r0, r1, m.d_out, out_t == GpuDtype::F32, st);
@@ -1035,7 +1083,7 @@ int upscale_gpu(aji_img_model &m, const aji_img_buffer *in,
                 continue;
             }
             if (m.native) {
-                e = m.native->run(m.d_in, in_t == GpuDtype::F32, m.d_out, out_t == GpuDtype::F32, Tw, Th, st);
+                e = m.native_tile(Tw, Th, graph_tiles && done > 0);
                 if (e != cudaSuccess)
                     return cuda_fail(e, "native kernels");
             } else if (!m.me.exec->enqueueV3(st)) {
