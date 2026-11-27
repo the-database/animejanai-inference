@@ -36,6 +36,8 @@ public:
     virtual size_t weight_bytes() const = 0;
     // Whether a w x h tile is accepted (size constraints of the model).
     virtual bool accepts(int w, int h) const = 0;
+    // The GPU image tiler may replay this model's fixed-address inference across equal-size tiles.
+    virtual bool capture_tiles() const { return false; }
 
     // Split models: the input rows of a tail() strip (a multiple of the model's input granularity), else 0.
     virtual int tail_rows() const { return 0; }
